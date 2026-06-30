@@ -38,7 +38,7 @@ repos:
 
   # Ruff - replaces Black, isort, flake8, and pylint
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.17
+    rev: v0.15.20
     hooks:
       - id: ruff
         args: ['--fix']
@@ -58,7 +58,7 @@ repos:
 
   # Security linting with bandit
   - repo: https://github.com/PyCQA/bandit
-    rev: 1.9.3
+    rev: 1.9.4
     hooks:
       - id: bandit
         args: ['-c', 'pyproject.toml', '-r', '.']
@@ -75,7 +75,7 @@ repos:
 
   # Markdown linting
   - repo: https://github.com/DavidAnson/markdownlint-cli2
-    rev: v0.21.0
+    rev: v0.22.1
     hooks:
       - id: markdownlint-cli2
         args: ['--config', '.markdownlint.json']

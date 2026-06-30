@@ -504,6 +504,7 @@ class PBXCore:
 
         # Register SIP trunks
         self.trunk_system.register_all()
+        self.trunk_system.start_health_monitoring()
 
         # Start security runtime monitor
         if hasattr(self, "security_monitor"):
@@ -561,6 +562,9 @@ class PBXCore:
         # Stop DND scheduler
         if self.dnd_scheduler:
             self.dnd_scheduler.stop()
+
+        # Stop SIP trunk health monitoring
+        self.trunk_system.stop_health_monitoring()
 
         # Stop API server
         self.api_server.stop()
@@ -1424,6 +1428,17 @@ class PBXCore:
                     status="completed",
                     direction=getattr(call, "direction", "inbound"),
                 )
+
+            # Release the trunk channel and record the call outcome for
+            # health tracking, if this call went out via a SIP trunk
+            if hasattr(call, "trunk") and call.trunk:
+                from pbx.core.call import CallState
+
+                call.trunk.release_channel()
+                if call.state == CallState.CONNECTED:
+                    call.trunk.record_successful_call()
+                else:
+                    call.trunk.record_failed_call(reason="call ended before answer")
 
             self.call_manager.end_call(call_id)
             self.rtp_relay.release_relay(call_id)

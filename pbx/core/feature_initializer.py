@@ -59,7 +59,7 @@ class FeatureInitializer:
         pbx_core.parking_system = CallParkingSystem()
         pbx_core.cdr_system = CDRSystem()
         pbx_core.moh_system = MusicOnHold()
-        pbx_core.trunk_system = SIPTrunkSystem(config=config)
+        pbx_core.trunk_system = SIPTrunkSystem(config=config, sip_server=pbx_core.sip_server)
 
         # Initialize statistics engine for analytics
         from pbx.features.statistics import StatisticsEngine
