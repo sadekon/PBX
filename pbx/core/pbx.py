@@ -156,13 +156,15 @@ class PBXCore:
         self.database = DatabaseBackend(self.config)
         self.registered_phones_db = None
         self.extension_db = None
+        self.trunk_db = None
         if self.database.connect():
             self._run_alembic_migrations()
             self.database.create_tables()
-            from pbx.utils.database import ExtensionDB
+            from pbx.utils.database import ExtensionDB, TrunkDB
 
             self.registered_phones_db = RegisteredPhonesDB(self.database)
             self.extension_db = ExtensionDB(self.database)
+            self.trunk_db = TrunkDB(self.database)
             self._log_startup(
                 f"Database backend initialized successfully ({self.database.db_type})"
             )

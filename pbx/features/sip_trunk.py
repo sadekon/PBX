@@ -99,6 +99,63 @@ class SIPTrunk:
         self.failover_count = 0
         self.last_failover_time = None
 
+    @staticmethod
+    def create_from_db(db_trunk: dict) -> "SIPTrunk":
+        """
+        Create a SIPTrunk object from a database row (as returned by ``TrunkDB``).
+
+        Args:
+            db_trunk: Trunk row dict (``trunk_id``, ``name``, ``host``, ``username``,
+                ``password``, ``port``, ``codec_preferences``, ``priority``,
+                ``max_channels``, ``health_check_interval``)
+
+        Returns:
+            SIPTrunk instance
+        """
+        return SIPTrunk(
+            trunk_id=db_trunk["trunk_id"],
+            name=db_trunk["name"],
+            host=db_trunk["host"],
+            username=db_trunk["username"],
+            password=db_trunk["password"],
+            port=db_trunk.get("port", 5060),
+            codec_preferences=db_trunk.get("codec_preferences"),
+            priority=db_trunk.get("priority", 100),
+            max_channels=db_trunk.get("max_channels", 10),
+            health_check_interval=db_trunk.get("health_check_interval", 60),
+        )
+
+    @staticmethod
+    def create_from_config(trunk_config: dict) -> "SIPTrunk":
+        """
+        Create a SIPTrunk object from a config.yml ``sip_trunks`` entry.
+
+        Matches the field names used in the existing trunk example templates
+        (``config_att_sip.yml``, ``config_comcast_sip.yml``), which key the
+        trunk identifier as ``id`` rather than ``trunk_id``.
+
+        Args:
+            trunk_config: Trunk dict from config (``id``/``trunk_id``, ``name``,
+                ``host``, ``username``, ``password``, ``port``,
+                ``codec_preferences``, ``priority``, ``max_channels``)
+
+        Returns:
+            SIPTrunk instance
+        """
+        trunk_id = trunk_config.get("trunk_id") or trunk_config["id"]
+        return SIPTrunk(
+            trunk_id=trunk_id,
+            name=trunk_config.get("name", trunk_id),
+            host=trunk_config["host"],
+            username=trunk_config["username"],
+            password=trunk_config["password"],
+            port=trunk_config.get("port", 5060),
+            codec_preferences=trunk_config.get("codec_preferences"),
+            priority=trunk_config.get("priority", 100),
+            max_channels=trunk_config.get("max_channels", 10),
+            health_check_interval=trunk_config.get("health_check_interval", 60),
+        )
+
     def register(self, sip_server: Any | None = None) -> bool:
         """
         Register trunk with provider.
@@ -399,20 +456,33 @@ class OutboundRule:
 class SIPTrunkSystem:
     """Manages SIP trunks for external calls with health monitoring and failover"""
 
-    def __init__(self, config: Any | None = None, sip_server: Any | None = None) -> None:
+    def __init__(
+        self,
+        config: Any | None = None,
+        sip_server: Any | None = None,
+        trunk_db: Any | None = None,
+    ) -> None:
         """Initialize SIP trunk system
 
         Args:
-            config: Configuration object (optional)
+            config: Configuration object (optional). Also used as a fallback
+                source of persisted trunks (``config.get_sip_trunks()``) when
+                ``trunk_db`` is not provided.
             sip_server: SIPServer instance used to send real SIP REGISTERs to
                 trunk providers. If omitted, ``register_all()``/``trunk.register()``
                 fall back to simulated (optimistic) registration.
+            trunk_db: TrunkDB instance used to load persisted trunks from the
+                database. If omitted (e.g. database disabled), persisted
+                trunks are instead loaded from ``config`` if it supports
+                ``get_sip_trunks()``.
         """
         self.trunks = {}
         self.outbound_rules = []
         self.logger = get_logger()
         self.e911_protection = E911Protection(config)
+        self.config = config
         self.sip_server = sip_server
+        self.trunk_db = trunk_db
 
         # Health monitoring
         self.health_check_enabled = True
@@ -424,6 +494,44 @@ class SIPTrunkSystem:
         self.failover_enabled = True
         self.auto_recovery_enabled = True
         self.failover_threshold = 3  # consecutive failures before failover
+
+        self._load_trunks()
+
+    def _load_trunks(self) -> None:
+        """
+        Load persisted trunk definitions into ``self.trunks``.
+
+        Prefers the database (``self.trunk_db``) when available; otherwise
+        falls back to ``self.config.get_sip_trunks()`` if ``config`` supports
+        it. Trunks with ``enabled`` explicitly set to False in the database
+        are skipped. Mirrors ``ExtensionRegistry._load_extensions()``.
+        """
+        if self.trunk_db is not None:
+            try:
+                db_trunks = self.trunk_db.get_all()
+            except (KeyError, TypeError, ValueError) as e:
+                self.logger.error(f"Failed to load SIP trunks from database: {e}")
+                return
+
+            if db_trunks:
+                self.logger.info(f"Loading {len(db_trunks)} SIP trunks from database")
+                for row in db_trunks:
+                    if row.get("enabled") is False:
+                        continue
+                    self.add_trunk(SIPTrunk.create_from_db(row))
+            return
+
+        if self.config is not None and hasattr(self.config, "get_sip_trunks"):
+            configured_trunks = self.config.get_sip_trunks()
+            if configured_trunks:
+                self.logger.info(f"Loading {len(configured_trunks)} SIP trunks from config")
+                for trunk_config in configured_trunks:
+                    self.add_trunk(SIPTrunk.create_from_config(trunk_config))
+
+    def reload_trunks(self) -> None:
+        """Discard all in-memory trunks and reload them from the database/config (e.g. after an admin API write)."""
+        self.trunks = {}
+        self._load_trunks()
 
     def start_health_monitoring(self) -> None:
         """Start a daemon background thread that periodically health-checks every trunk and triggers failover on outage (no-op if already running)."""

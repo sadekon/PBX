@@ -639,3 +639,28 @@ def register_all_migrations(manager: MigrationManager) -> None:
         );
     """),
     )
+
+    # Migration 1011: SIP Trunk Persistence
+    manager.register_migration(
+        1011,
+        "SIP Trunk Persistence",
+        manager._build_migration_sql("""
+        -- SIP trunk definitions (carrier/provider trunks for outbound routing)
+        CREATE TABLE IF NOT EXISTS sip_trunks (
+            id {SERIAL},
+            trunk_id VARCHAR(50) UNIQUE NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            host VARCHAR(255) NOT NULL,
+            port INTEGER DEFAULT 5060,
+            username VARCHAR(255) NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            codec_preferences TEXT,
+            priority INTEGER DEFAULT 100,
+            max_channels INTEGER DEFAULT 10,
+            health_check_interval INTEGER DEFAULT 60,
+            enabled BOOLEAN DEFAULT {BOOLEAN_TRUE},
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """),
+    )

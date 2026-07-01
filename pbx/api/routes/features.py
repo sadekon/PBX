@@ -775,35 +775,127 @@ def add_sip_trunk() -> tuple[Response, int]:
                     {"error": f"Missing required fields: {', '.join(missing)}"}, 400
                 ), 400
 
-            from pbx.features.sip_trunk import SIPTrunk
+            trunk_id = data["trunk_id"]
+            if pbx_core.trunk_system.get_trunk(trunk_id):
+                return send_json({"error": "Trunk already exists"}, 400), 400
 
-            trunk = SIPTrunk(
-                trunk_id=data["trunk_id"],
-                name=data["name"],
-                host=data["host"],
-                username=data["username"],
-                password=data["password"],
-                port=data.get("port", 5060),
-                codec_preferences=data.get("codec_preferences", ["G.711", "G.729"]),
-                priority=data.get("priority", 100),
-                max_channels=data.get("max_channels", 10),
-                health_check_interval=data.get("health_check_interval", 60),
-            )
+            port = data.get("port", 5060)
+            codec_preferences = data.get("codec_preferences", ["G.711", "G.729"])
+            priority = data.get("priority", 100)
+            max_channels = data.get("max_channels", 10)
+            health_check_interval = data.get("health_check_interval", 60)
 
-            pbx_core.trunk_system.add_trunk(trunk)
-            trunk.register()
+            # Try to persist to the database first, fall back to config.yml
+            if pbx_core.trunk_db:
+                success = pbx_core.trunk_db.add(
+                    trunk_id=trunk_id,
+                    name=data["name"],
+                    host=data["host"],
+                    username=data["username"],
+                    password=data["password"],
+                    port=port,
+                    codec_preferences=codec_preferences,
+                    priority=priority,
+                    max_channels=max_channels,
+                    health_check_interval=health_check_interval,
+                )
+            else:
+                success = pbx_core.config.add_sip_trunk(
+                    trunk_id=trunk_id,
+                    name=data["name"],
+                    host=data["host"],
+                    username=data["username"],
+                    password=data["password"],
+                    port=port,
+                    codec_preferences=codec_preferences,
+                    priority=priority,
+                    max_channels=max_channels,
+                )
+
+            if not success:
+                return send_json({"error": "Failed to add SIP trunk"}, 500), 500
+
+            # Reload trunks from the persisted source and register the new one
+            pbx_core.trunk_system.reload_trunks()
+            trunk = pbx_core.trunk_system.get_trunk(trunk_id)
+            if trunk:
+                trunk.register(pbx_core.sip_server)
 
             return send_json(
                 {
                     "success": True,
-                    "message": f"Trunk {trunk.name} added successfully",
-                    "trunk": trunk.to_dict(),
+                    "message": f"Trunk {data['name']} added successfully",
+                    "trunk": trunk.to_dict() if trunk else None,
                 }
             ), 200
 
         except (KeyError, TypeError, ValueError) as e:
             logger.error(f"Error adding SIP trunk: {e}")
             return send_json({"error": f"Error adding SIP trunk: {e!s}"}, 500), 500
+    else:
+        return send_json({"error": "SIP trunk system not initialized"}, 500), 500
+
+
+@features_bp.route("/api/sip-trunks/<trunk_id>", methods=["PUT"])
+@require_auth
+def update_sip_trunk(trunk_id: str) -> tuple[Response, int]:
+    """Update an existing SIP trunk."""
+    pbx_core = get_pbx_core()
+    if pbx_core and hasattr(pbx_core, "trunk_system"):
+        try:
+            if not pbx_core.trunk_system.get_trunk(trunk_id):
+                return send_json({"error": "Trunk not found"}, 404), 404
+
+            data = get_request_body()
+
+            # Try to persist to the database first, fall back to config.yml
+            if pbx_core.trunk_db:
+                success = pbx_core.trunk_db.update(
+                    trunk_id=trunk_id,
+                    name=data.get("name"),
+                    host=data.get("host"),
+                    username=data.get("username"),
+                    password=data.get("password"),
+                    port=data.get("port"),
+                    codec_preferences=data.get("codec_preferences"),
+                    priority=data.get("priority"),
+                    max_channels=data.get("max_channels"),
+                    health_check_interval=data.get("health_check_interval"),
+                )
+            else:
+                success = pbx_core.config.update_sip_trunk(
+                    trunk_id=trunk_id,
+                    name=data.get("name"),
+                    host=data.get("host"),
+                    username=data.get("username"),
+                    password=data.get("password"),
+                    port=data.get("port"),
+                    codec_preferences=data.get("codec_preferences"),
+                    priority=data.get("priority"),
+                    max_channels=data.get("max_channels"),
+                )
+
+            if not success:
+                return send_json({"error": "Failed to update SIP trunk"}, 500), 500
+
+            # Reload trunks from the persisted source and re-register the
+            # updated trunk (its credentials/host may have changed)
+            pbx_core.trunk_system.reload_trunks()
+            trunk = pbx_core.trunk_system.get_trunk(trunk_id)
+            if trunk:
+                trunk.register(pbx_core.sip_server)
+
+            return send_json(
+                {
+                    "success": True,
+                    "message": f"Trunk {trunk_id} updated successfully",
+                    "trunk": trunk.to_dict() if trunk else None,
+                }
+            ), 200
+
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error(f"Error updating SIP trunk: {e}")
+            return send_json({"error": f"Error updating SIP trunk: {e!s}"}, 500), 500
     else:
         return send_json({"error": "SIP trunk system not initialized"}, 500), 500
 
@@ -849,14 +941,24 @@ def delete_sip_trunk(trunk_id: str) -> tuple[Response, int]:
     if pbx_core and hasattr(pbx_core, "trunk_system"):
         try:
             trunk = pbx_core.trunk_system.get_trunk(trunk_id)
-            if trunk:
-                pbx_core.trunk_system.remove_trunk(trunk_id)
-                return send_json(
-                    {"success": True, "message": f"Trunk {trunk_id} removed successfully"}
-                ), 200
-            return send_json({"error": "Trunk not found"}, 404), 404
+            if not trunk:
+                return send_json({"error": "Trunk not found"}, 404), 404
 
-        except Exception as e:
+            # Try to delete from the database first, fall back to config.yml
+            if pbx_core.trunk_db:
+                success = pbx_core.trunk_db.delete(trunk_id)
+            else:
+                success = pbx_core.config.delete_sip_trunk(trunk_id)
+
+            if not success:
+                return send_json({"error": "Failed to delete SIP trunk"}, 500), 500
+
+            pbx_core.trunk_system.remove_trunk(trunk_id)
+            return send_json(
+                {"success": True, "message": f"Trunk {trunk_id} removed successfully"}
+            ), 200
+
+        except (KeyError, TypeError, ValueError) as e:
             logger.error(f"Error deleting SIP trunk: {e}")
             return send_json({"error": f"Error deleting SIP trunk: {e!s}"}, 500), 500
     else:
