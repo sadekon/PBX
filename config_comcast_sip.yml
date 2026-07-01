@@ -53,9 +53,11 @@ sip_trunks:
 
     # Trunk settings
     max_channels: 23              # Adjust based on your PRI/SIP channel count
+    # Numeric RTP static payload types -- same format used for internal
+    # extensions/phone models (0=PCMU/G.711u, 18=G.729).
     codec_preferences:
-      - "G.711u"                  # Comcast primary codec (PCMU)
-      - "G.729"                   # Compressed codec (if enabled by Comcast)
+      - "0"                       # Comcast primary codec (PCMU/G.711u)
+      - "18"                      # G.729 (compressed codec, if enabled by Comcast)
 
     # Comcast specific settings
     registration_required: false  # Comcast typically uses IP auth, not registration
@@ -75,9 +77,9 @@ sip_trunks:
     host: "sip-backup.voiceedge.com"
     port: 5060
     max_channels: 23
-    codec_preferences:
-      - "G.711u"
-      - "G.729"
+    codec_preferences:               # 0=PCMU/G.711u, 18=G.729
+      - "0"
+      - "18"
     registration_required: false
     transport: "UDP"
 

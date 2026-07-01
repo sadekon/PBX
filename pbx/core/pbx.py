@@ -1083,6 +1083,54 @@ class PBXCore:
         )
         return answered_codecs
 
+    def _get_compatible_trunk_codecs(
+        self, trunk_codecs: list[str] | None, caller_codecs: list[str] | None
+    ) -> list[str]:
+        """
+        Compute codecs to offer a trunk, restricted to what the internal caller
+        actually offered.
+
+        Mirrors ``_get_compatible_codecs`` for the trunk-outbound leg: the RTP
+        relay does not transcode, so offering the trunk a codec the caller
+        never proposed can leave the two legs unable to agree on shared audio.
+
+        ``SIPTrunk.codec_preferences`` and ``caller_codecs`` are both numeric
+        RTP static payload-type strings (e.g. ``"0"``, ``"18"``) — the same
+        format used for internal extensions/phone models throughout this
+        module — so this is a plain set intersection, order-preserved by the
+        caller's offer. If a trunk is configured for a codec set that shares
+        nothing with what the caller offered (e.g. caller offers only G.722
+        while the trunk only supports G.711/G.729), the intersection is empty
+        and this falls back to the trunk's configured preferences unchanged,
+        same as offering them without restriction — the trunk (or the caller,
+        via a 488) will reject if truly incompatible.
+
+        Args:
+            trunk_codecs: Trunk's configured ``codec_preferences``.
+            caller_codecs: Codecs the internal caller offered (from SDP), if any.
+
+        Returns:
+            list of codec identifiers to offer the trunk.
+        """
+        if not trunk_codecs:
+            return caller_codecs or []
+
+        if not caller_codecs:
+            return trunk_codecs
+
+        trunk_set = set(trunk_codecs)
+        compatible = [c for c in caller_codecs if c in trunk_set]
+
+        if compatible:
+            self.logger.debug(f"Compatible trunk codecs: {compatible}")
+            return compatible
+
+        self.logger.warning(
+            f"No codec overlap between trunk preferences {trunk_codecs} and caller "
+            f"codecs {caller_codecs}; falling back to trunk preferences unchanged"
+        )
+        return trunk_codecs
+
     def _get_phone_user_agent(self, extension_number: str) -> str | None:
         """
         Get User-Agent string for a registered phone by extension number

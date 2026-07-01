@@ -80,7 +80,7 @@ class TestSIPTrunkInit:
         assert trunk.port == 5060
         assert trunk.username == "user"
         assert trunk.password == "pass"
-        assert trunk.codec_preferences == ["G.711", "G.729"]
+        assert trunk.codec_preferences == ["0", "8", "9", "18", "2"]
         assert trunk.status == TrunkStatus.UNREGISTERED
         assert trunk.priority == 100
         assert trunk.max_channels == 10
@@ -146,6 +146,101 @@ class TestSIPTrunkRegistration:
         trunk.unregister()
         assert trunk.status == TrunkStatus.UNREGISTERED
         assert trunk.health_status == TrunkHealthStatus.DOWN
+
+
+@pytest.mark.unit
+class TestSIPTrunkMarkRegistered:
+    """Tests for SIPTrunk.mark_registered."""
+
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_sets_status_and_health(self, mock_logger: MagicMock) -> None:
+        trunk = SIPTrunk("t1", "Primary", "sip.example.com", "user", "pass")
+        trunk.consecutive_failures = 3
+        trunk.registration_failures = 2
+
+        trunk.mark_registered(expires_seconds=3600)
+
+        assert trunk.status == TrunkStatus.REGISTERED
+        assert trunk.health_status == TrunkHealthStatus.HEALTHY
+        assert trunk.registration_failures == 0
+        assert trunk.consecutive_failures == 0
+
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_schedules_expiry_and_refresh_at_half_the_interval(
+        self, mock_logger: MagicMock
+    ) -> None:
+        trunk = SIPTrunk("t1", "Primary", "sip.example.com", "user", "pass")
+        before = datetime.now(UTC)
+
+        trunk.mark_registered(expires_seconds=3600)
+
+        after = datetime.now(UTC)
+        assert trunk.registration_expires_at is not None
+        assert trunk.registration_refresh_at is not None
+        # Expires ~3600s out
+        assert (
+            before + timedelta(seconds=3600)
+            <= trunk.registration_expires_at
+            <= after + timedelta(seconds=3600)
+        )
+        # Refresh at 50% of that (REGISTRATION_REFRESH_FRACTION)
+        assert (
+            before + timedelta(seconds=1800)
+            <= trunk.registration_refresh_at
+            <= after + timedelta(seconds=1800)
+        )
+        assert trunk.registration_refresh_at < trunk.registration_expires_at
+
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_honors_shorter_provider_granted_expiry(self, mock_logger: MagicMock) -> None:
+        """A provider may grant less than the 3600s requested."""
+        trunk = SIPTrunk("t1", "Primary", "sip.example.com", "user", "pass")
+        before = datetime.now(UTC)
+
+        trunk.mark_registered(expires_seconds=120)
+
+        after = datetime.now(UTC)
+        assert (
+            before + timedelta(seconds=60)
+            <= trunk.registration_refresh_at
+            <= after + timedelta(seconds=60)
+        )
+
+
+@pytest.mark.unit
+class TestSIPTrunkNeedsReregistration:
+    """Tests for SIPTrunk.needs_reregistration."""
+
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_false_when_never_registered(self, mock_logger: MagicMock) -> None:
+        trunk = SIPTrunk("t1", "Primary", "sip.example.com", "user", "pass")
+        assert trunk.needs_reregistration() is False
+
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_false_when_recently_registered(self, mock_logger: MagicMock) -> None:
+        trunk = SIPTrunk("t1", "Primary", "sip.example.com", "user", "pass")
+        trunk.mark_registered(expires_seconds=3600)
+        assert trunk.needs_reregistration() is False
+
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_true_once_refresh_threshold_passed(self, mock_logger: MagicMock) -> None:
+        trunk = SIPTrunk("t1", "Primary", "sip.example.com", "user", "pass")
+        trunk.mark_registered(expires_seconds=3600)
+        # Simulate time passing well beyond the 50% refresh threshold.
+        trunk.registration_refresh_at = datetime.now(UTC) - timedelta(seconds=1)
+        assert trunk.needs_reregistration() is True
+
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_false_when_not_registered_even_if_refresh_time_passed(
+        self, mock_logger: MagicMock
+    ) -> None:
+        """A FAILED/UNREGISTERED trunk isn't auto-refreshed by this check --
+        that's the failover/health system's concern."""
+        trunk = SIPTrunk("t1", "Primary", "sip.example.com", "user", "pass")
+        trunk.mark_registered(expires_seconds=3600)
+        trunk.registration_refresh_at = datetime.now(UTC) - timedelta(seconds=1)
+        trunk.status = TrunkStatus.FAILED
+        assert trunk.needs_reregistration() is False
 
 
 @pytest.mark.unit
@@ -454,7 +549,7 @@ class TestSIPTrunkToDict:
         assert d["max_channels"] == 10
         assert d["channels_available"] == 10
         assert d["channels_in_use"] == 0
-        assert d["codec_preferences"] == ["G.711", "G.729"]
+        assert d["codec_preferences"] == ["0", "8", "9", "18", "2"]
         assert d["success_rate"] == 0.0
         assert d["consecutive_failures"] == 0
         assert d["total_calls"] == 0
@@ -906,6 +1001,87 @@ class TestSIPTrunkSystemHealthMonitoring:
             system._health_monitoring_loop()
         assert call_count == 2
 
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_health_monitoring_loop_also_runs_reregistration_checks(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        system = SIPTrunkSystem()
+        system.monitoring_active = True
+
+        def stop_after_one(*args, **kwargs):
+            system.monitoring_active = False
+
+        with (
+            patch.object(system, "_perform_health_checks"),
+            patch.object(
+                system, "_perform_reregistration_checks", side_effect=stop_after_one
+            ) as mock_rereg,
+            patch("pbx.features.sip_trunk.time.sleep"),
+        ):
+            system._health_monitoring_loop()
+
+        mock_rereg.assert_called_once()
+
+
+@pytest.mark.unit
+class TestSIPTrunkSystemReregistrationChecks:
+    """Tests for _perform_reregistration_checks()."""
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_reregisters_trunk_when_due(self, mock_logger: MagicMock, mock_e911: MagicMock) -> None:
+        system = SIPTrunkSystem()
+        trunk = MagicMock()
+        trunk.name = "Due Trunk"
+        trunk.needs_reregistration.return_value = True
+        system.trunks["t1"] = trunk
+
+        system._perform_reregistration_checks()
+
+        trunk.register.assert_called_once_with(system.sip_server)
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_does_not_reregister_trunk_when_not_due(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        system = SIPTrunkSystem()
+        trunk = MagicMock()
+        trunk.needs_reregistration.return_value = False
+        system.trunks["t1"] = trunk
+
+        system._perform_reregistration_checks()
+
+        trunk.register.assert_not_called()
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_handles_exception_gracefully(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        system = SIPTrunkSystem()
+        trunk = MagicMock()
+        trunk.name = "Broken"
+        trunk.needs_reregistration.side_effect = RuntimeError("boom")
+        system.trunks["t1"] = trunk
+
+        # Should not raise
+        system._perform_reregistration_checks()
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_passes_sip_server_through(self, mock_logger: MagicMock, mock_e911: MagicMock) -> None:
+        mock_sip_server = MagicMock()
+        system = SIPTrunkSystem(sip_server=mock_sip_server)
+        trunk = MagicMock()
+        trunk.needs_reregistration.return_value = True
+        system.trunks["t1"] = trunk
+
+        system._perform_reregistration_checks()
+
+        trunk.register.assert_called_once_with(mock_sip_server)
+
 
 @pytest.mark.unit
 class TestSIPTrunkSystemFailover:
@@ -1104,6 +1280,108 @@ class TestSIPTrunkSystemRouteWithFailover:
 
 
 @pytest.mark.unit
+class TestSIPTrunkSystemRouteWithFailoverNoRulesFallback:
+    """Tests for the no-outbound-rules priority fallback in route_outbound_with_failover."""
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_single_trunk_no_rules_routes_unmodified(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        mock_e911.return_value.block_if_e911.return_value = False
+        system = SIPTrunkSystem()
+        trunk = _make_trunk("t1", "Primary")
+        trunk.register()
+        system.add_trunk(trunk)
+
+        result_trunk, transformed = system.route_outbound_with_failover("12125551234")
+        assert result_trunk is trunk
+        assert transformed == "12125551234"
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_multiple_trunks_no_rules_picks_highest_priority(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        mock_e911.return_value.block_if_e911.return_value = False
+        system = SIPTrunkSystem()
+        low_priority = _make_trunk("t1", "Secondary", priority=100)
+        low_priority.register()
+        high_priority = _make_trunk("t2", "Primary", priority=10)
+        high_priority.register()
+        system.add_trunk(low_priority)
+        system.add_trunk(high_priority)
+
+        result_trunk, transformed = system.route_outbound_with_failover("12125551234")
+        assert result_trunk is high_priority
+        assert transformed == "12125551234"
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_multiple_trunks_no_rules_skips_unusable_trunk(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        """Highest-priority trunk is unhealthy/full -- falls through to the next one."""
+        mock_e911.return_value.block_if_e911.return_value = False
+        system = SIPTrunkSystem()
+        unusable = _make_trunk("t1", "Primary", priority=10)
+        unusable.status = TrunkStatus.REGISTERED
+        unusable.health_status = TrunkHealthStatus.DOWN
+        usable = _make_trunk("t2", "Secondary", priority=100)
+        usable.register()
+        system.add_trunk(unusable)
+        system.add_trunk(usable)
+
+        result_trunk, transformed = system.route_outbound_with_failover("12125551234")
+        assert result_trunk is usable
+        assert transformed == "12125551234"
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_no_rules_no_trunks_returns_none(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        mock_e911.return_value.block_if_e911.return_value = False
+        system = SIPTrunkSystem()
+
+        result_trunk, transformed = system.route_outbound_with_failover("12125551234")
+        assert result_trunk is None
+        assert transformed is None
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_no_rules_e911_still_blocked(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        mock_e911.return_value.block_if_e911.return_value = True
+        system = SIPTrunkSystem()
+        trunk = _make_trunk("t1", "Primary")
+        trunk.register()
+        system.add_trunk(trunk)
+
+        result_trunk, transformed = system.route_outbound_with_failover("911")
+        assert result_trunk is None
+        assert transformed is None
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_rules_defined_but_unmatched_does_not_use_fallback(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        """Once any rule exists, an unmatched number is 'no route', not a fallback trunk."""
+        mock_e911.return_value.block_if_e911.return_value = False
+        system = SIPTrunkSystem()
+        trunk = _make_trunk("t1", "Primary")
+        trunk.register()
+        system.add_trunk(trunk)
+        system.add_outbound_rule(OutboundRule("r1", r"^1\d{10}$", "t1"))
+
+        result_trunk, transformed = system.route_outbound_with_failover("555")
+        assert result_trunk is None
+        assert transformed is None
+
+
+@pytest.mark.unit
 class TestSIPTrunkSystemFindFailoverTrunk:
     """Tests for _find_failover_trunk."""
 
@@ -1143,6 +1421,48 @@ class TestSIPTrunkSystemFindFailoverTrunk:
         primary = _make_trunk("t1", "Primary")
         primary.register()
         system.add_trunk(primary)
+        result = system._find_failover_trunk(primary)
+        assert result is None
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_find_failover_skips_full_trunk_picks_next(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        """A REGISTERED/HEALTHY trunk that's at max_channels must be skipped
+        in favor of the next-best trunk that actually has room."""
+        system = SIPTrunkSystem()
+        primary = _make_trunk("t1", "Primary", priority=100)
+
+        full_alt = _make_trunk("t2", "Full Secondary", priority=10)
+        full_alt.register()
+        full_alt.channels_in_use = full_alt.max_channels
+
+        roomy_alt = _make_trunk("t3", "Roomy Tertiary", priority=20)
+        roomy_alt.register()
+
+        system.add_trunk(primary)
+        system.add_trunk(full_alt)
+        system.add_trunk(roomy_alt)
+
+        result = system._find_failover_trunk(primary)
+        assert result is roomy_alt
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_find_failover_none_if_only_alternative_is_full(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        system = SIPTrunkSystem()
+        primary = _make_trunk("t1", "Primary", priority=100)
+
+        full_alt = _make_trunk("t2", "Full Secondary", priority=10)
+        full_alt.register()
+        full_alt.channels_in_use = full_alt.max_channels
+
+        system.add_trunk(primary)
+        system.add_trunk(full_alt)
+
         result = system._find_failover_trunk(primary)
         assert result is None
 

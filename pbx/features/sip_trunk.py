@@ -6,7 +6,7 @@ Includes health monitoring and automatic failover
 
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -36,6 +36,11 @@ class TrunkHealthStatus(Enum):
 class SIPTrunk:
     """Represents a SIP trunk connection"""
 
+    # Re-REGISTER once this fraction of the granted Expires interval has
+    # elapsed, so the refresh lands with margin before the provider's lease
+    # actually lapses (standard SIP UA convention).
+    REGISTRATION_REFRESH_FRACTION = 0.5
+
     def __init__(
         self,
         trunk_id: str,
@@ -59,7 +64,12 @@ class SIPTrunk:
             username: SIP username
             password: SIP password
             port: SIP port (default 5060)
-            codec_preferences: list of preferred codecs
+            codec_preferences: list of preferred codecs, as numeric RTP static
+                payload-type strings (e.g. ``["0", "8", "18"]`` for PCMU/PCMA/G729)
+                -- the same format used for internal extensions/phone models
+                throughout ``pbx.core.pbx`` and ``pbx.sip.sdp``, so this list can
+                be intersected directly against a caller's offered codecs and
+                passed straight into ``SDPBuilder.build_audio_sdp``.
             priority: Trunk priority (lower is better, for failover)
             max_channels: Maximum concurrent channels
             health_check_interval: Seconds between health checks
@@ -70,7 +80,10 @@ class SIPTrunk:
         self.port = port
         self.username = username
         self.password = password
-        self.codec_preferences = codec_preferences or ["G.711", "G.729"]
+        # Default: PCMU, PCMA, G722, G729, G726-32 -- the same "unknown model"
+        # fallback set used for internal phones (see
+        # PBXCore._get_codecs_for_phone_model's ultimate fallback).
+        self.codec_preferences = codec_preferences or ["0", "8", "9", "18", "2"]
         self.status = TrunkStatus.UNREGISTERED
         self.priority = priority
         self.max_channels = max_channels
@@ -90,6 +103,11 @@ class SIPTrunk:
         self.failed_calls = 0
         self.last_registration_attempt = None
         self.registration_failures = 0
+        # When the current registration lease expires, and when it should be
+        # refreshed (REGISTRATION_REFRESH_FRACTION of the way through the
+        # granted Expires) -- both None until a REGISTER actually succeeds.
+        self.registration_expires_at: datetime | None = None
+        self.registration_refresh_at: datetime | None = None
 
         # Performance metrics
         self.average_call_setup_time = 0.0
@@ -164,8 +182,12 @@ class SIPTrunk:
         auth handled by ``sip_server.register_trunk``); the outcome
         (REGISTERED vs FAILED) is determined asynchronously once the
         provider responds, so ``status`` may still be UNREGISTERED right
-        after this call returns. Periodic re-REGISTER before the 3600s
-        Expires lapses is not yet implemented.
+        after this call returns -- ``sip_server`` calls ``mark_registered()``
+        on success. Also used for periodic re-REGISTER: ``SIPTrunkSystem``
+        calls this again via ``needs_reregistration()``/
+        ``_perform_reregistration_checks()`` before the granted Expires
+        lapses; a fresh REGISTER transaction is indistinguishable from the
+        initial one, so no special-casing is needed here.
 
         If ``sip_server`` is omitted (e.g. tests, or no live network),
         falls back to optimistically marking the trunk REGISTERED/HEALTHY
@@ -185,11 +207,51 @@ class SIPTrunk:
             sip_server.register_trunk(self)
             return True
 
+        self.mark_registered()
+        return True
+
+    def mark_registered(self, expires_seconds: int = 3600) -> None:
+        """
+        Record a successful registration: mark REGISTERED/HEALTHY, reset
+        failure counters, and schedule the next refresh.
+
+        Called by ``SIPServer._handle_trunk_register_response()`` on a 200 OK
+        (with the provider's actual granted Expires, which may differ from
+        what was requested), and by ``register()``'s no-``sip_server``
+        fallback (with the default, since there's no wire response to read).
+
+        Args:
+            expires_seconds: Registration lease length granted by the
+                provider, in seconds.
+        """
         self.status = TrunkStatus.REGISTERED
         self.health_status = TrunkHealthStatus.HEALTHY
         self.registration_failures = 0
         self.consecutive_failures = 0
-        return True
+
+        now = datetime.now(UTC)
+        self.registration_expires_at = now + timedelta(seconds=expires_seconds)
+        self.registration_refresh_at = now + timedelta(
+            seconds=expires_seconds * self.REGISTRATION_REFRESH_FRACTION
+        )
+
+    def needs_reregistration(self) -> bool:
+        """
+        Whether this trunk's registration should be refreshed now.
+
+        True only for a currently-REGISTERED trunk whose refresh threshold
+        (``registration_refresh_at``) has passed. A trunk that's UNREGISTERED,
+        FAILED, or DISABLED is not auto-refreshed here -- that's the
+        failover/health system's concern, not a plain lease renewal.
+
+        Returns:
+            True if a refresh REGISTER should be sent now.
+        """
+        return (
+            self.status == TrunkStatus.REGISTERED
+            and self.registration_refresh_at is not None
+            and datetime.now(UTC) >= self.registration_refresh_at
+        )
 
     def unregister(self) -> None:
         """Tear down the trunk's SIP registration and mark it DOWN so it stops receiving routed calls."""
@@ -365,6 +427,12 @@ class SIPTrunk:
                 self.last_failed_call.isoformat() if self.last_failed_call else None
             ),
             "failover_count": self.failover_count,
+            "registration_expires_at": (
+                self.registration_expires_at.isoformat() if self.registration_expires_at else None
+            ),
+            "registration_refresh_at": (
+                self.registration_refresh_at.isoformat() if self.registration_refresh_at else None
+            ),
         }
 
     def to_dict(self) -> dict:
@@ -561,6 +629,7 @@ class SIPTrunkSystem:
         while self.monitoring_active:
             try:
                 self._perform_health_checks()
+                self._perform_reregistration_checks()
                 time.sleep(self.health_check_interval)
             except Exception as e:
                 self.logger.error(f"Error in health monitoring loop: {e}")
@@ -587,6 +656,24 @@ class SIPTrunkSystem:
                         self._handle_trunk_failure(trunk)
             except Exception as e:
                 self.logger.error(f"Error checking health of trunk {trunk.name}: {e}")
+
+    def _perform_reregistration_checks(self) -> None:
+        """Re-REGISTER any trunk whose lease is due for a refresh.
+
+        Runs every health-monitoring cycle alongside ``_perform_health_checks``
+        (same thread, same cadence) rather than on a per-trunk timer -- a
+        trunk's ``needs_reregistration()`` stays True until its next 200 OK
+        updates ``registration_refresh_at``, so a refresh that's lost or
+        unanswered is naturally retried on the following cycle without any
+        separate retry bookkeeping here.
+        """
+        for trunk in self.trunks.values():
+            try:
+                if trunk.needs_reregistration():
+                    self.logger.info(f"Refreshing registration for trunk {trunk.name}")
+                    trunk.register(self.sip_server)
+            except Exception as e:
+                self.logger.error(f"Error refreshing registration for trunk {trunk.name}: {e}")
 
     def add_trunk(self, trunk: Any) -> None:
         """
@@ -752,6 +839,34 @@ class SIPTrunkSystem:
         # 3. Monitor for recovery of failed trunk
         # 4. Automatically restore when recovered (if auto_recovery_enabled)
 
+    def _route_via_priority_fallback(self, number: str) -> tuple[SIPTrunk | None, str | None]:
+        """
+        Route ``number`` unmodified via the highest-priority trunk that can
+        currently take a call, with no dial-plan rule involved.
+
+        Used by ``route_outbound_with_failover`` only when zero
+        ``outbound_rules`` are configured, so the common single-trunk (or
+        multiple-trunks-ranked-only-by-priority) deployment can place calls
+        without an admin having to define a rule first.
+
+        Args:
+            number: Dialed number (sent as-is; there is no rule to
+                strip/prepend digits).
+
+        Returns:
+            tuple of (trunk, number) or (None, None) if no trunk is usable.
+        """
+        for trunk in self._get_available_trunks_by_priority():
+            if trunk.can_make_call():
+                self.logger.info(
+                    f"No outbound rules configured; routing {number} via "
+                    f"highest-priority trunk {trunk.name}"
+                )
+                return (trunk, number)
+
+        self.logger.warning(f"No outbound rules configured and no trunk available for {number}")
+        return (None, None)
+
     def _get_available_trunks_by_priority(self) -> list[SIPTrunk]:
         """
         Collect trunks that are REGISTERED and HEALTHY/WARNING (regardless of
@@ -780,6 +895,16 @@ class SIPTrunkSystem:
         instead of giving up on that rule. This is the routing method that
         should be used for live calls.
 
+        If no ``outbound_rules`` are configured at all, routes via the
+        highest-priority trunk that can currently take a call (see
+        ``_route_via_priority_fallback``), so a deployment with one trunk
+        (or several ranked only by ``priority``) works without requiring
+        dial-plan rules to be defined first. This fallback only applies
+        when zero rules exist -- once any rule is added, an unmatched
+        number is treated as "no route" rather than silently going out an
+        arbitrary trunk, since a defined rule set expresses deliberate
+        routing intent (e.g. excluding premium/international numbers).
+
         Args:
             number: Dialed number
 
@@ -790,6 +915,9 @@ class SIPTrunkSystem:
         if self.e911_protection.block_if_e911(number, context="route_outbound_with_failover"):
             self.logger.error(f"E911 call to {number} blocked by protection system")
             return (None, None)
+
+        if not self.outbound_rules:
+            return self._route_via_priority_fallback(number)
 
         # Try primary trunk first
         for rule in self.outbound_rules:
@@ -821,8 +949,15 @@ class SIPTrunkSystem:
 
     def _find_failover_trunk(self, primary_trunk: SIPTrunk) -> SIPTrunk | None:
         """
-        Pick the highest-priority available trunk other than ``primary_trunk``
-        to take over a call. Returns None if no other usable trunk exists.
+        Pick the highest-priority trunk, other than ``primary_trunk``, that
+        can actually take a call right now to take over the routing. Returns
+        None if no other usable trunk exists.
+
+        ``_get_available_trunks_by_priority()`` only filters on status/health,
+        not free channel capacity, so it can include a trunk that is
+        REGISTERED and HEALTHY but already at ``max_channels``. Checking
+        ``can_make_call()`` here (same check ``allocate_channel()`` makes)
+        ensures failover never hands back a trunk with no room for the call.
 
         Args:
             primary_trunk: The primary trunk that failed
@@ -830,13 +965,9 @@ class SIPTrunkSystem:
         Returns:
             Alternative trunk or None
         """
-        available_trunks = self._get_available_trunks_by_priority()
-
-        # Exclude the failed trunk
-        available_trunks = [t for t in available_trunks if t.trunk_id != primary_trunk.trunk_id]
-
-        if available_trunks:
-            return available_trunks[0]
+        for trunk in self._get_available_trunks_by_priority():
+            if trunk.trunk_id != primary_trunk.trunk_id and trunk.can_make_call():
+                return trunk
 
         return None
 

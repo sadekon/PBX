@@ -1508,6 +1508,343 @@ class TestHandleResponse:
         # No specific handling for 486, just logs
         pbx.handle_callee_answer.assert_not_called()
 
+    @patch("pbx.sip.server.get_logger")
+    def test_response_401_on_trunk_invite_triggers_retry(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        mock_call = MagicMock()
+        mock_call.trunk = MagicMock()
+        mock_call.invite_auth_retried = False
+        pbx.call_manager.get_call.return_value = mock_call
+
+        server = SIPServer(pbx_core=pbx)
+        server._retry_trunk_invite_with_auth = MagicMock()
+
+        msg = _make_response_message(401)
+        msg.get_header.side_effect = {"Call-ID": "test-call-id-123", "CSeq": "1 INVITE"}.get
+        server._handle_response(msg, ADDR)
+
+        server._retry_trunk_invite_with_auth.assert_called_once_with(
+            mock_call, msg, ADDR, "test-call-id-123"
+        )
+        pbx.end_call.assert_not_called()
+
+    @patch("pbx.sip.server.get_logger")
+    def test_response_401_already_retried_falls_through_to_error(
+        self, mock_get_logger: MagicMock
+    ) -> None:
+        pbx = MagicMock()
+        mock_call = MagicMock()
+        mock_call.trunk = MagicMock()
+        mock_call.invite_auth_retried = True
+        mock_call.caller_addr = None
+        pbx.call_manager.get_call.return_value = mock_call
+
+        server = SIPServer(pbx_core=pbx)
+        server._retry_trunk_invite_with_auth = MagicMock()
+
+        msg = _make_response_message(401)
+        msg.get_header.side_effect = {"Call-ID": "test-call-id-123", "CSeq": "1 INVITE"}.get
+        server._handle_response(msg, ADDR)
+
+        server._retry_trunk_invite_with_auth.assert_not_called()
+        pbx.end_call.assert_called_once_with("test-call-id-123")
+
+    @patch("pbx.sip.server.get_logger")
+    def test_response_401_on_internal_call_does_not_retry(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        mock_call = MagicMock()
+        mock_call.trunk = None
+        mock_call.caller_addr = None
+        pbx.call_manager.get_call.return_value = mock_call
+
+        server = SIPServer(pbx_core=pbx)
+        server._retry_trunk_invite_with_auth = MagicMock()
+
+        msg = _make_response_message(401)
+        msg.get_header.side_effect = {"Call-ID": "test-call-id-123", "CSeq": "1 INVITE"}.get
+        server._handle_response(msg, ADDR)
+
+        server._retry_trunk_invite_with_auth.assert_not_called()
+        pbx.end_call.assert_called_once_with("test-call-id-123")
+
+
+# ===========================================================================
+# SIPServer._retry_trunk_invite_with_auth
+# ===========================================================================
+
+
+@pytest.mark.unit
+class TestRetryTrunkInviteWithAuth:
+    """Tests for _retry_trunk_invite_with_auth()."""
+
+    @patch("pbx.sip.server.get_logger")
+    def test_retries_with_digest_credentials(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        pbx._get_server_ip.return_value = "10.0.0.1"
+        pbx.config.get.return_value = 5060
+
+        mock_trunk = MagicMock()
+        mock_trunk.name = "Test Trunk"
+        mock_trunk.username = "trunkuser"
+        mock_trunk.password = "trunkpass"
+
+        callee_invite = MagicMock()
+        callee_invite.uri = "sip:12125551234@trunk.example.com"
+        callee_invite.get_header.side_effect = {"CSeq": "1 INVITE"}.get
+        callee_invite.build.return_value = "INVITE sip:... SIP/2.0\r\n\r\n"
+
+        mock_call = MagicMock()
+        mock_call.trunk = mock_trunk
+        mock_call.callee_invite = callee_invite
+        mock_call.callee_addr = ("trunk.example.com", 5060)
+        mock_call.invite_auth_retried = False
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_ack_to_callee = MagicMock()
+        server._send_message = MagicMock()
+
+        challenge = _make_response_message(401)
+        challenge.get_header.side_effect = {
+            "Call-ID": "call-1",
+            "WWW-Authenticate": 'Digest realm="trunk.example.com", nonce="abc123"',
+        }.get
+
+        with patch("pbx.sip.transaction.InviteClientTransaction") as mock_txn_cls:
+            mock_txn = MagicMock()
+            mock_txn_cls.return_value = mock_txn
+
+            server._retry_trunk_invite_with_auth(mock_call, challenge, ADDR, "call-1")
+
+        server._send_ack_to_callee.assert_called_once_with(challenge, ADDR, "call-1")
+        callee_invite.set_header.assert_any_call("CSeq", "2 INVITE")
+
+        auth_calls = [
+            c for c in callee_invite.set_header.call_args_list if c.args[0] == "Authorization"
+        ]
+        assert len(auth_calls) == 1
+        assert auth_calls[0].args[1].startswith("Digest ")
+        assert 'username="trunkuser"' in auth_calls[0].args[1]
+        assert 'realm="trunk.example.com"' in auth_calls[0].args[1]
+
+        assert mock_call.invite_auth_retried is True
+        mock_txn_cls.assert_called_once()
+        assert mock_txn_cls.call_args.kwargs["dest_addr"] == ("trunk.example.com", 5060)
+        mock_txn.start.assert_called_once()
+        assert mock_call.invite_transaction is mock_txn
+
+    @patch("pbx.sip.server.get_logger")
+    def test_407_uses_proxy_authenticate_and_proxy_authorization(
+        self, mock_get_logger: MagicMock
+    ) -> None:
+        pbx = MagicMock()
+        pbx._get_server_ip.return_value = "10.0.0.1"
+        pbx.config.get.return_value = 5060
+
+        mock_trunk = MagicMock()
+        mock_trunk.username = "trunkuser"
+        mock_trunk.password = "trunkpass"
+
+        callee_invite = MagicMock()
+        callee_invite.uri = "sip:12125551234@trunk.example.com"
+        callee_invite.get_header.side_effect = {"CSeq": "1 INVITE"}.get
+
+        mock_call = MagicMock()
+        mock_call.trunk = mock_trunk
+        mock_call.callee_invite = callee_invite
+        mock_call.callee_addr = ("trunk.example.com", 5060)
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_ack_to_callee = MagicMock()
+
+        challenge = _make_response_message(407)
+        challenge.get_header.side_effect = {
+            "Call-ID": "call-1",
+            "Proxy-Authenticate": 'Digest realm="trunk.example.com", nonce="abc123"',
+        }.get
+
+        with patch("pbx.sip.transaction.InviteClientTransaction"):
+            server._retry_trunk_invite_with_auth(mock_call, challenge, ADDR, "call-1")
+
+        auth_calls = [
+            c for c in callee_invite.set_header.call_args_list if c.args[0] == "Proxy-Authorization"
+        ]
+        assert len(auth_calls) == 1
+        no_auth_header = [
+            c for c in callee_invite.set_header.call_args_list if c.args[0] == "Authorization"
+        ]
+        assert no_auth_header == []
+
+    @patch("pbx.sip.server.get_logger")
+    def test_missing_challenge_header_logs_error_and_returns(
+        self, mock_get_logger: MagicMock
+    ) -> None:
+        pbx = MagicMock()
+        mock_trunk = MagicMock()
+        mock_trunk.name = "Test Trunk"
+        callee_invite = MagicMock()
+        mock_call = MagicMock()
+        mock_call.trunk = mock_trunk
+        mock_call.callee_invite = callee_invite
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_ack_to_callee = MagicMock()
+
+        challenge = _make_response_message(401)
+        challenge.get_header.side_effect = {"Call-ID": "call-1"}.get  # no WWW-Authenticate
+
+        server._retry_trunk_invite_with_auth(mock_call, challenge, ADDR, "call-1")
+
+        server.logger.error.assert_called()
+        callee_invite.set_header.assert_not_called()
+
+    @patch("pbx.sip.server.get_logger")
+    def test_no_trunk_returns_early(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        mock_call = MagicMock()
+        mock_call.trunk = None
+        mock_call.callee_invite = MagicMock()
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_ack_to_callee = MagicMock()
+
+        challenge = _make_response_message(401)
+        server._retry_trunk_invite_with_auth(mock_call, challenge, ADDR, "call-1")
+
+        server._send_ack_to_callee.assert_not_called()
+
+    @patch("pbx.sip.server.get_logger")
+    def test_no_callee_invite_returns_early(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        mock_call = MagicMock()
+        mock_call.trunk = MagicMock()
+        mock_call.callee_invite = None
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_ack_to_callee = MagicMock()
+
+        challenge = _make_response_message(401)
+        server._retry_trunk_invite_with_auth(mock_call, challenge, ADDR, "call-1")
+
+        server._send_ack_to_callee.assert_not_called()
+
+
+# ===========================================================================
+# SIPServer._handle_trunk_register_response
+# ===========================================================================
+
+
+@pytest.mark.unit
+class TestHandleTrunkRegisterResponse:
+    """Tests for _handle_trunk_register_response()."""
+
+    @patch("pbx.sip.server.get_logger")
+    def test_200_marks_registered_with_parsed_expires(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        server = SIPServer(pbx_core=pbx)
+
+        mock_trunk = MagicMock()
+        mock_trunk.name = "Test Trunk"
+        server._pending_trunk_registrations["call-1"] = {
+            "trunk": mock_trunk,
+            "cseq": 1,
+            "retried": False,
+        }
+
+        msg = _make_response_message(200, call_id="call-1")
+        msg.get_header.side_effect = {"Call-ID": "call-1", "Expires": "1800"}.get
+
+        server._handle_trunk_register_response(msg, ADDR, "call-1")
+
+        mock_trunk.mark_registered.assert_called_once_with(expires_seconds=1800)
+        assert "call-1" not in server._pending_trunk_registrations
+
+    @patch("pbx.sip.server.get_logger")
+    def test_200_defaults_to_3600_when_no_expires_header(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        server = SIPServer(pbx_core=pbx)
+
+        mock_trunk = MagicMock()
+        mock_trunk.name = "Test Trunk"
+        server._pending_trunk_registrations["call-1"] = {
+            "trunk": mock_trunk,
+            "cseq": 1,
+            "retried": False,
+        }
+
+        msg = _make_response_message(200, call_id="call-1")
+        msg.get_header.side_effect = {"Call-ID": "call-1"}.get  # no Expires
+
+        server._handle_trunk_register_response(msg, ADDR, "call-1")
+
+        mock_trunk.mark_registered.assert_called_once_with(expires_seconds=3600)
+
+    @patch("pbx.sip.server.get_logger")
+    def test_401_retries_with_digest_credentials(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        server = SIPServer(pbx_core=pbx)
+        server._send_message = MagicMock()
+
+        mock_trunk = MagicMock()
+        mock_trunk.name = "Test Trunk"
+        mock_trunk.host = "trunk.example.com"
+        mock_trunk.port = 5060
+        mock_trunk.username = "trunkuser"
+        mock_trunk.password = "trunkpass"
+        server._pending_trunk_registrations["call-1"] = {
+            "trunk": mock_trunk,
+            "cseq": 1,
+            "retried": False,
+        }
+
+        msg = _make_response_message(401, call_id="call-1")
+        msg.get_header.side_effect = {
+            "Call-ID": "call-1",
+            "WWW-Authenticate": 'Digest realm="trunk.example.com", nonce="abc123"',
+        }.get
+
+        server._handle_trunk_register_response(msg, ADDR, "call-1")
+
+        server._send_message.assert_called_once()
+        entry = server._pending_trunk_registrations["call-1"]
+        assert entry["retried"] is True
+        assert entry["cseq"] == 2
+        mock_trunk.mark_registered.assert_not_called()
+
+    @patch("pbx.sip.server.get_logger")
+    def test_failure_marks_trunk_failed(self, mock_get_logger: MagicMock) -> None:
+        from pbx.features.sip_trunk import TrunkHealthStatus, TrunkStatus
+
+        pbx = MagicMock()
+        server = SIPServer(pbx_core=pbx)
+
+        mock_trunk = MagicMock()
+        mock_trunk.name = "Test Trunk"
+        mock_trunk.registration_failures = 0
+        server._pending_trunk_registrations["call-1"] = {
+            "trunk": mock_trunk,
+            "cseq": 1,
+            "retried": False,
+        }
+
+        msg = _make_response_message(403, call_id="call-1")
+        msg.get_header.side_effect = {"Call-ID": "call-1"}.get
+
+        server._handle_trunk_register_response(msg, ADDR, "call-1")
+
+        assert mock_trunk.status == TrunkStatus.FAILED
+        assert mock_trunk.health_status == TrunkHealthStatus.DOWN
+        assert mock_trunk.registration_failures == 1
+        assert "call-1" not in server._pending_trunk_registrations
+
+    @patch("pbx.sip.server.get_logger")
+    def test_unknown_call_id_ignored(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        server = SIPServer(pbx_core=pbx)
+
+        msg = _make_response_message(200, call_id="unknown-call")
+        # Should not raise
+        server._handle_trunk_register_response(msg, ADDR, "unknown-call")
+
 
 # ===========================================================================
 # SIPServer._send_response / _send_message

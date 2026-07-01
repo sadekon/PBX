@@ -25,6 +25,7 @@ interface SIPTrunk {
     success_rate: number;
     successful_calls: number;
     total_calls: number;
+    codec_preferences?: string[];
 }
 
 interface SIPTrunksResponse {
@@ -126,6 +127,23 @@ function getHealthBadge(health: string): string {
     return badges[health] || health;
 }
 
+// Numeric RTP static payload-type strings -> human-readable codec name, for
+// displaying a trunk's codec_preferences without requiring the user to
+// memorize payload-type numbers. Matches the standard codec set in
+// pbx/sip/sdp.py's SDPBuilder.build_audio_sdp.
+const CODEC_LABELS: Record<string, string> = {
+    '0': 'PCMU (G.711u)',
+    '8': 'PCMA (G.711a)',
+    '9': 'G.722',
+    '18': 'G.729',
+    '2': 'G.726-32',
+};
+
+function formatCodecPreferences(codecs: string[] | undefined): string {
+    if (!codecs || codecs.length === 0) return '—';
+    return codecs.map(c => CODEC_LABELS[c] || c).join(', ');
+}
+
 // ---------------------------------------------------------------------------
 // SIP Trunk Management
 // ---------------------------------------------------------------------------
@@ -165,7 +183,7 @@ export async function loadSIPTrunks(): Promise<void> {
             if (!tbody) return;
 
             if (data.trunks.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" style="text-align: center;">No SIP trunks configured</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="9" style="text-align: center;">No SIP trunks configured</td></tr>';
             } else {
                 tbody.innerHTML = data.trunks.map(trunk => {
                     const statusBadge = getStatusBadge(trunk.status);
@@ -176,6 +194,7 @@ export async function loadSIPTrunks(): Promise<void> {
                         <tr>
                             <td><strong>${escapeHtml(trunk.name)}</strong><br/><small>${escapeHtml(trunk.trunk_id)}</small></td>
                             <td>${escapeHtml(trunk.host)}:${trunk.port}</td>
+                            <td>${escapeHtml(formatCodecPreferences(trunk.codec_preferences))}</td>
                             <td>${statusBadge}</td>
                             <td>${healthBadge}</td>
                             <td>${trunk.priority}</td>
@@ -282,9 +301,12 @@ export function closeAddTrunkModal(): void {
 export async function addSIPTrunk(event: Event): Promise<void> {
     event.preventDefault();
 
+    // Checkbox values are numeric RTP payload-type strings (matching the
+    // format used for internal extensions/phone models); G.711 covers both
+    // PCMU and PCMA via a single checkbox with a comma-separated value.
     const selectedCodecs = Array.from(
         document.querySelectorAll<HTMLInputElement>('input[name="trunk-codecs"]:checked')
-    ).map(cb => cb.value);
+    ).flatMap(cb => cb.value.split(','));
 
     const trunkData = {
         trunk_id: (document.getElementById('trunk-id') as HTMLInputElement).value,
@@ -295,7 +317,7 @@ export async function addSIPTrunk(event: Event): Promise<void> {
         password: (document.getElementById('trunk-password') as HTMLInputElement).value,
         priority: parseInt((document.getElementById('trunk-priority') as HTMLInputElement).value),
         max_channels: parseInt((document.getElementById('trunk-channels') as HTMLInputElement).value),
-        codec_preferences: selectedCodecs.length > 0 ? selectedCodecs : ['G.711', 'G.729']
+        codec_preferences: selectedCodecs.length > 0 ? selectedCodecs : ['0', '8', '18']
     };
 
     try {
