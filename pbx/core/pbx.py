@@ -1105,6 +1105,13 @@ class PBXCore:
         same as offering them without restriction — the trunk (or the caller,
         via a 488) will reject if truly incompatible.
 
+        DTMF (RFC 2833 telephone-event) is always allowed into the
+        intersection if the caller offered it, the same way
+        ``_get_codecs_for_phone_model`` always includes it for internal
+        calls — it's a PBX-wide relay capability, not a per-trunk codec
+        preference, so it doesn't need to be listed in
+        ``trunk.codec_preferences`` itself.
+
         Args:
             trunk_codecs: Trunk's configured ``codec_preferences``.
             caller_codecs: Codecs the internal caller offered (from SDP), if any.
@@ -1118,7 +1125,8 @@ class PBXCore:
         if not caller_codecs:
             return trunk_codecs
 
-        trunk_set = set(trunk_codecs)
+        dtmf_pt_str = str(self._get_dtmf_payload_type())
+        trunk_set = set(trunk_codecs) | {dtmf_pt_str}
         compatible = [c for c in caller_codecs if c in trunk_set]
 
         if compatible:

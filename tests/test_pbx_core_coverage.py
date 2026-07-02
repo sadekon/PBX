@@ -890,6 +890,28 @@ class TestGetCompatibleTrunkCodecs:
         pbx = _make_pbx_core_shell()
         pbx._get_compatible_trunk_codecs(["18"], ["9"])
 
+    def test_includes_dtmf_when_caller_offered_it(self) -> None:
+        """DTMF (telephone-event) is allowed into the intersection even
+        though it isn't literally listed in trunk.codec_preferences -- it's
+        a PBX-wide relay capability, not a per-trunk codec preference."""
+        pbx = _make_pbx_core_shell()
+        pbx.config.get.return_value = 101
+        result = pbx._get_compatible_trunk_codecs(["0", "18"], ["0", "101"])
+        assert result == ["0", "101"]
+
+    def test_excludes_dtmf_when_caller_did_not_offer_it(self) -> None:
+        pbx = _make_pbx_core_shell()
+        pbx.config.get.return_value = 101
+        result = pbx._get_compatible_trunk_codecs(["0", "18"], ["0", "18"])
+        assert result == ["0", "18"]
+        assert "101" not in result
+
+    def test_honors_configured_non_default_dtmf_payload_type(self) -> None:
+        pbx = _make_pbx_core_shell()
+        pbx.config.get.return_value = 96
+        result = pbx._get_compatible_trunk_codecs(["0"], ["0", "96"])
+        assert result == ["0", "96"]
+
 
 # =========================================================================
 # Tests for _get_phone_user_agent
