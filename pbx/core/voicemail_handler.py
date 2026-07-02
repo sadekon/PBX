@@ -1108,6 +1108,14 @@ class VoicemailHandler:
             # Stop recording
             recorder.stop()
 
+        # Hang up the caller's phone immediately -- end_call only tears down
+        # internal state and does not signal the caller's SIP endpoint, and
+        # the save below (file write, DB insert, optional transcription and
+        # email notification) can take seconds; the caller shouldn't be kept
+        # off-hook while it runs.
+        self._send_bye_to_caller(call, call_id)
+
+        if recorder:
             # Get recorded audio
             audio_data: bytes = recorder.get_recorded_audio()
             duration: float = recorder.get_duration()
@@ -1137,10 +1145,6 @@ class VoicemailHandler:
                     audio_data=placeholder_audio,
                     duration=0,
                 )
-
-        # Hang up the caller's phone -- end_call only tears down internal
-        # state and does not signal the caller's SIP endpoint.
-        self._send_bye_to_caller(call, call_id)
 
         # End the call
         pbx.end_call(call_id)
