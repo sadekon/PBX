@@ -293,6 +293,26 @@ class CallRouter:
         # Use the server's external IP address for SDP
         server_ip = pbx._get_server_ip()
 
+        # Never route a call to the PBX's own SIP address.  A stale or bogus
+        # registration (e.g. a loopback address recovered from the database)
+        # would make the PBX INVITE itself, receive its own INVITE as a new
+        # call with the same Call-ID, and re-route it in an infinite
+        # INVITE/100 Trying loop against 127.0.0.1.
+        dest_ip = str(dest_ext_obj.address[0])
+        dest_port = dest_ext_obj.address[1] if len(dest_ext_obj.address) > 1 else 5060
+        own_sip_port = pbx.config.get("server.sip_port", 5060)
+        if dest_ip.startswith("127.") or (dest_ip == server_ip and dest_port == own_sip_port):
+            pbx.logger.error(
+                f"Refusing to route call {call_id} to extension {to_ext}: registered "
+                f"address {dest_ip}:{dest_port} is the PBX itself (stale or bogus "
+                "registration) - unregistering it"
+            )
+            pbx.extension_registry.unregister(to_ext)
+            pbx.rtp_relay.release_relay(call_id)
+            pbx.cdr_system.end_record(call_id, hangup_cause="resource_unavailable")
+            pbx.call_manager.end_call(call_id)
+            return False
+
         # Determine which codecs to offer based on callee's phone model
         # Get callee's User-Agent to detect phone model
         callee_user_agent = pbx._get_phone_user_agent(to_ext)
