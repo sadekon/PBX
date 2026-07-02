@@ -137,11 +137,15 @@ call_waiting.enable = 1
 # DTMF Configuration
 # ============================================================================
 # Type 0: In-band, Type 1: RFC2833, Type 2: SIP INFO
-# SIP INFO provides the most reliable DTMF for ZIP33G voicemail/IVR
-account.1.dtmf.type = 2
-# Info type: 0=DTMF, 1=DTMF-Relay
+# RFC2833 (telephone-event) is verified working with the PBX when the
+# payload type below matches the PBX's features.dtmf.payload_type.
+# NOTE: earlier revisions used SIP INFO here citing ZIP33G RFC2833 issues;
+# if phantom keypresses reappear with RFC2833, revert to type = 2
+# (SIP INFO is also fully supported by the PBX).
+account.1.dtmf.type = 1
+# Info type (used only when type = 2 SIP INFO): 0=DTMF, 1=DTMF-Relay
 account.1.dtmf.info_type = 0
-# Payload type for RFC2833 (configurable, default 101)
+# Payload type for RFC2833 - must match PBX features.dtmf.payload_type (101)
 account.1.dtmf.dtmf_payload = {{DTMF_PAYLOAD_TYPE}}
 
 # ============================================================================
