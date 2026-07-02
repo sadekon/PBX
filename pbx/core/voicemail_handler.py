@@ -11,6 +11,7 @@ import struct
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -962,6 +963,7 @@ class VoicemailHandler:
             call: Call object
             recorder: RTPRecorder instance
         """
+        from pbx.utils.audio import g711_to_float_samples
         from pbx.utils.dtmf import DTMFDetector
 
         pbx = self.pbx_core
@@ -981,8 +983,19 @@ class VoicemailHandler:
             while recorder.running and call.state.value != "ended":
                 time.sleep(0.1)
 
-                # Check for recorded audio (DTMF tones from caller)
-                if (
+                digit: str | None = None
+
+                # Priority 1: out-of-band DTMF (SIP INFO or RFC 2833) queued
+                # on the call by handle_dtmf_info()
+                if getattr(call, "dtmf_info_queue", None):
+                    digit = call.dtmf_info_queue.pop(0)
+                    pbx.logger.info(
+                        f"Received out-of-band DTMF '{digit}' during voicemail "
+                        f"recording on call {call_id}"
+                    )
+
+                # Priority 2: in-band DTMF tones in the recorded audio
+                elif (
                     hasattr(recorder, "recorded_data")
                     and recorder.recorded_data
                     and len(recorder.recorded_data) > 0
@@ -991,36 +1004,89 @@ class VoicemailHandler:
                     recent_audio = b"".join(recorder.recorded_data[-dtmf_detection_packets:])
 
                     if len(recent_audio) > min_audio_bytes_for_dtmf:
-                        # Convert bytes to audio samples for DTMF detection
-                        # G.711 u-law is 8-bit samples, one byte per sample
-                        # Use struct.unpack for efficient batch conversion
-                        samples: list[float] = []
-                        # Process in chunks for efficiency
-                        chunk_size: int = min(len(recent_audio), 8192)  # Process up to 8KB at once
-                        for i in range(0, len(recent_audio), chunk_size):
-                            chunk = recent_audio[i : i + chunk_size]
-                            # Unpack bytes and convert to float samples
-                            unpacked = struct.unpack(f"{len(chunk)}B", chunk)
-                            # Convert unsigned byte to signed float (-1.0
-                            # to 1.0)
-                            samples.extend([(b - 128) / 128.0 for b in unpacked])
+                        # Decode G.711 to linear samples for tone detection --
+                        # companded bytes fed in as-is make the DTMF
+                        # frequencies unrecognizable to the detector.
+                        codec_pt: int = getattr(recorder, "detected_codec", 0) or 0
+                        samples: list[float] = g711_to_float_samples(recent_audio, codec_pt)
+                        digit = dtmf_detector.detect_tone(samples)
 
-                        # Detect DTMF
-                        digit: str | None = dtmf_detector.detect_tone(samples)
-
-                        if digit == "#":
-                            pbx.logger.info(
-                                f"Detected # key press during voicemail recording on call {call_id}"
-                            )
-                            # Complete the voicemail recording
-                            self.complete_voicemail_recording(call_id)
-                            return
+                if digit == "#":
+                    pbx.logger.info(
+                        f"Detected # key press during voicemail recording on call {call_id}"
+                    )
+                    # Complete the voicemail recording
+                    self.complete_voicemail_recording(call_id)
+                    return
 
             pbx.logger.debug(f"DTMF monitoring ended for voicemail recording on call {call_id}")
 
         except (KeyError, TypeError, ValueError, struct.error) as e:
             pbx.logger.error(f"Error in voicemail DTMF monitoring: {e}")
             pbx.logger.error(traceback.format_exc())
+
+    def _send_bye_to_caller(self, call: Any, call_id: str) -> None:
+        """
+        Send an in-dialog BYE to the caller to end the SIP session.
+
+        Needed when the PBX side ends a voicemail recording (max-duration
+        timeout or # keypress): ``PBXCore.end_call`` only tears down internal
+        state, so without this BYE the caller's phone stays off-hook in a
+        dead session.
+
+        Args:
+            call: Call object
+            call_id: Call identifier
+        """
+        import re
+
+        from pbx.sip.message import SIPMessageBuilder
+
+        pbx = self.pbx_core
+
+        invite = getattr(call, "original_invite", None)
+        caller_addr = getattr(call, "caller_addr", None)
+        if not (invite and caller_addr):
+            return
+
+        # In-dialog BYE from the PBX (the UAS of the original INVITE):
+        # From/To are swapped relative to the caller's INVITE, using the
+        # to-tag our 200 OK generated.
+        def _str_header(value: Any) -> str:
+            return value if isinstance(value, str) else ""
+
+        from_header = _str_header(getattr(call, "voicemail_dialog_to", None)) or _str_header(
+            invite.get_header("To")
+        )
+        to_header = _str_header(invite.get_header("From"))
+
+        # Request-URI: the caller's Contact if provided, else their
+        # network address.
+        uri = f"sip:{call.from_extension}@{caller_addr[0]}:{caller_addr[1]}"
+        contact = _str_header(invite.get_header("Contact"))
+        if contact:
+            match = re.search(r"<(sips?:[^>]+)>", contact)
+            if match:
+                uri = match.group(1)
+
+        try:
+            bye = SIPMessageBuilder.build_request(
+                method="BYE",
+                uri=uri,
+                from_addr=from_header,
+                to_addr=to_header,
+                call_id=call_id,
+                cseq=1,
+            )
+            server_ip = pbx._get_server_ip()
+            sip_port = pbx.config.get("server.sip_port", 5060)
+            branch_id = uuid.uuid4().hex
+            bye.set_header("Via", f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}")
+            bye.set_header("Max-Forwards", "70")
+            pbx.sip_server._send_message(bye.build(), caller_addr)
+            pbx.logger.info(f"Sent BYE to caller for completed voicemail recording {call_id}")
+        except (KeyError, OSError, TypeError, ValueError) as e:
+            pbx.logger.error(f"Failed to send BYE to caller for call {call_id}: {e}")
 
     def complete_voicemail_recording(self, call_id: str) -> None:
         """
@@ -1071,6 +1137,10 @@ class VoicemailHandler:
                     audio_data=placeholder_audio,
                     duration=0,
                 )
+
+        # Hang up the caller's phone -- end_call only tears down internal
+        # state and does not signal the caller's SIP endpoint.
+        self._send_bye_to_caller(call, call_id)
 
         # End the call
         pbx.end_call(call_id)

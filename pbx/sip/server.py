@@ -622,10 +622,14 @@ class SIPServer:
             self.logger.info(f"Forwarded re-INVITE to other party at {other_addr}")
 
     def _send_ack_to_callee(
-        self, response_200: SIPMessage, callee_addr: AddrTuple, call_id: str
+        self,
+        response_200: SIPMessage,
+        callee_addr: AddrTuple,
+        call_id: str,
+        use_invite_branch: bool = False,
     ) -> None:
         """
-        Generate and send ACK to callee after receiving their 200 OK.
+        Generate and send ACK to callee after receiving their final response.
 
         Per RFC 3261 Section 13.2.2.4, the UAC MUST acknowledge a 200 OK
         to INVITE with an ACK request.  Without this, the callee will
@@ -633,9 +637,16 @@ class SIPServer:
         Timer H expires), causing "call drops after a few seconds".
 
         Args:
-            response_200: The 200 OK SIPMessage from the callee.
+            response_200: The final response SIPMessage from the callee
+                (200 OK, or an error response when acknowledging a non-2xx).
             callee_addr: Callee's address tuple.
             call_id: Call identifier.
+            use_invite_branch: Reuse the INVITE's Via branch instead of
+                generating a new one.  RFC 3261 Section 17.1.1.3: the ACK
+                for a non-2xx final response belongs to the same transaction
+                as the INVITE and MUST have the same branch, or the callee
+                cannot match it and keeps retransmitting the response.
+                A 2xx ACK is a new transaction and gets a new branch.
         """
         import uuid as _uuid
 
@@ -671,13 +682,20 @@ class SIPServer:
         ack.set_header("Max-Forwards", "70")
 
         # Via header for the ACK
-        server_ip = self.pbx_core._get_server_ip()
-        sip_port = self.pbx_core.config.get("server.sip_port", 5060)
-        branch_id = str(_uuid.uuid4()).replace("-", "")
-        ack.set_header(
-            "Via",
-            f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}",
+        invite_via = (
+            callee_invite.get_header("Via") if use_invite_branch and callee_invite else None
         )
+        if invite_via:
+            # Non-2xx ACK: same transaction as the INVITE, same branch
+            ack.set_header("Via", invite_via)
+        else:
+            server_ip = self.pbx_core._get_server_ip()
+            sip_port = self.pbx_core.config.get("server.sip_port", 5060)
+            branch_id = str(_uuid.uuid4()).replace("-", "")
+            ack.set_header(
+                "Via",
+                f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}",
+            )
 
         self._send_message(ack.build(), callee_addr)
         self.logger.info(f"Sent ACK to callee at {callee_addr} for call {call_id}")
@@ -1821,6 +1839,28 @@ class SIPServer:
                 if call_id:
                     call = self.pbx_core.call_manager.get_call(call_id)
                     if call:
+                        from pbx.core.call import CallState
+
+                        # If the caller's leg was already answered (e.g. into
+                        # voicemail after the no-answer timeout), this response
+                        # is just the callee leg terminating -- typically the
+                        # 487 Request Terminated acknowledging our CANCEL.
+                        # ACK it to stop retransmissions, but leave the call
+                        # alone: forwarding the error to the caller or ending
+                        # the call would tear down the live voicemail
+                        # recording session.
+                        if call.routed_to_voicemail or call.state == CallState.CONNECTED:
+                            cseq_header = message.get_header("CSeq") or ""
+                            if "INVITE" in cseq_header:
+                                self._send_ack_to_callee(
+                                    message, addr, call_id, use_invite_branch=True
+                                )
+                            self.logger.info(
+                                f"Ignoring callee error {message.status_code} for call "
+                                f"{call_id} - caller leg already answered "
+                                "(callee leg cancelled)"
+                            )
+                            return
                         # Cancel no-answer timer since the callee already responded
                         if call.no_answer_timer:
                             call.no_answer_timer.cancel()

@@ -617,6 +617,11 @@ class CallRouter:
         contact_uri: str = f"<sip:{call.to_extension}@{server_ip}:{sip_port}>"
         ok_response.set_header("Contact", contact_uri)
 
+        # Remember the dialog's To header (which now carries the to-tag our
+        # 200 OK generated) so a proper in-dialog BYE can be sent to the
+        # caller when the recording completes (timeout or # keypress).
+        call.voicemail_dialog_to = ok_response.get_header("To")
+
         # Send to caller
         pbx.sip_server._send_message(ok_response.build(), call.caller_addr)
         pbx.logger.info(f"Answered call {call_id} for voicemail recording")
@@ -752,9 +757,26 @@ class CallRouter:
                 pbx.logger.error(f"Error playing voicemail greeting: {e}")
 
             # Start RTP recorder on the allocated port with the configured
-            # DTMF payload type so telephone-event packets are properly filtered
+            # DTMF payload type so telephone-event packets are properly
+            # filtered.  Wire in an RFC 2833 receiver (not started -- the
+            # recorder owns the socket and delegates telephone-event packets
+            # to it) so an out-of-band # from the caller reaches
+            # call.dtmf_info_queue via handle_dtmf_info().
+            from pbx.rtp.rfc2833 import RFC2833Receiver
+
             dtmf_pt = pbx._get_dtmf_payload_type()
-            recorder = RTPRecorder(call.rtp_ports[0], call_id, dtmf_payload_type=dtmf_pt)
+            rfc2833_rx = RFC2833Receiver(
+                local_port=call.rtp_ports[0],
+                pbx_core=pbx,
+                call_id=call_id,
+                payload_type=dtmf_pt,
+            )
+            recorder = RTPRecorder(
+                call.rtp_ports[0],
+                call_id,
+                rfc2833_handler=rfc2833_rx,
+                dtmf_payload_type=dtmf_pt,
+            )
             if recorder.start():
                 # Store recorder in call object for later retrieval
                 call.voicemail_recorder = recorder

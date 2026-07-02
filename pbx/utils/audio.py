@@ -108,6 +108,49 @@ def pcm16_to_ulaw(pcm_data: bytes) -> bytes:
     return bytes(ulaw_data)
 
 
+def _ulaw_byte_to_linear(ulaw_byte: int) -> int:
+    """Decode a single G.711 μ-law byte to a 16-bit linear PCM sample."""
+    ulaw_byte = ~ulaw_byte & 0xFF
+    sign = ulaw_byte & 0x80
+    exponent = (ulaw_byte >> 4) & 0x07
+    mantissa = ulaw_byte & 0x0F
+    sample = (((mantissa << 3) + _ULAW_BIAS) << exponent) - _ULAW_BIAS
+    return -sample if sign else sample
+
+
+def _alaw_byte_to_linear(alaw_byte: int) -> int:
+    """Decode a single G.711 A-law byte to a 16-bit linear PCM sample."""
+    alaw_byte ^= 0x55
+    sign = alaw_byte & 0x80
+    exponent = (alaw_byte >> 4) & 0x07
+    mantissa = alaw_byte & 0x0F
+    if exponent == 0:
+        sample = (mantissa << 4) + 8
+    else:
+        sample = ((mantissa << 4) + 0x108) << (exponent - 1)
+    return -sample if sign else sample
+
+
+def g711_to_float_samples(payload: bytes, payload_type: int = 0) -> list[float]:
+    """
+    Decode G.711 audio bytes to normalized float samples in [-1.0, 1.0].
+
+    Used for in-band DTMF tone detection on recorded RTP audio, which
+    requires linear samples -- treating companded G.711 bytes as linear
+    PCM makes the tone frequencies unrecognizable.
+
+    Args:
+        payload: Raw G.711 audio bytes (one byte per sample).
+        payload_type: RTP payload type (0 = PCMU/μ-law, 8 = PCMA/A-law).
+            Other payload types are decoded as μ-law.
+
+    Returns:
+        List of float samples normalized to [-1.0, 1.0].
+    """
+    decode = _alaw_byte_to_linear if payload_type == 8 else _ulaw_byte_to_linear
+    return [decode(b) / 32768.0 for b in payload]
+
+
 def pcm16_to_g722(pcm_data: bytes, sample_rate: int = 8000) -> bytes:
     """
     Convert 16-bit PCM audio data to G.722 format
