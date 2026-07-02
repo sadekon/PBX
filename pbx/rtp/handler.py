@@ -550,6 +550,7 @@ class RTPRecorder:
         call_id: str,
         rfc2833_handler: RFC2833Receiver | None = None,
         dtmf_payload_type: int = 101,
+        extra_dtmf_payload_types: set[int] | None = None,
     ) -> None:
         """
         Initialize RTP recorder.
@@ -559,6 +560,10 @@ class RTPRecorder:
             call_id: Call identifier for logging.
             rfc2833_handler: Optional RFC 2833 receiver for DTMF event handling.
             dtmf_payload_type: Payload type for RFC 2833 DTMF events (default 101).
+            extra_dtmf_payload_types: Additional payload types to treat as
+                telephone-event.  Some phones send DTMF using the payload
+                type from their own SDP offer rather than the one in our
+                SDP answer, so the caller's offered PT belongs here.
         """
         self.local_port: int = local_port
         self.call_id: str = call_id
@@ -570,6 +575,9 @@ class RTPRecorder:
         self.remote_endpoint: AddrTuple | None = None  # Will be learned from first packet
         self.rfc2833_handler: RFC2833Receiver | None = rfc2833_handler  # Optional RFC 2833 receiver
         self.dtmf_payload_type: int = dtmf_payload_type
+        self.dtmf_payload_types: set[int] = {dtmf_payload_type} | (
+            extra_dtmf_payload_types or set()
+        )
         # Track the audio codec payload type from the first audio packet
         self.detected_codec: int | None = None
 
@@ -648,10 +656,11 @@ class RTPRecorder:
                     payload = data[payload_offset:] if len(data) > payload_offset else b""
 
                     # Filter out RFC 2833 telephone-event packets using the
-                    # negotiated DTMF payload type (not hardcoded 101).
-                    if payload_type == self.dtmf_payload_type:
+                    # negotiated DTMF payload type(s) (not hardcoded 101).
+                    if payload_type in self.dtmf_payload_types:
                         self.logger.debug(
-                            "Received RFC 2833 telephone-event packet (filtered from recording)"
+                            f"Received RFC 2833 telephone-event packet (PT {payload_type}, "
+                            "filtered from recording)"
                         )
                         # If we have an RFC 2833 handler, delegate event
                         # processing

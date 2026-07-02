@@ -754,11 +754,15 @@ class SIPServer:
                 other_party_addr: AddrTuple | None = None
 
                 if call.caller_addr and call.caller_addr == addr:
-                    # Caller sent BYE, forward to callee
-                    other_party_addr = call.callee_addr
-                    self.logger.debug(
-                        f"BYE from caller, forwarding to callee at {other_party_addr}"
-                    )
+                    # Caller sent BYE, forward to callee -- unless the call
+                    # was routed to voicemail, in which case the callee leg
+                    # was already cancelled: the callee has no dialog for
+                    # this Call-ID and would just answer 481.
+                    if not call.routed_to_voicemail:
+                        other_party_addr = call.callee_addr
+                        self.logger.debug(
+                            f"BYE from caller, forwarding to callee at {other_party_addr}"
+                        )
                 elif call.callee_addr and call.callee_addr == addr:
                     # Callee sent BYE, forward to caller
                     other_party_addr = call.caller_addr

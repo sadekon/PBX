@@ -161,6 +161,86 @@ class TestCalleeErrorAfterVoicemailAnswer:
         pbx.end_call.assert_called_once_with(CALL_ID)
 
 
+def _make_rfc2833_rtp_packet(
+    pt: int, event: int, end: bool, seq: int, marker: bool = False
+) -> bytes:
+    """Build a raw RTP packet carrying an RFC 2833 telephone-event payload."""
+    byte0 = 0x80  # V=2
+    byte1 = (0x80 if marker else 0x00) | (pt & 0x7F)
+    header = struct.pack("!BBHII", byte0, byte1, seq, 1234, 0xABCD)
+    payload = struct.pack("!BBH", event, (0x80 if end else 0x00) | 10, 160)
+    return header + payload
+
+
+@pytest.mark.unit
+class TestDtmfPayloadTypeNegotiation:
+    """DTMF must be accepted on the caller's offered PT, not just the configured one."""
+
+    def test_receiver_accepts_callers_offered_payload_type(self) -> None:
+        from pbx.rtp.rfc2833 import RFC2833Receiver
+
+        pbx = MagicMock()
+        # Configured PT is 101, but the caller offered telephone-event on 96
+        # and sends with its own PT.
+        rx = RFC2833Receiver(
+            local_port=0,
+            pbx_core=pbx,
+            call_id=CALL_ID,
+            payload_type=101,
+            extra_payload_types={96},
+        )
+
+        hash_event = 11  # RFC 2833 event code for '#'
+        rx.handle_rtp_packet(_make_rfc2833_rtp_packet(96, hash_event, False, 1, marker=True), ADDR)
+        rx.handle_rtp_packet(_make_rfc2833_rtp_packet(96, hash_event, True, 2), ADDR)
+
+        pbx.handle_dtmf_info.assert_called_once_with(CALL_ID, "#")
+
+    def test_recorder_filters_callers_offered_payload_type(self) -> None:
+        from pbx.rtp.handler import RTPRecorder
+
+        handler = MagicMock()
+        recorder = RTPRecorder(
+            0,
+            CALL_ID,
+            rfc2833_handler=handler,
+            dtmf_payload_type=101,
+            extra_dtmf_payload_types={96},
+        )
+        assert recorder.dtmf_payload_types == {96, 101}
+
+
+@pytest.mark.unit
+class TestByeNotForwardedToCancelledCallee:
+    """The caller's BYE must not be forwarded to a callee leg cancelled by voicemail."""
+
+    @patch("pbx.sip.server.get_logger")
+    def test_bye_not_forwarded_when_routed_to_voicemail(self, mock_get_logger: MagicMock) -> None:
+        caller_addr = ("192.168.1.10", 5060)
+        pbx = MagicMock()
+        call = MagicMock()
+        call.routed_to_voicemail = True
+        call.voicemail_access = False
+        call.caller_addr = caller_addr
+        call.callee_addr = ("192.168.1.50", 5060)
+        pbx.call_manager.get_call.return_value = call
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_message = MagicMock()  # used for forwarding
+        server._send_response = MagicMock()  # used for the 200 OK to the BYE
+
+        bye = MagicMock()
+        bye.method = "BYE"
+        bye.get_header.side_effect = {"Call-ID": CALL_ID}.get
+        server._handle_bye(bye, caller_addr)
+
+        # No BYE forwarded to the cancelled callee (it would answer 481)
+        server._send_message.assert_not_called()
+        # The call is still ended (saving the voicemail) and the BYE answered
+        pbx.end_call.assert_called_once_with(CALL_ID)
+        server._send_response.assert_called_once_with(200, "OK", bye, caller_addr)
+
+
 @pytest.mark.unit
 class TestMonitorVoicemailDtmf:
     """# keypress during recording must complete the voicemail."""

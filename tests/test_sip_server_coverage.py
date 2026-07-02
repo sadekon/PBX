@@ -691,6 +691,7 @@ class TestHandleBye:
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
         mock_call.state = "CONNECTED"
+        mock_call.routed_to_voicemail = False
         pbx.call_manager.get_call.return_value = mock_call
 
         server = SIPServer(pbx_core=pbx)
