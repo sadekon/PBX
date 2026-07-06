@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
-from rtp.handler import RTPRecorder
+from pbx.rtp.handler import RTPRecorder
 
 
 class CallState(Enum):
