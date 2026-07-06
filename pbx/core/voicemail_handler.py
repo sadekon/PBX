@@ -375,7 +375,7 @@ class VoicemailHandler:
 
         from pbx.core.call import CallState
         from pbx.rtp.handler import RTPPlayer, RTPRecorder
-        from pbx.utils.audio import get_prompt_audio
+        from pbx.utils.audio import g711_to_float_samples, get_prompt_audio
         from pbx.utils.dtmf import DTMFDetector
 
         pbx = self.pbx_core
@@ -633,9 +633,17 @@ class VoicemailHandler:
                                 len(recent_audio) > min_audio_bytes_for_dtmf
                             ):  # Need sufficient audio for DTMF
                                 try:
-                                    # Detect DTMF in audio with error
-                                    # handling
-                                    digit = dtmf_detector.detect(recent_audio)
+                                    # Decode G.711 to linear samples before
+                                    # tone detection. The recorder stores
+                                    # companded µ-law/A-law RTP payload;
+                                    # feeding those bytes to detect() (which
+                                    # parses 16-bit PCM) scrambles them into
+                                    # spurious DTMF hits -- e.g. false digits
+                                    # in the greeting-review state trigger
+                                    # endless invalid-option beeps.
+                                    codec_pt = getattr(recorder, "detected_codec", 0) or 0
+                                    samples = g711_to_float_samples(recent_audio, codec_pt)
+                                    digit = dtmf_detector.detect_tone(samples)
                                 except Exception as e:
                                     pbx.logger.error(f"Error detecting DTMF: {e}")
                                     digit = None
@@ -852,7 +860,13 @@ class VoicemailHandler:
                                     )
                                     if len(recent_audio) > min_audio_bytes_for_dtmf:
                                         try:
-                                            stop_digit = dtmf_detector.detect(recent_audio)
+                                            # Decode companded G.711 to linear
+                                            # samples first (see main loop) --
+                                            # detect() would misread µ-law/A-law
+                                            # bytes as PCM and false-trigger.
+                                            codec_pt = getattr(recorder, "detected_codec", 0) or 0
+                                            samples = g711_to_float_samples(recent_audio, codec_pt)
+                                            stop_digit = dtmf_detector.detect_tone(samples)
                                             if stop_digit:
                                                 pbx.logger.info(
                                                     f"Received DTMF from in-band audio during recording: {stop_digit}"

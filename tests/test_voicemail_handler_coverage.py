@@ -566,6 +566,71 @@ class TestVoicemailIVRSession:
         assert len(prompt_calls) >= 2  # record_greeting + greeting_review_menu
 
     @patch("pbx.core.voicemail_handler.time")
+    def test_ivr_inband_dtmf_decodes_g711_not_raw_pcm(self, mock_time) -> None:
+        """In-band DTMF detection must decode companded G.711 to linear
+        samples (g711_to_float_samples + detect_tone), not feed the raw
+        µ-law/A-law RTP payload to detect() which parses it as 16-bit PCM.
+
+        Regression test: the raw-PCM misread scrambled companded bytes into
+        spurious digits, producing endless invalid-option beeps in the
+        greeting-review state.
+        """
+        from pbx.core.call import CallState
+
+        mock_time.time.return_value = 1000.0
+
+        mock_player_cls, mock_recorder_cls, mock_dtmf_cls, mock_get_prompt = _setup_rtp_mocks()
+        mock_get_prompt.return_value = b"WAV_PROMPT"
+
+        mock_player = MagicMock()
+        mock_player.start.return_value = True
+        mock_player_cls.return_value = mock_player
+
+        # Recorder holds companded G.711 payload and a detected codec.
+        mock_recorder = MagicMock()
+        mock_recorder.start.return_value = True
+        mock_recorder.recorded_data = [b"\xff" * 2000]  # > min_audio_bytes_for_dtmf
+        mock_recorder.detected_codec = 0  # PCMU / µ-law
+        mock_recorder_cls.return_value = mock_recorder
+
+        # No out-of-band digits, so the loop must use the in-band path.
+        detector = MagicMock()
+        detector.detect_tone.return_value = "1"
+        mock_dtmf_cls.return_value = detector
+
+        # Decoder returns linear float samples.
+        decoded_samples = [0.0, 0.1, -0.1]
+        _mock_utils_audio.g711_to_float_samples = MagicMock(return_value=decoded_samples)
+
+        pbx = _make_pbx_core()
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+        call_obj.state = CallState.CONNECTED
+        call_obj.dtmf_info_queue = []  # force in-band detection
+
+        call_count = 0
+
+        def handle_dtmf_side_effect(digit):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {"action": "play_prompt", "prompt": "enter_pin"}  # priming "*"
+            # First real in-band digit ends the session.
+            call_obj.state = CallState.ENDED
+            return {"action": "hangup"}
+
+        voicemail_ivr = MagicMock()
+        voicemail_ivr.handle_dtmf.side_effect = handle_dtmf_side_effect
+
+        handler._voicemail_ivr_session("call-1", call_obj, MagicMock(), voicemail_ivr)
+
+        # Must decode G.711 with the detected codec, then run tone detection
+        # on the decoded samples -- never the raw-bytes detect() path.
+        _mock_utils_audio.g711_to_float_samples.assert_any_call(b"\xff" * 2000, 0)
+        detector.detect_tone.assert_any_call(decoded_samples)
+        detector.detect.assert_not_called()
+
+    @patch("pbx.core.voicemail_handler.time")
     def test_ivr_exception_logged_and_call_ended(self, mock_time) -> None:
         """On ValueError in IVR session, error should be logged and call ended."""
         from pbx.core.call import CallState
