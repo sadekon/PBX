@@ -643,7 +643,17 @@ class VoicemailHandler:
                                     # endless invalid-option beeps.
                                     codec_pt = getattr(recorder, "detected_codec", 0) or 0
                                     samples = g711_to_float_samples(recent_audio, codec_pt)
-                                    digit = dtmf_detector.detect_tone(samples)
+                                    # detect_tone() only inspects the first
+                                    # samples_per_frame (~25ms) samples of
+                                    # whatever it's given, so calling it
+                                    # directly on this ~0.8s window silently
+                                    # ignores almost all of the audio and
+                                    # misses tones that don't happen to start
+                                    # exactly at the window's leading edge.
+                                    # detect_sequence() slides a frame across
+                                    # the whole window instead.
+                                    detected_sequence = dtmf_detector.detect_sequence(samples)
+                                    digit = detected_sequence[-1] if detected_sequence else None
                                 except Exception as e:
                                     pbx.logger.error(f"Error detecting DTMF: {e}")
                                     digit = None
@@ -866,7 +876,19 @@ class VoicemailHandler:
                                             # bytes as PCM and false-trigger.
                                             codec_pt = getattr(recorder, "detected_codec", 0) or 0
                                             samples = g711_to_float_samples(recent_audio, codec_pt)
-                                            stop_digit = dtmf_detector.detect_tone(samples)
+                                            # detect_tone() only looks at the
+                                            # leading ~25ms of the samples
+                                            # it's handed, so on this ~0.8s
+                                            # window it misses a "#" press
+                                            # unless it happens to start at
+                                            # the very front. detect_sequence()
+                                            # scans the whole window instead.
+                                            detected_sequence = dtmf_detector.detect_sequence(
+                                                samples
+                                            )
+                                            stop_digit = (
+                                                detected_sequence[-1] if detected_sequence else None
+                                            )
                                             if stop_digit:
                                                 pbx.logger.info(
                                                     f"Received DTMF from in-band audio during recording: {stop_digit}"
@@ -937,6 +959,27 @@ class VoicemailHandler:
                                     f"Playing recorded greeting for review ({len(greeting_data)} bytes)"
                                 )
 
+                                # Play the "Playing your greeting..." lead-in
+                                # that _handle_greeting_review returns as
+                                # action["prompt"] -- previously ignored, so
+                                # the caller went straight from pressing '1'
+                                # to hearing their own recording with no cue.
+                                playback_prompt_type = action.get("prompt", "greeting_playback")
+                                playback_lead_in: bytes = get_prompt_audio(playback_prompt_type)
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".wav", delete=False
+                                ) as temp_file:
+                                    temp_file.write(playback_lead_in)
+                                    lead_in_file: str = temp_file.name
+
+                                try:
+                                    player.play_file(lead_in_file)
+                                finally:
+                                    with contextlib.suppress(OSError):
+                                        Path(lead_in_file).unlink()
+
+                                time.sleep(0.2)
+
                                 # Greeting is already in WAV format (converted when recorded)
                                 with tempfile.NamedTemporaryFile(
                                     suffix=".wav", delete=False
@@ -987,6 +1030,15 @@ class VoicemailHandler:
                         # adding clear() method to RTPRecorder
                         if hasattr(recorder, "recorded_data"):
                             recorder.recorded_data = []
+
+                        # Reset the inactivity timer now that the action is
+                        # done. Actions like "start_recording" can block for
+                        # up to 120s (greeting recording); without this the
+                        # very next loop iteration sees a stale
+                        # last_audio_check and immediately times out the
+                        # session, killing it before the caller can respond
+                        # to the greeting-review menu that was just played.
+                        last_audio_check = time.time()
 
                     # Timeout after 60 seconds of no activity
                     if time.time() - last_audio_check > 60:
@@ -1081,7 +1133,13 @@ class VoicemailHandler:
                         # frequencies unrecognizable to the detector.
                         codec_pt: int = getattr(recorder, "detected_codec", 0) or 0
                         samples: list[float] = g711_to_float_samples(recent_audio, codec_pt)
-                        digit = dtmf_detector.detect_tone(samples)
+                        # detect_tone() only examines the first
+                        # samples_per_frame samples it's handed, so calling
+                        # it on this whole ~0.8s window misses tones that
+                        # aren't at the very front. detect_sequence() slides
+                        # a frame across the entire window instead.
+                        detected_sequence = dtmf_detector.detect_sequence(samples)
+                        digit = detected_sequence[-1] if detected_sequence else None
 
                 if digit == "#":
                     pbx.logger.info(

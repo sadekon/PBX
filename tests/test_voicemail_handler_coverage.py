@@ -568,7 +568,7 @@ class TestVoicemailIVRSession:
     @patch("pbx.core.voicemail_handler.time")
     def test_ivr_inband_dtmf_decodes_g711_not_raw_pcm(self, mock_time) -> None:
         """In-band DTMF detection must decode companded G.711 to linear
-        samples (g711_to_float_samples + detect_tone), not feed the raw
+        samples (g711_to_float_samples + detect_sequence), not feed the raw
         µ-law/A-law RTP payload to detect() which parses it as 16-bit PCM.
 
         Regression test: the raw-PCM misread scrambled companded bytes into
@@ -595,7 +595,7 @@ class TestVoicemailIVRSession:
 
         # No out-of-band digits, so the loop must use the in-band path.
         detector = MagicMock()
-        detector.detect_tone.return_value = "1"
+        detector.detect_sequence.return_value = "1"
         mock_dtmf_cls.return_value = detector
 
         # Decoder returns linear float samples.
@@ -627,7 +627,7 @@ class TestVoicemailIVRSession:
         # Must decode G.711 with the detected codec, then run tone detection
         # on the decoded samples -- never the raw-bytes detect() path.
         _mock_utils_audio.g711_to_float_samples.assert_any_call(b"\xff" * 2000, 0)
-        detector.detect_tone.assert_any_call(decoded_samples)
+        detector.detect_sequence.assert_any_call(decoded_samples)
         detector.detect.assert_not_called()
 
     @patch("pbx.core.voicemail_handler.time")
@@ -715,7 +715,7 @@ class TestMonitorVoicemailDTMF:
         """When # is detected, should call complete_voicemail_recording."""
         _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
         mock_detector = MagicMock()
-        mock_detector.detect_tone.return_value = "#"
+        mock_detector.detect_sequence.return_value = "#"
         mock_dtmf_cls.return_value = mock_detector
 
         pbx = _make_pbx_core()
@@ -735,7 +735,7 @@ class TestMonitorVoicemailDTMF:
         """Non-# digit should not trigger completion."""
         _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
         mock_detector = MagicMock()
-        mock_detector.detect_tone.return_value = "5"
+        mock_detector.detect_sequence.return_value = "5"
         mock_dtmf_cls.return_value = mock_detector
 
         pbx = _make_pbx_core()
@@ -823,7 +823,7 @@ class TestMonitorVoicemailDTMF:
 
         with patch.object(handler, "complete_voicemail_recording") as _mock_complete:
             handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
-            mock_detector.detect_tone.assert_not_called()
+            mock_detector.detect_sequence.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
