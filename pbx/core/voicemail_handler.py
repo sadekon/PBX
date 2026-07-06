@@ -465,7 +465,45 @@ class VoicemailHandler:
             pbx.logger.info(
                 f"[VM IVR] Creating RTP recorder for DTMF detection (port {call.rtp_ports[0]})..."
             )
-            recorder = RTPRecorder(call.rtp_ports[0], call_id)
+            # Wire in an RFC 2833 receiver (not started -- the recorder owns
+            # the socket and delegates telephone-event packets to it) so
+            # out-of-band DTMF (PIN digits, #, menu selections) sent via
+            # RTP telephone-event reaches call.dtmf_info_queue through
+            # handle_dtmf_info(). Without this, telephone-event packets are
+            # filtered out of the recording but silently dropped, so PIN
+            # entry never advances.
+            from pbx.rtp.rfc2833 import RFC2833Receiver
+
+            dtmf_pt = pbx._get_dtmf_payload_type()
+
+            # Also accept the telephone-event payload type(s) from the
+            # caller's own SDP offer: RFC 3264 says the caller should send
+            # using the PT from our answer, but many phones send using the
+            # PT they offered instead.
+            caller_dtmf_pts: set[int] = set()
+            rtpmap_names = (call.caller_rtp or {}).get("rtpmap_names") or {}
+            for pt_str, rtpmap_name in rtpmap_names.items():
+                if str(rtpmap_name).lower().startswith("telephone-event") and str(pt_str).isdigit():
+                    caller_dtmf_pts.add(int(pt_str))
+            pbx.logger.info(
+                f"[VM IVR] DTMF payload types for call {call_id}: "
+                f"{sorted({dtmf_pt} | caller_dtmf_pts)}"
+            )
+
+            rfc2833_rx = RFC2833Receiver(
+                local_port=call.rtp_ports[0],
+                pbx_core=pbx,
+                call_id=call_id,
+                payload_type=dtmf_pt,
+                extra_payload_types=caller_dtmf_pts,
+            )
+            recorder = RTPRecorder(
+                call.rtp_ports[0],
+                call_id,
+                rfc2833_handler=rfc2833_rx,
+                dtmf_payload_type=dtmf_pt,
+                extra_dtmf_payload_types=caller_dtmf_pts,
+            )
             if not recorder.start():
                 pbx.logger.error("[VM IVR] ✗ Failed to start RTP recorder")
                 player.stop()
