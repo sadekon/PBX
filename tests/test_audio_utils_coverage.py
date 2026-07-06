@@ -608,7 +608,7 @@ class TestGenerateVoicePrompt:
             "timeout",
             "transferring",
             "invalid_pin",
-            "recording_greeting",
+            "record_greeting",
             "greeting_saved",
             "message_deleted",
             "end_of_messages",

@@ -14,7 +14,7 @@ Covers:
 
 import sys
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -497,6 +497,73 @@ class TestVoicemailIVRSession:
 
         handler._voicemail_ivr_session("call-1", call_obj, MagicMock(), voicemail_ivr)
         pbx.end_call.assert_called()
+
+    @patch("pbx.core.voicemail_handler.time")
+    def test_ivr_greeting_recording_plays_prompt_beep_and_review_menu(self, mock_time) -> None:
+        """Full record-greeting flow: entering the state must play the
+        instructional prompt before the beep, and finishing recording (#)
+        must play the review menu prompt.
+
+        Regression test for two bugs where these action types
+        ("start_recording", "stop_recording") carried a "prompt" field that
+        the dispatcher silently ignored, leaving the caller with only a beep
+        (or dead silence) instead of the intended spoken prompt.
+        """
+        from pbx.core.call import CallState
+
+        # Use a constant real time so timeout comparisons in the recording
+        # sub-loop don't blow up on unconfigured MagicMock arithmetic.
+        mock_time.time.return_value = 1000.0
+
+        mock_player_cls, mock_recorder_cls, _mock_dtmf_cls, mock_get_prompt = _setup_rtp_mocks()
+        mock_get_prompt.return_value = b"WAV_PROMPT"
+
+        mock_player = MagicMock()
+        mock_player.start.return_value = True
+        mock_player_cls.return_value = mock_player
+
+        mock_recorder = MagicMock()
+        mock_recorder.start.return_value = True
+        mock_recorder.recorded_data = [b"\x00" * 10]
+        mock_recorder.detected_codec = 0
+        mock_recorder_cls.return_value = mock_recorder
+
+        pbx = _make_pbx_core()
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+        call_obj.state = CallState.CONNECTED
+        # "1" (options menu selection) starts recording; "#" (already queued)
+        # is picked up inside the recording sub-loop to stop it.
+        call_obj.dtmf_info_queue = ["1", "#"]
+
+        voicemail_ivr = MagicMock()
+        call_count = 0
+
+        def handle_dtmf_side_effect(digit):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Initial handle_dtmf("*") priming call the session makes
+                # before the main loop starts (see _voicemail_ivr_session).
+                return {"action": "play_prompt", "prompt": "enter_pin"}
+            if call_count == 2:
+                return {"action": "start_recording", "prompt": "record_greeting"}
+            call_obj.state = CallState.ENDED  # end the outer loop after this
+            return {"action": "stop_recording", "prompt": "greeting_review_menu"}
+
+        voicemail_ivr.handle_dtmf.side_effect = handle_dtmf_side_effect
+
+        handler._voicemail_ivr_session("call-1", call_obj, MagicMock(), voicemail_ivr)
+
+        # The instructional prompt must be fetched before the beep, and the
+        # review menu prompt must be fetched after recording stops.
+        prompt_calls = [c for c in mock_get_prompt.call_args_list if c != call("beep")]
+        assert call("record_greeting") in mock_get_prompt.call_args_list
+        assert call("greeting_review_menu") in mock_get_prompt.call_args_list
+        assert mock_get_prompt.call_args_list.index(
+            call("record_greeting")
+        ) < mock_get_prompt.call_args_list.index(call("beep"))
+        assert len(prompt_calls) >= 2  # record_greeting + greeting_review_menu
 
     @patch("pbx.core.voicemail_handler.time")
     def test_ivr_exception_logged_and_call_ended(self, mock_time) -> None:

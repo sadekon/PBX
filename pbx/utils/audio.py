@@ -539,6 +539,14 @@ def generate_voice_prompt(prompt_type: str, sample_rate: int = 8000) -> bytes:
             # Low buzz for invalid option
             (300, 400),
         ],
+        "error": [
+            # Generic error/failure buzz (e.g. greeting save failed)
+            (300, 300),
+            (0, 100),
+            (300, 300),
+            (0, 100),
+            (300, 300),
+        ],
         "you_have_messages": [
             # Cheerful ascending tones
             (600, 150),
@@ -580,7 +588,7 @@ def generate_voice_prompt(prompt_type: str, sample_rate: int = 8000) -> bytes:
             (0, 100),
             (300, 400),
         ],
-        "recording_greeting": [
+        "record_greeting": [
             # Recording prompt tones
             (700, 200),
             (900, 200),
@@ -591,6 +599,28 @@ def generate_voice_prompt(prompt_type: str, sample_rate: int = 8000) -> bytes:
             (1000, 200),
             (1200, 200),
             (1000, 200),
+        ],
+        "greeting_review_menu": [
+            # Menu options tone pattern (listen/re-record/delete/save)
+            (800, 150),
+            (0, 80),
+            (900, 150),
+            (0, 80),
+            (700, 150),
+            (0, 80),
+            (1000, 250),
+        ],
+        "greeting_deleted": [
+            # Deletion confirmation - descending, distinct from message_deleted
+            (850, 150),
+            (650, 150),
+            (450, 250),
+        ],
+        "greeting_playback": [
+            # Playback starting indicator
+            (1000, 100),
+            (0, 50),
+            (1000, 100),
         ],
         "message_deleted": [
             # Deletion confirmation - descending

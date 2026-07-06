@@ -775,6 +775,27 @@ class VoicemailHandler:
                                 f"Starting greeting recording for extension {call.voicemail_extension}"
                             )
 
+                            # Play the instructional voice prompt (e.g.
+                            # "record_greeting") before the beep -- this
+                            # action carries its own "prompt" field that the
+                            # other branches read via action.get("prompt"),
+                            # but this branch previously ignored it entirely.
+                            record_prompt_type = action.get("prompt", "record_greeting")
+                            record_prompt_audio: bytes = get_prompt_audio(record_prompt_type)
+                            with tempfile.NamedTemporaryFile(
+                                suffix=".wav", delete=False
+                            ) as temp_file:
+                                temp_file.write(record_prompt_audio)
+                                record_prompt_file: str = temp_file.name
+
+                            try:
+                                player.play_file(record_prompt_file)
+                            finally:
+                                with contextlib.suppress(OSError):
+                                    Path(record_prompt_file).unlink()
+
+                            time.sleep(0.3)
+
                             # Play beep tone
                             beep_prompt: bytes = get_prompt_audio("beep")
                             with tempfile.NamedTemporaryFile(
@@ -862,9 +883,13 @@ class VoicemailHandler:
                                         pbx.logger.info(
                                             f"Saved recorded greeting as WAV ({len(greeting_audio_wav)} bytes, {len(greeting_audio_raw)} bytes raw audio)"
                                         )
-                                    # Handle the returned action
-                                    if action.get("action") == "play_prompt":
-                                        # Play greeting review menu prompt
+                                    # Handle the returned action. Both "play_prompt" and
+                                    # "stop_recording" (returned by _handle_recording_greeting
+                                    # for '#') carry a "prompt" field for the greeting review
+                                    # menu -- play it either way, since previously
+                                    # "stop_recording" was only logged and the caller never
+                                    # heard the review menu options.
+                                    if action.get("action") in ("play_prompt", "stop_recording"):
                                         prompt_type = action.get("prompt", "greeting_review_menu")
                                         prompt_audio = get_prompt_audio(prompt_type)
                                         with tempfile.NamedTemporaryFile(
@@ -877,11 +902,6 @@ class VoicemailHandler:
                                         finally:
                                             with contextlib.suppress(OSError):
                                                 Path(prompt_file).unlink()
-                                    elif action.get("action") == "stop_recording":
-                                        # Also valid, just log it
-                                        pbx.logger.info(
-                                            "IVR returned stop_recording action, continuing"
-                                        )
                                     else:
                                         # Unexpected action type
                                         pbx.logger.warning(
