@@ -91,11 +91,14 @@ def pcm16_to_ulaw(pcm_data: bytes) -> bytes:
         # Add bias
         sample = sample + _ULAW_BIAS
 
-        # Find exponent (position of highest set bit in range)
-        # Start from highest exponent and work down
+        # Find exponent (segment/chord number). For the biased 14-bit
+        # magnitude, the exponent is the position of the highest set bit
+        # among bits 8..14 minus 7 (exponent 7 -> bit 14, exponent 1 -> bit 8;
+        # exponent 0 when no bit above bit 7 is set). Start from the highest
+        # exponent and work down.
         exponent = 0
         for exp in range(7, -1, -1):
-            if sample & (1 << (exp + 3)):
+            if sample & (1 << (exp + 7)):
                 exponent = exp
                 break
 
