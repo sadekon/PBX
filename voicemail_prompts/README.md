@@ -18,7 +18,7 @@ See [scripts/README_VOICE_GENERATION.md](../scripts/README_VOICE_GENERATION.md) 
 
 ## Required Files
 
-This directory needs these 18 voice files:
+This directory needs these 19 voice files:
 
 - `enter_pin.wav` - PIN entry prompt
 - `invalid_pin.wav` - Invalid PIN message
@@ -26,6 +26,7 @@ This directory needs these 18 voice files:
 - `options_menu.wav` - Options menu
 - `message_menu.wav` - Message playback menu
 - `no_messages.wav` - No messages notification
+- `no_more_messages.wav` - End of message list notification
 - `you_have_messages.wav` - Message count announcement
 - `goodbye.wav` - Goodbye message
 - `leave_message.wav` - Leave message prompt

@@ -784,6 +784,37 @@ class VoicemailHandler:
 
                             time.sleep(0.3)
 
+                            # If this prompt returned the caller to the main
+                            # menu (e.g. "no more messages" after 2, "message
+                            # deleted" after 3, or the greeting-deleted/saved
+                            # confirmations), follow it with the main menu
+                            # options so the caller isn't stranded in silence
+                            # not knowing what to do. Skip when the prompt we
+                            # just played *is* the main menu, to avoid saying
+                            # it twice.
+                            if (
+                                call.state != CallState.ENDED
+                                and voicemail_ivr.state == voicemail_ivr.STATE_MAIN_MENU
+                                and prompt_type != "main_menu"
+                            ):
+                                pbx.logger.info(
+                                    "[VM IVR] Returned to main menu, replaying main menu prompt"
+                                )
+                                main_menu_audio: bytes = get_prompt_audio("main_menu")
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".wav", delete=False
+                                ) as temp_file:
+                                    temp_file.write(main_menu_audio)
+                                    main_menu_file: str = temp_file.name
+
+                                try:
+                                    player.play_file(main_menu_file)
+                                finally:
+                                    with contextlib.suppress(OSError):
+                                        Path(main_menu_file).unlink()
+
+                                time.sleep(0.3)
+
                         elif action["action"] == "hangup":
                             # Check if call is still active before playing
                             # goodbye

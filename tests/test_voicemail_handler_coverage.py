@@ -500,6 +500,75 @@ class TestVoicemailIVRSession:
         pbx.end_call.assert_called()
 
     @patch("pbx.core.voicemail_handler.time")
+    def test_ivr_return_to_main_menu_replays_main_menu_prompt(self, mock_time) -> None:
+        """A play_prompt that lands the IVR back in the main menu (e.g. "no
+        more messages" after 2, or "message deleted" after 3) must be
+        followed by the main menu prompt so the caller hears their options
+        instead of silence.
+
+        Regression test: these fall-through-to-main-menu paths played only
+        their status prompt and left the caller stranded in MAIN_MENU with
+        no menu announcement.
+        """
+        from pbx.core.call import CallState
+
+        mock_time.time.return_value = 1000.0
+
+        mock_player_cls, mock_recorder_cls, _mock_dtmf_cls, mock_get_prompt = _setup_rtp_mocks()
+        mock_get_prompt.return_value = b"WAV_PROMPT"
+
+        mock_player = MagicMock()
+        mock_player.start.return_value = True
+        mock_player_cls.return_value = mock_player
+
+        mock_recorder = MagicMock()
+        mock_recorder.start.return_value = True
+        mock_recorder.recorded_data = []
+        mock_recorder_cls.return_value = mock_recorder
+
+        # play_file fires for: (1) priming PIN prompt, (2) the no_more_messages
+        # status prompt, (3) the follow-up main_menu prompt. End after #3.
+        play_count = 0
+
+        def play_file_side_effect(_path):
+            nonlocal play_count
+            play_count += 1
+            if play_count >= 3:
+                call_obj.state = CallState.ENDED
+
+        mock_player.play_file.side_effect = play_file_side_effect
+
+        pbx = _make_pbx_core()
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+        call_obj.state = CallState.CONNECTED
+        call_obj.dtmf_info_queue = ["2"]
+
+        voicemail_ivr = MagicMock()
+        voicemail_ivr.STATE_MAIN_MENU = "main_menu"
+        call_count = 0
+
+        def handle_dtmf_side_effect(digit):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {"action": "play_prompt", "prompt": "enter_pin"}
+            # Pressing 2 at the end of the list lands back in the main menu.
+            voicemail_ivr.state = "main_menu"
+            return {"action": "play_prompt", "prompt": "no_more_messages"}
+
+        voicemail_ivr.handle_dtmf.side_effect = handle_dtmf_side_effect
+
+        handler._voicemail_ivr_session("call-1", call_obj, MagicMock(), voicemail_ivr)
+
+        # The status prompt plays, then the main menu prompt is replayed.
+        assert call("no_more_messages") in mock_get_prompt.call_args_list
+        assert call("main_menu") in mock_get_prompt.call_args_list
+        assert mock_get_prompt.call_args_list.index(
+            call("no_more_messages")
+        ) < mock_get_prompt.call_args_list.index(call("main_menu"))
+
+    @patch("pbx.core.voicemail_handler.time")
     def test_ivr_greeting_recording_plays_prompt_beep_and_review_menu(self, mock_time) -> None:
         """Full record-greeting flow: entering the state must play the
         instructional prompt before the beep, and finishing recording (#)

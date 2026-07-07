@@ -160,6 +160,10 @@ def generate_voicemail_voices(output_dir: str = "voicemail_prompts") -> int:
             "text": "You have no new messages.",
             "description": "No messages notification",
         },
+        "no_more_messages.wav": {
+            "text": "No more messages. Returning to the main menu.",
+            "description": "End of message list notification",
+        },
         "you_have_messages.wav": {
             "text": "You have new messages.",
             "description": "Message count announcement",

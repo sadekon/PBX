@@ -530,6 +530,12 @@ def generate_voice_prompt(prompt_type: str, sample_rate: int = 8000) -> bytes:
             (600, 200),
             (400, 300),
         ],
+        "no_more_messages": [
+            # End-of-list notification, distinct from no_messages
+            (700, 200),
+            (500, 200),
+            (500, 300),
+        ],
         "goodbye": [
             # Descending dual tone for goodbye
             (700, 250),
