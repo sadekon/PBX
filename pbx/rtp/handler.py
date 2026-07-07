@@ -23,6 +23,8 @@ from pbx.utils.audio import (
 from pbx.utils.logger import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pbx.features.qos_monitoring import QoSMetrics, QoSMonitor
     from pbx.rtp.rfc2833 import RFC2833Receiver
 
@@ -801,6 +803,7 @@ class RTPPlayer:
         payload_type: int = 0,
         samples_per_packet: int = 160,
         bytes_per_sample: int | None = None,
+        interrupt_check: Callable[[], bool] | None = None,
     ) -> bool:
         """
         Send audio data via RTP packets.
@@ -816,9 +819,15 @@ class RTPPlayer:
                 (default 160 = 20ms at 8kHz).
             bytes_per_sample: Bytes per sample (None=auto-detect, 1 for
                 G.711/G.722, 2 for 16-bit PCM).
+            interrupt_check: Optional predicate polled once per 20ms packet.
+                When it returns True, playback stops early (barge-in) and the
+                method returns True. Used by IVR menus so a caller can cut a
+                prompt short by pressing a key. The predicate must only peek at
+                the pending-DTMF source (never consume the digit) so the IVR
+                loop still pops it and drives the state machine.
 
         Returns:
-            True if successful.
+            True if successful (including an intentional barge-in stop).
         """
         if not self.running or not self.socket:
             self.logger.warning("Cannot send audio - RTP player not running")
@@ -840,6 +849,16 @@ class RTPPlayer:
             num_packets = (len(audio_data) + bytes_per_packet - 1) // bytes_per_packet
 
             for i in range(num_packets):
+                # Barge-in: stop sending as soon as the caller presses a key.
+                # The digit stays queued (interrupt_check only peeks) so the
+                # IVR loop pops it next and advances the state machine.
+                if interrupt_check is not None and interrupt_check():
+                    self.logger.info(
+                        f"Playback interrupted by caller input (barge-in) "
+                        f"after {i}/{num_packets} packets for call {self.call_id}"
+                    )
+                    return True
+
                 start = i * bytes_per_packet
                 end = min(start + bytes_per_packet, len(audio_data))
                 payload = audio_data[start:end]
@@ -916,7 +935,11 @@ class RTPPlayer:
             self.logger.error("Audio utilities not available")
             return False
 
-    def play_file(self, file_path: str | Path) -> bool:
+    def play_file(
+        self,
+        file_path: str | Path,
+        interrupt_check: Callable[[], bool] | None = None,
+    ) -> bool:
         """
         Play an audio file from a WAV file.
 
@@ -927,6 +950,9 @@ class RTPPlayer:
 
         Args:
             file_path: Path to WAV file.
+            interrupt_check: Optional barge-in predicate forwarded to
+                send_audio; when it returns True playback stops early. See
+                send_audio for the peek-don't-consume contract.
 
         Returns:
             True if successful.
@@ -1133,7 +1159,12 @@ class RTPPlayer:
                         self.logger.info(
                             f"Playing audio file: {file_path} ({len(audio_data)} bytes)"
                         )
-                        return self.send_audio(audio_data, payload_type, samples_per_packet)
+                        return self.send_audio(
+                            audio_data,
+                            payload_type,
+                            samples_per_packet,
+                            interrupt_check=interrupt_check,
+                        )
 
                     # Skip this chunk (with size validation)
                     if chunk_size > 100 * 1024 * 1024:  # 100MB limit
@@ -1393,6 +1424,20 @@ class RTPDTMFListener:
             time.sleep(0.05)
 
         return None
+
+    def has_digit(self) -> bool:
+        """
+        Report whether a detected DTMF digit is waiting, without consuming it.
+
+        Used as a barge-in predicate: it lets the player stop a prompt early
+        while leaving the digit in the buffer so the caller's IVR loop still
+        retrieves it via get_digit() and advances the state machine.
+
+        Returns:
+            True if at least one digit is buffered.
+        """
+        with self.lock:
+            return bool(self.detected_digits)
 
     def clear_digits(self) -> None:
         """Clear all detected digits from the buffer."""

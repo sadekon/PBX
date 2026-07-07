@@ -516,6 +516,17 @@ class VoicemailHandler:
             )
 
             try:
+                # Barge-in predicate for menu prompts: True the moment an
+                # out-of-band DTMF digit (RFC 2833 telephone-event via the
+                # RFC2833Receiver wired above, or SIP INFO) is delivered into
+                # call.dtmf_info_queue by handle_dtmf_info(). It only *peeks* --
+                # the digit stays queued so the main loop below still pops it
+                # and calls voicemail_ivr.handle_dtmf(), advancing the state
+                # machine exactly as if the prompt had played to the end. This
+                # lets callers skip ahead through menus without waiting.
+                def _dtmf_pending() -> bool:
+                    return bool(getattr(call, "dtmf_info_queue", None))
+
                 # Start the IVR flow - transition from WELCOME to PIN_ENTRY state
                 # Use '*' which won't be collected as part of PIN (only 0-9 are
                 # collected)
@@ -548,7 +559,7 @@ class VoicemailHandler:
                     pbx.logger.info(
                         f"[VM IVR] Playing PIN entry prompt (call state: {call.state})..."
                     )
-                    player.play_file(prompt_file)
+                    player.play_file(prompt_file, interrupt_check=_dtmf_pending)
                     pbx.logger.info(
                         f"[VM IVR] ✓ Finished playing PIN entry prompt (call state: {call.state})"
                     )
@@ -711,7 +722,7 @@ class VoicemailHandler:
                                 f"[VM IVR] Playing voicemail message: {message_id} from {caller_id}"
                             )
                             if file_path and Path(file_path).exists():
-                                player.play_file(file_path)
+                                player.play_file(file_path, interrupt_check=_dtmf_pending)
                                 if message_id:
                                     mailbox.mark_listened(message_id)
                                 pbx.logger.info(
@@ -748,7 +759,9 @@ class VoicemailHandler:
                                     menu_prompt_file: str = temp_file.name
 
                                 try:
-                                    player.play_file(menu_prompt_file)
+                                    player.play_file(
+                                        menu_prompt_file, interrupt_check=_dtmf_pending
+                                    )
                                 finally:
                                     with contextlib.suppress(OSError):
                                         Path(menu_prompt_file).unlink()
@@ -776,7 +789,7 @@ class VoicemailHandler:
                                 prompt_file = temp_file.name
 
                             try:
-                                player.play_file(prompt_file)
+                                player.play_file(prompt_file, interrupt_check=_dtmf_pending)
                                 pbx.logger.info(f"[VM IVR] ✓ Prompt '{prompt_type}' played")
                             finally:
                                 with contextlib.suppress(OSError):
@@ -808,7 +821,9 @@ class VoicemailHandler:
                                     main_menu_file: str = temp_file.name
 
                                 try:
-                                    player.play_file(main_menu_file)
+                                    player.play_file(
+                                        main_menu_file, interrupt_check=_dtmf_pending
+                                    )
                                 finally:
                                     with contextlib.suppress(OSError):
                                         Path(main_menu_file).unlink()
@@ -997,7 +1012,9 @@ class VoicemailHandler:
                                             temp_file.write(prompt_audio)
                                             prompt_file = temp_file.name
                                         try:
-                                            player.play_file(prompt_file)
+                                            player.play_file(
+                                                prompt_file, interrupt_check=_dtmf_pending
+                                            )
                                         finally:
                                             with contextlib.suppress(OSError):
                                                 Path(prompt_file).unlink()
@@ -1067,7 +1084,7 @@ class VoicemailHandler:
                                     prompt_file = temp_file.name
 
                                 try:
-                                    player.play_file(prompt_file)
+                                    player.play_file(prompt_file, interrupt_check=_dtmf_pending)
                                 finally:
                                     with contextlib.suppress(OSError):
                                         Path(prompt_file).unlink()
