@@ -12,6 +12,7 @@ Covers:
   - complete_voicemail_recording (call not found, no recorder, audio present, no audio)
 """
 
+import contextlib
 import sys
 from typing import Any
 from unittest.mock import MagicMock, call, patch
@@ -564,6 +565,93 @@ class TestVoicemailIVRSession:
             call("record_greeting")
         ) < mock_get_prompt.call_args_list.index(call("beep"))
         assert len(prompt_calls) >= 2  # record_greeting + greeting_review_menu
+
+    @patch("pbx.core.voicemail_handler.time")
+    def test_ivr_play_message_advances_to_message_menu(self, mock_time) -> None:
+        """After a voicemail message finishes playing, the handler must play
+        the message menu prompt and advance the IVR to the message-menu
+        state.
+
+        Regression test: the play_message branch played the audio then went
+        silent, leaving the IVR in PLAYING_MESSAGE. Because playback is
+        synchronous no key can be pressed during the message, so
+        _handle_playing_message never fired and the caller heard the message
+        followed by dead silence -- no replay/next/delete/main-menu options.
+        """
+        import tempfile
+        from pathlib import Path
+
+        from pbx.core.call import CallState
+
+        mock_time.time.return_value = 1000.0
+
+        mock_player_cls, mock_recorder_cls, _mock_dtmf_cls, mock_get_prompt = _setup_rtp_mocks()
+        mock_get_prompt.return_value = b"WAV_PROMPT"
+
+        # A real file so the handler's Path(file_path).exists() check passes.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as msg_file:
+            msg_file.write(b"RIFF_MESSAGE_AUDIO")
+            message_path = msg_file.name
+
+        mock_player = MagicMock()
+        mock_player.start.return_value = True
+        mock_player_cls.return_value = mock_player
+
+        mock_recorder = MagicMock()
+        mock_recorder.start.return_value = True
+        mock_recorder.recorded_data = []
+        mock_recorder_cls.return_value = mock_recorder
+
+        # play_file is called for: (1) the priming PIN prompt, (2) the message
+        # audio, (3) the message menu prompt. End the call after the menu
+        # prompt so the outer loop exits on its next iteration.
+        play_count = 0
+
+        def play_file_side_effect(_path):
+            nonlocal play_count
+            play_count += 1
+            if play_count >= 3:
+                call_obj.state = CallState.ENDED
+
+        mock_player.play_file.side_effect = play_file_side_effect
+
+        pbx = _make_pbx_core()
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+        call_obj.state = CallState.CONNECTED
+        call_obj.dtmf_info_queue = ["1"]
+
+        # Use a real string for the state so the handler can assign the
+        # message-menu constant to it and we can assert on the result.
+        voicemail_ivr = MagicMock()
+        voicemail_ivr.STATE_MESSAGE_MENU = "message_menu"
+        call_count = 0
+
+        def handle_dtmf_side_effect(digit):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {"action": "play_prompt", "prompt": "enter_pin"}
+            return {
+                "action": "play_message",
+                "message_id": "msg-1",
+                "file_path": message_path,
+                "caller_id": "2001",
+            }
+
+        voicemail_ivr.handle_dtmf.side_effect = handle_dtmf_side_effect
+
+        try:
+            handler._voicemail_ivr_session("call-1", call_obj, MagicMock(), voicemail_ivr)
+        finally:
+            with contextlib.suppress(OSError):
+                Path(message_path).unlink()
+
+        # The message audio must have been played, then the message menu
+        # prompt fetched and played, and the IVR advanced to MESSAGE_MENU.
+        mock_player.play_file.assert_any_call(message_path)
+        assert call("message_menu") in mock_get_prompt.call_args_list
+        assert voicemail_ivr.state == voicemail_ivr.STATE_MESSAGE_MENU
 
     @patch("pbx.core.voicemail_handler.time")
     def test_ivr_inband_dtmf_decodes_g711_not_raw_pcm(self, mock_time) -> None:

@@ -723,6 +723,38 @@ class VoicemailHandler:
                                 )
                             time.sleep(0.5)
 
+                            # After the message finishes, advance to the
+                            # message menu so the caller hears their options
+                            # (1 replay, 2 next, 3 delete, * main menu).
+                            # Playback is synchronous and blocks the DTMF
+                            # loop, so no key can be pressed during the
+                            # message and _handle_playing_message never
+                            # fires -- without this the caller heard the
+                            # message then dead silence, with no hint the
+                            # menu even existed. Set state to MESSAGE_MENU
+                            # (not PLAYING_MESSAGE) so the next digit routes
+                            # straight to _handle_message_menu rather than
+                            # requiring a throwaway press to reach the menu.
+                            if call.state != CallState.ENDED:
+                                voicemail_ivr.state = voicemail_ivr.STATE_MESSAGE_MENU
+                                pbx.logger.info(
+                                    "[VM IVR] Message playback finished, playing message menu"
+                                )
+                                menu_prompt_audio: bytes = get_prompt_audio("message_menu")
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".wav", delete=False
+                                ) as temp_file:
+                                    temp_file.write(menu_prompt_audio)
+                                    menu_prompt_file: str = temp_file.name
+
+                                try:
+                                    player.play_file(menu_prompt_file)
+                                finally:
+                                    with contextlib.suppress(OSError):
+                                        Path(menu_prompt_file).unlink()
+
+                                time.sleep(0.3)
+
                         elif action["action"] == "play_prompt":
                             # Check if call is still active before playing
                             if call.state == CallState.ENDED:
