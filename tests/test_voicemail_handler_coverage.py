@@ -15,7 +15,7 @@ Covers:
 import contextlib
 import sys
 from typing import Any
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -530,7 +530,7 @@ class TestVoicemailIVRSession:
         # status prompt, (3) the follow-up main_menu prompt. End after #3.
         play_count = 0
 
-        def play_file_side_effect(_path):
+        def play_file_side_effect(_path, interrupt_check=None):
             nonlocal play_count
             play_count += 1
             if play_count >= 3:
@@ -676,7 +676,7 @@ class TestVoicemailIVRSession:
         # prompt so the outer loop exits on its next iteration.
         play_count = 0
 
-        def play_file_side_effect(_path):
+        def play_file_side_effect(_path, interrupt_check=None):
             nonlocal play_count
             play_count += 1
             if play_count >= 3:
@@ -718,7 +718,7 @@ class TestVoicemailIVRSession:
 
         # The message audio must have been played, then the message menu
         # prompt fetched and played, and the IVR advanced to MESSAGE_MENU.
-        mock_player.play_file.assert_any_call(message_path)
+        mock_player.play_file.assert_any_call(message_path, interrupt_check=ANY)
         assert call("message_menu") in mock_get_prompt.call_args_list
         assert voicemail_ivr.state == voicemail_ivr.STATE_MESSAGE_MENU
 

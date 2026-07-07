@@ -1564,6 +1564,72 @@ class TestRTPPlayerSendAudio:
         assert result is True
         assert mock_sock.sendto.call_count == 1
 
+    def test_send_audio_barge_in_stops_early(self) -> None:
+        """interrupt_check returning True stops playback before all packets."""
+        with patch("pbx.rtp.handler.get_logger"):
+            from pbx.rtp.handler import RTPPlayer
+
+            p = RTPPlayer(local_port=5000, remote_host="10.0.0.1", remote_port=6000)
+
+        mock_sock = MagicMock()
+        p.socket = mock_sock
+        p.running = True
+
+        # 800 bytes at PT 0 = 5 packets (160 bytes each). Interrupt on the
+        # 3rd poll so only 2 packets go out before barge-in.
+        calls = {"n": 0}
+
+        def interrupt() -> bool:
+            calls["n"] += 1
+            return calls["n"] > 2
+
+        with patch("pbx.rtp.handler.time.sleep"):
+            result = p.send_audio(b"\x00" * 800, payload_type=0, interrupt_check=interrupt)
+
+        assert result is True
+        assert mock_sock.sendto.call_count == 2
+
+    def test_send_audio_no_barge_in_sends_all(self) -> None:
+        """interrupt_check that never fires sends every packet."""
+        with patch("pbx.rtp.handler.get_logger"):
+            from pbx.rtp.handler import RTPPlayer
+
+            p = RTPPlayer(local_port=5000, remote_host="10.0.0.1", remote_port=6000)
+
+        mock_sock = MagicMock()
+        p.socket = mock_sock
+        p.running = True
+
+        with patch("pbx.rtp.handler.time.sleep"):
+            result = p.send_audio(
+                b"\x00" * 800, payload_type=0, interrupt_check=lambda: False
+            )
+
+        assert result is True
+        assert mock_sock.sendto.call_count == 5
+
+    def test_play_file_forwards_interrupt_check(self, tmp_path) -> None:
+        """play_file passes its interrupt_check through to send_audio."""
+        import wave
+
+        with patch("pbx.rtp.handler.get_logger"):
+            from pbx.rtp.handler import RTPPlayer
+
+            p = RTPPlayer(local_port=5000, remote_host="10.0.0.1", remote_port=6000)
+
+        wav_path = tmp_path / "prompt.wav"
+        with wave.open(str(wav_path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(1)  # 8-bit -> WAV format PCM path
+            w.setframerate(8000)
+            w.writeframes(b"\x00" * 320)
+
+        sentinel = object()
+        with patch.object(p, "send_audio", return_value=True) as mock_send:
+            p.play_file(wav_path, interrupt_check=sentinel)
+
+        assert mock_send.call_args.kwargs.get("interrupt_check") is sentinel
+
     def test_send_pcma_auto_bytes_per_sample(self) -> None:
         with patch("pbx.rtp.handler.get_logger"):
             from pbx.rtp.handler import RTPPlayer
@@ -2735,3 +2801,29 @@ class TestRTPDTMFListenerClearDigits:
         listener.detected_digits = ["1", "2", "3"]
         listener.clear_digits()
         assert listener.detected_digits == []
+
+
+@pytest.mark.unit
+class TestRTPDTMFListenerHasDigit:
+    """Tests for RTPDTMFListener.has_digit (barge-in peek)."""
+
+    def _make_listener(self):
+        with (
+            patch("pbx.rtp.handler.get_logger"),
+            patch("pbx.utils.dtmf.DTMFDetector"),
+        ):
+            from pbx.rtp.handler import RTPDTMFListener
+
+            return RTPDTMFListener(local_port=5000)
+
+    def test_has_digit_true_without_consuming(self) -> None:
+        listener = self._make_listener()
+        listener.detected_digits = ["1", "2"]
+        assert listener.has_digit() is True
+        # Peek must not pop -- the loop still retrieves the digit via get_digit.
+        assert listener.detected_digits == ["1", "2"]
+
+    def test_has_digit_false_when_empty(self) -> None:
+        listener = self._make_listener()
+        listener.detected_digits = []
+        assert listener.has_digit() is False

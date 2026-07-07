@@ -258,6 +258,18 @@ class AutoAttendantHandler:
                 "Auto attendant RTP setup complete - bidirectional audio channel established"
             )
 
+            # Barge-in predicate for menu prompts: True as soon as a digit is
+            # pending from either input path the main loop below consumes --
+            # out-of-band DTMF queued on call.dtmf_info_queue by
+            # handle_dtmf_info() (SIP INFO / RFC 2833 telephone-event), or an
+            # in-band tone detected by the RTPDTMFListener. Both are *peeked*
+            # only: the digit stays queued/buffered so the loop still retrieves
+            # it and feeds auto_attendant.handle_dtmf(), advancing the state
+            # machine. Lets callers dial their choice over the greeting/menu
+            # without waiting for it to finish.
+            def _dtmf_pending() -> bool:
+                return bool(getattr(call, "dtmf_info_queue", None)) or dtmf_listener.has_digit()
+
             # Play welcome greeting
             action = session.get("session")
             audio_file: str | None = session.get("file")
@@ -267,7 +279,7 @@ class AutoAttendantHandler:
 
             if audio_file and Path(audio_file).exists():
                 pbx.logger.info(f"[Auto Attendant] Playing welcome file: {audio_file}")
-                audio_played = player.play_file(audio_file)
+                audio_played = player.play_file(audio_file, interrupt_check=_dtmf_pending)
                 if audio_played:
                     pbx.logger.info("[Auto Attendant] ✓ Welcome audio played successfully")
                 else:
@@ -281,7 +293,7 @@ class AutoAttendantHandler:
                     temp_file.write(prompt_data)
                     temp_file_path = temp_file.name
                 try:
-                    audio_played = player.play_file(temp_file_path)
+                    audio_played = player.play_file(temp_file_path, interrupt_check=_dtmf_pending)
                     if audio_played:
                         pbx.logger.info(
                             "[Auto Attendant] ✓ Generated welcome audio played successfully"
@@ -301,7 +313,7 @@ class AutoAttendantHandler:
             menu_audio: str | None = pbx.auto_attendant._get_audio_file("main_menu")
             if menu_audio and Path(menu_audio).exists():
                 pbx.logger.info(f"[Auto Attendant] Playing menu file: {menu_audio}")
-                audio_played = player.play_file(menu_audio)
+                audio_played = player.play_file(menu_audio, interrupt_check=_dtmf_pending)
                 if audio_played:
                     pbx.logger.info("[Auto Attendant] ✓ Menu audio played successfully")
                 else:
@@ -315,7 +327,7 @@ class AutoAttendantHandler:
                     temp_file.write(prompt_data)
                     temp_file_path = temp_file.name
                 try:
-                    audio_played = player.play_file(temp_file_path)
+                    audio_played = player.play_file(temp_file_path, interrupt_check=_dtmf_pending)
                     if audio_played:
                         pbx.logger.info(
                             "[Auto Attendant] ✓ Generated menu audio played successfully"
@@ -400,7 +412,7 @@ class AutoAttendantHandler:
                         # Play the requested audio
                         audio_file = result.get("file")
                         if audio_file and Path(audio_file).exists():
-                            player.play_file(audio_file)
+                            player.play_file(audio_file, interrupt_check=_dtmf_pending)
 
                         # Reset timeout
                         start_time = time.time()
