@@ -422,6 +422,53 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 
 ---
 
+## Office cutover readiness checklist
+
+> **Context:** office analog (POTS) lines terminate ~August 2026. This list is the
+> deployment gate — deliberately over-complete; strike items during review.
+> Development continues in parallel; only these items block the cutover.
+
+### Start immediately (long-lead, non-code)
+
+- [ ] Order SIP trunk account + one **test DID** (low-cost provider first; AT&T/Comcast templates are the production targets)
+- [ ] **Submit number port** for all office numbers (2–4 week lead; requires bill/LOA; numbers are lost if analog disconnects before port completes — schedule the port date explicitly)
+- [ ] **Analog-dependents audit**: fax, alarm panel, elevator phone, door buzzer, card terminals, postage meter, paging amp — disposition each (alarm/elevator → cellular communicator, usually legally required; do not route through the PBX)
+- [ ] Fax plan: ATA G.711 passthrough test early (ATA templates enable T.38 but the RTP relay has no T.38/UDPTL handling — unverified); fallback = e-fax service
+- [ ] Hardware orders: production server, PoE switch capacity, **UPS for server/switch/router** (911 availability during power loss), spare phone + spare ATA
+- [ ] ISP: static public IP, bandwidth check (~100 kbps per concurrent call each way), **disable router SIP ALG**
+
+### Code blockers (critical path)
+
+- [ ] **Inbound DID routing** (C5) — recognize INVITEs from trunk hosts, DID → extension/AA/queue map (does not exist today)
+- [ ] Outbound trunk validation on test DID: registration, NAT/public-IP in SDP/Via/Contact, DTMF to external IVRs, codec negotiation
+- [ ] Finish + merge `voicemail-fix` (regression on office phone models)
+- [ ] **Kari's Law notification** — replace `emergency_notification.py` "Would email…" stubs with real email (SMTP) and/or webhook minimum (call/page notify needs C4 — post-cutover)
+- [ ] E911: register dispatchable address with provider; verify karis_law/e911_location routing; validate via provider test number (933-style — never live 911; keep test-mode protection on until final check)
+- [ ] SIP exposure hardening: 5060/udp restricted to trunk provider IPs; no WAN registrations
+
+### Infrastructure & configuration
+
+- [ ] Production server: Ubuntu 24.04, `make install-production`, systemd service, health check + auto-restart
+- [ ] PostgreSQL (not SQLite); migrations run; **backup.sh tested including a restore**
+- [ ] Firewall (5060 from provider, RTP 10000–20000/udp, 9000 LAN/proxy-only); voice VLAN / switch QoS (PBX relay does not DSCP-mark its own packets — trust/remark at switch)
+- [ ] Admin HTTPS (see Admin HTTPS row, Tier 0) + change default credentials + MFA
+- [ ] Extension/numbering plan checked against dialplan collisions (2xxx conf, 7x park, 8xxx queues, 10/11-digit trunk, 911)
+- [ ] Provision every phone model on office network; per-model DTMF verification
+- [ ] Auto-attendant: menus, business-hours/night mode (time-based routing), generate prompt files; MoH audio in `moh/`
+- [ ] Voicemail boxes/PINs; optional voicemail-to-email (SMTP)
+- [ ] Outbound caller-ID mapping (station → DID) + CNAM registration; international-call blocking / fraud limits
+- [ ] Monitoring: Prometheus/Grafana or health-check email alerts; NTP; log rotation
+
+### Validation & cutover
+
+- [ ] **Two-week parallel run** on test DIDs while analog still live: full per-phone regression (in/out, transfer, hold, park, VM deposit/retrieve, AA paths, DTMF to external IVRs), soak at expected concurrent load
+- [ ] Failure drills: server reboot, power pull, internet drop — documented 911 behavior for each
+- [ ] Cutover runbook: per-number port verification, day-of provider contact, rollback notes
+- [ ] User training + quick-reference cards; week-one escalation path
+- [ ] Accepted gaps recorded at cutover: no conference mixing (C3), no click-to-dial/callbacks (C4), no SIP-TLS/SRTP, WebRTC unhardened
+
+---
+
 ## Related documents
 
 - `docs/PLANNED_FEATURES.md` — documented-but-unimplemented API surface per feature (kept during a docs accuracy audit; treat as the aspirational backlog)
