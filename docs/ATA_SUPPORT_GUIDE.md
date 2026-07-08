@@ -263,10 +263,12 @@ Consult your ATA documentation for region-specific values.
 **Symptoms**: Can't navigate voicemail menus, keypad tones don't work
 
 **Solutions**:
-1. Check DTMF method in template (should be SIP INFO or RFC2833)
-2. Try different DTMF payload type (101, 100, 102)
+1. Check DTMF method in template (RFC2833/AVT is recommended for Cisco ATAs and
+   Zultys phones; SIP INFO has caused phantom keypresses on those devices)
+2. Try different DTMF payload type (101, 100, 102) — must match `features.dtmf.payload_type`
 3. For Grandstream: Set `P79 = 2` (SIP INFO)
-4. For Cisco: Set `<DTMF_Tx_Method_1_>Auto</DTMF_Tx_Method_1_>`
+4. For Cisco: Set `<DTMF_Tx_Method_1_>AVT</DTMF_Tx_Method_1_>` and
+   `<DTMF_Tx_Mode_1_>Normal</DTMF_Tx_Mode_1_>` (`Strict` can silently send no DTMF)
 
 ### Poor Audio Quality
 
@@ -374,8 +376,9 @@ Sends SIP NOTIFY to trigger ATA reboot.
 - **G.722** - HD audio (if ATA supports it)
 
 ### DTMF Methods
-- **SIP INFO** - Recommended (most reliable)
-- **RFC 2833 (RTP Events)** - Good compatibility
+- **RFC 2833 / AVT (RTP Events)** - Recommended; SIP INFO has caused phantom keypresses
+  on Cisco ATA 191/192 and Zultys ZIP 33G/37G
+- **SIP INFO** - Good compatibility on other models
 - **In-band** - Fallback option
 
 ### Fax Protocol

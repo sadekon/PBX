@@ -293,6 +293,26 @@ class CallRouter:
         # Use the server's external IP address for SDP
         server_ip = pbx._get_server_ip()
 
+        # Never route a call to the PBX's own SIP address.  A stale or bogus
+        # registration (e.g. a loopback address recovered from the database)
+        # would make the PBX INVITE itself, receive its own INVITE as a new
+        # call with the same Call-ID, and re-route it in an infinite
+        # INVITE/100 Trying loop against 127.0.0.1.
+        dest_ip = str(dest_ext_obj.address[0])
+        dest_port = dest_ext_obj.address[1] if len(dest_ext_obj.address) > 1 else 5060
+        own_sip_port = pbx.config.get("server.sip_port", 5060)
+        if dest_ip.startswith("127.") or (dest_ip == server_ip and dest_port == own_sip_port):
+            pbx.logger.error(
+                f"Refusing to route call {call_id} to extension {to_ext}: registered "
+                f"address {dest_ip}:{dest_port} is the PBX itself (stale or bogus "
+                "registration) - unregistering it"
+            )
+            pbx.extension_registry.unregister(to_ext)
+            pbx.rtp_relay.release_relay(call_id)
+            pbx.cdr_system.end_record(call_id, hangup_cause="resource_unavailable")
+            pbx.call_manager.end_call(call_id)
+            return False
+
         # Determine which codecs to offer based on callee's phone model
         # Get callee's User-Agent to detect phone model
         callee_user_agent = pbx._get_phone_user_agent(to_ext)
@@ -617,6 +637,11 @@ class CallRouter:
         contact_uri: str = f"<sip:{call.to_extension}@{server_ip}:{sip_port}>"
         ok_response.set_header("Contact", contact_uri)
 
+        # Remember the dialog's To header (which now carries the to-tag our
+        # 200 OK generated) so a proper in-dialog BYE can be sent to the
+        # caller when the recording completes (timeout or # keypress).
+        call.voicemail_dialog_to = ok_response.get_header("To")
+
         # Send to caller
         pbx.sip_server._send_message(ok_response.build(), call.caller_addr)
         pbx.logger.info(f"Answered call {call_id} for voicemail recording")
@@ -752,9 +777,43 @@ class CallRouter:
                 pbx.logger.error(f"Error playing voicemail greeting: {e}")
 
             # Start RTP recorder on the allocated port with the configured
-            # DTMF payload type so telephone-event packets are properly filtered
+            # DTMF payload type so telephone-event packets are properly
+            # filtered.  Wire in an RFC 2833 receiver (not started -- the
+            # recorder owns the socket and delegates telephone-event packets
+            # to it) so an out-of-band # from the caller reaches
+            # call.dtmf_info_queue via handle_dtmf_info().
+            from pbx.rtp.rfc2833 import RFC2833Receiver
+
             dtmf_pt = pbx._get_dtmf_payload_type()
-            recorder = RTPRecorder(call.rtp_ports[0], call_id, dtmf_payload_type=dtmf_pt)
+
+            # Also accept the telephone-event payload type(s) from the
+            # caller's own SDP offer: RFC 3264 says the caller should send
+            # using the PT from our answer, but many phones send using the
+            # PT they offered instead.
+            caller_dtmf_pts: set[int] = set()
+            rtpmap_names = (call.caller_rtp or {}).get("rtpmap_names") or {}
+            for pt_str, rtpmap_name in rtpmap_names.items():
+                if str(rtpmap_name).lower().startswith("telephone-event") and str(pt_str).isdigit():
+                    caller_dtmf_pts.add(int(pt_str))
+            pbx.logger.info(
+                f"Voicemail recording DTMF payload types for call {call_id}: "
+                f"{sorted({dtmf_pt} | caller_dtmf_pts)}"
+            )
+
+            rfc2833_rx = RFC2833Receiver(
+                local_port=call.rtp_ports[0],
+                pbx_core=pbx,
+                call_id=call_id,
+                payload_type=dtmf_pt,
+                extra_payload_types=caller_dtmf_pts,
+            )
+            recorder = RTPRecorder(
+                call.rtp_ports[0],
+                call_id,
+                rfc2833_handler=rfc2833_rx,
+                dtmf_payload_type=dtmf_pt,
+                extra_dtmf_payload_types=caller_dtmf_pts,
+            )
             if recorder.start():
                 # Store recorder in call object for later retrieval
                 call.voicemail_recorder = recorder

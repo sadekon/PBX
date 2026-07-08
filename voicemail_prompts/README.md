@@ -4,7 +4,9 @@ This directory contains voice prompt files for the voicemail system.
 
 ## Generate Voice Files
 
-Voice files are **not included** in the repository. Generate them using gTTS (Google Text-to-Speech):
+Voice files **are committed** to this directory (`.gitignore` excludes `*.wav` here, but each
+required file is force-added). To regenerate them — e.g. after a wording change — use gTTS
+(Google Text-to-Speech):
 
 ```bash
 uv pip install gTTS pydub
@@ -18,7 +20,7 @@ See [scripts/README_VOICE_GENERATION.md](../scripts/README_VOICE_GENERATION.md) 
 
 ## Required Files
 
-This directory needs these 13 voice files:
+This directory needs these 18 voice files:
 
 - `enter_pin.wav` - PIN entry prompt
 - `invalid_pin.wav` - Invalid PIN message
@@ -26,11 +28,16 @@ This directory needs these 13 voice files:
 - `options_menu.wav` - Options menu
 - `message_menu.wav` - Message playback menu
 - `no_messages.wav` - No messages notification
+- `no_more_messages.wav` - End of message list notification
 - `you_have_messages.wav` - Message count announcement
 - `goodbye.wav` - Goodbye message
 - `leave_message.wav` - Leave message prompt
-- `recording_greeting.wav` - Record greeting prompt
+- `record_greeting.wav` - Record greeting prompt
+- `greeting_review_menu.wav` - Greeting review menu (listen/re-record/delete/save)
+- `greeting_playback.wav` - Greeting playback lead-in
 - `greeting_saved.wav` - Greeting saved confirmation
+- `greeting_deleted.wav` - Greeting deleted confirmation
+- `error.wav` - Greeting save error
 - `message_deleted.wav` - Message deleted confirmation
 - `end_of_messages.wav` - End of messages notification
 

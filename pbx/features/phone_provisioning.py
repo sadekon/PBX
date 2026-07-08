@@ -433,8 +433,10 @@ account.1.rtp.port_min = 10000
 account.1.rtp.port_max = 20000
 account.1.rtp.packet_time = 20
 
-# DTMF — SIP INFO for reliable voicemail/IVR (avoids ZIP 33G RFC2833 issues)
-account.1.dtmf.type = 2
+# DTMF — RFC2833 (telephone-event); payload type must match the PBX's
+# features.dtmf.payload_type. Earlier revisions used SIP INFO (type = 2)
+# citing ZIP 33G RFC2833 issues; revert if phantom keypresses reappear.
+account.1.dtmf.type = 1
 account.1.dtmf.info_type = 0
 account.1.dtmf.dtmf_payload = {{DTMF_PAYLOAD_TYPE}}
 
@@ -624,8 +626,11 @@ account.1.rtp.port_min = 10000
 account.1.rtp.port_max = 20000
 account.1.rtp.packet_time = 20
 
-# DTMF — SIP INFO to avoid ZIP 37G overly sensitive RFC2833 detection
-account.1.dtmf.type = 2
+# DTMF — RFC2833 (telephone-event); payload type must match the PBX's
+# features.dtmf.payload_type. Earlier revisions used SIP INFO (type = 2)
+# citing overly sensitive ZIP 37G RFC2833 detection (phantom keypresses);
+# revert if that reappears.
+account.1.dtmf.type = 1
 account.1.dtmf.info_type = 0
 account.1.dtmf.dtmf_payload = {{DTMF_PAYLOAD_TYPE}}
 
@@ -2052,7 +2057,9 @@ P2351 = 1
 
 <!-- DTMF -->
 <DTMF_Tx_Method_1_>AVT</DTMF_Tx_Method_1_>
-<DTMF_Tx_Mode_1_>Strict</DTMF_Tx_Mode_1_>
+<DTMF_Tx_Mode_1_>Normal</DTMF_Tx_Mode_1_>
+<DTMF_Process_INFO_1_>Yes</DTMF_Process_INFO_1_>
+<DTMF_Process_AVT_1_>Yes</DTMF_Process_AVT_1_>
 <Hook_Flash_Tx_Method_1_>None</Hook_Flash_Tx_Method_1_>
 <RTP_Packet_Size_1_>0.020</RTP_Packet_Size_1_>
 
@@ -2106,7 +2113,9 @@ P2351 = 1
 <iLBC_Enable_2_>No</iLBC_Enable_2_>
 
 <DTMF_Tx_Method_2_>AVT</DTMF_Tx_Method_2_>
-<DTMF_Tx_Mode_2_>Strict</DTMF_Tx_Mode_2_>
+<DTMF_Tx_Mode_2_>Normal</DTMF_Tx_Mode_2_>
+<DTMF_Process_INFO_2_>Yes</DTMF_Process_INFO_2_>
+<DTMF_Process_AVT_2_>Yes</DTMF_Process_AVT_2_>
 <Hook_Flash_Tx_Method_2_>None</Hook_Flash_Tx_Method_2_>
 <RTP_Packet_Size_2_>0.020</RTP_Packet_Size_2_>
 
@@ -2140,6 +2149,7 @@ P2351 = 1
 <SIP_Port>{{SIP_PORT}}</SIP_Port>
 <RTP_Port_Min>16384</RTP_Port_Min>
 <RTP_Port_Max>16482</RTP_Port_Max>
+<AVT_Dynamic_Payload>{{DTMF_PAYLOAD_TYPE}}</AVT_Dynamic_Payload>
 <SIP_Transport_1_>UDP</SIP_Transport_1_>
 <SIP_Transport_2_>UDP</SIP_Transport_2_>
 
@@ -2205,7 +2215,9 @@ P2351 = 1
 
 <!-- DTMF -->
 <DTMF_Tx_Method_1_>AVT</DTMF_Tx_Method_1_>
-<DTMF_Tx_Mode_1_>Strict</DTMF_Tx_Mode_1_>
+<DTMF_Tx_Mode_1_>Normal</DTMF_Tx_Mode_1_>
+<DTMF_Process_INFO_1_>Yes</DTMF_Process_INFO_1_>
+<DTMF_Process_AVT_1_>Yes</DTMF_Process_AVT_1_>
 <Hook_Flash_Tx_Method_1_>None</Hook_Flash_Tx_Method_1_>
 <RTP_Packet_Size_1_>0.020</RTP_Packet_Size_1_>
 
@@ -2259,7 +2271,9 @@ P2351 = 1
 <iLBC_Enable_2_>No</iLBC_Enable_2_>
 
 <DTMF_Tx_Method_2_>AVT</DTMF_Tx_Method_2_>
-<DTMF_Tx_Mode_2_>Strict</DTMF_Tx_Mode_2_>
+<DTMF_Tx_Mode_2_>Normal</DTMF_Tx_Mode_2_>
+<DTMF_Process_INFO_2_>Yes</DTMF_Process_INFO_2_>
+<DTMF_Process_AVT_2_>Yes</DTMF_Process_AVT_2_>
 <Hook_Flash_Tx_Method_2_>None</Hook_Flash_Tx_Method_2_>
 <RTP_Packet_Size_2_>0.020</RTP_Packet_Size_2_>
 
@@ -2292,6 +2306,7 @@ P2351 = 1
 <SIP_Port>{{SIP_PORT}}</SIP_Port>
 <RTP_Port_Min>16384</RTP_Port_Min>
 <RTP_Port_Max>16482</RTP_Port_Max>
+<AVT_Dynamic_Payload>{{DTMF_PAYLOAD_TYPE}}</AVT_Dynamic_Payload>
 <SIP_Transport_1_>UDP</SIP_Transport_1_>
 <SIP_Transport_2_>UDP</SIP_Transport_2_>
 

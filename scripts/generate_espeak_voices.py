@@ -160,6 +160,10 @@ def generate_voicemail_voices(output_dir: str = "voicemail_prompts") -> int:
             "text": "You have no new messages.",
             "description": "No messages notification",
         },
+        "no_more_messages.wav": {
+            "text": "No more messages. Returning to the main menu.",
+            "description": "End of message list notification",
+        },
         "you_have_messages.wav": {
             "text": "You have new messages.",
             "description": "Message count announcement",
@@ -169,13 +173,30 @@ def generate_voicemail_voices(output_dir: str = "voicemail_prompts") -> int:
             "text": "Please leave a message after the tone. When you are finished, hang up or press pound.",
             "description": "Leave message prompt",
         },
-        "recording_greeting.wav": {
+        "record_greeting.wav": {
             "text": "Record your greeting after the tone. When finished, press pound.",
             "description": "Record greeting prompt",
+        },
+        "greeting_review_menu.wav": {
+            "text": "Greeting recorded. Press 1 to listen, 2 to re-record, "
+            "3 to delete and use the default, or star to save and return to the main menu.",
+            "description": "Greeting review menu prompt",
+        },
+        "greeting_playback.wav": {
+            "text": "Playing your greeting.",
+            "description": "Greeting playback lead-in",
         },
         "greeting_saved.wav": {
             "text": "Your greeting has been saved.",
             "description": "Greeting saved confirmation",
+        },
+        "greeting_deleted.wav": {
+            "text": "Custom greeting deleted. Using the default greeting.",
+            "description": "Greeting deleted confirmation",
+        },
+        "error.wav": {
+            "text": "There was an error saving your greeting. Please try again.",
+            "description": "Greeting save error",
         },
         "message_deleted.wav": {
             "text": "Message deleted.",

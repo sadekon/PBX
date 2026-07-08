@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
+from pbx.rtp.handler import RTPRecorder
+
 
 class CallState(Enum):
     """Call states"""
@@ -58,6 +60,8 @@ class Call:
         self.voicemail_access: bool = False  # Flag indicating voicemail access call
         self.voicemail_extension: str | None = None  # Target extension for voicemail access
         self.voicemail_ivr: Any | None = None  # VoicemailIVR instance for interactive menus
+        self.voicemail_recorder: RTPRecorder | None = None #
+        self.voicemail_timer: threading.Timer | None = None #
 
         # Auto attendant attributes
         self.auto_attendant_active: bool = False  # Flag indicating auto attendant call

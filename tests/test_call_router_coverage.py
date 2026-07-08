@@ -1809,3 +1809,49 @@ class TestRouteCallRegisteredPhonesDB:
         )
 
         assert result is True
+
+
+# ===========================================================================
+# CallRouter.route_call - self-INVITE loop guard
+# ===========================================================================
+
+
+@pytest.mark.unit
+class TestRouteCallSelfInviteGuard:
+    """Calls must never be routed to the PBX's own SIP address."""
+
+    def _route(self, pbx: MagicMock) -> bool:
+        router = CallRouter(pbx)
+        return router.route_call(
+            "<sip:1001@pbx.local>",
+            "<sip:1002@pbx.local>",
+            "call-loop-1",
+            _make_invite_message(),
+            CALLER_ADDR,
+        )
+
+    def test_loopback_destination_rejected(self) -> None:
+        pbx = _make_pbx_core()
+        pbx.extension_registry.get.return_value.address = ("127.0.0.1", 5060)
+
+        assert self._route(pbx) is False
+        pbx.extension_registry.unregister.assert_called_once_with("1002")
+        pbx.rtp_relay.release_relay.assert_called_once_with("call-loop-1")
+        pbx.call_manager.end_call.assert_called_once_with("call-loop-1")
+
+    def test_own_sip_address_rejected(self) -> None:
+        pbx = _make_pbx_core()
+        # _make_pbx_core sets server IP to 10.0.0.1 and sip_port to 5060
+        pbx.extension_registry.get.return_value.address = ("10.0.0.1", 5060)
+
+        assert self._route(pbx) is False
+        pbx.extension_registry.unregister.assert_called_once_with("1002")
+        pbx.call_manager.end_call.assert_called_once_with("call-loop-1")
+
+    def test_own_ip_different_port_allowed_past_guard(self) -> None:
+        """A softphone on the server's IP but a different port is legitimate."""
+        pbx = _make_pbx_core()
+        pbx.extension_registry.get.return_value.address = ("10.0.0.1", 5080)
+
+        self._route(pbx)
+        pbx.extension_registry.unregister.assert_not_called()

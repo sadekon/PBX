@@ -11,6 +11,7 @@ import struct
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -374,7 +375,7 @@ class VoicemailHandler:
 
         from pbx.core.call import CallState
         from pbx.rtp.handler import RTPPlayer, RTPRecorder
-        from pbx.utils.audio import get_prompt_audio
+        from pbx.utils.audio import g711_to_float_samples, get_prompt_audio
         from pbx.utils.dtmf import DTMFDetector
 
         pbx = self.pbx_core
@@ -464,7 +465,45 @@ class VoicemailHandler:
             pbx.logger.info(
                 f"[VM IVR] Creating RTP recorder for DTMF detection (port {call.rtp_ports[0]})..."
             )
-            recorder = RTPRecorder(call.rtp_ports[0], call_id)
+            # Wire in an RFC 2833 receiver (not started -- the recorder owns
+            # the socket and delegates telephone-event packets to it) so
+            # out-of-band DTMF (PIN digits, #, menu selections) sent via
+            # RTP telephone-event reaches call.dtmf_info_queue through
+            # handle_dtmf_info(). Without this, telephone-event packets are
+            # filtered out of the recording but silently dropped, so PIN
+            # entry never advances.
+            from pbx.rtp.rfc2833 import RFC2833Receiver
+
+            dtmf_pt = pbx._get_dtmf_payload_type()
+
+            # Also accept the telephone-event payload type(s) from the
+            # caller's own SDP offer: RFC 3264 says the caller should send
+            # using the PT from our answer, but many phones send using the
+            # PT they offered instead.
+            caller_dtmf_pts: set[int] = set()
+            rtpmap_names = (call.caller_rtp or {}).get("rtpmap_names") or {}
+            for pt_str, rtpmap_name in rtpmap_names.items():
+                if str(rtpmap_name).lower().startswith("telephone-event") and str(pt_str).isdigit():
+                    caller_dtmf_pts.add(int(pt_str))
+            pbx.logger.info(
+                f"[VM IVR] DTMF payload types for call {call_id}: "
+                f"{sorted({dtmf_pt} | caller_dtmf_pts)}"
+            )
+
+            rfc2833_rx = RFC2833Receiver(
+                local_port=call.rtp_ports[0],
+                pbx_core=pbx,
+                call_id=call_id,
+                payload_type=dtmf_pt,
+                extra_payload_types=caller_dtmf_pts,
+            )
+            recorder = RTPRecorder(
+                call.rtp_ports[0],
+                call_id,
+                rfc2833_handler=rfc2833_rx,
+                dtmf_payload_type=dtmf_pt,
+                extra_dtmf_payload_types=caller_dtmf_pts,
+            )
             if not recorder.start():
                 pbx.logger.error("[VM IVR] ✗ Failed to start RTP recorder")
                 player.stop()
@@ -477,6 +516,28 @@ class VoicemailHandler:
             )
 
             try:
+                # Barge-in predicate for menu prompts: True the moment an
+                # out-of-band DTMF digit (RFC 2833 telephone-event via the
+                # RFC2833Receiver wired above, or SIP INFO) is delivered into
+                # call.dtmf_info_queue by handle_dtmf_info(). It only *peeks* --
+                # the digit stays queued so the main loop below still pops it
+                # and calls voicemail_ivr.handle_dtmf(), advancing the state
+                # machine exactly as if the prompt had played to the end. This
+                # lets callers skip ahead through menus without waiting.
+                #
+                # Exception: during PIN entry the prompt must keep playing while
+                # the caller dials their PIN digits and only stop on '#'
+                # (submit). So while in PIN entry we look for '#' anywhere in the
+                # queued digits rather than any digit -- the PIN digits keep
+                # queueing and are collected by the loop once the prompt ends.
+                def _dtmf_pending() -> bool:
+                    queue = getattr(call, "dtmf_info_queue", None)
+                    if not queue:
+                        return False
+                    if voicemail_ivr.state == voicemail_ivr.STATE_PIN_ENTRY:
+                        return "#" in queue
+                    return True
+
                 # Start the IVR flow - transition from WELCOME to PIN_ENTRY state
                 # Use '*' which won't be collected as part of PIN (only 0-9 are
                 # collected)
@@ -509,7 +570,7 @@ class VoicemailHandler:
                     pbx.logger.info(
                         f"[VM IVR] Playing PIN entry prompt (call state: {call.state})..."
                     )
-                    player.play_file(prompt_file)
+                    player.play_file(prompt_file, interrupt_check=_dtmf_pending)
                     pbx.logger.info(
                         f"[VM IVR] ✓ Finished playing PIN entry prompt (call state: {call.state})"
                     )
@@ -594,9 +655,27 @@ class VoicemailHandler:
                                 len(recent_audio) > min_audio_bytes_for_dtmf
                             ):  # Need sufficient audio for DTMF
                                 try:
-                                    # Detect DTMF in audio with error
-                                    # handling
-                                    digit = dtmf_detector.detect(recent_audio)
+                                    # Decode G.711 to linear samples before
+                                    # tone detection. The recorder stores
+                                    # companded µ-law/A-law RTP payload;
+                                    # feeding those bytes to detect() (which
+                                    # parses 16-bit PCM) scrambles them into
+                                    # spurious DTMF hits -- e.g. false digits
+                                    # in the greeting-review state trigger
+                                    # endless invalid-option beeps.
+                                    codec_pt = getattr(recorder, "detected_codec", 0) or 0
+                                    samples = g711_to_float_samples(recent_audio, codec_pt)
+                                    # detect_tone() only inspects the first
+                                    # samples_per_frame (~25ms) samples of
+                                    # whatever it's given, so calling it
+                                    # directly on this ~0.8s window silently
+                                    # ignores almost all of the audio and
+                                    # misses tones that don't happen to start
+                                    # exactly at the window's leading edge.
+                                    # detect_sequence() slides a frame across
+                                    # the whole window instead.
+                                    detected_sequence = dtmf_detector.detect_sequence(samples)
+                                    digit = detected_sequence[-1] if detected_sequence else None
                                 except Exception as e:
                                     pbx.logger.error(f"Error detecting DTMF: {e}")
                                     digit = None
@@ -654,7 +733,7 @@ class VoicemailHandler:
                                 f"[VM IVR] Playing voicemail message: {message_id} from {caller_id}"
                             )
                             if file_path and Path(file_path).exists():
-                                player.play_file(file_path)
+                                player.play_file(file_path, interrupt_check=_dtmf_pending)
                                 if message_id:
                                     mailbox.mark_listened(message_id)
                                 pbx.logger.info(
@@ -665,6 +744,40 @@ class VoicemailHandler:
                                     f"[VM IVR] ✗ Voicemail file not found: {file_path}"
                                 )
                             time.sleep(0.5)
+
+                            # After the message finishes, advance to the
+                            # message menu so the caller hears their options
+                            # (1 replay, 2 next, 3 delete, * main menu).
+                            # Playback is synchronous and blocks the DTMF
+                            # loop, so no key can be pressed during the
+                            # message and _handle_playing_message never
+                            # fires -- without this the caller heard the
+                            # message then dead silence, with no hint the
+                            # menu even existed. Set state to MESSAGE_MENU
+                            # (not PLAYING_MESSAGE) so the next digit routes
+                            # straight to _handle_message_menu rather than
+                            # requiring a throwaway press to reach the menu.
+                            if call.state != CallState.ENDED:
+                                voicemail_ivr.state = voicemail_ivr.STATE_MESSAGE_MENU
+                                pbx.logger.info(
+                                    "[VM IVR] Message playback finished, playing message menu"
+                                )
+                                menu_prompt_audio: bytes = get_prompt_audio("message_menu")
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".wav", delete=False
+                                ) as temp_file:
+                                    temp_file.write(menu_prompt_audio)
+                                    menu_prompt_file: str = temp_file.name
+
+                                try:
+                                    player.play_file(
+                                        menu_prompt_file, interrupt_check=_dtmf_pending
+                                    )
+                                finally:
+                                    with contextlib.suppress(OSError):
+                                        Path(menu_prompt_file).unlink()
+
+                                time.sleep(0.3)
 
                         elif action["action"] == "play_prompt":
                             # Check if call is still active before playing
@@ -687,13 +800,46 @@ class VoicemailHandler:
                                 prompt_file = temp_file.name
 
                             try:
-                                player.play_file(prompt_file)
+                                player.play_file(prompt_file, interrupt_check=_dtmf_pending)
                                 pbx.logger.info(f"[VM IVR] ✓ Prompt '{prompt_type}' played")
                             finally:
                                 with contextlib.suppress(OSError):
                                     Path(prompt_file).unlink()
 
                             time.sleep(0.3)
+
+                            # If this prompt returned the caller to the main
+                            # menu (e.g. "no more messages" after 2, "message
+                            # deleted" after 3, or the greeting-deleted/saved
+                            # confirmations), follow it with the main menu
+                            # options so the caller isn't stranded in silence
+                            # not knowing what to do. Skip when the prompt we
+                            # just played *is* the main menu, to avoid saying
+                            # it twice.
+                            if (
+                                call.state != CallState.ENDED
+                                and voicemail_ivr.state == voicemail_ivr.STATE_MAIN_MENU
+                                and prompt_type != "main_menu"
+                            ):
+                                pbx.logger.info(
+                                    "[VM IVR] Returned to main menu, replaying main menu prompt"
+                                )
+                                main_menu_audio: bytes = get_prompt_audio("main_menu")
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".wav", delete=False
+                                ) as temp_file:
+                                    temp_file.write(main_menu_audio)
+                                    main_menu_file: str = temp_file.name
+
+                                try:
+                                    player.play_file(
+                                        main_menu_file, interrupt_check=_dtmf_pending
+                                    )
+                                finally:
+                                    with contextlib.suppress(OSError):
+                                        Path(main_menu_file).unlink()
+
+                                time.sleep(0.3)
 
                         elif action["action"] == "hangup":
                             # Check if call is still active before playing
@@ -735,6 +881,27 @@ class VoicemailHandler:
                             pbx.logger.info(
                                 f"Starting greeting recording for extension {call.voicemail_extension}"
                             )
+
+                            # Play the instructional voice prompt (e.g.
+                            # "record_greeting") before the beep -- this
+                            # action carries its own "prompt" field that the
+                            # other branches read via action.get("prompt"),
+                            # but this branch previously ignored it entirely.
+                            record_prompt_type = action.get("prompt", "record_greeting")
+                            record_prompt_audio: bytes = get_prompt_audio(record_prompt_type)
+                            with tempfile.NamedTemporaryFile(
+                                suffix=".wav", delete=False
+                            ) as temp_file:
+                                temp_file.write(record_prompt_audio)
+                                record_prompt_file: str = temp_file.name
+
+                            try:
+                                player.play_file(record_prompt_file)
+                            finally:
+                                with contextlib.suppress(OSError):
+                                    Path(record_prompt_file).unlink()
+
+                            time.sleep(0.3)
 
                             # Play beep tone
                             beep_prompt: bytes = get_prompt_audio("beep")
@@ -792,7 +959,25 @@ class VoicemailHandler:
                                     )
                                     if len(recent_audio) > min_audio_bytes_for_dtmf:
                                         try:
-                                            stop_digit = dtmf_detector.detect(recent_audio)
+                                            # Decode companded G.711 to linear
+                                            # samples first (see main loop) --
+                                            # detect() would misread µ-law/A-law
+                                            # bytes as PCM and false-trigger.
+                                            codec_pt = getattr(recorder, "detected_codec", 0) or 0
+                                            samples = g711_to_float_samples(recent_audio, codec_pt)
+                                            # detect_tone() only looks at the
+                                            # leading ~25ms of the samples
+                                            # it's handed, so on this ~0.8s
+                                            # window it misses a "#" press
+                                            # unless it happens to start at
+                                            # the very front. detect_sequence()
+                                            # scans the whole window instead.
+                                            detected_sequence = dtmf_detector.detect_sequence(
+                                                samples
+                                            )
+                                            stop_digit = (
+                                                detected_sequence[-1] if detected_sequence else None
+                                            )
                                             if stop_digit:
                                                 pbx.logger.info(
                                                     f"Received DTMF from in-band audio during recording: {stop_digit}"
@@ -823,9 +1008,13 @@ class VoicemailHandler:
                                         pbx.logger.info(
                                             f"Saved recorded greeting as WAV ({len(greeting_audio_wav)} bytes, {len(greeting_audio_raw)} bytes raw audio)"
                                         )
-                                    # Handle the returned action
-                                    if action.get("action") == "play_prompt":
-                                        # Play greeting review menu prompt
+                                    # Handle the returned action. Both "play_prompt" and
+                                    # "stop_recording" (returned by _handle_recording_greeting
+                                    # for '#') carry a "prompt" field for the greeting review
+                                    # menu -- play it either way, since previously
+                                    # "stop_recording" was only logged and the caller never
+                                    # heard the review menu options.
+                                    if action.get("action") in ("play_prompt", "stop_recording"):
                                         prompt_type = action.get("prompt", "greeting_review_menu")
                                         prompt_audio = get_prompt_audio(prompt_type)
                                         with tempfile.NamedTemporaryFile(
@@ -834,15 +1023,12 @@ class VoicemailHandler:
                                             temp_file.write(prompt_audio)
                                             prompt_file = temp_file.name
                                         try:
-                                            player.play_file(prompt_file)
+                                            player.play_file(
+                                                prompt_file, interrupt_check=_dtmf_pending
+                                            )
                                         finally:
                                             with contextlib.suppress(OSError):
                                                 Path(prompt_file).unlink()
-                                    elif action.get("action") == "stop_recording":
-                                        # Also valid, just log it
-                                        pbx.logger.info(
-                                            "IVR returned stop_recording action, continuing"
-                                        )
                                     else:
                                         # Unexpected action type
                                         pbx.logger.warning(
@@ -863,6 +1049,27 @@ class VoicemailHandler:
                                 pbx.logger.info(
                                     f"Playing recorded greeting for review ({len(greeting_data)} bytes)"
                                 )
+
+                                # Play the "Playing your greeting..." lead-in
+                                # that _handle_greeting_review returns as
+                                # action["prompt"] -- previously ignored, so
+                                # the caller went straight from pressing '1'
+                                # to hearing their own recording with no cue.
+                                playback_prompt_type = action.get("prompt", "greeting_playback")
+                                playback_lead_in: bytes = get_prompt_audio(playback_prompt_type)
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".wav", delete=False
+                                ) as temp_file:
+                                    temp_file.write(playback_lead_in)
+                                    lead_in_file: str = temp_file.name
+
+                                try:
+                                    player.play_file(lead_in_file)
+                                finally:
+                                    with contextlib.suppress(OSError):
+                                        Path(lead_in_file).unlink()
+
+                                time.sleep(0.2)
 
                                 # Greeting is already in WAV format (converted when recorded)
                                 with tempfile.NamedTemporaryFile(
@@ -888,7 +1095,7 @@ class VoicemailHandler:
                                     prompt_file = temp_file.name
 
                                 try:
-                                    player.play_file(prompt_file)
+                                    player.play_file(prompt_file, interrupt_check=_dtmf_pending)
                                 finally:
                                     with contextlib.suppress(OSError):
                                         Path(prompt_file).unlink()
@@ -914,6 +1121,15 @@ class VoicemailHandler:
                         # adding clear() method to RTPRecorder
                         if hasattr(recorder, "recorded_data"):
                             recorder.recorded_data = []
+
+                        # Reset the inactivity timer now that the action is
+                        # done. Actions like "start_recording" can block for
+                        # up to 120s (greeting recording); without this the
+                        # very next loop iteration sees a stale
+                        # last_audio_check and immediately times out the
+                        # session, killing it before the caller can respond
+                        # to the greeting-review menu that was just played.
+                        last_audio_check = time.time()
 
                     # Timeout after 60 seconds of no activity
                     if time.time() - last_audio_check > 60:
@@ -962,6 +1178,7 @@ class VoicemailHandler:
             call: Call object
             recorder: RTPRecorder instance
         """
+        from pbx.utils.audio import g711_to_float_samples
         from pbx.utils.dtmf import DTMFDetector
 
         pbx = self.pbx_core
@@ -981,8 +1198,19 @@ class VoicemailHandler:
             while recorder.running and call.state.value != "ended":
                 time.sleep(0.1)
 
-                # Check for recorded audio (DTMF tones from caller)
-                if (
+                digit: str | None = None
+
+                # Priority 1: out-of-band DTMF (SIP INFO or RFC 2833) queued
+                # on the call by handle_dtmf_info()
+                if getattr(call, "dtmf_info_queue", None):
+                    digit = call.dtmf_info_queue.pop(0)
+                    pbx.logger.info(
+                        f"Received out-of-band DTMF '{digit}' during voicemail "
+                        f"recording on call {call_id}"
+                    )
+
+                # Priority 2: in-band DTMF tones in the recorded audio
+                elif (
                     hasattr(recorder, "recorded_data")
                     and recorder.recorded_data
                     and len(recorder.recorded_data) > 0
@@ -991,36 +1219,95 @@ class VoicemailHandler:
                     recent_audio = b"".join(recorder.recorded_data[-dtmf_detection_packets:])
 
                     if len(recent_audio) > min_audio_bytes_for_dtmf:
-                        # Convert bytes to audio samples for DTMF detection
-                        # G.711 u-law is 8-bit samples, one byte per sample
-                        # Use struct.unpack for efficient batch conversion
-                        samples: list[float] = []
-                        # Process in chunks for efficiency
-                        chunk_size: int = min(len(recent_audio), 8192)  # Process up to 8KB at once
-                        for i in range(0, len(recent_audio), chunk_size):
-                            chunk = recent_audio[i : i + chunk_size]
-                            # Unpack bytes and convert to float samples
-                            unpacked = struct.unpack(f"{len(chunk)}B", chunk)
-                            # Convert unsigned byte to signed float (-1.0
-                            # to 1.0)
-                            samples.extend([(b - 128) / 128.0 for b in unpacked])
+                        # Decode G.711 to linear samples for tone detection --
+                        # companded bytes fed in as-is make the DTMF
+                        # frequencies unrecognizable to the detector.
+                        codec_pt: int = getattr(recorder, "detected_codec", 0) or 0
+                        samples: list[float] = g711_to_float_samples(recent_audio, codec_pt)
+                        # detect_tone() only examines the first
+                        # samples_per_frame samples it's handed, so calling
+                        # it on this whole ~0.8s window misses tones that
+                        # aren't at the very front. detect_sequence() slides
+                        # a frame across the entire window instead.
+                        detected_sequence = dtmf_detector.detect_sequence(samples)
+                        digit = detected_sequence[-1] if detected_sequence else None
 
-                        # Detect DTMF
-                        digit: str | None = dtmf_detector.detect_tone(samples)
-
-                        if digit == "#":
-                            pbx.logger.info(
-                                f"Detected # key press during voicemail recording on call {call_id}"
-                            )
-                            # Complete the voicemail recording
-                            self.complete_voicemail_recording(call_id)
-                            return
+                if digit == "#":
+                    pbx.logger.info(
+                        f"Detected # key press during voicemail recording on call {call_id}"
+                    )
+                    # Complete the voicemail recording
+                    self.complete_voicemail_recording(call_id)
+                    return
 
             pbx.logger.debug(f"DTMF monitoring ended for voicemail recording on call {call_id}")
 
         except (KeyError, TypeError, ValueError, struct.error) as e:
             pbx.logger.error(f"Error in voicemail DTMF monitoring: {e}")
             pbx.logger.error(traceback.format_exc())
+
+    def _send_bye_to_caller(self, call: Any, call_id: str) -> None:
+        """
+        Send an in-dialog BYE to the caller to end the SIP session.
+
+        Needed when the PBX side ends a voicemail recording (max-duration
+        timeout or # keypress): ``PBXCore.end_call`` only tears down internal
+        state, so without this BYE the caller's phone stays off-hook in a
+        dead session.
+
+        Args:
+            call: Call object
+            call_id: Call identifier
+        """
+        import re
+
+        from pbx.sip.message import SIPMessageBuilder
+
+        pbx = self.pbx_core
+
+        invite = getattr(call, "original_invite", None)
+        caller_addr = getattr(call, "caller_addr", None)
+        if not (invite and caller_addr):
+            return
+
+        # In-dialog BYE from the PBX (the UAS of the original INVITE):
+        # From/To are swapped relative to the caller's INVITE, using the
+        # to-tag our 200 OK generated.
+        def _str_header(value: Any) -> str:
+            return value if isinstance(value, str) else ""
+
+        from_header = _str_header(getattr(call, "voicemail_dialog_to", None)) or _str_header(
+            invite.get_header("To")
+        )
+        to_header = _str_header(invite.get_header("From"))
+
+        # Request-URI: the caller's Contact if provided, else their
+        # network address.
+        uri = f"sip:{call.from_extension}@{caller_addr[0]}:{caller_addr[1]}"
+        contact = _str_header(invite.get_header("Contact"))
+        if contact:
+            match = re.search(r"<(sips?:[^>]+)>", contact)
+            if match:
+                uri = match.group(1)
+
+        try:
+            bye = SIPMessageBuilder.build_request(
+                method="BYE",
+                uri=uri,
+                from_addr=from_header,
+                to_addr=to_header,
+                call_id=call_id,
+                cseq=1,
+            )
+            server_ip = pbx._get_server_ip()
+            sip_port = pbx.config.get("server.sip_port", 5060)
+            branch_id = uuid.uuid4().hex
+            bye.set_header("Via", f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}")
+            bye.set_header("Max-Forwards", "70")
+            pbx.sip_server._send_message(bye.build(), caller_addr)
+            pbx.logger.info(f"Sent BYE to caller for completed voicemail recording {call_id}")
+        except (KeyError, OSError, TypeError, ValueError) as e:
+            pbx.logger.error(f"Failed to send BYE to caller for call {call_id}: {e}")
 
     def complete_voicemail_recording(self, call_id: str) -> None:
         """
@@ -1042,6 +1329,14 @@ class VoicemailHandler:
             # Stop recording
             recorder.stop()
 
+        # Hang up the caller's phone immediately -- end_call only tears down
+        # internal state and does not signal the caller's SIP endpoint, and
+        # the save below (file write, DB insert, optional transcription and
+        # email notification) can take seconds; the caller shouldn't be kept
+        # off-hook while it runs.
+        self._send_bye_to_caller(call, call_id)
+
+        if recorder:
             # Get recorded audio
             audio_data: bytes = recorder.get_recorded_audio()
             duration: float = recorder.get_duration()
