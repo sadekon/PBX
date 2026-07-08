@@ -260,7 +260,7 @@ class AutoAttendantHandler:
 
             # Play welcome greeting
             action = session.get("session")
-            audio_file: str | None = session.get("file")
+            audio_file: Path | None = session.get("file")
 
             pbx.logger.info(f"[Auto Attendant] Starting audio playback for call {call_id}")
             audio_played: bool = False
@@ -298,7 +298,7 @@ class AutoAttendantHandler:
 
             # Play main menu
             pbx.logger.info(f"[Auto Attendant] Playing main menu for call {call_id}")
-            menu_audio: str | None = pbx.auto_attendant._get_audio_file("main_menu")
+            menu_audio: Path | None = pbx.auto_attendant._get_audio_file("main_menu")
             if menu_audio and Path(menu_audio).exists():
                 pbx.logger.info(f"[Auto Attendant] Playing menu file: {menu_audio}")
                 audio_played = player.play_file(menu_audio)
@@ -359,7 +359,7 @@ class AutoAttendantHandler:
                         pbx.logger.info(f"Auto attendant transferring to {destination}")
 
                         # Play transfer message
-                        transfer_audio: str | None = pbx.auto_attendant._get_audio_file(
+                        transfer_audio: Path | None = pbx.auto_attendant._get_audio_file(
                             "transferring"
                         )
                         if transfer_audio and Path(transfer_audio).exists():
