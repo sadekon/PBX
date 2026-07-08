@@ -4,7 +4,9 @@ This directory contains voice prompt files for the voicemail system.
 
 ## Generate Voice Files
 
-Voice files are **not included** in the repository. Generate them using gTTS (Google Text-to-Speech):
+Voice files **are committed** to this directory (`.gitignore` excludes `*.wav` here, but each
+required file is force-added). To regenerate them — e.g. after a wording change — use gTTS
+(Google Text-to-Speech):
 
 ```bash
 uv pip install gTTS pydub
@@ -18,7 +20,7 @@ See [scripts/README_VOICE_GENERATION.md](../scripts/README_VOICE_GENERATION.md) 
 
 ## Required Files
 
-This directory needs these 19 voice files:
+This directory needs these 18 voice files:
 
 - `enter_pin.wav` - PIN entry prompt
 - `invalid_pin.wav` - Invalid PIN message
