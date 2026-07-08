@@ -6,6 +6,7 @@
             "version": "22"
         }
     },
+    "onCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh",
     "postCreateCommand": "uv pip install -e '.[dev]' && npm install",
     "forwardPorts": [5060, 9000, 10000],
     "customizations": {
