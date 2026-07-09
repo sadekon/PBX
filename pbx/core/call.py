@@ -45,6 +45,10 @@ class Call:
         self.rtp_ports: tuple[int, int] | None = None
         self.recording: bool = False
         self.on_hold: bool = False
+        # Which leg put the call on hold via re-INVITE: "caller" or
+        # "callee". None if hold was not initiated via SIP re-INVITE
+        # (e.g. triggered through the API) or if not currently on hold.
+        self.held_by: str | None = None
         self.caller_rtp: dict[str, Any] | None = None  # Caller's RTP endpoint info
         self.caller_addr: tuple[str, int] | None = None  # Caller's SIP address
         self.callee_rtp: dict[str, Any] | None = None  # Callee's RTP endpoint info
@@ -88,15 +92,23 @@ class Call:
         self.state = CallState.CONNECTED
         self.answer_time = datetime.now(UTC)
 
-    def hold(self) -> None:
-        """Put call on hold"""
+    def hold(self, held_by: str | None = None) -> None:
+        """
+        Put call on hold
+
+        Args:
+            held_by: Which leg initiated the hold ("caller" or "callee"),
+                when triggered by a SIP re-INVITE. None for API-triggered hold.
+        """
         self.state = CallState.HOLD
         self.on_hold = True
+        self.held_by = held_by
 
     def resume(self) -> None:
         """Resume call from hold"""
         self.state = CallState.CONNECTED
         self.on_hold = False
+        self.held_by = None
 
     def end(self) -> None:
         """End the call"""

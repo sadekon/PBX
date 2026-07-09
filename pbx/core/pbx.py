@@ -1426,6 +1426,9 @@ class PBXCore:
                 )
 
             self.call_manager.end_call(call_id)
+            # Stop any hold music before releasing the relay it runs on
+            # (no-op when the call was not on hold).
+            self.moh_system.stop_moh(call_id)
             self.rtp_relay.release_relay(call_id)
 
             # End CDR record for analytics

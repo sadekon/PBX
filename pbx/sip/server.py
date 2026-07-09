@@ -512,7 +512,10 @@ class SIPServer:
         if new_sdp:
             new_address = new_sdp.get("address")
             new_port = new_sdp.get("port")
-            if new_address and new_port:
+            # Skip retargeting on a legacy null hold address (c=0.0.0.0):
+            # it isn't a usable RTP destination, and the endpoint the PBX
+            # already has on file remains valid for when hold ends.
+            if new_address and new_port and new_address != "0.0.0.0":
                 if is_caller:
                     call.caller_rtp = new_sdp
                     self.logger.info(
@@ -537,6 +540,35 @@ class SIPServer:
                         else None
                     )
                     self.pbx_core.rtp_relay.set_endpoints(call_id, caller_ep, callee_ep)
+
+        # Detect hold/resume from the offered media direction (RFC 3264):
+        # a=sendonly or a=inactive means the sender is placing the call on
+        # hold; a=sendrecv (or a body-less re-INVITE) means normal media.
+        # A legacy c=0.0.0.0 connection address is also treated as hold.
+        sender_leg = "caller" if is_caller else "callee"
+        held_side = "b" if is_caller else "a"  # the *other* leg hears MOH
+        direction = new_sdp.get("direction", "sendrecv") if new_sdp else "sendrecv"
+        is_hold_signal = new_sdp is not None and (
+            direction in ("sendonly", "inactive") or new_sdp.get("address") == "0.0.0.0"
+        )
+        was_on_hold = call.state.value == "hold"
+
+        answer_direction = "sendrecv"
+        skip_forward = False
+
+        if is_hold_signal:
+            call.hold(held_by=sender_leg)
+            relay_handler = self.pbx_core.rtp_relay.get_handler(call_id)
+            if relay_handler:
+                self.pbx_core.moh_system.start_moh(call_id, relay_handler, held_side)
+            answer_direction = "recvonly"
+            skip_forward = True
+            self.logger.info(f"Call {call_id} placed on hold by {sender_leg} (a={direction})")
+        elif new_sdp and was_on_hold and call.held_by == sender_leg:
+            call.resume()
+            self.pbx_core.moh_system.stop_moh(call_id)
+            skip_forward = True
+            self.logger.info(f"Call {call_id} resumed by {sender_leg} (a={direction})")
 
         # Build answer SDP with codecs compatible with the offered set
         server_ip = self.pbx_core._get_server_ip()
@@ -567,6 +599,7 @@ class SIPServer:
             protocol=reinvite_protocol,
             crypto=reinvite_crypto,
             rtpmap_overrides=reinvite_rtpmap,
+            direction=answer_direction,
         )
 
         response = SIPMessageBuilder.build_response(200, "OK", message, body=answer_sdp)
@@ -580,9 +613,12 @@ class SIPServer:
         self._send_message(response.build(), addr)
         self.logger.info(f"Answered re-INVITE for call {call_id} with codecs {answer_codecs}")
 
-        # Forward the re-INVITE to the other party so they can update too
+        # Forward the re-INVITE to the other party so they can update too.
+        # Skipped for hold/resume: the PBX absorbs those locally (swapping
+        # in MOH or resuming the relay) without changing what the far end's
+        # own session looks like.
         other_addr = call.callee_addr if is_caller else call.caller_addr
-        if other_addr and new_sdp:
+        if other_addr and new_sdp and not skip_forward:
             # Use the other party's rtpmap names (from their original SDP offer)
             other_rtp = call.callee_rtp if is_caller else call.caller_rtp
             other_rtpmap = (other_rtp.get("rtpmap_names") or None) if other_rtp else None
