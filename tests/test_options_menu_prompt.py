@@ -24,7 +24,7 @@ def test_options_menu_prompt_file_exists() -> None:
     if not Path(options_menu_path).exists():
         pytest.skip(
             "options_menu.wav not generated "
-            "(run scripts/generate_tts_prompts.py to produce voice prompts)"
+            "(run scripts/generate_espeak_voices.py to produce voice prompts)"
         )
 
     # Verify it's a valid file with non-zero size

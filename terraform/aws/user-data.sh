@@ -124,7 +124,7 @@ if [ ! -d "/opt/pbx/app/voicemail_prompts" ] || [ -z "$(ls -A /opt/pbx/app/voice
     echo "Generating voice prompts..."
     cd /opt/pbx/app
     source /opt/pbx/venv/bin/activate
-    python scripts/generate_tts_prompts.py
+    python scripts/generate_espeak_voices.py
 fi
 
 # Create systemd service

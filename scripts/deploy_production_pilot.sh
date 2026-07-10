@@ -536,7 +536,7 @@ QUICK NEXT STEPS:
 -----------------
 1. Update database password in config.yml
 2. Initialize database: python scripts/init_database.py
-3. Generate voice prompts: python scripts/generate_tts_prompts.py
+3. Generate voice prompts: python scripts/generate_espeak_voices.py
 4. Configure SSL certificate: sudo certbot --nginx -d your-domain.com
 5. Start PBX service: sudo systemctl start pbx
 6. View logs: sudo journalctl -u pbx -f

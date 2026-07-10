@@ -41,18 +41,6 @@ uv pip install gTTS pydub
 
 ---
 
-## Alternative Script: `generate_tts_prompts.py`
-
-Same functionality as `generate_espeak_voices.py`, provided for compatibility. Both scripts use gTTS.
-
-**Usage:**
-```bash
-uv pip install gTTS pydub
-python3 scripts/generate_tts_prompts.py --company "Your Company"
-```
-
----
-
 ## Admin Panel Integration
 
 You can configure voice prompts directly from the Admin Panel:
@@ -73,9 +61,9 @@ You can configure voice prompts directly from the Admin Panel:
 
 ## Generated Files
 
-All scripts generate files in these directories:
+The script generates files in these directories:
 - `auto_attendant/` - Auto attendant prompts (5 files)
-- `voicemail_prompts/` - Voicemail system prompts (13 files)
+- `voicemail_prompts/` - Voicemail system prompts (18 files)
 
 All files are in telephony format:
 - Format: WAV
@@ -106,25 +94,30 @@ The easiest way to customize prompts:
 3. Click "Save & Regenerate Voices"
 4. Voices are automatically regenerated with your custom text
 
-### Option 2: Edit Script and Regenerate
+### Option 2: Edit `config.yml` and Regenerate
 
-Edit the script to change the text, then regenerate:
+Auto attendant prompt text is read from the `auto_attendant.prompts` section of
+`config.yml`, falling back to built-in defaults for any key you omit. Edit it,
+then regenerate:
 
-```python
-# In generate_espeak_voices.py or generate_tts_prompts.py, find:
-prompts = {
-    'welcome.wav': {
-        'text': f'Thank you for calling {company_name}.',
-        'description': 'Welcome greeting'
-    },
-    # ... edit the text here
-}
+```yaml
+auto_attendant:
+  prompts:
+    welcome: "Thank you for calling {company_name}."
+    main_menu: "For Sales, press 1. For Support, press 2. For Accounting, press 3."
+    # invalid / timeout / transferring may also be overridden
 ```
 
-Then run:
+`{company_name}` is substituted from the top-level `company_name` key in
+`config.yml` (or the `--company` flag). Then run:
+
 ```bash
 python3 scripts/generate_espeak_voices.py --company "Your Company"
 ```
+
+Voicemail prompt text is **not** config-driven — to change it, edit the
+`prompts` dict inside `generate_voicemail_voices()` in
+`scripts/generate_espeak_voices.py`.
 
 ### Option 3: Replace Files (Best Quality)
 

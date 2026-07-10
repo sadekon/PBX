@@ -74,7 +74,7 @@ cp config.yml your_config.yml
 python scripts/generate_ssl_cert.py --hostname YOUR_IP_OR_HOSTNAME
 
 # 8. Generate voice prompts (REQUIRED)
-python scripts/generate_tts_prompts.py
+python scripts/generate_espeak_voices.py
 
 # 9. Start PBX (with auto-reload for development)
 make dev              # Backend + frontend with hot reload
@@ -183,7 +183,7 @@ python scripts/generate_ssl_cert.py --hostname pbx.yourcompany.com
 #### Step 3: Generate Voice Prompts (CRITICAL)
 ```bash
 # Voice prompts are REQUIRED for auto-attendant and voicemail
-python scripts/generate_tts_prompts.py
+python scripts/generate_espeak_voices.py
 
 # Verify prompts were created
 ls -lh voicemail_prompts/
@@ -637,11 +637,11 @@ auto_attendant:
 
 **Generating Voice Prompts:**
 ```bash
-# Generate all default prompts
-python scripts/generate_tts_prompts.py
+# Generate all default prompts (reads auto_attendant.prompts + company_name from config.yml)
+python scripts/generate_espeak_voices.py
 
-# Generate custom prompt
-python scripts/generate_tts_prompts.py --text "Thank you for calling ABC Company" --output auto_attendant/custom_welcome.wav
+# Override the company name used in the greeting
+python scripts/generate_espeak_voices.py --company "ABC Company"
 ```
 
 ### 4.3 Phone Provisioning
@@ -1265,7 +1265,7 @@ sudo ufw allow 10000:20000/udp
 # Check config.yml codecs match phone codecs
 
 # Regenerate voice prompts at correct sample rate
-python scripts/generate_tts_prompts.py
+python scripts/generate_espeak_voices.py
 ```
 
 **Issue: Extensions Won't Register**
@@ -1628,7 +1628,7 @@ sudo systemctl status pbx
 ```bash
 # Regenerate voice prompts (if espeak was updated)
 cd /opt/pbx
-python scripts/generate_tts_prompts.py
+python scripts/generate_espeak_voices.py
 
 # Test audio functionality
 python scripts/test_audio_comprehensive.py
@@ -2532,7 +2532,7 @@ integrations:
 | Login fails | Clear cache: `Ctrl+Shift+R`, check service: `systemctl status pbx` |
 | Email not sending | Check SMTP config in `.env`, verify connectivity |
 | Database error | Verify: `python scripts/verify_database.py` |
-| Voice prompts missing | Generate: `python scripts/generate_tts_prompts.py` |
+| Voice prompts missing | Generate: `python scripts/generate_espeak_voices.py` |
 
 ### Appendix F: Additional Resources
 

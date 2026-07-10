@@ -103,7 +103,7 @@ flag. Grouped by gating capability.
 | Feature | Module | Config gate | Status | Remaining work | Test rig |
 |---------|--------|------------|--------|----------------|----------|
 | Voicemail | `voicemail.py` + `core/voicemail_handler.py` | `features.voicemail` | 🚧 | Active on `voicemail-fix`: RFC 2833 + in-band DTMF in IVR, prompts, barge-in, greeting review. Finish: deployed test on real phones, merge to DEV. Email notify needs SMTP (Rig E); transcription needs a Vosk model on disk (Rig E). | A (+E) |
-| Auto attendant | `auto_attendant.py` + handler | `features.auto_attendant` | 🚧 | Same IVR/DTMF plumbing as voicemail (barge-in landed). Needs prompt files (`scripts/` generator) and deployed DTMF test across phone models. | A |
+| Auto attendant | `auto_attendant.py` + handler | `features.auto_attendant` | 🚧 | Same IVR/DTMF plumbing as voicemail (barge-in landed). Prompt text now config-driven (`auto_attendant.prompts` + `company_name`) via the single `generate_espeak_voices.py` generator. G.711 (PCMU) only — HD/G.722 prompt audio intentionally not supported. Needs prompt files generated on the box and deployed DTMF test across phone models. | A |
 | Music on hold | `music_on_hold.py` | `features.music_on_hold` | ✅ | Needs audio files in `moh/`. | A |
 | Call recording | `call_recording.py` | `features.call_recording` | ✅ | Records from RTP relay. Retention (`recording_retention.py`) and announcements (`recording_announcements.py`) wired. Verify storage growth + retention sweeps on Rig F. | A |
 | Paging | `paging.py` + `core/paging_handler.py` | `features.paging` | 🔶 | Handler contains production-gap language; multicast paging needs real phones on a LAN segment that permits multicast. | B |
@@ -395,7 +395,7 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 |---|------|
 | D-1 | Extension plan per employee; voicemail boxes + PINs |
 | D-2 | DID→destination map (main → AA/reception; direct DIDs) — needs A1 |
-| D-3 | AA greetings (`generate_tts_prompts.py`), business-hours + after-hours routing |
+| D-3 | AA greetings (`generate_espeak_voices.py`), business-hours + after-hours routing |
 | D-4 | MoH audio (license-safe); provisioning template per phone model; DHCP opt-66 if auto-provisioning |
 | D-5 | Dial-plan hygiene: block 900/976, confirm 911/933, dialing conventions |
 
