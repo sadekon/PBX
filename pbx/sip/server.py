@@ -945,8 +945,36 @@ class SIPServer:
             call_id=call.call_id,
             cseq=call.pbx_leg_cseq,
         )
+        self._add_pbx_request_headers(bye_msg, target_addr)
         self._send_message(bye_msg.build(), target_addr)
         self.logger.info(f"Sent leg BYE for call {call.call_id} to {target_addr}")
+
+    def _add_pbx_request_headers(self, message: SIPMessage, target_addr: AddrTuple) -> None:
+        """
+        Add the mandatory RFC 3261 headers a PBX-originated request needs to
+        be accepted as a valid transaction by a real phone.
+
+        SIPMessageBuilder.build_request() only sets From/To/Call-ID/CSeq;
+        Via and Max-Forwards are required (RFC 3261 SS8.1.1.6-7) and their
+        absence causes strict UAs to silently drop the request rather than
+        act on it -- e.g. a BYE that never ends the peer's call timer.
+
+        Args:
+            message: The request to finish building (mutated in place).
+            target_addr: Destination address, used to pick the local
+                Contact identity.
+        """
+        if self.pbx_core is None:
+            return
+
+        import uuid
+
+        server_ip = self.pbx_core._get_server_ip()
+        sip_port = self.pbx_core.config.get("server.sip_port", 5060)
+        branch_id = str(uuid.uuid4()).replace("-", "")
+        message.set_header("Via", f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}")
+        message.set_header("Max-Forwards", "70")
+        message.set_header("Contact", f"<sip:{server_ip}:{sip_port}>")
 
     def _handle_cancel(self, message: SIPMessage, addr: AddrTuple) -> None:
         """

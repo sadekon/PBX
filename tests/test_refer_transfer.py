@@ -218,8 +218,10 @@ class TestBridgeAttendedTransfer:
         # C is re-INVITEd onto the surviving relay; consult relay released
         pbx._send_bridge_reinvite.assert_called_once_with(original, consult)
         pbx.rtp_relay.release_relay.assert_called_once_with("call2")
-        # BYE sent to the transferor's old consult leg
+        # BYE sent to the transferor's old consult leg, with mandatory
+        # headers (Via/Max-Forwards) added so a real phone accepts it.
         assert pbx.sip_server._send_message.called
+        pbx.sip_server._add_pbx_request_headers.assert_called_once()
 
     def test_bridge_when_transferor_is_callee(self) -> None:
         """B called A originally; A (callee of call1) transfers B to C."""
@@ -496,6 +498,8 @@ class TestStartBlindReferTransfer:
             assert "Referred-By: <sip:1513@pbx>" in raw
             # SDP advertises the original call's relay port directly
             assert "m=audio 20000 " in raw
+            assert "Via: SIP/2.0/UDP" in raw
+            assert "Max-Forwards: 70" in raw
         finally:
             if consult.no_answer_timer:
                 consult.no_answer_timer.cancel()
@@ -751,6 +755,45 @@ class TestHandleByeBridged:
 
 
 @pytest.mark.unit
+class TestAddPbxRequestHeaders:
+    """Tests for the mandatory-header helper shared by transfer teardown.
+
+    SIPMessageBuilder.build_request() only sets From/To/Call-ID/CSeq -- Via
+    and Max-Forwards are mandatory per RFC 3261 SS8.1.1.6-7, and _send_message
+    is a raw UDP send with no header injection of its own. Omitting them was
+    the actual root cause of a real-world bug: a bridged party's phone kept
+    its call timer running after hangup because the BYE built without a Via
+    header was silently dropped by its (strict) SIP stack.
+    """
+
+    def test_adds_via_max_forwards_and_contact(self) -> None:
+        cm = CallManager()
+        pbx = _make_pbx(cm)
+        server = _make_server(pbx)
+        msg = MagicMock()
+
+        server._add_pbx_request_headers(msg, C_ADDR)
+
+        headers = dict(c.args for c in msg.set_header.call_args_list)
+        assert headers["Via"].startswith("SIP/2.0/UDP 192.168.1.14:5060;branch=z9hG4bK")
+        assert headers["Max-Forwards"] == "70"
+        assert headers["Contact"] == "<sip:192.168.1.14:5060>"
+
+    def test_branch_id_is_unique_per_call(self) -> None:
+        cm = CallManager()
+        pbx = _make_pbx(cm)
+        server = _make_server(pbx)
+        msg1, msg2 = MagicMock(), MagicMock()
+
+        server._add_pbx_request_headers(msg1, C_ADDR)
+        server._add_pbx_request_headers(msg2, C_ADDR)
+
+        via1 = dict(c.args for c in msg1.set_header.call_args_list)["Via"]
+        via2 = dict(c.args for c in msg2.set_header.call_args_list)["Via"]
+        assert via1 != via2
+
+
+@pytest.mark.unit
 class TestSendLegBye:
     """Tests for building in-dialog BYEs toward a leg's remaining party."""
 
@@ -771,6 +814,12 @@ class TestSendLegBye:
         assert "tag=3972643251" in raw  # C's own tag from its 200 OK
         assert "CSeq: 2 BYE" in raw
         assert consult.pbx_leg_cseq == 2
+        # Mandatory headers a strict UA requires to accept the request
+        # (RFC 3261 SS8.1.1.6-7) -- without these a real phone (e.g. the
+        # Zultys ZIP) silently drops the BYE and its call timer never ends.
+        assert "Via: SIP/2.0/UDP" in raw
+        assert "Max-Forwards: 70" in raw
+        assert "Contact:" in raw
 
     def test_bye_to_caller_leg_swaps_dialog_headers(self) -> None:
         cm = CallManager()
@@ -799,6 +848,8 @@ class TestSendLegBye:
         assert raw.startswith(f"BYE sip:1512@{B_ADDR[0]}:{B_ADDR[1]} SIP/2.0")
         # Direction swapped: request goes To the caller's identity
         assert "To: <sip:1512@192.168.1.14:5060>;tag=518364649" in raw
+        assert "Via: SIP/2.0/UDP" in raw
+        assert "Max-Forwards: 70" in raw
 
 
 # ===========================================================================

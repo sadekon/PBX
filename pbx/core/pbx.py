@@ -1874,6 +1874,7 @@ class PBXCore:
                 call_id=consult.call_id,
                 cseq=2,
             )
+            self.sip_server._add_pbx_request_headers(bye_msg, consult.caller_addr)
             self.sip_server._send_message(bye_msg.build(), consult.caller_addr)
 
         # Un-park the transferee: stop MOH (also un-pauses the relay).
@@ -2004,6 +2005,7 @@ class PBXCore:
         reinvite.set_header("Via", f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}")
         reinvite.set_header("Contact", f"<sip:{consult.from_extension}@{server_ip}:{sip_port}>")
         reinvite.set_header("Content-type", "application/sdp")
+        reinvite.set_header("Max-Forwards", "70")
 
         self.sip_server._send_message(reinvite.build(), dest_addr)
         self.logger.info(
@@ -2096,6 +2098,13 @@ class PBXCore:
             invite_msg.set_header("Referred-By", referred_by)
         invite_msg.set_header("Contact", f"<sip:{transferee_ext}@{server_ip}:{sip_port}>")
         invite_msg.set_header("Content-type", "application/sdp")
+        # Via and Max-Forwards are mandatory (RFC 3261 SS8.1.1.6-7); some
+        # strict SIP stacks silently drop requests missing them.
+        branch_id = str(uuid.uuid4()).replace("-", "")
+        invite_msg.set_header(
+            "Via", f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}"
+        )
+        invite_msg.set_header("Max-Forwards", "70")
         consult.callee_invite = invite_msg
 
         self.sip_server._send_message(invite_msg.build(), dest_addr)
