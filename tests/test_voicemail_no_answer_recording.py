@@ -219,6 +219,7 @@ class TestByeNotForwardedToCancelledCallee:
     def test_bye_not_forwarded_when_routed_to_voicemail(self, mock_get_logger: MagicMock) -> None:
         caller_addr = ("192.168.1.10", 5060)
         pbx = MagicMock()
+        pbx.handle_invite_transfer_hangup.return_value = False
         call = MagicMock()
         call.routed_to_voicemail = True
         call.voicemail_access = False

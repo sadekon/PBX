@@ -182,6 +182,29 @@ class CallRouter:
         call.start()
         call.original_invite = message  # Store original INVITE for later response
 
+        # Detect INVITE-based transfer: phones that don't support REFER
+        # implement transfer as hold + new INVITE + hangup instead. If the
+        # caller already has exactly one other call parked on hold, link the
+        # two calls so the PBX can bridge the held party with this new
+        # destination once the transferor hangs up (see
+        # PBXCore.handle_invite_transfer_hangup).
+        from pbx.core.call import CallState
+
+        held_calls = [
+            c
+            for c in pbx.call_manager.get_extension_calls(from_ext)
+            if c.call_id != call_id and c.state == CallState.HOLD
+        ]
+        if len(held_calls) == 1:
+            original_call = held_calls[0]
+            original_call.linked_call_id = call_id
+            call.linked_call_id = original_call.call_id
+            call.is_transfer_consult = True
+            pbx.logger.info(
+                f"Linked new call {call_id} to held call {original_call.call_id} "
+                f"as transfer consultation for {from_ext}"
+            )
+
         # Start CDR record for analytics
         pbx.cdr_system.start_record(call_id, from_ext, to_ext)
 

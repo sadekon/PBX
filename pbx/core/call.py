@@ -60,6 +60,13 @@ class Call:
         self.transferred: bool = False  # Flag to track if call has been transferred
         self.transfer_destination: str | None = None  # Destination extension for transfer
 
+        # INVITE-based transfer detection (phones without REFER support signal
+        # transfer via hold + new INVITE + hangup instead of REFER)
+        self.linked_call_id: str | None = None  # The other call in a transfer pair
+        self.is_transfer_consult: bool = False  # True on the newer (consultation) call
+        self.pending_transfer_consult_id: str | None = None  # Set on original call while
+        # awaiting the consultation call's answer
+
         # Voicemail access attributes
         self.voicemail_access: bool = False  # Flag indicating voicemail access call
         self.voicemail_extension: str | None = None  # Target extension for voicemail access

@@ -778,6 +778,16 @@ class SIPServer:
         if self.pbx_core:
             call = self.pbx_core.call_manager.get_call(call_id)
 
+            # Check whether this BYE completes (or otherwise relates to) an
+            # INVITE-based transfer -- phones without REFER support signal
+            # transfer via hold + new INVITE + hangup instead of REFER.
+            if call and self.pbx_core.handle_invite_transfer_hangup(call_id, addr):
+                self.logger.info(f"  BYE for {call_id} handled as INVITE-based transfer")
+                self._send_response(200, "OK", message, addr)
+                self.logger.info(f"  Sent 200 OK response to {addr}")
+                self.logger.info("")
+                return
+
             # Forward BYE to the other party in the call if present
             if call:
                 self.logger.info(
@@ -861,6 +871,25 @@ class SIPServer:
                 # Forward CANCEL to callee to stop their phone from ringing
                 if call.callee_addr and hasattr(call, "callee_invite") and call.callee_invite:
                     self.pbx_core._call_router._send_cancel_to_callee(call, call_id)
+
+                # If this was an INVITE-based transfer consultation call
+                # being abandoned before the destination answered, resume
+                # the original (held) call instead of leaving it parked on
+                # hold forever.
+                if call.linked_call_id:
+                    from pbx.core.call import CallState
+
+                    linked_call = self.pbx_core.call_manager.get_call(call.linked_call_id)
+                    if linked_call:
+                        linked_call.linked_call_id = None
+                        if linked_call.state == CallState.HOLD:
+                            linked_call.resume()
+                            self.pbx_core.moh_system.stop_moh(linked_call.call_id)
+                            self.logger.info(
+                                f"Resumed call {linked_call.call_id} after transfer "
+                                f"consultation {call_id} was cancelled"
+                            )
+                    call.linked_call_id = None
 
                 # End the call
                 self.pbx_core.end_call(call_id)

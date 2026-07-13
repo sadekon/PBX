@@ -687,6 +687,7 @@ class TestHandleBye:
     @patch("pbx.sip.server.get_logger")
     def test_bye_from_caller_forwards_to_callee(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
+        pbx.handle_invite_transfer_hangup.return_value = False
         mock_call = MagicMock()
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
@@ -708,6 +709,7 @@ class TestHandleBye:
     @patch("pbx.sip.server.get_logger")
     def test_bye_from_callee_forwards_to_caller(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
+        pbx.handle_invite_transfer_hangup.return_value = False
         callee_addr = ("10.0.0.2", 5060)
         mock_call = MagicMock()
         mock_call.caller_addr = ("10.0.0.1", 5060)
@@ -743,6 +745,7 @@ class TestHandleBye:
     @patch("pbx.sip.server.get_logger")
     def test_bye_forward_exception(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
+        pbx.handle_invite_transfer_hangup.return_value = False
         mock_call = MagicMock()
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
@@ -774,6 +777,7 @@ class TestHandleBye:
     def test_bye_voicemail_call_attributes(self, mock_get_logger: MagicMock) -> None:
         """Test BYE handling with voicemail access attributes on call."""
         pbx = MagicMock()
+        pbx.handle_invite_transfer_hangup.return_value = False
         mock_call = MagicMock()
         mock_call.voicemail_access = True
         mock_call.voicemail_extension = "1001"

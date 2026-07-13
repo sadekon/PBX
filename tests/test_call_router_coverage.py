@@ -86,6 +86,7 @@ def _make_pbx_core(
     pbx.call_manager = MagicMock()
     pbx.call_manager.create_call.return_value = mock_call
     pbx.call_manager.get_call.return_value = mock_call
+    pbx.call_manager.get_extension_calls.return_value = []
 
     # CDR
     pbx.cdr_system = MagicMock()

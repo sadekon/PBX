@@ -29,6 +29,7 @@ from pbx.utils.database import DatabaseBackend, RegisteredPhonesDB
 from pbx.utils.logger import PBXLogger, get_logger
 
 if TYPE_CHECKING:
+    from pbx.core.call import Call
     from pbx.features.auto_attendant import AutoAttendant
     from pbx.features.call_parking import CallParkingSystem
     from pbx.features.call_queue import QueueSystem
@@ -1237,6 +1238,16 @@ class PBXCore:
             call.no_answer_timer.cancel()
             self.logger.info(f"Cancelled no-answer timer for call {call_id}")
 
+        # If this is a transfer consultation call and the transferor already
+        # hung up while it was still ringing (INVITE-based transfer, see
+        # handle_invite_transfer_hangup), complete the deferred bridge now
+        # instead of connecting the callee to the transferor, who is gone.
+        if call.is_transfer_consult:
+            for other_call in self.call_manager.get_active_calls():
+                if other_call.pending_transfer_consult_id == call_id:
+                    self._complete_invite_transfer(other_call, call)
+                    return
+
         # Check if this is a WebRTC-originated call
         webrtc_session_id = getattr(call, "webrtc_session_id", None)
 
@@ -1733,9 +1744,14 @@ class PBXCore:
         # Resume the original call from hold
         original_call.state = CallState.CONNECTED
         original_call.on_hold = False
+        original_call.held_by = None
         original_call.to_extension = consult_call.to_extension
         original_call.callee_addr = consult_call.callee_addr
         original_call.callee_rtp = consult_call.callee_rtp
+
+        # Stop MOH in case the original call was held via a phone-initiated
+        # re-INVITE (a no-op if MOH was never started for this call).
+        self.moh_system.stop_moh(call_id)
 
         # Send BYE to the transferring party (consultation call's A-leg)
         if consult_call.caller_addr:
@@ -1773,6 +1789,160 @@ class PBXCore:
         )
 
         return True
+
+    def handle_invite_transfer_hangup(self, hungup_call_id: str, addr: tuple[str, int]) -> bool:
+        """
+        Detect and act on a BYE for a call that is linked to another call via
+        INVITE-based transfer detection (see CallRouter.route_call).
+
+        Phones that don't support REFER implement transfer as: hold the
+        current call, dial the destination as a brand-new INVITE, then hang
+        up one of the two legs. This method inspects a hung-up call's link
+        to decide whether that BYE is the transferor completing a transfer
+        (bridge the other two parties together) or an unrelated party simply
+        leaving the call (no special handling).
+
+        Args:
+            hungup_call_id: Call-ID the BYE was received for.
+            addr: Source address the BYE was received from.
+
+        Returns:
+            True if this BYE was handled as transfer-related and the caller
+            should skip its normal forward-BYE/end-call handling for
+            hungup_call_id. False if normal BYE handling should proceed.
+        """
+        call = self.call_manager.get_call(hungup_call_id)
+        if not call or not call.linked_call_id:
+            return False
+
+        linked_call = self.call_manager.get_call(call.linked_call_id)
+        if not linked_call:
+            call.linked_call_id = None
+            return False
+
+        # The transferor is the extension shared between both calls.
+        call_exts = {call.from_extension, call.to_extension}
+        linked_exts = {linked_call.from_extension, linked_call.to_extension}
+        shared = call_exts & linked_exts
+        if len(shared) != 1:
+            call.linked_call_id = None
+            linked_call.linked_call_id = None
+            return False
+        transferor_ext = next(iter(shared))
+
+        transferor_addr = (
+            call.caller_addr if call.from_extension == transferor_ext else call.callee_addr
+        )
+        if transferor_addr != addr:
+            # The other party (not the transferor) hung up -- not a transfer
+            # signal. Unlink so each call proceeds independently.
+            call.linked_call_id = None
+            linked_call.linked_call_id = None
+            return False
+
+        original_call, consult_call = (
+            (linked_call, call) if call.is_transfer_consult else (call, linked_call)
+        )
+
+        if consult_call.callee_rtp:
+            # Destination already answered -- bridge immediately.
+            self._complete_invite_transfer(original_call, consult_call)
+        else:
+            # Destination hasn't answered yet -- defer until it does.
+            # handle_callee_answer() completes the bridge when the 200 OK
+            # for the consultation call arrives.
+            original_call.pending_transfer_consult_id = consult_call.call_id
+            self.logger.info(
+                f"Deferring transfer completion: {original_call.call_id} will bridge "
+                f"to {consult_call.call_id} once it is answered"
+            )
+
+        return True
+
+    def _complete_invite_transfer(self, held_call: Call, consult_call: Call) -> None:
+        """
+        Bridge the held call's other party directly with the consultation
+        call's destination, dropping the transferor from both legs.
+
+        Unlike attended_transfer() -- which assumes the transferor is always
+        the *to_extension* of the original call, matching the API-driven
+        consultation flow's fixed contract -- the transferor in an
+        INVITE-based transfer may be either the caller or callee of the held
+        call, depending on which party originally placed that call. This
+        method handles both orientations explicitly.
+
+        Args:
+            held_call: The original call, with the transferred-away party
+                still parked on hold.
+            consult_call: The consultation call to the transfer destination
+                (its callee has already answered).
+        """
+        from pbx.core.call import CallState
+        from pbx.sip.message import SIPMessageBuilder
+
+        transferor_is_callee = held_call.to_extension == consult_call.from_extension
+        if transferor_is_callee:
+            held_call.to_extension = consult_call.to_extension
+            held_call.callee_addr = consult_call.callee_addr
+            held_call.callee_rtp = consult_call.callee_rtp
+        else:
+            held_call.from_extension = consult_call.to_extension
+            held_call.caller_addr = consult_call.callee_addr
+            held_call.caller_rtp = consult_call.callee_rtp
+
+        if held_call.rtp_ports and held_call.caller_rtp and held_call.callee_rtp:
+            caller_endpoint = (held_call.caller_rtp["address"], held_call.caller_rtp["port"])
+            callee_endpoint = (held_call.callee_rtp["address"], held_call.callee_rtp["port"])
+            self.rtp_relay.set_endpoints(held_call.call_id, caller_endpoint, callee_endpoint)
+            self.logger.info(f"RTP relay re-bridged: {caller_endpoint} <-> {callee_endpoint}")
+
+        held_call.state = CallState.CONNECTED
+        held_call.on_hold = False
+        held_call.held_by = None
+        held_call.transferred = True
+        held_call.transfer_destination = consult_call.to_extension
+        self.moh_system.stop_moh(held_call.call_id)
+
+        # Send BYE to the transferor's leg on the consultation call -- they
+        # already hung up their other leg and should not stay connected here.
+        server_ip = self._get_server_ip()
+        if consult_call.caller_addr:
+            bye_msg = SIPMessageBuilder.build_request(
+                method="BYE",
+                uri=(
+                    f"sip:{consult_call.from_extension}@"
+                    f"{consult_call.caller_addr[0]}:{consult_call.caller_addr[1]}"
+                ),
+                from_addr=f"<sip:{consult_call.to_extension}@{server_ip}>",
+                to_addr=f"<sip:{consult_call.from_extension}@{server_ip}>",
+                call_id=consult_call.call_id,
+                cseq=2,
+            )
+            self.sip_server._send_message(bye_msg.build(), consult_call.caller_addr)
+
+        self.rtp_relay.release_relay(consult_call.call_id)
+        self.call_manager.end_call(consult_call.call_id)
+        self.cdr_system.end_record(consult_call.call_id, hangup_cause="invite_based_transfer")
+
+        held_call.linked_call_id = None
+        held_call.pending_transfer_consult_id = None
+
+        self.logger.info(
+            f"INVITE-based transfer complete: {held_call.from_extension} "
+            f"now connected to {held_call.to_extension}"
+        )
+
+        self.webhook_system.trigger_event(
+            WebhookEvent.CALL_TRANSFERRED,
+            {
+                "call_id": held_call.call_id,
+                "consultation_call_id": consult_call.call_id,
+                "from_extension": held_call.from_extension,
+                "transfer_destination": held_call.to_extension,
+                "transfer_type": "invite_based",
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
 
     def consultation_transfer_start(self, call_id: str, destination: str) -> str | None:
         """
