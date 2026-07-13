@@ -60,19 +60,32 @@ class Call:
         self.transferred: bool = False  # Flag to track if call has been transferred
         self.transfer_destination: str | None = None  # Destination extension for transfer
 
-        # INVITE-based transfer detection (phones without REFER support signal
-        # transfer via hold + new INVITE + hangup instead of REFER)
-        self.linked_call_id: str | None = None  # The other call in a transfer pair
-        self.is_transfer_consult: bool = False  # True on the newer (consultation) call
-        self.pending_transfer_consult_id: str | None = None  # Set on original call while
-        # awaiting the consultation call's answer
+        # REFER-based transfer state (RFC 3515 / RFC 3891). The consultation
+        # call is the transferor's leg to the transfer destination; on
+        # completion the two surviving legs are bridged, each keeping its own
+        # Call record cross-linked via bridged_peer_call_id.
+        self.is_transfer_consult: bool = False  # True on the consultation call
+        self.pending_transfer_consult_id: str | None = None  # On the original call
+        # while awaiting the consultation call's answer (deferred bridge)
+        self.bridged_peer_call_id: str | None = None  # Other leg's record after bridge
+        self.bridge_peer_side: str | None = None  # Relay side ("a"/"b") this leg's
+        # party occupies on the bridged peer's relay
+        self.transfer_referrer_addr: tuple[str, int] | None = None  # REFER sender
+        self.transfer_referrer_is_caller: bool | None = None  # Referrer's side on
+        # the original call, recorded at REFER time (addresses may be nulled later)
+        self.uses_peer_relay: bool = False  # Consult leg was originated by the PBX
+        # advertising the original call's relay port (blind transfer)
+        self.callee_dialog_to: str | None = None  # To header (with tag) from the
+        # callee's 200 OK -- dialog identity for PBX-originated in-dialog requests
+        self.pbx_leg_cseq: int = 1  # CSeq counter for PBX-originated requests
+        # toward the callee leg (1 = the INVITE)
 
         # Voicemail access attributes
         self.voicemail_access: bool = False  # Flag indicating voicemail access call
         self.voicemail_extension: str | None = None  # Target extension for voicemail access
         self.voicemail_ivr: Any | None = None  # VoicemailIVR instance for interactive menus
-        self.voicemail_recorder: RTPRecorder | None = None #
-        self.voicemail_timer: threading.Timer | None = None #
+        self.voicemail_recorder: RTPRecorder | None = None
+        self.voicemail_timer: threading.Timer | None = None
 
         # Auto attendant attributes
         self.auto_attendant_active: bool = False  # Flag indicating auto attendant call

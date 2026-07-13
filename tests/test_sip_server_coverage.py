@@ -614,6 +614,9 @@ class TestHandleAck:
     def test_ack_with_pbx_core_forwards_to_callee(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.callee_addr = ("10.0.0.2", 5060)
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -643,6 +646,9 @@ class TestHandleAck:
     def test_ack_call_no_callee_addr(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.callee_addr = None
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -687,8 +693,10 @@ class TestHandleBye:
     @patch("pbx.sip.server.get_logger")
     def test_bye_from_caller_forwards_to_callee(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
-        pbx.handle_invite_transfer_hangup.return_value = False
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
         mock_call.state = "CONNECTED"
@@ -709,9 +717,11 @@ class TestHandleBye:
     @patch("pbx.sip.server.get_logger")
     def test_bye_from_callee_forwards_to_caller(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
-        pbx.handle_invite_transfer_hangup.return_value = False
         callee_addr = ("10.0.0.2", 5060)
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.caller_addr = ("10.0.0.1", 5060)
         mock_call.callee_addr = callee_addr
         mock_call.state = "CONNECTED"
@@ -745,8 +755,10 @@ class TestHandleBye:
     @patch("pbx.sip.server.get_logger")
     def test_bye_forward_exception(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
-        pbx.handle_invite_transfer_hangup.return_value = False
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
         mock_call.state = "CONNECTED"
@@ -777,8 +789,10 @@ class TestHandleBye:
     def test_bye_voicemail_call_attributes(self, mock_get_logger: MagicMock) -> None:
         """Test BYE handling with voicemail access attributes on call."""
         pbx = MagicMock()
-        pbx.handle_invite_transfer_hangup.return_value = False
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.voicemail_access = True
         mock_call.voicemail_extension = "1001"
         mock_call.caller_addr = ADDR
@@ -1427,6 +1441,9 @@ class TestHandleResponse:
     def test_response_180_ringing_forwards_to_caller(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.caller_addr = ("10.0.0.1", 5060)
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -1444,6 +1461,9 @@ class TestHandleResponse:
     def test_response_180_no_caller_addr(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.caller_addr = None
         pbx.call_manager.get_call.return_value = mock_call
 

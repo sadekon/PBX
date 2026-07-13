@@ -29,7 +29,6 @@ from pbx.utils.database import DatabaseBackend, RegisteredPhonesDB
 from pbx.utils.logger import PBXLogger, get_logger
 
 if TYPE_CHECKING:
-    from pbx.core.call import Call
     from pbx.features.auto_attendant import AutoAttendant
     from pbx.features.call_parking import CallParkingSystem
     from pbx.features.call_queue import QueueSystem
@@ -1203,6 +1202,8 @@ class PBXCore:
         # re-process call state, CDR, or send a duplicate 200 OK to the caller.
         if call.state.value == "connected":
             self.logger.info(f"200 OK for already-connected call {call_id} (re-INVITE response)")
+            if not call.callee_dialog_to:
+                call.callee_dialog_to = response_message.get_header("To")
             if response_message.body:
                 sdp_obj = SDPSession()
                 sdp_obj.parse(response_message.body)
@@ -1210,6 +1211,19 @@ class PBXCore:
                 if new_sdp:
                     call.callee_rtp = new_sdp
                     callee_endpoint = (new_sdp["address"], new_sdp["port"])
+                    if call.bridged_peer_call_id and call.bridge_peer_side:
+                        # 200 OK to the bridge re-INVITE: this leg's media
+                        # now lives on the bridged peer's relay.
+                        self.rtp_relay.replace_endpoint(
+                            call.bridged_peer_call_id,
+                            call.bridge_peer_side,
+                            callee_endpoint,
+                        )
+                        self.logger.info(
+                            f"Refreshed bridged endpoint for call {call_id} on relay "
+                            f"{call.bridged_peer_call_id}"
+                        )
+                        return
                     caller_endpoint = (
                         (call.caller_rtp["address"], call.caller_rtp["port"])
                         if call.caller_rtp
@@ -1232,20 +1246,24 @@ class PBXCore:
                 call.callee_rtp = callee_sdp
                 call.callee_addr = callee_addr
 
+        # Capture the callee's dialog identity (To header with their tag)
+        # for later PBX-originated in-dialog requests (re-INVITE, BYE).
+        call.callee_dialog_to = response_message.get_header("To")
+
         # Now we have both endpoints, complete the RTP relay setup
         # Cancel no-answer timer if it's running
         if call is not None and call.no_answer_timer:
             call.no_answer_timer.cancel()
             self.logger.info(f"Cancelled no-answer timer for call {call_id}")
 
-        # If this is a transfer consultation call and the transferor already
-        # hung up while it was still ringing (INVITE-based transfer, see
-        # handle_invite_transfer_hangup), complete the deferred bridge now
-        # instead of connecting the callee to the transferor, who is gone.
+        # If this is a transfer consultation call whose bridge was deferred
+        # (REFER arrived before the destination answered -- semi-attended,
+        # or a PBX-originated blind transfer leg), complete the bridge now
+        # instead of running the normal answer flow: the transferor is gone.
         if call.is_transfer_consult:
             for other_call in self.call_manager.get_active_calls():
                 if other_call.pending_transfer_consult_id == call_id:
-                    self._complete_invite_transfer(other_call, call)
+                    self.bridge_attended_transfer(other_call, call)
                     return
 
         # Check if this is a WebRTC-originated call
@@ -1790,159 +1808,357 @@ class PBXCore:
 
         return True
 
-    def handle_invite_transfer_hangup(self, hungup_call_id: str, addr: tuple[str, int]) -> bool:
+    def bridge_attended_transfer(self, original: Any, consult: Any) -> bool:
         """
-        Detect and act on a BYE for a call that is linked to another call via
-        INVITE-based transfer detection (see CallRouter.route_call).
+        Complete a REFER-based attended transfer by bridging the original
+        call's remaining party with the consultation call's destination.
 
-        Phones that don't support REFER implement transfer as: hold the
-        current call, dial the destination as a brand-new INVITE, then hang
-        up one of the two legs. This method inspects a hung-up call's link
-        to decide whether that BYE is the transferor completing a transfer
-        (bridge the other two parties together) or an unrelated party simply
-        leaving the call (no special handling).
+        The transferor (referrer) drops out of both calls. Both Call records
+        stay alive -- the original as the transferee's leg, the consultation
+        as the destination's leg -- cross-linked via bridged_peer_call_id so
+        each party's own SIP dialog keeps resolving to a live record. Media
+        flows through the original call's relay only: the transferor's side
+        of that relay is replaced with the destination's endpoint, and the
+        destination is re-INVITEd onto the original relay's port (unless the
+        consultation leg was PBX-originated and already advertises it).
 
         Args:
-            hungup_call_id: Call-ID the BYE was received for.
-            addr: Source address the BYE was received from.
+            original: The original call (transferee still parked on hold).
+            consult: The consultation call to the transfer destination
+                (destination must have answered -- callee_rtp set).
 
         Returns:
-            True if this BYE was handled as transfer-related and the caller
-            should skip its normal forward-BYE/end-call handling for
-            hungup_call_id. False if normal BYE handling should proceed.
-        """
-        call = self.call_manager.get_call(hungup_call_id)
-        if not call or not call.linked_call_id:
-            return False
-
-        linked_call = self.call_manager.get_call(call.linked_call_id)
-        if not linked_call:
-            call.linked_call_id = None
-            return False
-
-        # The transferor is the extension shared between both calls.
-        call_exts = {call.from_extension, call.to_extension}
-        linked_exts = {linked_call.from_extension, linked_call.to_extension}
-        shared = call_exts & linked_exts
-        if len(shared) != 1:
-            call.linked_call_id = None
-            linked_call.linked_call_id = None
-            return False
-        transferor_ext = next(iter(shared))
-
-        transferor_addr = (
-            call.caller_addr if call.from_extension == transferor_ext else call.callee_addr
-        )
-        if transferor_addr != addr:
-            # The other party (not the transferor) hung up -- not a transfer
-            # signal. Unlink so each call proceeds independently.
-            call.linked_call_id = None
-            linked_call.linked_call_id = None
-            return False
-
-        original_call, consult_call = (
-            (linked_call, call) if call.is_transfer_consult else (call, linked_call)
-        )
-
-        if consult_call.callee_rtp:
-            # Destination already answered -- bridge immediately.
-            self._complete_invite_transfer(original_call, consult_call)
-        else:
-            # Destination hasn't answered yet -- defer until it does.
-            # handle_callee_answer() completes the bridge when the 200 OK
-            # for the consultation call arrives.
-            original_call.pending_transfer_consult_id = consult_call.call_id
-            self.logger.info(
-                f"Deferring transfer completion: {original_call.call_id} will bridge "
-                f"to {consult_call.call_id} once it is answered"
-            )
-
-        return True
-
-    def _complete_invite_transfer(self, held_call: Call, consult_call: Call) -> None:
-        """
-        Bridge the held call's other party directly with the consultation
-        call's destination, dropping the transferor from both legs.
-
-        Unlike attended_transfer() -- which assumes the transferor is always
-        the *to_extension* of the original call, matching the API-driven
-        consultation flow's fixed contract -- the transferor in an
-        INVITE-based transfer may be either the caller or callee of the held
-        call, depending on which party originally placed that call. This
-        method handles both orientations explicitly.
-
-        Args:
-            held_call: The original call, with the transferred-away party
-                still parked on hold.
-            consult_call: The consultation call to the transfer destination
-                (its callee has already answered).
+            True if the bridge completed.
         """
         from pbx.core.call import CallState
         from pbx.sip.message import SIPMessageBuilder
 
-        transferor_is_callee = held_call.to_extension == consult_call.from_extension
-        if transferor_is_callee:
-            held_call.to_extension = consult_call.to_extension
-            held_call.callee_addr = consult_call.callee_addr
-            held_call.callee_rtp = consult_call.callee_rtp
-        else:
-            held_call.from_extension = consult_call.to_extension
-            held_call.caller_addr = consult_call.callee_addr
-            held_call.caller_rtp = consult_call.callee_rtp
+        dest_rtp = consult.callee_rtp
+        if not dest_rtp:
+            self.logger.error(
+                f"Cannot bridge transfer: consultation call {consult.call_id} has no "
+                "destination media"
+            )
+            return False
 
-        if held_call.rtp_ports and held_call.caller_rtp and held_call.callee_rtp:
-            caller_endpoint = (held_call.caller_rtp["address"], held_call.caller_rtp["port"])
-            callee_endpoint = (held_call.callee_rtp["address"], held_call.callee_rtp["port"])
-            self.rtp_relay.set_endpoints(held_call.call_id, caller_endpoint, callee_endpoint)
-            self.logger.info(f"RTP relay re-bridged: {caller_endpoint} <-> {callee_endpoint}")
+        # Which side of the original call (and its relay) the transferor
+        # occupies. Recorded at REFER time; fall back to the shared-extension
+        # heuristic for phone-originated consultation calls.
+        transferor_is_caller = original.transfer_referrer_is_caller
+        if transferor_is_caller is None:
+            transferor_is_caller = original.from_extension in (
+                consult.from_extension,
+                consult.to_extension,
+            )
+        transferor_side = "a" if transferor_is_caller else "b"
 
-        held_call.state = CallState.CONNECTED
-        held_call.on_hold = False
-        held_call.held_by = None
-        held_call.transferred = True
-        held_call.transfer_destination = consult_call.to_extension
-        self.moh_system.stop_moh(held_call.call_id)
+        self.logger.info(
+            f"Bridging transfer: call {original.call_id} "
+            f"({'callee' if transferor_is_caller else 'caller'} leg kept) -> "
+            f"{consult.to_extension} (consult {consult.call_id})"
+        )
 
-        # Send BYE to the transferor's leg on the consultation call -- they
-        # already hung up their other leg and should not stay connected here.
-        server_ip = self._get_server_ip()
-        if consult_call.caller_addr:
+        # Deterministically end the transferor's leg on the consultation
+        # call (their phone usually also sends its own BYE, which the
+        # bridged/stale guards in _handle_bye absorb).
+        if consult.caller_addr:
+            server_ip = self._get_server_ip()
             bye_msg = SIPMessageBuilder.build_request(
                 method="BYE",
                 uri=(
-                    f"sip:{consult_call.from_extension}@"
-                    f"{consult_call.caller_addr[0]}:{consult_call.caller_addr[1]}"
+                    f"sip:{consult.from_extension}@"
+                    f"{consult.caller_addr[0]}:{consult.caller_addr[1]}"
                 ),
-                from_addr=f"<sip:{consult_call.to_extension}@{server_ip}>",
-                to_addr=f"<sip:{consult_call.from_extension}@{server_ip}>",
-                call_id=consult_call.call_id,
+                from_addr=f"<sip:{consult.to_extension}@{server_ip}>",
+                to_addr=f"<sip:{consult.from_extension}@{server_ip}>",
+                call_id=consult.call_id,
                 cseq=2,
             )
-            self.sip_server._send_message(bye_msg.build(), consult_call.caller_addr)
+            self.sip_server._send_message(bye_msg.build(), consult.caller_addr)
 
-        self.rtp_relay.release_relay(consult_call.call_id)
-        self.call_manager.end_call(consult_call.call_id)
-        self.cdr_system.end_record(consult_call.call_id, hangup_cause="invite_based_transfer")
+        # Un-park the transferee: stop MOH (also un-pauses the relay).
+        self.moh_system.stop_moh(original.call_id)
 
-        held_call.linked_call_id = None
-        held_call.pending_transfer_consult_id = None
+        # Retarget the original relay's transferor side to the destination.
+        dest_endpoint = (dest_rtp["address"], dest_rtp["port"])
+        self.rtp_relay.replace_endpoint(original.call_id, transferor_side, dest_endpoint)
+
+        # Rewrite the transferor's side of the original record.
+        if transferor_is_caller:
+            original.from_extension = consult.to_extension
+            original.caller_addr = None
+            original.caller_rtp = dest_rtp
+        else:
+            original.to_extension = consult.to_extension
+            original.callee_addr = None
+            original.callee_rtp = dest_rtp
+
+        original.state = CallState.CONNECTED
+        original.on_hold = False
+        original.held_by = None
+        original.transferred = True
+        original.transfer_destination = consult.to_extension
+        original.pending_transfer_consult_id = None
+
+        consult.state = CallState.CONNECTED
+        consult.transferred = True
+        consult.is_transfer_consult = False
+        consult.caller_addr = None
+        consult.caller_rtp = None
+        if consult.no_answer_timer:
+            consult.no_answer_timer.cancel()
+            consult.no_answer_timer = None
+
+        original.bridged_peer_call_id = consult.call_id
+        consult.bridged_peer_call_id = original.call_id
+        consult.bridge_peer_side = transferor_side
+
+        # Move the destination's media onto the original relay's port. A
+        # PBX-originated blind leg already advertised that port in its
+        # INVITE, so no re-INVITE is needed there.
+        if not consult.uses_peer_relay:
+            self._send_bridge_reinvite(original, consult)
+            self.rtp_relay.release_relay(consult.call_id)
 
         self.logger.info(
-            f"INVITE-based transfer complete: {held_call.from_extension} "
-            f"now connected to {held_call.to_extension}"
+            f"Transfer bridge complete: {original.from_extension} <-> "
+            f"{original.to_extension} on relay of call {original.call_id}"
         )
 
         self.webhook_system.trigger_event(
             WebhookEvent.CALL_TRANSFERRED,
             {
-                "call_id": held_call.call_id,
-                "consultation_call_id": consult_call.call_id,
-                "from_extension": held_call.from_extension,
-                "transfer_destination": held_call.to_extension,
-                "transfer_type": "invite_based",
+                "call_id": original.call_id,
+                "consultation_call_id": consult.call_id,
+                "from_extension": original.from_extension,
+                "transfer_destination": consult.to_extension,
+                "transfer_type": "refer_attended",
                 "timestamp": datetime.now(UTC).isoformat(),
             },
         )
+        return True
+
+    def _send_bridge_reinvite(self, original: Any, consult: Any) -> None:
+        """
+        Re-INVITE the transfer destination onto the original call's relay.
+
+        The destination negotiated media toward the consultation call's
+        relay port; after the bridge, media flows through the original
+        call's relay, so the destination must be re-INVITEd (in its own
+        dialog on the consultation Call-ID) with SDP advertising the
+        surviving relay port. The 200 OK lands in handle_callee_answer's
+        already-connected branch, which refreshes the bridged peer relay's
+        endpoint.
+
+        Args:
+            original: Surviving call whose relay carries the bridged media.
+            consult: Consultation call record (destination's leg).
+        """
+        from pbx.sip.message import SIPMessageBuilder
+        from pbx.sip.sdp import SDPBuilder
+
+        dest_addr = consult.callee_addr
+        dest_rtp = consult.callee_rtp
+        if not dest_addr or not original.rtp_ports:
+            return
+
+        server_ip = self._get_server_ip()
+        sip_port = self.config.get("server.sip_port", 5060)
+
+        # Dialog identity for the PBX->destination leg: From as sent in the
+        # INVITE (correct tag), To as returned in the destination's 200 OK.
+        source_invite = getattr(consult, "callee_invite", None) or consult.original_invite
+        from_header = source_invite.get_header("From") if source_invite else None
+        to_header = consult.callee_dialog_to or (
+            source_invite.get_header("To") if source_invite else None
+        )
+
+        # Mirror the codecs/protocol the destination already negotiated.
+        user_agent = self._get_phone_user_agent(consult.to_extension)
+        phone_model = self._detect_phone_model(user_agent)
+        codecs = self._get_compatible_codecs(phone_model, dest_rtp.get("formats"))
+
+        reinvite_sdp = SDPBuilder.build_audio_sdp(
+            server_ip,
+            original.rtp_ports[0],
+            session_id=consult.call_id,
+            codecs=codecs,
+            dtmf_payload_type=self._get_dtmf_payload_type(),
+            ilbc_mode=self._get_ilbc_mode(),
+            protocol=dest_rtp.get("protocol", "RTP/AVP"),
+            crypto=dest_rtp.get("crypto") or None,
+            rtpmap_overrides=dest_rtp.get("rtpmap_names") or None,
+        )
+
+        consult.pbx_leg_cseq += 1
+        reinvite = SIPMessageBuilder.build_request(
+            method="INVITE",
+            uri=f"sip:{consult.to_extension}@{dest_addr[0]}:{dest_addr[1]}",
+            from_addr=from_header or f"<sip:{consult.from_extension}@{server_ip}>",
+            to_addr=to_header or f"<sip:{consult.to_extension}@{server_ip}>",
+            call_id=consult.call_id,
+            cseq=consult.pbx_leg_cseq,
+            body=reinvite_sdp,
+        )
+        branch_id = str(uuid.uuid4()).replace("-", "")
+        reinvite.set_header("Via", f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}")
+        reinvite.set_header("Contact", f"<sip:{consult.from_extension}@{server_ip}:{sip_port}>")
+        reinvite.set_header("Content-type", "application/sdp")
+
+        self.sip_server._send_message(reinvite.build(), dest_addr)
+        self.logger.info(
+            f"Sent bridge re-INVITE to {consult.to_extension} at {dest_addr} "
+            f"(relay port {original.rtp_ports[0]})"
+        )
+
+    def start_blind_refer_transfer(
+        self,
+        original: Any,
+        referrer_is_caller: bool,
+        destination: str,
+        referrer_addr: tuple[str, int],
+        referred_by: str | None = None,
+    ) -> bool:
+        """
+        Start a blind (unattended) REFER transfer: the PBX originates the
+        leg to the destination itself, advertising the original call's
+        relay port, and defers the bridge until the destination answers.
+
+        Args:
+            original: The call whose remaining party is being transferred.
+            referrer_is_caller: Whether the REFER sender is the original
+                call's caller leg.
+            destination: Destination extension.
+            referrer_addr: SIP source address of the REFER sender.
+            referred_by: Referred-By header value to pass along, if any.
+
+        Returns:
+            True if the destination leg was originated.
+        """
+        from pbx.sip.message import SIPMessageBuilder
+        from pbx.sip.sdp import SDPBuilder
+
+        if not self.extension_registry.is_registered(destination):
+            self.logger.error(f"Blind transfer destination {destination} not registered")
+            return False
+
+        dest_addr = self.extension_registry.get_address(destination)
+        if not dest_addr or not original.rtp_ports:
+            self.logger.error(f"No address or relay for blind transfer to {destination}")
+            return False
+
+        if referrer_is_caller:
+            transferee_ext = original.to_extension
+            transferee_rtp = original.callee_rtp
+        else:
+            transferee_ext = original.from_extension
+            transferee_rtp = original.caller_rtp
+
+        consult_call_id = str(uuid.uuid4())
+        consult = self.call_manager.create_call(consult_call_id, transferee_ext, destination)
+        consult.start()
+        consult.rtp_ports = original.rtp_ports
+        consult.uses_peer_relay = True
+        consult.is_transfer_consult = True
+        consult.transfer_referrer_addr = referrer_addr
+
+        original.pending_transfer_consult_id = consult_call_id
+        original.transfer_referrer_addr = referrer_addr
+        original.transfer_referrer_is_caller = referrer_is_caller
+
+        server_ip = self._get_server_ip()
+        sip_port = self.config.get("server.sip_port", 5060)
+
+        protocol = "RTP/AVP"
+        crypto: list[str] | None = None
+        if transferee_rtp:
+            protocol = transferee_rtp.get("protocol", "RTP/AVP")
+            crypto = transferee_rtp.get("crypto") or None
+
+        invite_sdp = SDPBuilder.build_audio_sdp(
+            server_ip,
+            original.rtp_ports[0],
+            session_id=consult_call_id,
+            protocol=protocol,
+            crypto=crypto,
+        )
+
+        invite_msg = SIPMessageBuilder.build_request(
+            method="INVITE",
+            uri=f"sip:{destination}@{dest_addr[0]}:{dest_addr[1]}",
+            from_addr=f"<sip:{transferee_ext}@{server_ip}>",
+            to_addr=f"<sip:{destination}@{server_ip}>",
+            call_id=consult_call_id,
+            cseq=1,
+            body=invite_sdp,
+        )
+        if referred_by:
+            invite_msg.set_header("Referred-By", referred_by)
+        invite_msg.set_header("Contact", f"<sip:{transferee_ext}@{server_ip}:{sip_port}>")
+        invite_msg.set_header("Content-type", "application/sdp")
+        consult.callee_invite = invite_msg
+
+        self.sip_server._send_message(invite_msg.build(), dest_addr)
+        self.cdr_system.start_record(consult_call_id, transferee_ext, destination)
+
+        # Abort the whole transfer if the destination never answers.
+        no_answer_timeout = self.config.get("voicemail.no_answer_timeout", 30)
+        timer = threading.Timer(
+            float(no_answer_timeout),
+            self.abort_pending_transfer,
+            args=(consult,),
+            kwargs={"cancel_destination": True},
+        )
+        timer.daemon = True
+        consult.no_answer_timer = timer
+        timer.start()
+
+        self.logger.info(
+            f"Blind transfer leg originated: {consult_call_id} ({transferee_ext} -> {destination})"
+        )
+        return True
+
+    def abort_pending_transfer(self, consult: Any, cancel_destination: bool = False) -> None:
+        """
+        Abort a pending (deferred) transfer whose destination declined,
+        failed, or never answered. The transferor is already gone, so both
+        the consultation leg and the parked transferee leg are torn down.
+
+        Args:
+            consult: The consultation call record.
+            cancel_destination: Send CANCEL to the (still ringing)
+                destination -- used by the no-answer timer path.
+        """
+        original = next(
+            (
+                c
+                for c in self.call_manager.get_active_calls()
+                if c.pending_transfer_consult_id == consult.call_id
+            ),
+            None,
+        )
+
+        self.logger.warning(
+            f"Aborting pending transfer: consult {consult.call_id}"
+            + (f", original {original.call_id}" if original else "")
+        )
+
+        if cancel_destination and consult.callee_addr is None and consult.callee_invite:
+            self._call_router._send_cancel_to_callee(consult, consult.call_id)
+
+        self.end_call(consult.call_id)
+
+        if original:
+            original.pending_transfer_consult_id = None
+            # Null the departed transferor's side so the leg BYE reaches the
+            # parked transferee, then tear the original call down.
+            if original.transfer_referrer_addr is not None:
+                if original.caller_addr == original.transfer_referrer_addr:
+                    original.caller_addr = None
+                elif original.callee_addr == original.transfer_referrer_addr:
+                    original.callee_addr = None
+            self.sip_server._send_leg_bye(original)
+            self.end_call(original.call_id)
 
     def consultation_transfer_start(self, call_id: str, destination: str) -> str | None:
         """

@@ -293,6 +293,25 @@ class RTPRelay:
         relay = self.active_relays.get(call_id)
         return relay["handler"] if relay else None
 
+    def replace_endpoint(self, call_id: str, side: str, endpoint: AddrTuple) -> None:
+        """
+        Replace one endpoint of a relay with a new party (call transfer).
+
+        Unlike set_endpoints, this clears the learned source address for the
+        replaced side and re-opens the symmetric-RTP learning window, so
+        packets from the new party are accepted and forwarding stops
+        targeting the departed party's learned address.
+
+        Args:
+            call_id: Call identifier.
+            side: Which side to replace ("a" or "b").
+            endpoint: (host, port) of the new party from its SDP.
+        """
+        if call_id in self.active_relays:
+            handler: RTPRelayHandler = self.active_relays[call_id]["handler"]
+            handler.replace_endpoint(side, endpoint)
+            self.logger.info(f"RTP relay {call_id}: side {side} replaced with {endpoint}")
+
     def release_relay(self, call_id: str) -> None:
         """
         Release RTP relay for a call.
@@ -382,6 +401,29 @@ class RTPRelayHandler:
                 self.endpoint_a = endpoint_a
             if endpoint_b is not None:
                 self.endpoint_b = endpoint_b
+
+    def replace_endpoint(self, side: str, endpoint: AddrTuple) -> None:
+        """
+        Replace one side's endpoint with a new party (call transfer).
+
+        Clears the learned source for that side -- forwarding prefers
+        learned addresses over SDP endpoints, so without this the relay
+        would keep sending to the departed party and reject packets from
+        the new one -- and restarts the learning window so the new party's
+        actual source can be learned (symmetric RTP / NAT).
+
+        Args:
+            side: Which side to replace ("a" or "b").
+            endpoint: (host, port) of the new party from its SDP.
+        """
+        with self.lock:
+            if side == "a":
+                self.endpoint_a = endpoint
+                self.learned_a = None
+            else:
+                self.endpoint_b = endpoint
+                self.learned_b = None
+            self._start_time = time.time()  # Re-open the learning window
 
     def start(self) -> bool:
         """

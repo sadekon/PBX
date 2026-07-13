@@ -38,7 +38,7 @@ with a second gate says so in its row.
 
 | ID | Capability | Status | Built in | Finishing it unblocks |
 |----|-----------|--------|----------|----------------------|
-| **C1** | SIP signaling core — registration, dialogs, routing, transfer/hold | ✅ working (UDP-only) | `pbx/sip/`, `core/call_router.py` | Call-handling features work today; TLS/TCP transport is Phase-7 hardening |
+| **C1** | SIP signaling core — registration, dialogs, routing, transfer/hold | ✅ working (UDP-only) | `pbx/sip/`, `core/call_router.py` | Call-handling features work today; TLS/TCP transport is Phase-7 hardening. REFER transfer rewritten on `auto-attendant` (attended via Replaces per RFC 3891, blind via PBX-originated leg); pending field verification with Zultys ZIP phones |
 | **C2** | RTP media relay & IVR plumbing — relay, DTMF (RFC 2833 + in-band), prompt playback, recording tap | 🚧 solid, DTMF/prompt fixes landing on `voicemail-fix` | `pbx/rtp/`, `core/voicemail_handler.py`, `rtp/handler.py` | Voicemail, AA, MoH, recording, paging; codec expansion slots in here |
 | **C3** | **Audio mixer (N-way media) — does not exist** | ❌ missing | (to build: sum/mix G.711 streams per participant, or bridge via Jitsi) | Conference audio, 3-way calling, barge/whisper/screening |
 | **C4** | **Call-originate primitive — does not exist** ("PBX creates a leg to X, then bridges") | ❌ missing | (to build in `core/` + SIP server) | Click-to-dial, callback completion, predictive dialing, emergency-notification calls, operator console actions |

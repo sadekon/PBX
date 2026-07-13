@@ -46,7 +46,7 @@ from pbx.utils.logger import get_logger
 _G711_PAYLOAD_TYPES = (0, 8)
 
 
-class DTMFMonitor:
+class DTMFMonitor:git
     """Single digit source merging RFC 2833 / SIP INFO / in-band DTMF.
 
     Thread model: ``on_audio_packet`` is called from the RTPRecorder's

@@ -82,6 +82,9 @@ class TestCalleeErrorAfterVoicemailAnswer:
     def test_487_ignored_when_routed_to_voicemail(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.routed_to_voicemail = True
         call.caller_addr = ("10.0.0.1", 5060)
         pbx.call_manager.get_call.return_value = call
@@ -109,6 +112,9 @@ class TestCalleeErrorAfterVoicemailAnswer:
         invite_via = "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKinvite-branch-42"
         pbx = MagicMock()
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.callee_invite.uri = "sip:1001@192.168.1.50:5060"
         call.callee_invite.get_header.side_effect = {"Via": invite_via}.get
         pbx.call_manager.get_call.return_value = call
@@ -132,6 +138,9 @@ class TestCalleeErrorAfterVoicemailAnswer:
     def test_4xx_ignored_when_call_connected(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.routed_to_voicemail = False
         call.state = CallState.CONNECTED
         pbx.call_manager.get_call.return_value = call
@@ -149,6 +158,9 @@ class TestCalleeErrorAfterVoicemailAnswer:
     def test_4xx_still_ends_unanswered_call(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.routed_to_voicemail = False
         call.state = CallState.RINGING
         call.caller_addr = None  # skip error forwarding, assert teardown only
@@ -219,8 +231,10 @@ class TestByeNotForwardedToCancelledCallee:
     def test_bye_not_forwarded_when_routed_to_voicemail(self, mock_get_logger: MagicMock) -> None:
         caller_addr = ("192.168.1.10", 5060)
         pbx = MagicMock()
-        pbx.handle_invite_transfer_hangup.return_value = False
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.routed_to_voicemail = True
         call.voicemail_access = False
         call.caller_addr = caller_addr
@@ -249,6 +263,9 @@ class TestMonitorVoicemailDtmf:
 
     def _make_call(self) -> MagicMock:
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         state = MagicMock()
         state.value = "connected"
         call.state = state
@@ -304,6 +321,9 @@ class TestCompleteRecordingSendsBye:
 
     def _make_call(self) -> MagicMock:
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.from_extension = "2001"
         call.to_extension = "1001"
         call.caller_addr = ("192.168.1.10", 5060)
