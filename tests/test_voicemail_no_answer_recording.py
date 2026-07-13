@@ -20,6 +20,7 @@ import pytest
 
 from pbx.core.call import CallState
 from pbx.core.voicemail_handler import VoicemailHandler
+from pbx.rtp.dtmf_monitor import DTMFMonitor
 from pbx.sip.server import SIPServer
 from pbx.utils.audio import g711_to_float_samples, pcm16_to_ulaw
 from pbx.utils.dtmf import DTMFDetector
@@ -277,6 +278,12 @@ class TestMonitorVoicemailDtmf:
         ulaw = pcm16_to_ulaw(_make_dtmf_pcm16(941, 1477))
         packets = [ulaw[i : i + 160] for i in range(0, len(ulaw), 160)]
         recorder = _FakeRecorder(recorded_data=packets)
+
+        # Mirror production wiring: the RTPRecorder feeds each audio payload
+        # to its attached DTMFMonitor, which monitor_voicemail_dtmf consumes.
+        recorder.dtmf_monitor = DTMFMonitor(call)
+        for packet in packets:
+            recorder.dtmf_monitor.on_audio_packet(0, packet)
 
         with patch("time.sleep"):
             handler.monitor_voicemail_dtmf(CALL_ID, call, recorder)

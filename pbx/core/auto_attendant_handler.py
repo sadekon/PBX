@@ -212,7 +212,8 @@ class AutoAttendantHandler:
         """
         import tempfile
 
-        from pbx.rtp.handler import RTPDTMFListener, RTPPlayer
+        from pbx.rtp.dtmf_monitor import build_ivr_dtmf_channel
+        from pbx.rtp.handler import RTPPlayer
         from pbx.utils.audio import get_prompt_audio
 
         pbx = self.pbx_core
@@ -229,11 +230,11 @@ class AutoAttendantHandler:
             # ============================================================
             # RTP SETUP FOR AUTO ATTENDANT - BIDIRECTIONAL AUDIO
             # ============================================================
-            # This section sets up RTP for interactive auto attendant:
-            # 1. RTPPlayer: Sends audio prompts/menus to the caller (server -> client)
-            # 2. RTPDTMFListener: Receives audio and detects DTMF tones (client -> server)
-            # Both use the same local port (call.rtp_ports[0]) allocated by RTP relay.
-            # This creates a full-duplex audio channel for the auto attendant system.
+            # 1. RTPPlayer: Sends audio prompts/menus to the caller.
+            # 2. build_ivr_dtmf_channel: RTPRecorder + DTMFMonitor merging all
+            #    DTMF sources (RFC 2833 telephone-event, SIP INFO, in-band
+            #    G.711 tones) into one deduped digit queue.
+            # All share the local port (call.rtp_ports[0]) from the RTP pool.
             # ============================================================
 
             # Create RTP player for sending audio prompts to the caller
@@ -248,10 +249,9 @@ class AutoAttendantHandler:
                 pbx.logger.error(f"Failed to start RTP player for auto attendant {call_id}")
                 return
 
-            # Create DTMF listener for receiving and detecting user input
-            dtmf_listener = RTPDTMFListener(call.rtp_ports[0])
-            if not dtmf_listener.start():
-                pbx.logger.error(f"Failed to start DTMF listener for auto attendant {call_id}")
+            recorder, dtmf_monitor = build_ivr_dtmf_channel(pbx, call, call_id, call.rtp_ports[0])
+            if not recorder.start():
+                pbx.logger.error(f"Failed to start RTP recorder for auto attendant {call_id}")
                 player.stop()
                 return
             pbx.logger.info(
@@ -259,16 +259,12 @@ class AutoAttendantHandler:
             )
 
             # Barge-in predicate for menu prompts: True as soon as a digit is
-            # pending from either input path the main loop below consumes --
-            # out-of-band DTMF queued on call.dtmf_info_queue by
-            # handle_dtmf_info() (SIP INFO / RFC 2833 telephone-event), or an
-            # in-band tone detected by the RTPDTMFListener. Both are *peeked*
-            # only: the digit stays queued/buffered so the loop still retrieves
-            # it and feeds auto_attendant.handle_dtmf(), advancing the state
-            # machine. Lets callers dial their choice over the greeting/menu
-            # without waiting for it to finish.
-            def _dtmf_pending() -> bool:
-                return bool(getattr(call, "dtmf_info_queue", None)) or dtmf_listener.has_digit()
+            # pending from any source. has_digit() only *peeks* -- the digit
+            # stays queued so the loop below still pops it via get_digit() and
+            # feeds auto_attendant.handle_dtmf(), advancing the state machine.
+            # Lets callers dial their choice over the greeting/menu without
+            # waiting for it to finish.
+            _dtmf_pending = dtmf_monitor.has_digit
 
             # Play welcome greeting
             action = session.get("session")
@@ -344,18 +340,9 @@ class AutoAttendantHandler:
             start_time: float = time.time()
 
             while session_active and (time.time() - start_time) < timeout:
-                # Check for DTMF input from SIP INFO or in-band
-                digit: str | None = None
-
-                # Priority 1: Check SIP INFO queue
-                if hasattr(call, "dtmf_info_queue") and call.dtmf_info_queue:
-                    digit = call.dtmf_info_queue.pop(0)
-                    pbx.logger.info(f"Auto attendant received DTMF from SIP INFO: {digit}")
-                else:
-                    # Priority 2: Check in-band DTMF
-                    digit = dtmf_listener.get_digit(timeout=1.0)
-                    if digit:
-                        pbx.logger.info(f"Auto attendant received DTMF from in-band audio: {digit}")
+                # One call covers every DTMF source (RFC 2833 telephone-event,
+                # SIP INFO, in-band G.711 tones), deduped by the monitor.
+                digit: str | None = dtmf_monitor.get_digit(timeout=1.0)
 
                 if digit:
                     pbx.logger.info(f"Auto attendant received DTMF: {digit}")
@@ -421,6 +408,12 @@ class AutoAttendantHandler:
                     if "session" in result:
                         session["session"] = result["session"]
 
+                    # The AA never saves the recording; drop accumulated audio
+                    # so a long menu session doesn't grow memory. (In-band DTMF
+                    # detection buffers independently inside the DTMFMonitor.)
+                    if hasattr(recorder, "recorded_data"):
+                        recorder.recorded_data = []
+
             # Timeout - handle it
             if time.time() - start_time >= timeout:
                 result = pbx.auto_attendant.handle_timeout(session["session"])
@@ -440,7 +433,7 @@ class AutoAttendantHandler:
 
             # Clean up
             player.stop()
-            dtmf_listener.stop()
+            recorder.stop()
 
             # Return port to pool (thread-safe)
             if hasattr(call, "aa_rtp_port"):

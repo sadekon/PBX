@@ -656,7 +656,7 @@ class CallRouter:
             call_id: Call identifier
         """
         from pbx.core.call import CallState
-        from pbx.rtp.handler import RTPPlayer, RTPRecorder
+        from pbx.rtp.handler import RTPPlayer
         from pbx.utils.audio import get_prompt_audio
 
         pbx = self.pbx_core
@@ -776,44 +776,14 @@ class CallRouter:
             except OSError as e:
                 pbx.logger.error(f"Error playing voicemail greeting: {e}")
 
-            # Start RTP recorder on the allocated port with the configured
-            # DTMF payload type so telephone-event packets are properly
-            # filtered.  Wire in an RFC 2833 receiver (not started -- the
-            # recorder owns the socket and delegates telephone-event packets
-            # to it) so an out-of-band # from the caller reaches
-            # call.dtmf_info_queue via handle_dtmf_info().
-            from pbx.rtp.rfc2833 import RFC2833Receiver
+            # Start the receive side on the allocated port: RTPRecorder +
+            # DTMFMonitor merging every DTMF source (RFC 2833 telephone-event
+            # -- including the caller's own offered payload types -- SIP INFO,
+            # and in-band tones), so an out-of-band or in-band # from the
+            # caller stops the recording via monitor_voicemail_dtmf.
+            from pbx.rtp.dtmf_monitor import build_ivr_dtmf_channel
 
-            dtmf_pt = pbx._get_dtmf_payload_type()
-
-            # Also accept the telephone-event payload type(s) from the
-            # caller's own SDP offer: RFC 3264 says the caller should send
-            # using the PT from our answer, but many phones send using the
-            # PT they offered instead.
-            caller_dtmf_pts: set[int] = set()
-            rtpmap_names = (call.caller_rtp or {}).get("rtpmap_names") or {}
-            for pt_str, rtpmap_name in rtpmap_names.items():
-                if str(rtpmap_name).lower().startswith("telephone-event") and str(pt_str).isdigit():
-                    caller_dtmf_pts.add(int(pt_str))
-            pbx.logger.info(
-                f"Voicemail recording DTMF payload types for call {call_id}: "
-                f"{sorted({dtmf_pt} | caller_dtmf_pts)}"
-            )
-
-            rfc2833_rx = RFC2833Receiver(
-                local_port=call.rtp_ports[0],
-                pbx_core=pbx,
-                call_id=call_id,
-                payload_type=dtmf_pt,
-                extra_payload_types=caller_dtmf_pts,
-            )
-            recorder = RTPRecorder(
-                call.rtp_ports[0],
-                call_id,
-                rfc2833_handler=rfc2833_rx,
-                dtmf_payload_type=dtmf_pt,
-                extra_dtmf_payload_types=caller_dtmf_pts,
-            )
+            recorder, _dtmf_monitor = build_ivr_dtmf_channel(pbx, call, call_id, call.rtp_ports[0])
             if recorder.start():
                 # Store recorder in call object for later retrieval
                 call.voicemail_recorder = recorder

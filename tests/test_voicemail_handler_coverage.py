@@ -23,6 +23,7 @@ import pytest
 # Pre-mock modules that use Python 3.12+ syntax and cannot be imported
 # ---------------------------------------------------------------------------
 _mock_rtp_handler = MagicMock()
+_mock_dtmf_monitor = MagicMock()
 _mock_utils_audio = MagicMock()
 _mock_utils_dtmf = MagicMock()
 _mock_sip_message = MagicMock()
@@ -37,6 +38,7 @@ from pbx.core.voicemail_handler import VoicemailHandler
 
 _MOCK_MODULES = {
     "pbx.rtp.handler": _mock_rtp_handler,
+    "pbx.rtp.dtmf_monitor": _mock_dtmf_monitor,
     "pbx.utils.audio": _mock_utils_audio,
     "pbx.utils.dtmf": _mock_utils_dtmf,
     "pbx.sip.message": _mock_sip_message,
@@ -57,6 +59,9 @@ def _install_mock_modules():
     """
     originals = {name: sys.modules.get(name) for name in _MOCK_MODULES}
     sys.modules.update(_MOCK_MODULES)
+    # Default DTMF-channel wiring so tests that don't call _setup_rtp_mocks()
+    # still get a well-formed (recorder, monitor) pair from the factory.
+    _wire_dtmf_channel()
     try:
         yield
     finally:
@@ -99,6 +104,41 @@ def _make_call(state_value: str = "connected") -> MagicMock:
     return call_obj
 
 
+def _wire_dtmf_channel(recorder_source=None) -> None:
+    """Wire the mocked build_ivr_dtmf_channel factory.
+
+    The factory returns (recorder, monitor) where the monitor's get_digit
+    drains the call's dtmf_info_queue (so tests keep driving digits through
+    call_obj.dtmf_info_queue as before), then any digits pre-seeded on
+    call_obj.test_inband_digits (simulating in-band detections), then None.
+
+    Args:
+        recorder_source: Zero-arg callable returning the recorder mock to
+            hand out (so assertions on a test's mock_recorder work). Defaults
+            to a fresh MagicMock per call.
+    """
+
+    def _factory(pbx_core, call, call_id, local_port):
+        monitor = MagicMock()
+        inband = list(getattr(call, "test_inband_digits", []) or [])
+
+        def _get_digit(timeout=1.0):
+            if call.dtmf_info_queue:
+                return call.dtmf_info_queue.pop(0)
+            if inband:
+                return inband.pop(0)
+            return None
+
+        monitor.get_digit.side_effect = _get_digit
+        monitor.has_digit.side_effect = lambda: bool(call.dtmf_info_queue) or bool(inband)
+        monitor.peek_digits.side_effect = lambda: tuple(call.dtmf_info_queue) + tuple(inband)
+        recorder = recorder_source() if recorder_source else MagicMock()
+        recorder.dtmf_monitor = monitor
+        return recorder, monitor
+
+    _mock_dtmf_monitor.build_ivr_dtmf_channel = MagicMock(side_effect=_factory)
+
+
 def _setup_rtp_mocks() -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
     """Reset and return fresh RTPPlayer, RTPRecorder, DTMFDetector, get_prompt_audio mocks."""
     mock_player_cls = MagicMock()
@@ -110,6 +150,10 @@ def _setup_rtp_mocks() -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
     _mock_rtp_handler.RTPRecorder = mock_recorder_cls
     _mock_utils_dtmf.DTMFDetector = mock_dtmf_cls
     _mock_utils_audio.get_prompt_audio = mock_get_prompt
+
+    # The handler obtains its recorder via build_ivr_dtmf_channel, so hand
+    # out this test's recorder mock from the mocked factory.
+    _wire_dtmf_channel(lambda: mock_recorder_cls.return_value)
 
     return mock_player_cls, mock_recorder_cls, mock_dtmf_cls, mock_get_prompt
 
@@ -723,47 +767,36 @@ class TestVoicemailIVRSession:
         assert voicemail_ivr.state == voicemail_ivr.STATE_MESSAGE_MENU
 
     @patch("pbx.core.voicemail_handler.time")
-    def test_ivr_inband_dtmf_decodes_g711_not_raw_pcm(self, mock_time) -> None:
-        """In-band DTMF detection must decode companded G.711 to linear
-        samples (g711_to_float_samples + detect_sequence), not feed the raw
-        µ-law/A-law RTP payload to detect() which parses it as 16-bit PCM.
+    def test_ivr_inband_digit_processed_via_monitor(self, mock_time) -> None:
+        """In-band digits surfaced by the DTMFMonitor drive the IVR exactly
+        like out-of-band digits.
 
-        Regression test: the raw-PCM misread scrambled companded bytes into
-        spurious digits, producing endless invalid-option beeps in the
-        greeting-review state.
+        The G.711-decode-before-detection regression (companded bytes misread
+        as PCM producing spurious digits) is now guarded inside the monitor by
+        tests/test_dtmf_monitor.py, which exercises real µ-law tone audio.
         """
         from pbx.core.call import CallState
 
         mock_time.time.return_value = 1000.0
 
-        mock_player_cls, mock_recorder_cls, mock_dtmf_cls, mock_get_prompt = _setup_rtp_mocks()
+        mock_player_cls, mock_recorder_cls, _mock_dtmf_cls, mock_get_prompt = _setup_rtp_mocks()
         mock_get_prompt.return_value = b"WAV_PROMPT"
 
         mock_player = MagicMock()
         mock_player.start.return_value = True
         mock_player_cls.return_value = mock_player
 
-        # Recorder holds companded G.711 payload and a detected codec.
         mock_recorder = MagicMock()
         mock_recorder.start.return_value = True
-        mock_recorder.recorded_data = [b"\xff" * 2000]  # > min_audio_bytes_for_dtmf
-        mock_recorder.detected_codec = 0  # PCMU / µ-law
+        mock_recorder.recorded_data = []
         mock_recorder_cls.return_value = mock_recorder
-
-        # No out-of-band digits, so the loop must use the in-band path.
-        detector = MagicMock()
-        detector.detect_sequence.return_value = "1"
-        mock_dtmf_cls.return_value = detector
-
-        # Decoder returns linear float samples.
-        decoded_samples = [0.0, 0.1, -0.1]
-        _mock_utils_audio.g711_to_float_samples = MagicMock(return_value=decoded_samples)
 
         pbx = _make_pbx_core()
         handler = VoicemailHandler(pbx)
         call_obj = _make_call()
         call_obj.state = CallState.CONNECTED
-        call_obj.dtmf_info_queue = []  # force in-band detection
+        call_obj.dtmf_info_queue = []  # no out-of-band digits
+        call_obj.test_inband_digits = ["1"]  # digit arrives via in-band detection
 
         call_count = 0
 
@@ -781,11 +814,8 @@ class TestVoicemailIVRSession:
 
         handler._voicemail_ivr_session("call-1", call_obj, MagicMock(), voicemail_ivr)
 
-        # Must decode G.711 with the detected codec, then run tone detection
-        # on the decoded samples -- never the raw-bytes detect() path.
-        _mock_utils_audio.g711_to_float_samples.assert_any_call(b"\xff" * 2000, 0)
-        detector.detect_sequence.assert_any_call(decoded_samples)
-        detector.detect.assert_not_called()
+        # The in-band digit must reach the IVR state machine.
+        voicemail_ivr.handle_dtmf.assert_any_call("1")
 
     @patch("pbx.core.voicemail_handler.time")
     def test_ivr_exception_logged_and_call_ended(self, mock_time) -> None:
@@ -865,23 +895,27 @@ class TestVoicemailIVRSession:
 
 @pytest.mark.unit
 class TestMonitorVoicemailDTMF:
-    """Tests for monitor_voicemail_dtmf."""
+    """Tests for monitor_voicemail_dtmf (digits via the recorder's DTMFMonitor)."""
+
+    @staticmethod
+    def _recorder_with_monitor(digits: list[str], running: bool = True) -> MagicMock:
+        """Recorder mock whose attached monitor pops from `digits` then None."""
+        recorder = MagicMock()
+        recorder.running = running
+        pending = list(digits)
+        monitor = MagicMock()
+        monitor.get_digit.side_effect = lambda timeout=0.5: pending.pop(0) if pending else None
+        recorder.dtmf_monitor = monitor
+        return recorder
 
     @patch("pbx.core.voicemail_handler.time")
     def test_hash_detected_completes_recording(self, mock_time) -> None:
         """When # is detected, should call complete_voicemail_recording."""
-        _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
-        mock_detector = MagicMock()
-        mock_detector.detect_sequence.return_value = "#"
-        mock_dtmf_cls.return_value = mock_detector
-
         pbx = _make_pbx_core()
         handler = VoicemailHandler(pbx)
         call_obj = _make_call()
 
-        recorder = MagicMock()
-        recorder.running = True
-        recorder.recorded_data = [b"\x80" * 2000]
+        recorder = self._recorder_with_monitor(["#"])
 
         with patch.object(handler, "complete_voicemail_recording") as mock_complete:
             handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
@@ -890,19 +924,21 @@ class TestMonitorVoicemailDTMF:
     @patch("pbx.core.voicemail_handler.time")
     def test_non_hash_digit_does_not_complete(self, mock_time) -> None:
         """Non-# digit should not trigger completion."""
-        _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
-        mock_detector = MagicMock()
-        mock_detector.detect_sequence.return_value = "5"
-        mock_dtmf_cls.return_value = mock_detector
-
         pbx = _make_pbx_core()
         handler = VoicemailHandler(pbx)
         call_obj = _make_call()
-        call_obj.state.value = "ended"
 
-        recorder = MagicMock()
-        recorder.running = True
-        recorder.recorded_data = [b"\x80" * 2000]
+        recorder = self._recorder_with_monitor(["5"])
+        # Stop the loop after the non-# digit is consumed.
+        original_side_effect = recorder.dtmf_monitor.get_digit.side_effect
+
+        def _get_digit_then_stop(timeout=0.5):
+            digit = original_side_effect(timeout)
+            if digit is None:
+                recorder.running = False
+            return digit
+
+        recorder.dtmf_monitor.get_digit.side_effect = _get_digit_then_stop
 
         with patch.object(handler, "complete_voicemail_recording") as mock_complete:
             handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
@@ -911,15 +947,25 @@ class TestMonitorVoicemailDTMF:
     @patch("pbx.core.voicemail_handler.time")
     def test_recorder_not_running_exits(self, mock_time) -> None:
         """When recorder.running is False, monitoring loop should exit."""
-        _setup_rtp_mocks()
-
         pbx = _make_pbx_core()
         handler = VoicemailHandler(pbx)
         call_obj = _make_call()
 
-        recorder = MagicMock()
-        recorder.running = False
-        recorder.recorded_data = []
+        recorder = self._recorder_with_monitor([], running=False)
+
+        with patch.object(handler, "complete_voicemail_recording") as mock_complete:
+            handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
+            mock_complete.assert_not_called()
+
+    @patch("pbx.core.voicemail_handler.time")
+    def test_call_ended_exits(self, mock_time) -> None:
+        """When the call has ended, monitoring loop should exit without completing."""
+        pbx = _make_pbx_core()
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+        call_obj.state.value = "ended"
+
+        recorder = self._recorder_with_monitor(["#"])
 
         with patch.object(handler, "complete_voicemail_recording") as mock_complete:
             handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
@@ -928,59 +974,35 @@ class TestMonitorVoicemailDTMF:
     @patch("pbx.core.voicemail_handler.time")
     def test_error_in_monitoring_logged(self, mock_time) -> None:
         """Errors during monitoring should be logged without raising."""
-        _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
-        mock_dtmf_cls.side_effect = ValueError("detector init failed")
-
         pbx = _make_pbx_core()
         handler = VoicemailHandler(pbx)
         call_obj = _make_call()
 
         recorder = MagicMock()
         recorder.running = True
-        recorder.recorded_data = [b"\x80" * 2000]
+        recorder.dtmf_monitor = MagicMock()
+        recorder.dtmf_monitor.get_digit.side_effect = ValueError("monitor failure")
 
         handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
         pbx.logger.error.assert_called()
 
     @patch("pbx.core.voicemail_handler.time")
-    def test_no_recorded_data_continues(self, mock_time) -> None:
-        """When recorded_data is empty, loop should continue without crash."""
-        _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
-        mock_detector = MagicMock()
-        mock_dtmf_cls.return_value = mock_detector
-
+    def test_creates_monitor_when_recorder_has_none(self, mock_time) -> None:
+        """A recorder built without a monitor gets one created and attached."""
         pbx = _make_pbx_core()
         handler = VoicemailHandler(pbx)
         call_obj = _make_call()
-        call_obj.state.value = "ended"
 
         recorder = MagicMock()
-        recorder.running = True
-        recorder.recorded_data = []
+        recorder.running = False  # exit immediately; we only check the wiring
+        recorder.dtmf_monitor = None
 
-        with patch.object(handler, "complete_voicemail_recording") as mock_complete:
-            handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
-            mock_complete.assert_not_called()
+        handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
 
-    @patch("pbx.core.voicemail_handler.time")
-    def test_insufficient_audio_data_skips_detection(self, mock_time) -> None:
-        """When audio data is below the threshold, DTMF detection should be skipped."""
-        _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
-        mock_detector = MagicMock()
-        mock_dtmf_cls.return_value = mock_detector
-
-        pbx = _make_pbx_core()
-        handler = VoicemailHandler(pbx)
-        call_obj = _make_call()
-        call_obj.state.value = "ended"
-
-        recorder = MagicMock()
-        recorder.running = True
-        recorder.recorded_data = [b"\x80" * 100]
-
-        with patch.object(handler, "complete_voicemail_recording") as _mock_complete:
-            handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
-            mock_detector.detect_sequence.assert_not_called()
+        # The handler imports DTMFMonitor from the (mocked) module and
+        # attaches the constructed instance to the recorder.
+        assert recorder.dtmf_monitor is _mock_dtmf_monitor.DTMFMonitor.return_value
+        _mock_dtmf_monitor.DTMFMonitor.assert_called_with(call_obj)
 
 
 # ---------------------------------------------------------------------------

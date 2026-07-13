@@ -237,9 +237,28 @@ class TestHandleAutoAttendant:
 # ---------------------------------------------------------------------------
 
 
+def _mock_channel(
+    digits: list[str] | None = None, start: bool = True
+) -> tuple[MagicMock, MagicMock]:
+    """Build a (recorder, monitor) pair mimicking build_ivr_dtmf_channel.
+
+    The monitor's get_digit pops from `digits` and returns None once
+    exhausted (never raising), so loops always see a clean timeout.
+    """
+    recorder = MagicMock()
+    recorder.start.return_value = start
+    recorder.recorded_data = []
+    monitor = MagicMock()
+    pending = list(digits or [])
+    monitor.get_digit.side_effect = lambda timeout=1.0: pending.pop(0) if pending else None
+    monitor.has_digit.side_effect = lambda: bool(pending)
+    monitor.peek_digits.side_effect = lambda: tuple(pending)
+    return recorder, monitor
+
+
 @pytest.mark.unit
 class TestAutoAttendantSession:
-    """Tests for _auto_attendant_session."""
+    """Tests for _auto_attendant_session (DTMF via unified DTMFMonitor)."""
 
     @patch("pbx.core.auto_attendant_handler.time")
     def test_no_caller_rtp_returns_early(self, mock_time) -> None:
@@ -271,10 +290,10 @@ class TestAutoAttendantSession:
         pbx.end_call.assert_called_with("call-1")
 
     @patch("pbx.core.auto_attendant_handler.time")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
-    def test_dtmf_listener_start_failure(self, mock_player_cls, mock_dtmf_cls, mock_time) -> None:
-        """If DTMF listener fails to start, should stop player and end call."""
+    def test_recorder_start_failure(self, mock_player_cls, mock_channel, mock_time) -> None:
+        """If the RTP recorder fails to start, should stop player and end call."""
         pbx = _make_pbx_core()
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
@@ -284,9 +303,7 @@ class TestAutoAttendantSession:
         mock_player.start.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = False
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel(start=False)
 
         handler._auto_attendant_session("call-1", call_obj, session)
         mock_player.stop.assert_called()
@@ -294,10 +311,10 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
     def test_welcome_audio_from_file(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
         """When welcome audio file exists, should play it directly."""
         pbx = _make_pbx_core()
@@ -314,10 +331,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf.get_digit.return_value = None
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel()
 
         mock_get_prompt.return_value = b"PROMPT_AUDIO"
 
@@ -329,10 +343,10 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
     def test_welcome_audio_generated(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
         """When no welcome file exists, should generate prompt audio."""
         pbx = _make_pbx_core()
@@ -349,10 +363,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf.get_digit.return_value = None
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel()
 
         mock_get_prompt.return_value = b"GENERATED_WELCOME"
 
@@ -362,10 +373,10 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
     def test_dtmf_transfer_action(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
         """On DTMF resulting in transfer, should call transfer_call."""
         mock_time.time.return_value = 100.0
@@ -380,7 +391,6 @@ class TestAutoAttendantSession:
         pbx.transfer_call.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
-        call_obj.dtmf_info_queue = ["1"]
 
         session = {"session": {"state": "MAIN_MENU"}, "file": None}
 
@@ -389,10 +399,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf.get_digit.return_value = None
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel(digits=["1"])
 
         mock_get_prompt.return_value = b"TRANSFER_AUDIO"
 
@@ -402,10 +409,10 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
     def test_dtmf_transfer_failure_logged(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
         """If transfer_call returns False, a warning should be logged."""
         mock_time.time.return_value = 100.0
@@ -420,7 +427,6 @@ class TestAutoAttendantSession:
         pbx.transfer_call.return_value = False
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
-        call_obj.dtmf_info_queue = ["1"]
 
         session = {"session": {"state": "MAIN_MENU"}, "file": None}
 
@@ -429,9 +435,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel(digits=["1"])
 
         mock_get_prompt.return_value = b"AUDIO"
 
@@ -440,10 +444,10 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
     def test_dtmf_play_action_resets_timeout(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
         """On DTMF play action, timeout should be reset."""
         mock_time.time.return_value = 100.0
@@ -471,7 +475,6 @@ class TestAutoAttendantSession:
         pbx.transfer_call.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
-        call_obj.dtmf_info_queue = ["3", "2"]
 
         session = {"session": {"state": "MAIN_MENU"}, "file": None}
 
@@ -480,10 +483,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf.get_digit.return_value = None
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel(digits=["3", "2"])
 
         mock_get_prompt.return_value = b"AUDIO"
 
@@ -493,10 +493,10 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
     def test_timeout_triggers_transfer(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
         """When session times out, should handle timeout and potentially transfer."""
         mock_time.time.return_value = 100.0
@@ -518,10 +518,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf.get_digit.return_value = None
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel()
 
         mock_get_prompt.return_value = b"AUDIO"
 
@@ -532,10 +529,10 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
     def test_timeout_transfer_failure_logged(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
         """When timeout transfer fails, a warning should be logged."""
         mock_time.time.return_value = 100.0
@@ -557,10 +554,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf.get_digit.return_value = None
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel()
 
         mock_get_prompt.return_value = b"AUDIO"
 
@@ -569,10 +563,10 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
     def test_port_returned_on_success(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
         """RTP port should be returned to pool after session ends."""
         pbx = _make_pbx_core()
@@ -590,10 +584,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf.get_digit.return_value = None
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel()
 
         mock_get_prompt.return_value = b"AUDIO"
 
@@ -603,10 +594,10 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
     def test_error_in_session_returns_port(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
         """On error, RTP port should still be returned to the pool."""
         pbx = _make_pbx_core()
@@ -623,9 +614,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.side_effect = TypeError("bad type")
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel()
 
         mock_get_prompt.return_value = b"AUDIO"
 
@@ -635,12 +624,12 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
-    def test_inband_dtmf_processed(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+    def test_monitor_digit_processed(
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
-        """In-band DTMF detection should be used when SIP INFO queue is empty."""
+        """Digits from the DTMFMonitor (any source) drive the state machine."""
         mock_time.time.return_value = 100.0
         pbx = _make_pbx_core()
         pbx.auto_attendant._get_audio_file.return_value = None
@@ -653,7 +642,6 @@ class TestAutoAttendantSession:
         pbx.transfer_call.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
-        call_obj.dtmf_info_queue = []  # Empty SIP INFO queue
 
         session = {"session": {"state": "MAIN_MENU"}, "file": None}
 
@@ -662,10 +650,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf.get_digit.return_value = "1"  # In-band digit
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel(digits=["1"])
 
         mock_get_prompt.return_value = b"AUDIO"
 
@@ -674,10 +659,10 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
     def test_transfer_audio_from_file(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
         """When transferring audio file exists, should play it directly."""
         mock_time.time.return_value = 100.0
@@ -694,7 +679,6 @@ class TestAutoAttendantSession:
         pbx.transfer_call.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
-        call_obj.dtmf_info_queue = ["1"]
 
         session = {"session": {"state": "MAIN_MENU"}, "file": None}
 
@@ -703,9 +687,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel(digits=["1"])
 
         mock_get_prompt.return_value = b"AUDIO"
 
@@ -717,10 +699,10 @@ class TestAutoAttendantSession:
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPDTMFListener")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
     @patch("pbx.rtp.handler.RTPPlayer")
     def test_main_menu_audio_from_file(
-        self, mock_player_cls, mock_dtmf_cls, mock_get_prompt, mock_time
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
         """When main_menu audio file exists, should play it directly."""
         pbx = _make_pbx_core()
@@ -737,10 +719,7 @@ class TestAutoAttendantSession:
         mock_player.play_file.return_value = True
         mock_player_cls.return_value = mock_player
 
-        mock_dtmf = MagicMock()
-        mock_dtmf.start.return_value = True
-        mock_dtmf.get_digit.return_value = None
-        mock_dtmf_cls.return_value = mock_dtmf
+        mock_channel.return_value = _mock_channel()
 
         mock_get_prompt.return_value = b"AUDIO"
 

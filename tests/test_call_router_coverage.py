@@ -1286,7 +1286,7 @@ class TestHandleNoAnswer:
     """Tests for _handle_no_answer() method."""
 
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
     def test_call_not_found(
@@ -1305,7 +1305,7 @@ class TestHandleNoAnswer:
         pbx.logger.warning.assert_called()
 
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
     def test_call_already_connected(
@@ -1327,7 +1327,7 @@ class TestHandleNoAnswer:
         pbx.logger.debug.assert_called()
 
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
     def test_already_routed_to_voicemail(
@@ -1349,7 +1349,7 @@ class TestHandleNoAnswer:
         pbx.logger.debug.assert_called()
 
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
     def test_no_answer_routes_to_voicemail(
@@ -1406,7 +1406,7 @@ class TestHandleNoAnswer:
         router._answer_call_for_voicemail.assert_called_once()
 
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
     def test_no_answer_answer_fails_returns_early(
@@ -1433,7 +1433,7 @@ class TestHandleNoAnswer:
         mock_rtp_player_cls.assert_not_called()
 
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
     def test_no_answer_no_caller_rtp_ends_call(
@@ -1462,7 +1462,7 @@ class TestHandleNoAnswer:
         pbx.end_call.assert_called_once_with("call-1")
 
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
     def test_no_answer_player_start_fails(
@@ -1512,7 +1512,7 @@ class TestHandleNoAnswer:
         pbx.logger.warning.assert_called()
 
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
     def test_no_answer_recorder_start_fails(
@@ -1558,7 +1558,7 @@ class TestHandleNoAnswer:
         pbx.end_call.assert_called_once_with("call-1")
 
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
     def test_no_answer_with_custom_greeting(
@@ -1615,7 +1615,7 @@ class TestHandleNoAnswer:
         mock_player.play_beep.assert_called_once_with(frequency=1000, duration_ms=500)
 
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
     def test_no_answer_custom_greeting_file_not_found_falls_back(
@@ -1672,7 +1672,7 @@ class TestHandleNoAnswer:
         mock_get_prompt.assert_called_once_with("leave_message")
 
     @patch("pbx.utils.audio.get_prompt_audio")
-    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
     def test_no_answer_greeting_oserror(

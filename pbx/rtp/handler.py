@@ -605,6 +605,7 @@ class RTPRecorder:
         rfc2833_handler: RFC2833Receiver | None = None,
         dtmf_payload_type: int = 101,
         extra_dtmf_payload_types: set[int] | None = None,
+        dtmf_monitor: Any | None = None,
     ) -> None:
         """
         Initialize RTP recorder.
@@ -618,6 +619,8 @@ class RTPRecorder:
                 telephone-event.  Some phones send DTMF using the payload
                 type from their own SDP offer rather than the one in our
                 SDP answer, so the caller's offered PT belongs here.
+            dtmf_monitor: Optional DTMFMonitor fed each audio payload for
+                in-band tone detection (see pbx.rtp.dtmf_monitor).
         """
         self.local_port: int = local_port
         self.call_id: str = call_id
@@ -632,6 +635,7 @@ class RTPRecorder:
         self.dtmf_payload_types: set[int] = {dtmf_payload_type} | (
             extra_dtmf_payload_types or set()
         )
+        self.dtmf_monitor: Any | None = dtmf_monitor
         # Track the audio codec payload type from the first audio packet
         self.detected_codec: int | None = None
 
@@ -729,6 +733,11 @@ class RTPRecorder:
                         self.logger.info(
                             f"Detected audio codec PT {payload_type} for recording {self.call_id}"
                         )
+
+                    # Feed the DTMF monitor for in-band tone detection
+                    # (cheap append; detection runs in the consumer thread).
+                    if self.dtmf_monitor is not None:
+                        self.dtmf_monitor.on_audio_packet(payload_type, payload)
 
                     # Store only audio payloads (not telephone-events)
                     with self.lock:
