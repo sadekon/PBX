@@ -1841,15 +1841,39 @@ class PBXCore:
             )
             return False
 
+        # If `original` is itself a peer leg from an earlier bridge, it has
+        # no relay of its own (already released when that bridge completed)
+        # -- its party's real media lives on the relay-owning record it's
+        # cross-linked to. Redirect there before doing anything else, using
+        # the same bridged_peer_call_id/bridge_peer_side indirection
+        # handle_callee_answer already follows for a re-INVITE arriving on
+        # a peer leg's own dialog.
+        stale_peer: Any | None = None
+        if (
+            self.rtp_relay.get_handler(original.call_id) is None
+            and original.bridged_peer_call_id
+            and original.bridge_peer_side
+        ):
+            relay_owner = self.call_manager.get_call(original.bridged_peer_call_id)
+            if relay_owner and self.rtp_relay.get_handler(relay_owner.call_id) is not None:
+                self.logger.info(
+                    f"Transfer REFER arrived on peer leg {original.call_id}; "
+                    f"redirecting to relay owner {relay_owner.call_id}"
+                )
+                stale_peer, original = original, relay_owner
+
         # Which side of the original call (and its relay) the transferor
         # occupies. Recorded at REFER time; fall back to the shared-extension
         # heuristic for phone-originated consultation calls.
-        transferor_is_caller = original.transfer_referrer_is_caller
-        if transferor_is_caller is None:
-            transferor_is_caller = original.from_extension in (
-                consult.from_extension,
-                consult.to_extension,
-            )
+        if stale_peer is not None:
+            transferor_is_caller = stale_peer.bridge_peer_side == "a"
+        else:
+            transferor_is_caller = original.transfer_referrer_is_caller
+            if transferor_is_caller is None:
+                transferor_is_caller = original.from_extension in (
+                    consult.from_extension,
+                    consult.to_extension,
+                )
         transferor_side = "a" if transferor_is_caller else "b"
 
         self.logger.info(
@@ -1937,6 +1961,15 @@ class PBXCore:
                 "timestamp": datetime.now(UTC).isoformat(),
             },
         )
+
+        # The redirected-from peer leg no longer represents anyone's live
+        # identity -- its party's dialog now resolves through the (possibly
+        # new) relay-owning record above. No SIP signaling needed: it has
+        # no relay to release, and a stale BYE its former party's phone may
+        # still send lands on _handle_bye's existing "call not found" path.
+        if stale_peer is not None:
+            self.call_manager.end_call(stale_peer.call_id)
+
         return True
 
     def _send_bridge_reinvite(self, original: Any, consult: Any) -> None:

@@ -1369,6 +1369,26 @@ class SIPServer:
             )
             return
 
+        # A transfer already pending (waiting on an unanswered consult) on
+        # this same dialog means this REFER is a genuine double-attempt
+        # racing the first one -- silently overwriting
+        # pending_transfer_consult_id would orphan the first consultation
+        # call, left ringing forever with nothing to bridge to. This does
+        # NOT reject a REFER on an *already fully bridged* call (e.g. C
+        # transferring B onward after A's earlier transfer completed) --
+        # that's a distinct, legitimate later transfer with no pending
+        # state to collide with; bridge_attended_transfer's peer-leg
+        # redirect handles it.
+        if call.pending_transfer_consult_id:
+            self.logger.warning(
+                f"REFER for {call_id} arrived while a transfer is already "
+                "pending on this dialog; rejecting"
+            )
+            self._send_transfer_notify(
+                message, addr, "SIP/2.0 480 Temporarily Unavailable", call_id
+            )
+            return
+
         # Record which side of the call the referrer occupies now, while
         # its address is still known (it is nulled as legs are dropped).
         referrer_is_caller = addr == call.caller_addr
@@ -1382,6 +1402,11 @@ class SIPServer:
             self.logger.info(
                 f"Attended transfer: {destination}, replacing dialog {replaces_call_id}"
             )
+
+            if replaces_call_id == call_id:
+                self.logger.error(f"REFER Replaces names its own dialog ({call_id}); rejecting")
+                self._send_transfer_notify(message, addr, "SIP/2.0 400 Bad Request", call_id)
+                return
 
             consult = self.pbx_core.call_manager.get_call(replaces_call_id)
             if not consult:
