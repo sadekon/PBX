@@ -2041,6 +2041,26 @@ class SIPServer:
 
                     self.pbx_core.handle_callee_answer(call_id, message, addr)
 
+            elif message.status_code and 300 <= message.status_code < 400:
+                # Redirect (e.g. 302 Moved Temporarily) - the callee wants
+                # the call sent elsewhere, typically a phone-side "always
+                # forward" configuration.  Only meaningful as a response to
+                # our INVITE (a redirect to a BYE/CANCEL/etc. is not
+                # actionable).
+                cseq_header = message.get_header("CSeq") or ""
+                if call_id and "INVITE" in cseq_header:
+                    self.logger.info(f"Callee redirect {message.status_code} for call {call_id}")
+
+                    # Per RFC 3261 Section 17.1.1.3, the ACK for a non-2xx
+                    # final response (which includes 3xx) is part of the
+                    # same transaction as the INVITE and MUST reuse its Via
+                    # branch.  Without this ACK, the callee's UAS transaction
+                    # never completes and keeps retransmitting the 3xx.
+                    self._send_ack_to_callee(message, addr, call_id, use_invite_branch=True)
+
+                    contact_header = message.get_header("Contact")
+                    self.pbx_core._call_router.handle_redirect(call_id, contact_header)
+
             elif message.status_code and message.status_code >= 400:
                 # Error response from callee (4xx/5xx/6xx) - build a proper
                 # error response to the caller's original INVITE so the Via

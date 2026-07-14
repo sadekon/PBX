@@ -98,6 +98,9 @@ class Call:
         # INVITE transaction for retransmission (RFC 3261)
         self.invite_transaction: Any | None = None
 
+        # Count of SIP 3xx redirects followed for this call (loop guard)
+        self.redirect_count: int = 0
+
     def start(self) -> None:
         """Start the call"""
         self.state = CallState.CALLING
