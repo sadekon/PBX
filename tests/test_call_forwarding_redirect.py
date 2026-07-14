@@ -85,6 +85,8 @@ class TestHandleRedirect:
         target_ext_obj = MagicMock()
         target_ext_obj.address = ("10.0.0.9", 5060)
         target_ext_obj.name = "Forward Target"
+        target_ext_obj.registered = True
+        target_ext_obj.is_expired.return_value = False
         pbx.extension_registry.get.return_value = target_ext_obj
 
         router = CallRouter(pbx)
@@ -96,6 +98,35 @@ class TestHandleRedirect:
         assert call.invite_transaction is not None
         assert call.no_answer_timer is not None
         assert call.redirect_count == 1
+        pbx.sip_server._send_message.assert_called()
+
+    def test_redirect_target_registration_recovered_from_database(self) -> None:
+        """
+        A 302 pointing at a sibling extension on the same physical phone
+        (e.g. another line on a multi-line device) must still succeed when
+        that extension's in-memory registration was lost -- e.g. after a
+        PBX restart -- but its database record and last-known IP persist.
+        Mirrors the DB-recovery fallback already used for the initially
+        dialed extension in route_call().
+        """
+        pbx = _make_pbx_core()
+        call = _make_call()
+        pbx.call_manager.get_call.return_value = call
+
+        # Target extension is not currently in the in-memory registry.
+        pbx.extension_registry.get.return_value = None
+        pbx.extension_registry.extensions = {}
+        pbx.registered_phones_db.get_by_extension.return_value = [
+            {"ip_address": "192.168.1.14", "mac_address": "AA:BB:CC:DD:EE:FF"}
+        ]
+        pbx.extension_db = MagicMock()
+        pbx.extension_db.get.return_value = {"number": "1517", "name": "Line 1517"}
+
+        router = CallRouter(pbx)
+        router.handle_redirect("call-1", "<sip:1517@192.168.1.14:5060>")
+
+        assert call.to_extension == "1517"
+        assert call.callee_addr == ("192.168.1.14", 5060)
         pbx.sip_server._send_message.assert_called()
 
     def test_redirect_no_contact_falls_back_to_voicemail(self) -> None:
@@ -199,9 +230,12 @@ class TestHandleRedirect:
 
         target_ext_obj = MagicMock()
         target_ext_obj.address = ("10.0.0.9", 5060)
+        target_ext_obj.registered = True
+        target_ext_obj.is_expired.return_value = False
         pbx.extension_registry.get.return_value = target_ext_obj
 
         router = CallRouter(pbx)
         router.handle_redirect("call-1", "<sip:1003@10.0.0.9:5060>")
 
         stale_timer.cancel.assert_called_once()
+        assert call.to_extension == "1003"

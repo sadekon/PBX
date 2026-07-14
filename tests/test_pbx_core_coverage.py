@@ -1104,6 +1104,11 @@ class TestHandleCalleeAnswer:
         mock_call.connect.assert_called_once()
         pbx.cdr_system.mark_answered.assert_called_once_with("call-42")
         mock_call.no_answer_timer.cancel.assert_called_once()
+        # The tagged To header actually sent to the caller must be captured
+        # -- it's the caller's real dialog identity for any later
+        # PBX-originated request toward it (e.g. a transfer-bridge BYE),
+        # and can't be recovered from original_invite afterward.
+        assert mock_call.caller_dialog_to is not None
 
     def test_callee_answer_no_body(self) -> None:
         """Handle callee answer when response has no SDP body."""

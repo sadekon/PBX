@@ -928,9 +928,12 @@ class SIPServer:
             to_header = call.callee_dialog_to or (source.get_header("To") if source else "")
             uri = f"sip:{call.to_extension}@{target_addr[0]}:{target_addr[1]}"
         elif call.caller_addr and original_invite:
-            # Remaining party is the caller leg -- swap dialog direction
+            # Remaining party is the caller leg -- swap dialog direction.
+            # original_invite's own To header predates any response and so
+            # carries no tag; the caller's real dialog identity is the
+            # tagged To header from the 200 OK the PBX actually sent it.
             target_addr = call.caller_addr
-            from_header = original_invite.get_header("To") or ""
+            from_header = call.caller_dialog_to or (original_invite.get_header("To") or "")
             to_header = original_invite.get_header("From") or ""
             uri = f"sip:{call.from_extension}@{target_addr[0]}:{target_addr[1]}"
         else:

@@ -595,3 +595,66 @@ class TestBlindTransferSequences:
         assert dest == C_ADDR
         assert cm.get_call("call1") is None
         assert cm.get_call(consult_id) is None
+
+    def test_blind_transfer_by_callee_bridges_caller_with_correct_dialog_tag(
+        self, cm: CallManager, relay: RTPRelay
+    ) -> None:
+        """The transferring party can be either side of the original call.
+        Here the *callee* (1517) blind-transfers to D -- the party left
+        connected is the *caller* (1513), exercising _send_leg_bye's
+        caller-remains branch, which depends on caller_dialog_to (the
+        tagged To header the PBX actually sent the caller in its original
+        200 OK) rather than original_invite's own untagged To header."""
+        pbx = _wire_pbx(cm, relay)
+        server = _wire_server(pbx)
+        pbx.extension_registry.get_address.return_value = D_ADDR
+
+        ports = _seed_relay(relay, "call1")
+        relay.set_endpoints("call1", (A_ADDR[0], 100), (B_RTP["address"], B_RTP["port"]))
+        call1 = _basic_call(
+            cm,
+            "call1",
+            "1513",
+            "1517",
+            state=CallState.CONNECTED,
+            caller_addr=A_ADDR,
+            callee_addr=B_ADDR,
+            caller_rtp={"address": A_ADDR[0], "port": 100},
+            callee_rtp=B_RTP,
+            rtp_ports=ports,
+        )
+        # What handle_callee_answer would have captured when 1517 (callee)
+        # originally answered call1 -- a tag the PBX generated, unrelated to
+        # anything in original_invite.
+        call1.caller_dialog_to = "<sip:1513@192.168.1.14:5060>;tag=pbxminted42"
+
+        # 1517 (the callee) blind-transfers to D -- referrer address is B_ADDR
+        server._handle_refer(
+            _refer_message("call1", "<sip:1519@192.168.1.14:5060>", "1517", B_ADDR),
+            B_ADDR,
+        )
+        consult_id = cm.get_call("call1").pending_transfer_consult_id
+        assert consult_id is not None
+        server._handle_bye(_bye_message("call1"), B_ADDR)
+
+        response = MagicMock()
+        response.body = (
+            "v=0\r\no=- 0 0 IN IP4 192.168.10.141\r\ns=-\r\n"
+            f"c=IN IP4 {D_RTP['address']}\r\nt=0 0\r\n"
+            f"m=audio {D_RTP['port']} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
+        )
+        response.get_header.side_effect = {"To": "<sip:1519@192.168.1.14>;tag=answered"}.get
+        pbx.handle_callee_answer(consult_id, response, D_ADDR)
+
+        original = cm.get_call("call1")
+        assert original.bridged_peer_call_id == consult_id
+        assert original.caller_addr == A_ADDR  # 1513 untouched throughout
+
+        # D hangs up -- the BYE reaching 1513 must carry its real dialog tag.
+        server._send_message.reset_mock()
+        server._handle_bye(_bye_message(consult_id), D_ADDR)
+        raw, dest = server._send_message.call_args[0]
+        assert dest == A_ADDR
+        assert "From: <sip:1513@192.168.1.14:5060>;tag=pbxminted42" in raw
+        assert cm.get_call("call1") is None
+        assert cm.get_call(consult_id) is None

@@ -837,6 +837,10 @@ class TestSendLegBye:
             "From": "<sip:1512@192.168.1.14:5060>;tag=518364649",
             "To": "<sip:1513@192.168.1.14:5060>",
         }.get
+        # The tagged To header the PBX actually sent the caller in its 200
+        # OK (captured by handle_callee_answer) -- NOT the same as
+        # original_invite's own To header, which predates any tag.
+        original.caller_dialog_to = "<sip:1513@192.168.1.14:5060>;tag=pbxgenerated99"
 
         pbx = _make_pbx(cm)
         server = _make_server(pbx)
@@ -848,8 +852,41 @@ class TestSendLegBye:
         assert raw.startswith(f"BYE sip:1512@{B_ADDR[0]}:{B_ADDR[1]} SIP/2.0")
         # Direction swapped: request goes To the caller's identity
         assert "To: <sip:1512@192.168.1.14:5060>;tag=518364649" in raw
+        # From must carry the caller's real dialog tag (caller_dialog_to),
+        # not original_invite's untagged To header -- a mismatched/missing
+        # From-tag means the caller's phone can't match this BYE to its
+        # active dialog and never ends the call.
+        assert "From: <sip:1513@192.168.1.14:5060>;tag=pbxgenerated99" in raw
         assert "Via: SIP/2.0/UDP" in raw
         assert "Max-Forwards: 70" in raw
+
+    def test_bye_to_caller_leg_falls_back_when_caller_dialog_to_unset(self) -> None:
+        """Defensive fallback for a call whose caller_dialog_to was never
+        captured (shouldn't happen in practice, but must not crash)."""
+        cm = CallManager()
+        original = _make_call(
+            cm,
+            "call1",
+            "1512",
+            "1513",
+            state=CallState.CONNECTED,
+            caller_addr=B_ADDR,
+            callee_addr=None,
+        )
+        original.original_invite = MagicMock()
+        original.original_invite.get_header.side_effect = {
+            "From": "<sip:1512@192.168.1.14:5060>;tag=518364649",
+            "To": "<sip:1513@192.168.1.14:5060>",
+        }.get
+        assert original.caller_dialog_to is None
+
+        pbx = _make_pbx(cm)
+        server = _make_server(pbx)
+
+        server._send_leg_bye(original)
+
+        raw, _dest = server._send_message.call_args[0]
+        assert "From: <sip:1513@192.168.1.14:5060>" in raw
 
 
 # ===========================================================================

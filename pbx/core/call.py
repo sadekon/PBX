@@ -77,6 +77,12 @@ class Call:
         # advertising the original call's relay port (blind transfer)
         self.callee_dialog_to: str | None = None  # To header (with tag) from the
         # callee's 200 OK -- dialog identity for PBX-originated in-dialog requests
+        # toward the callee leg
+        self.caller_dialog_to: str | None = None  # To header (with the tag the PBX
+        # generated) from the 200 OK the PBX sent the caller -- dialog identity for
+        # PBX-originated in-dialog requests toward the caller leg. build_response()
+        # mints this tag fresh per call; it is never derivable from original_invite
+        # (whose To header predates any response and so carries no tag).
         self.pbx_leg_cseq: int = 1  # CSeq counter for PBX-originated requests
         # toward the callee leg (1 = the INVITE)
 

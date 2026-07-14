@@ -1386,6 +1386,13 @@ class PBXCore:
                 contact_uri = f"<sip:{call.to_extension}@{server_ip}:{sip_port}>"
                 ok_response.set_header("Contact", contact_uri)
 
+                # Capture the tagged To header actually sent to the caller --
+                # build_response() mints this tag fresh; it's the caller's own
+                # dialog identity for any later PBX-originated request toward
+                # it (e.g. a bridge-teardown BYE), and cannot be recovered from
+                # original_invite (whose To header predates this tag).
+                call.caller_dialog_to = ok_response.get_header("To")
+
                 # Send to caller
                 self.sip_server._send_message(ok_response.build(), call.caller_addr)
                 self.logger.info(f"Sent 200 OK to caller for call {call_id}")
