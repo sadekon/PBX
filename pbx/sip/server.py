@@ -898,21 +898,29 @@ class SIPServer:
         self.logger.info(f"  Bridged call ended: {call.call_id} (peer {call.bridged_peer_call_id})")
         self.logger.info("")
 
-    def _send_leg_bye(self, call: Any) -> None:
+    def _send_leg_bye(self, call: Any, side: str | None = None) -> None:
         """
-        Send a BYE to the surviving party of a call leg, using the leg's
-        own stored dialog identity.
+        Send a BYE to a party of a call leg, using the leg's own stored
+        dialog identity.
 
-        For a leg where the remaining party is the callee (e.g. the
-        transfer destination), the dialog is identified by the original
-        INVITE's From header and the To header captured from the callee's
-        200 OK. For a leg where the remaining party is the caller (e.g.
-        the transferee parked by the transferor), the dialog headers are
+        For the callee side (e.g. the transfer destination), the dialog is
+        identified by the original INVITE's From header and the To header
+        captured from the callee's 200 OK. For the caller side (e.g. the
+        transferee parked by the transferor), the dialog headers are
         swapped, mirroring how in-dialog requests toward the caller are
         built elsewhere (see _send_transfer_notify).
 
         Args:
-            call: Call record whose remaining party should receive a BYE.
+            call: Call record whose party should receive a BYE.
+            side: Force which side to target ("caller" or "callee"). If
+                None (default), auto-selects whichever side is populated,
+                callee preferred -- correct for a leg where only one side
+                is expected to still have a real address (e.g. a peer leg
+                after a bridge, whose other side was already nulled). Pass
+                "caller" or "callee" explicitly when both sides are still
+                populated and a specific party must be targeted (e.g. the
+                transferor's own original leg, ended alongside their
+                consultation leg at transfer completion).
         """
         if self.pbx_core is None:
             return
@@ -920,18 +928,18 @@ class SIPServer:
         original_invite = call.original_invite
         callee_invite = getattr(call, "callee_invite", None)
 
-        if call.callee_addr:
-            # Remaining party is the callee leg
+        if call.callee_addr and side != "caller":
+            # Callee side
             target_addr = call.callee_addr
             source = callee_invite or original_invite
             from_header = source.get_header("From") if source else ""
             to_header = call.callee_dialog_to or (source.get_header("To") if source else "")
             uri = f"sip:{call.to_extension}@{target_addr[0]}:{target_addr[1]}"
-        elif call.caller_addr and original_invite:
-            # Remaining party is the caller leg -- swap dialog direction.
-            # original_invite's own To header predates any response and so
-            # carries no tag; the caller's real dialog identity is the
-            # tagged To header from the 200 OK the PBX actually sent it.
+        elif call.caller_addr and original_invite and side != "callee":
+            # Caller side -- swap dialog direction. original_invite's own
+            # To header predates any response and so carries no tag; the
+            # caller's real dialog identity is the tagged To header from
+            # the 200 OK the PBX actually sent it.
             target_addr = call.caller_addr
             from_header = call.caller_dialog_to or (original_invite.get_header("To") or "")
             to_header = original_invite.get_header("From") or ""
@@ -2111,6 +2119,13 @@ class SIPServer:
                         # Cancel no-answer timer since the callee already responded
                         if call.no_answer_timer:
                             call.no_answer_timer.cancel()
+                        # Per RFC 3261 Section 17.1.1.3, ACK the non-2xx final
+                        # response (e.g. 487 Request Terminated after our
+                        # CANCEL) so the callee's transaction completes
+                        # instead of retransmitting.
+                        cseq_header = message.get_header("CSeq") or ""
+                        if "INVITE" in cseq_header:
+                            self._send_ack_to_callee(message, addr, call_id, use_invite_branch=True)
                         if call.caller_addr and call.original_invite:
                             error_response = SIPMessageBuilder.build_response(
                                 message.status_code,

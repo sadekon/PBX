@@ -1838,7 +1838,6 @@ class PBXCore:
             True if the bridge completed.
         """
         from pbx.core.call import CallState
-        from pbx.sip.message import SIPMessageBuilder
 
         dest_rtp = consult.callee_rtp
         if not dest_rtp:
@@ -1889,24 +1888,26 @@ class PBXCore:
             f"{consult.to_extension} (consult {consult.call_id})"
         )
 
-        # Deterministically end the transferor's leg on the consultation
-        # call (their phone usually also sends its own BYE, which the
-        # bridged/stale guards in _handle_bye absorb).
+        # Deterministically end both of the transferor's legs: the
+        # consultation call, and their original leg (the dialog the REFER
+        # itself arrived on, or -- after a peer-leg redirect -- the stale
+        # peer record, whichever still holds the transferor's own address).
+        # Relying on the transferor's phone to end these on its own does
+        # not hold universally: some phones leave one leg's dialog state
+        # untouched, appearing permanently connected/on-hold with no way to
+        # hang up or resume, even though the PBX has already moved on.
         if consult.caller_addr:
-            server_ip = self._get_server_ip()
-            bye_msg = SIPMessageBuilder.build_request(
-                method="BYE",
-                uri=(
-                    f"sip:{consult.from_extension}@"
-                    f"{consult.caller_addr[0]}:{consult.caller_addr[1]}"
-                ),
-                from_addr=f"<sip:{consult.to_extension}@{server_ip}>",
-                to_addr=f"<sip:{consult.from_extension}@{server_ip}>",
-                call_id=consult.call_id,
-                cseq=2,
+            self.sip_server._send_leg_bye(consult, side="caller")
+
+        if stale_peer is not None:
+            # Only one side of the stale peer's own record still holds a
+            # real address (the other was nulled by the earlier bridge) --
+            # auto-detect picks it correctly.
+            self.sip_server._send_leg_bye(stale_peer)
+        else:
+            self.sip_server._send_leg_bye(
+                original, side="caller" if transferor_is_caller else "callee"
             )
-            self.sip_server._add_pbx_request_headers(bye_msg, consult.caller_addr)
-            self.sip_server._send_message(bye_msg.build(), consult.caller_addr)
 
         # Un-park the transferee: stop MOH (also un-pauses the relay).
         self.moh_system.stop_moh(original.call_id)

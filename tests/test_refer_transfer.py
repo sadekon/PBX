@@ -14,7 +14,7 @@ Covers the flow observed from real Zultys ZIP phones:
 """
 
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -218,10 +218,14 @@ class TestBridgeAttendedTransfer:
         # C is re-INVITEd onto the surviving relay; consult relay released
         pbx._send_bridge_reinvite.assert_called_once_with(original, consult)
         pbx.rtp_relay.release_relay.assert_called_once_with("call2")
-        # BYE sent to the transferor's old consult leg, with mandatory
-        # headers (Via/Max-Forwards) added so a real phone accepts it.
-        assert pbx.sip_server._send_message.called
-        pbx.sip_server._add_pbx_request_headers.assert_called_once()
+        # BYE sent to the transferor's old consult leg AND their original
+        # leg -- relying on the transferor's phone to end either on its own
+        # doesn't hold universally (some leave one dialog stuck, appearing
+        # permanently connected/on-hold with no way to hang up or resume).
+        assert pbx.sip_server._send_leg_bye.call_args_list == [
+            call(consult, side="caller"),
+            call(original, side="caller"),
+        ]
 
     def test_bridge_when_transferor_is_callee(self) -> None:
         """B called A originally; A (callee of call1) transfers B to C."""
@@ -264,6 +268,10 @@ class TestBridgeAttendedTransfer:
         assert original.callee_addr is None
         assert original.callee_rtp == C_RTP
         assert consult.bridge_peer_side == "b"
+        assert pbx.sip_server._send_leg_bye.call_args_list == [
+            call(consult, side="caller"),
+            call(original, side="callee"),
+        ]
 
     def test_bridge_falls_back_to_shared_extension_heuristic(self) -> None:
         cm = CallManager()

@@ -225,6 +225,36 @@ class TestFullAttendedTransferSequence:
         assert handler.endpoint_a == (C_RTP["address"], C_RTP["port"])
         assert handler.endpoint_b == (B_RTP["address"], B_RTP["port"])
 
+    def test_transferor_gets_bye_for_both_its_own_legs(
+        self, cm: CallManager, relay: RTPRelay
+    ) -> None:
+        """Relying on the transferor's phone to end its own legs on hangup
+        does not hold universally -- some phones leave the original (held)
+        leg's dialog state untouched, appearing permanently connected/
+        on-hold with no way to hang up or resume even though the PBX has
+        already dropped them from the call entirely."""
+        _pbx, server = self._setup(cm, relay)
+
+        server._handle_refer(
+            _refer_message("call1", _replaces_refer_to("1517", "call2"), "1513", A_ADDR),
+            A_ADDR,
+        )
+
+        byes_to_a = [
+            c.args
+            for c in server._send_message.call_args_list
+            if c.args[1] == A_ADDR and c.args[0].startswith("BYE ")
+        ]
+        assert len(byes_to_a) == 2
+        call_ids_byed = set()
+        for raw, _dest in byes_to_a:
+            assert raw.startswith("BYE ")
+            call_ids_byed.add(next(ln for ln in raw.split("\r\n") if ln.startswith("Call-ID:")))
+        # One BYE for the consultation leg (call2), one for the original
+        # leg (call1) -- A's own dialog identity on both.
+        assert any("call2" in cid for cid in call_ids_byed)
+        assert any("call1" in cid for cid in call_ids_byed)
+
     def test_transferee_hangup_after_bridge_sends_real_bye_to_destination(
         self, cm: CallManager, relay: RTPRelay
     ) -> None:
