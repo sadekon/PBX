@@ -378,7 +378,9 @@ class TestAutoAttendantSession:
     def test_dtmf_transfer_action(
         self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
-        """On DTMF resulting in transfer, should call transfer_call."""
+        """On a transfer, hands off via the blind-transfer pipeline: adopt the
+        caller's port into a relay, set the caller as side A, and originate
+        the destination leg with referrer_addr=None (no real transferor)."""
         mock_time.time.return_value = 100.0
         pbx = _make_pbx_core()
         pbx.auto_attendant._get_audio_file.return_value = None
@@ -388,7 +390,8 @@ class TestAutoAttendantSession:
             "destination": "8001",
             "session": {"state": "TRANSFERRING"},
         }
-        pbx.transfer_call.return_value = True
+        pbx.rtp_relay.adopt_existing_port.return_value = True
+        pbx.start_blind_refer_transfer.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -405,7 +408,15 @@ class TestAutoAttendantSession:
 
         handler._auto_attendant_session("call-1", call_obj, session)
 
-        pbx.transfer_call.assert_called_with("call-1", "8001")
+        pbx.rtp_relay.adopt_existing_port.assert_called_once_with("call-1", 30000, 30001)
+        pbx.rtp_relay.set_endpoints.assert_called_once_with("call-1", ("192.168.1.10", 40000), None)
+        pbx.start_blind_refer_transfer.assert_called_once_with(
+            call_obj, referrer_is_caller=False, destination="8001", referrer_addr=None
+        )
+        # Handed off: the session must not end the call or return the port
+        # (the pool is left untouched -- no extra append of aa_rtp_port).
+        pbx.end_call.assert_not_called()
+        assert pbx.rtp_relay.port_pool == [30000, 30002, 30004]
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
@@ -414,7 +425,8 @@ class TestAutoAttendantSession:
     def test_dtmf_transfer_failure_logged(
         self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
-        """If transfer_call returns False, a warning should be logged."""
+        """If the transfer fails to start (destination offline), a warning is
+        logged and the caller is returned to the menu."""
         mock_time.time.return_value = 100.0
         pbx = _make_pbx_core()
         pbx.auto_attendant._get_audio_file.return_value = None
@@ -424,7 +436,8 @@ class TestAutoAttendantSession:
             "destination": "8001",
             "session": {"state": "TRANSFERRING"},
         }
-        pbx.transfer_call.return_value = False
+        pbx.rtp_relay.adopt_existing_port.return_value = True
+        pbx.start_blind_refer_transfer.return_value = False  # synchronous failure
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -439,8 +452,13 @@ class TestAutoAttendantSession:
 
         mock_get_prompt.return_value = b"AUDIO"
 
-        handler._auto_attendant_session("call-1", call_obj, session)
+        # Stub _return_to_menu so the failure path doesn't spawn a real
+        # background session thread.
+        with patch.object(handler, "_return_to_menu") as mock_return:
+            handler._auto_attendant_session("call-1", call_obj, session)
+
         pbx.logger.warning.assert_called()
+        mock_return.assert_called_once_with("call-1", call_obj)
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
@@ -507,7 +525,8 @@ class TestAutoAttendantSession:
             "action": "transfer",
             "destination": "1001",
         }
-        pbx.transfer_call.return_value = True
+        pbx.rtp_relay.adopt_existing_port.return_value = True
+        pbx.start_blind_refer_transfer.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -525,7 +544,9 @@ class TestAutoAttendantSession:
         handler._auto_attendant_session("call-1", call_obj, session)
 
         pbx.auto_attendant.handle_timeout.assert_called()
-        pbx.transfer_call.assert_called()
+        pbx.start_blind_refer_transfer.assert_called_once_with(
+            call_obj, referrer_is_caller=False, destination="1001", referrer_addr=None
+        )
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
@@ -534,7 +555,8 @@ class TestAutoAttendantSession:
     def test_timeout_transfer_failure_logged(
         self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
-        """When timeout transfer fails, a warning should be logged."""
+        """When a timeout-triggered transfer fails to start, a warning is
+        logged and the caller is returned to the menu."""
         mock_time.time.return_value = 100.0
         pbx = _make_pbx_core()
         pbx.auto_attendant._get_audio_file.return_value = None
@@ -543,7 +565,8 @@ class TestAutoAttendantSession:
             "action": "transfer",
             "destination": "1001",
         }
-        pbx.transfer_call.return_value = False
+        pbx.rtp_relay.adopt_existing_port.return_value = True
+        pbx.start_blind_refer_transfer.return_value = False  # synchronous failure
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -558,8 +581,11 @@ class TestAutoAttendantSession:
 
         mock_get_prompt.return_value = b"AUDIO"
 
-        handler._auto_attendant_session("call-1", call_obj, session)
+        with patch.object(handler, "_return_to_menu") as mock_return:
+            handler._auto_attendant_session("call-1", call_obj, session)
+
         pbx.logger.warning.assert_called()
+        mock_return.assert_called_once_with("call-1", call_obj)
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
@@ -664,7 +690,8 @@ class TestAutoAttendantSession:
     def test_transfer_audio_from_file(
         self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
     ) -> None:
-        """When transferring audio file exists, should play it directly."""
+        """When a transferring audio file exists, it's played before handing
+        off to the transfer pipeline."""
         mock_time.time.return_value = 100.0
         pbx = _make_pbx_core()
         pbx.auto_attendant._get_audio_file.side_effect = lambda name: (
@@ -676,7 +703,8 @@ class TestAutoAttendantSession:
             "destination": "8001",
             "session": {"state": "TRANSFERRING"},
         }
-        pbx.transfer_call.return_value = True
+        pbx.rtp_relay.adopt_existing_port.return_value = True
+        pbx.start_blind_refer_transfer.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -694,8 +722,9 @@ class TestAutoAttendantSession:
         with patch.object(Path, "exists", return_value=True):
             handler._auto_attendant_session("call-1", call_obj, session)
 
-        # transfer should still happen
-        pbx.transfer_call.assert_called()
+        # The transferring prompt file was played, then the transfer started.
+        mock_player.play_file.assert_any_call("/audio/transferring.wav")
+        pbx.start_blind_refer_transfer.assert_called_once()
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
@@ -727,3 +756,69 @@ class TestAutoAttendantSession:
             handler._auto_attendant_session("call-1", call_obj, session)
 
         assert mock_player.play_file.called
+
+    @patch("pbx.core.auto_attendant_handler.time")
+    @patch("pbx.utils.audio.get_prompt_audio")
+    @patch("pbx.rtp.dtmf_monitor.build_ivr_dtmf_channel")
+    @patch("pbx.rtp.handler.RTPPlayer")
+    def test_transfer_adopt_failure_returns_to_menu(
+        self, mock_player_cls, mock_channel, mock_get_prompt, mock_time
+    ) -> None:
+        """If the port cannot be promoted to a relay, return to the menu
+        without originating a destination leg."""
+        mock_time.time.return_value = 100.0
+        pbx = _make_pbx_core()
+        pbx.auto_attendant._get_audio_file.return_value = None
+        pbx.auto_attendant.timeout = 60
+        pbx.auto_attendant.handle_dtmf.return_value = {
+            "action": "transfer",
+            "destination": "8001",
+            "session": {"state": "TRANSFERRING"},
+        }
+        pbx.rtp_relay.adopt_existing_port.return_value = False  # promotion fails
+        handler = AutoAttendantHandler(pbx)
+        call_obj = _make_call()
+
+        session = {"session": {"state": "MAIN_MENU"}, "file": None}
+
+        mock_player = MagicMock()
+        mock_player.start.return_value = True
+        mock_player.play_file.return_value = True
+        mock_player_cls.return_value = mock_player
+
+        mock_channel.return_value = _mock_channel(digits=["1"])
+        mock_get_prompt.return_value = b"AUDIO"
+
+        with patch.object(handler, "_return_to_menu") as mock_return:
+            handler._auto_attendant_session("call-1", call_obj, session)
+
+        pbx.start_blind_refer_transfer.assert_not_called()
+        mock_return.assert_called_once_with("call-1", call_obj)
+
+
+@pytest.mark.unit
+class TestReturnToMenu:
+    """Tests for _return_to_menu (transfer-failure fallback)."""
+
+    @patch("threading.Thread")
+    def test_reclaims_port_and_restarts_reentry_session(self, mock_thread_cls) -> None:
+        """Reclaims the port without returning it to the pool, then spawns a
+        fresh re-entry menu session on the same call."""
+        pbx = _make_pbx_core()
+        handler = AutoAttendantHandler(pbx)
+        call_obj = _make_call()
+        fresh_session = {"session": {"state": "MAIN_MENU"}, "file": None}
+        pbx.auto_attendant.start_session.return_value = fresh_session
+
+        handler._return_to_menu("call-1", call_obj)
+
+        # Port reclaimed from the relay but NOT returned to the pool.
+        pbx.rtp_relay.release_relay_keep_port.assert_called_once_with("call-1")
+        assert pbx.rtp_relay.port_pool == [30000, 30002, 30004]
+        # A fresh menu session was started and spawned with reentry=True.
+        pbx.auto_attendant.start_session.assert_called_once_with("call-1", call_obj.from_extension)
+        mock_thread_cls.assert_called_once()
+        kwargs = mock_thread_cls.call_args.kwargs
+        assert kwargs["args"] == ("call-1", call_obj, fresh_session)
+        assert kwargs["kwargs"] == {"reentry": True}
+        mock_thread_cls.return_value.start.assert_called_once()

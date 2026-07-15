@@ -2059,7 +2059,7 @@ class PBXCore:
         original: Any,
         referrer_is_caller: bool,
         destination: str,
-        referrer_addr: tuple[str, int],
+        referrer_addr: tuple[str, int] | None,
         referred_by: str | None = None,
     ) -> bool:
         """
@@ -2069,10 +2069,19 @@ class PBXCore:
 
         Args:
             original: The call whose remaining party is being transferred.
-            referrer_is_caller: Whether the REFER sender is the original
-                call's caller leg.
+            referrer_is_caller: Whether the referrer occupies the original
+                call's caller leg. There need not be a real REFER sender --
+                an IVR session (e.g. auto attendant) transferring its own
+                single-leg call passes False here, since the caller is
+                always the remaining party in that case.
             destination: Destination extension.
-            referrer_addr: SIP source address of the REFER sender.
+            referrer_addr: SIP source address of the REFER sender, or None
+                if the transfer was not initiated by a real SIP party (e.g.
+                an IVR session transferring its own call). None disables the
+                "absorb the referrer's own BYE" handling in
+                _handle_bye -- there is no referrer leg whose BYE should be
+                silently swallowed, so a real hangup on the remaining leg
+                correctly ends the call instead of being mistaken for it.
             referred_by: Referred-By header value to pass along, if any.
 
         Returns:
@@ -2171,8 +2180,15 @@ class PBXCore:
     def abort_pending_transfer(self, consult: Any, cancel_destination: bool = False) -> None:
         """
         Abort a pending (deferred) transfer whose destination declined,
-        failed, or never answered. The transferor is already gone, so both
-        the consultation leg and the parked transferee leg are torn down.
+        failed, or never answered.
+
+        Default behavior assumes a REFER-based transfer: the transferor is
+        already gone, so both the consultation leg and the parked transferee
+        leg are torn down. If `original.transfer_failure_callback` is set,
+        it is invoked instead of that default -- for a transfer with no real
+        transferor phone to fall back to (e.g. an IVR session transferring
+        its own call), which needs to keep its own call alive and handle the
+        failure itself (e.g. replay a menu) rather than being hung up on.
 
         Args:
             consult: The consultation call record.
@@ -2200,6 +2216,13 @@ class PBXCore:
 
         if original:
             original.pending_transfer_consult_id = None
+
+            if original.transfer_failure_callback is not None:
+                callback = original.transfer_failure_callback
+                original.transfer_failure_callback = None
+                callback()
+                return
+
             # Null the departed transferor's side so the leg BYE reaches the
             # parked transferee, then tear the original call down.
             if original.transfer_referrer_addr is not None:

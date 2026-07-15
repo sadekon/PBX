@@ -267,6 +267,52 @@ class RTPRelay:
             self.port_pool.insert(0, rtp_port)
         return None
 
+    def adopt_existing_port(self, call_id: str, rtp_port: int, rtcp_port: int) -> bool:
+        """
+        Register an already-allocated port pair as an active relay, without
+        drawing a new port from the pool.
+
+        For a call whose audio was being generated/consumed locally (e.g. an
+        IVR session playing prompts directly rather than bridging two
+        parties) and now needs to be handed off to a real two-party relay --
+        typically to transfer such a call while keeping the existing party's
+        RTP flowing to the same address it already knows, with no
+        re-signaling needed on that side. The caller must have already
+        released whatever was previously bound to `rtp_port` (e.g. stopped
+        an RTPPlayer/RTPRecorder using it) -- this rebinds the same port.
+
+        Thread-safe: uses the same lock as allocate_relay/release_relay.
+
+        Args:
+            call_id: Call identifier to register the relay under.
+            rtp_port: Already-allocated RTP port (not drawn from port_pool).
+            rtcp_port: Corresponding RTCP port.
+
+        Returns:
+            True if the relay was registered, False if a relay already
+            exists for `call_id` or the port failed to bind.
+        """
+        with self._pool_lock:
+            if call_id in self.active_relays:
+                self.logger.error(f"Relay already exists for call {call_id}, cannot adopt port")
+                return False
+
+        handler = RTPRelayHandler(rtp_port, call_id, qos_monitor=self.qos_monitor)
+        if not handler.start():
+            self.logger.error(f"Failed to bind adopted port {rtp_port} for call {call_id}")
+            return False
+
+        with self._pool_lock:
+            self.active_relays[call_id] = {
+                "rtp_port": rtp_port,
+                "rtcp_port": rtcp_port,
+                "handler": handler,
+            }
+        self.logger.info(
+            f"Adopted existing port {rtp_port}/{rtcp_port} as relay for call {call_id}"
+        )
+        return True
+
     def set_endpoints(
         self, call_id: str, endpoint_a: AddrTuple | None, endpoint_b: AddrTuple | None
     ) -> None:
@@ -330,6 +376,43 @@ class RTPRelay:
             self.port_pool.sort()
             del self.active_relays[call_id]
             self.logger.info(f"Released RTP relay for call {call_id}")
+
+    def release_relay_keep_port(self, call_id: str) -> tuple[int, int] | None:
+        """
+        Stop and deregister a relay WITHOUT returning its port to the pool.
+
+        The counterpart to adopt_existing_port: for a port that was adopted
+        from outside the normal allocate/release cycle (never drawn from
+        port_pool) and now needs to go back to being owned by a raw
+        RTPPlayer/RTPRecorder on the same port -- e.g. an IVR session
+        reclaiming its port after a transfer attempt failed, to keep serving
+        the same caller on the same port with no re-signaling. Returning the
+        port to the pool here would double-count it (it was never removed),
+        letting an unrelated call allocate the same port and collide.
+
+        The caller owns the returned port pair and is responsible for either
+        rebinding it (RTPPlayer/RTPRecorder) or returning it to the pool
+        itself once truly done.
+
+        Thread-safe: uses the same lock as allocate_relay/release_relay.
+
+        Args:
+            call_id: Call identifier.
+
+        Returns:
+            (rtp_port, rtcp_port) of the released relay, or None if no relay
+            existed for `call_id`.
+        """
+        with self._pool_lock:
+            relay = self.active_relays.pop(call_id, None)
+            if relay is None:
+                return None
+            relay["handler"].stop()
+            self.logger.info(
+                f"Released RTP relay for call {call_id}, keeping port "
+                f"{relay['rtp_port']} for caller reuse"
+            )
+            return (relay["rtp_port"], relay["rtcp_port"])
 
 
 class RTPRelayHandler:

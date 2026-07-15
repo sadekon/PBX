@@ -75,6 +75,13 @@ class Call:
         # the original call, recorded at REFER time (addresses may be nulled later)
         self.uses_peer_relay: bool = False  # Consult leg was originated by the PBX
         # advertising the original call's relay port (blind transfer)
+        # Optional hook invoked by abort_pending_transfer() instead of its
+        # default BYE+end_call when a pending transfer's destination never
+        # answers/declines. Lets a transfer initiator with no real transferor
+        # phone to fall back to (e.g. an IVR session) keep its own call alive
+        # and handle the failure itself, without abort_pending_transfer
+        # needing to know who initiated the transfer.
+        self.transfer_failure_callback: Any | None = None
         self.callee_dialog_to: str | None = None  # To header (with tag) from the
         # callee's 200 OK -- dialog identity for PBX-originated in-dialog requests
         # toward the callee leg

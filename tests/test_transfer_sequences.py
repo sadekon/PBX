@@ -145,6 +145,23 @@ def _replaces_refer_to(dest_ext: str, replaces_call_id: str) -> str:
     return f"<sip:{dest_ext}@192.168.1.14:5060?Replaces={replaces}>"
 
 
+def _hold_reinvite_message(call_id: str, rtp: dict[str, Any]) -> MagicMock:
+    """A re-INVITE placing the call on hold (a=sendonly)."""
+    msg = MagicMock()
+    msg.body = (
+        f"v=0\r\no=- 0 1 IN IP4 {rtp['address']}\r\ns=-\r\n"
+        f"c=IN IP4 {rtp['address']}\r\nt=0 0\r\n"
+        f"m=audio {rtp['port']} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendonly\r\n"
+    )
+    msg.get_header.side_effect = {
+        "Call-ID": call_id,
+        "From": f"<sip:x@192.168.1.14>;tag=t-{call_id}",
+        "To": "<sip:y@192.168.1.14>;tag=u",
+        "CSeq": "2 INVITE",
+    }.get
+    return msg
+
+
 @pytest.fixture
 def relay():  # type: ignore[no-untyped-def]
     r = RTPRelay(port_range_start=30000, port_range_end=30100)
@@ -254,6 +271,46 @@ class TestFullAttendedTransferSequence:
         # leg (call1) -- A's own dialog identity on both.
         assert any("call2" in cid for cid in call_ids_byed)
         assert any("call1" in cid for cid in call_ids_byed)
+
+    def test_hold_on_peer_leg_starts_moh_on_the_shared_relay(
+        self, cm: CallManager, relay: RTPRelay
+    ) -> None:
+        """After a bridge, the destination's dialog is a peer leg that owns
+        no relay of its own. When that party holds (to transfer onward, as
+        happens on the third-and-later transfer of a chain), MOH must start
+        on the shared relay owner -- keying it off the peer leg's own
+        (released) Call-ID silently plays no music."""
+        pbx, server = self._setup(cm, relay)
+        server._handle_refer(
+            _refer_message("call1", _replaces_refer_to("1517", "call2"), "1513", A_ADDR),
+            A_ADDR,
+        )
+        # call2 is now C's peer-leg dialog with no relay; C occupies side "a"
+        # of call1's relay (transferor A was call1's caller).
+        assert relay.get_handler("call2") is None
+        assert cm.get_call("call2").bridge_peer_side == "a"
+
+        # C holds (re-INVITE with a=sendonly on call2).
+        server._handle_reinvite(
+            _hold_reinvite_message("call2", C_RTP), C_ADDR, cm.get_call("call2")
+        )
+
+        # MOH started on the shared relay (call1), not the relay-less peer
+        # leg (call2), and plays to side "b" -- the transferee B.
+        pbx.moh_system.start_moh.assert_called_once()
+        moh_call_id, moh_handler, moh_side = pbx.moh_system.start_moh.call_args[0]
+        assert moh_call_id == "call1"
+        assert moh_handler is relay.get_handler("call1")
+        assert moh_side == "b"
+
+        # The 200 OK advertises call1's live relay port, so C resumes to the
+        # real relay rather than call2's released one.
+        answer = next(
+            c.args[0]
+            for c in server._send_message.call_args_list
+            if c.args[1] == C_ADDR and c.args[0].startswith("SIP/2.0 200")
+        )
+        assert f"m=audio {relay.get_handler('call1').local_port} " in answer
 
     def test_transferee_hangup_after_bridge_sends_real_bye_to_destination(
         self, cm: CallManager, relay: RTPRelay

@@ -509,6 +509,29 @@ class SIPServer:
 
         # Determine which party sent the re-INVITE and update their endpoint
         is_caller = addr == call.caller_addr
+
+        # Resolve which relay actually carries this call's media. A peer leg
+        # left over from an earlier transfer bridge owns no relay of its own
+        # -- the live media flows through the bridged relay owner, where this
+        # leg's remaining party sits on bridge_peer_side. Hold/resume, MOH,
+        # and the answer SDP port must all act on that relay, or a hold on a
+        # thrice-transferred call silently plays no music (get_handler(call_id)
+        # is None) and resume advertises the released relay's dead port.
+        relay_owner = call
+        relay_call_id = call_id
+        peer_side: str | None = None
+        if (
+            self.pbx_core.rtp_relay.get_handler(call_id) is None
+            and call.bridged_peer_call_id
+            and call.bridge_peer_side
+        ):
+            owner = self.pbx_core.call_manager.get_call(call.bridged_peer_call_id)
+            if owner and self.pbx_core.rtp_relay.get_handler(owner.call_id) is not None:
+                relay_owner = owner
+                relay_call_id = owner.call_id
+                peer_side = call.bridge_peer_side
+                self.logger.info(f"Re-INVITE on peer leg {call_id}; media relay is {relay_call_id}")
+
         if new_sdp:
             new_address = new_sdp.get("address")
             new_port = new_sdp.get("port")
@@ -527,8 +550,11 @@ class SIPServer:
                         f"Updated callee media via re-INVITE: {new_address}:{new_port}"
                     )
 
-                # Update RTP relay endpoints
-                if call.rtp_ports:
+                # Update RTP relay endpoints. Skipped for a peer leg: its
+                # party's endpoint on the shared relay is unchanged by a
+                # hold (sendonly keeps the same address) and is owned by the
+                # relay-owner record, not this one.
+                if call.rtp_ports and peer_side is None:
                     caller_ep = (
                         (call.caller_rtp["address"], call.caller_rtp["port"])
                         if call.caller_rtp
@@ -546,7 +572,12 @@ class SIPServer:
         # hold; a=sendrecv (or a body-less re-INVITE) means normal media.
         # A legacy c=0.0.0.0 connection address is also treated as hold.
         sender_leg = "caller" if is_caller else "callee"
-        held_side = "b" if is_caller else "a"  # the *other* leg hears MOH
+        if peer_side is not None:
+            # Holder sits on peer_side of the shared relay; the other side
+            # (the transferee) hears MOH.
+            held_side = "a" if peer_side == "b" else "b"
+        else:
+            held_side = "b" if is_caller else "a"  # the *other* leg hears MOH
         direction = new_sdp.get("direction", "sendrecv") if new_sdp else "sendrecv"
         is_hold_signal = new_sdp is not None and (
             direction in ("sendonly", "inactive") or new_sdp.get("address") == "0.0.0.0"
@@ -558,21 +589,24 @@ class SIPServer:
 
         if is_hold_signal:
             call.hold(held_by=sender_leg)
-            relay_handler = self.pbx_core.rtp_relay.get_handler(call_id)
+            relay_handler = self.pbx_core.rtp_relay.get_handler(relay_call_id)
             if relay_handler:
-                self.pbx_core.moh_system.start_moh(call_id, relay_handler, held_side)
+                self.pbx_core.moh_system.start_moh(relay_call_id, relay_handler, held_side)
             answer_direction = "recvonly"
             skip_forward = True
             self.logger.info(f"Call {call_id} placed on hold by {sender_leg} (a={direction})")
         elif new_sdp and was_on_hold and call.held_by == sender_leg:
             call.resume()
-            self.pbx_core.moh_system.stop_moh(call_id)
+            self.pbx_core.moh_system.stop_moh(relay_call_id)
             skip_forward = True
             self.logger.info(f"Call {call_id} resumed by {sender_leg} (a={direction})")
 
-        # Build answer SDP with codecs compatible with the offered set
+        # Build answer SDP with codecs compatible with the offered set.
+        # The advertised port is the relay owner's (which differs from this
+        # record's own released port on a peer leg), so the holder resumes
+        # sending to the live relay.
         server_ip = self.pbx_core._get_server_ip()
-        rtp_port = call.rtp_ports[0] if call.rtp_ports else 10000
+        rtp_port = relay_owner.rtp_ports[0] if relay_owner.rtp_ports else 10000
 
         # Detect phone model for codec filtering
         ext_number = call.from_extension if is_caller else call.to_extension
