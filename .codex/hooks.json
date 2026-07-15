@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/sadekoninck/Documents/GitHub/PBX/.codex/hooks/session-start.sh'"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -5,7 +5,7 @@ from __future__ import annotations
 import socket
 import struct
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
@@ -181,6 +181,43 @@ class TestMusicOnHold:
     def test_stop_moh_is_idempotent(self, tmp_path: Path) -> None:
         moh = MusicOnHold(moh_directory=str(tmp_path))
         moh.stop_moh("never_held")  # must not raise
+
+    def test_repeated_start_stops_previous_playback(self, tmp_path: Path, monkeypatch) -> None:
+        _write_wav(tmp_path / "default" / "hold.wav")
+        moh = MusicOnHold(moh_directory=str(tmp_path))
+        relay = RTPRelayHandler(local_port=0, call_id="duplicate_hold")
+
+        class FakeThread:
+            instances: ClassVar[list[FakeThread]] = []
+
+            def __init__(self, **_kwargs) -> None:
+                self.alive = False
+                self.join_timeout: float | None = None
+                self.__class__.instances.append(self)
+
+            def start(self) -> None:
+                self.alive = True
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+            def join(self, timeout: float | None = None) -> None:
+                self.join_timeout = timeout
+                self.alive = False
+
+        monkeypatch.setattr("pbx.features.music_on_hold.threading.Thread", FakeThread)
+
+        moh.start_moh("duplicate_hold", relay, "a")
+        previous = moh.active_sessions["duplicate_hold"]
+        previous_thread = previous["thread"]
+
+        moh.start_moh("duplicate_hold", relay, "a")
+
+        assert previous["stop_event"].is_set()
+        assert previous_thread.join_timeout == 1.0
+        assert moh.active_sessions["duplicate_hold"] is not previous
+        assert len(FakeThread.instances) == 2
+        assert relay.paused is True
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ class MusicOnHold:
         self.classes: dict[str, list[Path]] = {}  # class_name -> list of audio files
         self.logger = get_logger()
         self.active_sessions: dict[str, dict[str, Any]] = {}  # call_id -> session state
+        self._session_lock = threading.RLock()
 
         Path(moh_directory).mkdir(parents=True, exist_ok=True)
         self._load_classes()
@@ -90,35 +91,47 @@ class MusicOnHold:
         moh_class = moh_class or self.default_class
         audio_files = self.classes.get(moh_class, [])
 
-        relay_handler.pause_relay()
-        stop_event = threading.Event()
-        session: dict[str, Any] = {
-            "class": moh_class,
-            "relay_handler": relay_handler,
-            "stop_event": stop_event,
-            "thread": None,
-            "file": None,
-        }
-        self.active_sessions[call_id] = session
+        # A phone can repeat its hold re-INVITE.  Keep exactly one playback
+        # thread per relay: multiple RTPPlayers sharing the relay socket each
+        # generate their own RTP sequence/timestamp stream, which garbles
+        # hold audio and can continue after the call is resumed.
+        with self._session_lock:
+            previous = self.active_sessions.pop(call_id, None)
+            if previous is not None:
+                self._stop_session(
+                    previous, resume_relay=previous["relay_handler"] is not relay_handler
+                )
+                self.logger.warning(f"Replaced existing MOH session for call {call_id}")
 
-        if not audio_files:
-            self.logger.warning(
-                f"No MOH files for class '{moh_class}'; holding call {call_id} in silence"
+            relay_handler.pause_relay()
+            stop_event = threading.Event()
+            session: dict[str, Any] = {
+                "class": moh_class,
+                "relay_handler": relay_handler,
+                "stop_event": stop_event,
+                "thread": None,
+                "file": None,
+            }
+            self.active_sessions[call_id] = session
+
+            if not audio_files:
+                self.logger.warning(
+                    f"No MOH files for class '{moh_class}'; holding call {call_id} in silence"
+                )
+                return None
+
+            audio_file = random.choice(audio_files)
+            session["file"] = audio_file
+            thread = threading.Thread(
+                target=self._stream_loop,
+                args=(relay_handler, held_side, audio_file, stop_event),
+                daemon=True,
             )
-            return None
+            session["thread"] = thread
+            thread.start()
 
-        audio_file = random.choice(audio_files)
-        session["file"] = audio_file
-        thread = threading.Thread(
-            target=self._stream_loop,
-            args=(relay_handler, held_side, audio_file, stop_event),
-            daemon=True,
-        )
-        session["thread"] = thread
-        thread.start()
-
-        self.logger.info(f"Started MOH for call {call_id}: {audio_file} -> side {held_side}")
-        return audio_file
+            self.logger.info(f"Started MOH for call {call_id}: {audio_file} -> side {held_side}")
+            return audio_file
 
     def stop_moh(self, call_id: str) -> None:
         """
@@ -129,16 +142,23 @@ class MusicOnHold:
         Args:
             call_id: Call identifier.
         """
-        session = self.active_sessions.pop(call_id, None)
-        if session is None:
-            return
+        with self._session_lock:
+            session = self.active_sessions.pop(call_id, None)
+            if session is None:
+                return
 
+            self._stop_session(session, resume_relay=True)
+            self.logger.info(f"Stopped MOH for call {call_id}")
+
+    @staticmethod
+    def _stop_session(session: dict[str, Any], resume_relay: bool) -> None:
+        """Stop one MOH playback session, optionally resuming its relay."""
         session["stop_event"].set()
         thread: threading.Thread | None = session.get("thread")
         if thread and thread.is_alive():
             thread.join(timeout=1.0)
-        session["relay_handler"].resume_relay()
-        self.logger.info(f"Stopped MOH for call {call_id}")
+        if resume_relay:
+            session["relay_handler"].resume_relay()
 
     def _stream_loop(
         self,
