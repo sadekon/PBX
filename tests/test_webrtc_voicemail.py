@@ -40,7 +40,7 @@ class TestWebRTCVoicemailAccess:
         mock_pbx_core.extension_registry = MagicMock()
         mock_pbx_core.extension_registry.get_extension.return_value = None
         mock_pbx_core.extension_registry.get.return_value = None
-        mock_pbx_core._check_dialplan.return_value = True
+        mock_pbx_core.call_router._check_dialplan.return_value = True
         mock_pbx_core.call_manager = MagicMock()
 
         # Mock call
@@ -159,7 +159,7 @@ class TestWebRTCVoicemailAccess:
         mock_pbx_core = MagicMock()
         mock_pbx_core.extension_registry = MagicMock()
         mock_pbx_core.extension_registry.get_extension.return_value = None
-        mock_pbx_core._check_dialplan.return_value = False
+        mock_pbx_core.call_router._check_dialplan.return_value = False
 
         gateway = WebRTCGateway(mock_pbx_core)
 
@@ -251,7 +251,7 @@ class TestWebRTCAutoAttendant:
         mock_pbx_core.extension_registry = MagicMock()
         mock_pbx_core.extension_registry.get_extension.return_value = None
         mock_pbx_core.extension_registry.get.return_value = None
-        mock_pbx_core._check_dialplan.return_value = True
+        mock_pbx_core.call_router._check_dialplan.return_value = True
         mock_pbx_core.call_manager = MagicMock()
 
         mock_call = MagicMock(spec=Call)
@@ -315,7 +315,7 @@ class TestWebRTCAutoAttendant:
             thread_call = mock_thread.call_args
             assert (
                 thread_call[1]["target"]
-                == mock_pbx_core._auto_attendant_handler._auto_attendant_session
+                == mock_pbx_core.auto_attendant_handler._auto_attendant_session
             )
             assert thread_call[1]["daemon"]
             args = thread_call[1]["args"]
@@ -333,7 +333,7 @@ class TestWebRTCPaging:
         mock_pbx_core.extension_registry = MagicMock()
         mock_pbx_core.extension_registry.get_extension.return_value = None
         mock_pbx_core.extension_registry.get.return_value = None
-        mock_pbx_core._check_dialplan.return_value = True
+        mock_pbx_core.call_router._check_dialplan.return_value = True
         mock_pbx_core.call_manager = MagicMock()
 
         mock_call = MagicMock(spec=Call)
@@ -407,7 +407,7 @@ class TestWebRTCPaging:
         mock_pbx_core.extension_registry = MagicMock()
         mock_pbx_core.extension_registry.get_extension.return_value = None
         mock_pbx_core.extension_registry.get.return_value = None
-        mock_pbx_core._check_dialplan.return_value = True
+        mock_pbx_core.call_router._check_dialplan.return_value = True
         mock_pbx_core.call_manager = MagicMock()
 
         mock_call = MagicMock(spec=Call)
@@ -456,7 +456,7 @@ class TestWebRTCUnsupportedDialplan:
         mock_pbx_core.extension_registry = MagicMock()
         mock_pbx_core.extension_registry.get_extension.return_value = None
         mock_pbx_core.extension_registry.get.return_value = None
-        mock_pbx_core._check_dialplan.return_value = True
+        mock_pbx_core.call_router._check_dialplan.return_value = True
         mock_pbx_core.call_manager = MagicMock()
 
         mock_call = MagicMock(spec=Call)
@@ -502,7 +502,7 @@ class TestWebRTCServiceMediaBridgeFailure:
         mock_pbx_core.extension_registry = MagicMock()
         mock_pbx_core.extension_registry.get_extension.return_value = None
         mock_pbx_core.extension_registry.get.return_value = None
-        mock_pbx_core._check_dialplan.return_value = True
+        mock_pbx_core.call_router._check_dialplan.return_value = True
         mock_pbx_core.call_manager = MagicMock()
 
         mock_call = MagicMock(spec=Call)

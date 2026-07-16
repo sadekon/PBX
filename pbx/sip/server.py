@@ -465,7 +465,9 @@ class SIPServer:
                 return
 
             # Route new call through PBX core
-            success = self.pbx_core.route_call(from_header, to_header, call_id, message, addr)
+            success = self.pbx_core.call_router.route_call(
+                from_header, to_header, call_id, message, addr
+            )
 
             if not success:
                 self._send_response(404, "Not Found", message, addr)
@@ -882,7 +884,9 @@ class SIPServer:
                 consult = self.pbx_core.call_manager.get_call(call.pending_transfer_consult_id)
                 call.pending_transfer_consult_id = None
                 if consult:
-                    self.pbx_core.abort_pending_transfer(consult, cancel_destination=True)
+                    self.pbx_core.transfer_handler.abort_pending_transfer(
+                        consult, cancel_destination=True
+                    )
 
             # End the call internally
             self.logger.info(f"  Processing BYE - ending call {call_id}")
@@ -1056,7 +1060,7 @@ class SIPServer:
 
                 # Forward CANCEL to callee to stop their phone from ringing
                 if call.callee_addr and hasattr(call, "callee_invite") and call.callee_invite:
-                    self.pbx_core._call_router._send_cancel_to_callee(call, call_id)
+                    self.pbx_core.call_router._send_cancel_to_callee(call, call_id)
 
                 # End the call
                 self.pbx_core.end_call(call_id)
@@ -1467,7 +1471,7 @@ class SIPServer:
 
             if consult.callee_rtp:
                 # Destination already answered: bridge immediately.
-                if self.pbx_core.bridge_attended_transfer(call, consult):
+                if self.pbx_core.transfer_handler.bridge_attended_transfer(call, consult):
                     self._send_transfer_notify(message, addr, "SIP/2.0 200 OK", call_id)
                 else:
                     self._send_transfer_notify(
@@ -1484,7 +1488,7 @@ class SIPServer:
             # Blind transfer: PBX originates the destination leg itself
             # and bridges when it answers.
             self.logger.info(f"Blind transfer to {destination}")
-            if self.pbx_core.start_blind_refer_transfer(
+            if self.pbx_core.transfer_handler.start_blind_refer_transfer(
                 call, referrer_is_caller, destination, addr, referred_by
             ):
                 self._send_transfer_notify(message, addr, "SIP/2.0 200 OK", call_id)
@@ -2084,7 +2088,7 @@ class SIPServer:
                     # the 200 OK and eventually tears down the call.
                     self._send_ack_to_callee(message, addr, call_id)
 
-                    self.pbx_core.handle_callee_answer(call_id, message, addr)
+                    self.pbx_core.call_router.handle_callee_answer(call_id, message, addr)
 
             elif message.status_code and 300 <= message.status_code < 400:
                 # Redirect (e.g. 302 Moved Temporarily) - the callee wants
@@ -2104,7 +2108,7 @@ class SIPServer:
                     self._send_ack_to_callee(message, addr, call_id, use_invite_branch=True)
 
                     contact_header = message.get_header("Contact")
-                    self.pbx_core._call_router.handle_redirect(call_id, contact_header)
+                    self.pbx_core.call_router.handle_redirect(call_id, contact_header)
 
             elif message.status_code and message.status_code >= 400:
                 # Error response from callee (4xx/5xx/6xx) - build a proper
@@ -2127,7 +2131,7 @@ class SIPServer:
                                 self._send_ack_to_callee(
                                     message, addr, call_id, use_invite_branch=True
                                 )
-                            self.pbx_core.abort_pending_transfer(call)
+                            self.pbx_core.transfer_handler.abort_pending_transfer(call)
                             return
 
                         # If the caller's leg was already answered (e.g. into

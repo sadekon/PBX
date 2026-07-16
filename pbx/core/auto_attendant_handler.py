@@ -457,7 +457,7 @@ class AutoAttendantHandler:
         Promotes the single-leg IVR port to a two-party relay -- the raw
         RTPPlayer/RTPRecorder are stopped so the relay can rebind the same
         port, the caller becomes side A -- then originates the destination
-        leg through PBXCore.start_blind_refer_transfer (referrer_addr=None:
+        leg through TransferHandler.start_blind_refer_transfer (referrer_addr=None:
         the AA has no real transferor phone). The bridge completes when the
         destination answers (handle_callee_answer -> bridge_attended_transfer
         sets side B). On any failure the registered failure callback returns
@@ -510,7 +510,7 @@ class AutoAttendantHandler:
         # default hangup (see PBXCore.abort_pending_transfer).
         call.transfer_failure_callback = lambda: self._return_to_menu(call_id, call)
 
-        if not pbx.start_blind_refer_transfer(
+        if not pbx.transfer_handler.start_blind_refer_transfer(
             call,
             referrer_is_caller=False,
             destination=destination,

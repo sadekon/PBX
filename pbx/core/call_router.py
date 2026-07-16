@@ -76,7 +76,7 @@ class CallRouter:
         # Must be handled first for immediate routing
         if pbx.karis_law and pbx.karis_law.is_emergency_number(to_ext):
             return bool(
-                pbx._emergency_handler.handle_emergency_call(
+                pbx.emergency_handler.handle_emergency_call(
                     from_ext, to_ext, call_id, message, from_addr
                 )
             )
@@ -84,7 +84,7 @@ class CallRouter:
         # Check if this is an auto attendant call (extension 0)
         if pbx.auto_attendant and to_ext == pbx.auto_attendant.get_extension():
             return bool(
-                pbx._auto_attendant_handler.handle_auto_attendant(
+                pbx.auto_attendant_handler.handle_auto_attendant(
                     from_ext, to_ext, call_id, message, from_addr
                 )
             )
@@ -98,7 +98,7 @@ class CallRouter:
             and to_ext[1:].isdigit()
         ):
             return bool(
-                pbx._voicemail_handler.handle_voicemail_access(
+                pbx.voicemail_handler.handle_voicemail_access(
                     from_ext, to_ext, call_id, message, from_addr
                 )
             )
@@ -106,7 +106,7 @@ class CallRouter:
         # Check if this is a paging call (7xx pattern or all-call)
         if pbx.paging_system and pbx.paging_system.is_paging_extension(to_ext):
             return bool(
-                pbx._paging_handler.handle_paging(from_ext, to_ext, call_id, message, from_addr)
+                pbx.paging_handler.handle_paging(from_ext, to_ext, call_id, message, from_addr)
             )
 
         # Check if destination extension is registered and not expired,
@@ -211,6 +211,232 @@ class CallRouter:
         )
 
         return True
+
+    def handle_callee_answer(
+        self, call_id: str, response_message: Any, callee_addr: tuple[str, int]
+    ) -> None:
+        """
+        Handle when callee answers the call.
+
+        This method handles the initial 200 OK for a new call.  If the call
+        is already connected (e.g., 200 OK to a re-INVITE forwarded by the
+        PBX), only the SDP/RTP endpoints are updated — the call state and
+        CDR are not re-processed.
+
+        Args:
+            call_id: Call identifier
+            response_message: 200 OK response from callee
+            callee_addr: Callee's address
+        """
+        from pbx.sip.message import SIPMessageBuilder
+        from pbx.sip.sdp import SDPBuilder, SDPSession
+
+        pbx = self.pbx_core
+
+        call = pbx.call_manager.get_call(call_id)
+        if not call:
+            pbx.logger.error(f"Call {call_id} not found")
+            return
+
+        # If the call is already connected, this 200 OK is a response to a
+        # re-INVITE we forwarded.  Update the SDP/RTP endpoints but do NOT
+        # re-process call state, CDR, or send a duplicate 200 OK to the caller.
+        if call.state.value == "connected":
+            pbx.logger.info(f"200 OK for already-connected call {call_id} (re-INVITE response)")
+            if not call.callee_dialog_to:
+                call.callee_dialog_to = response_message.get_header("To")
+            if response_message.body:
+                sdp_obj = SDPSession()
+                sdp_obj.parse(response_message.body)
+                new_sdp = sdp_obj.get_audio_info()
+                if new_sdp:
+                    call.callee_rtp = new_sdp
+                    callee_endpoint = (new_sdp["address"], new_sdp["port"])
+                    if call.bridged_peer_call_id and call.bridge_peer_side:
+                        # 200 OK to the bridge re-INVITE: this leg's media
+                        # now lives on the bridged peer's relay.
+                        pbx.rtp_relay.replace_endpoint(
+                            call.bridged_peer_call_id,
+                            call.bridge_peer_side,
+                            callee_endpoint,
+                        )
+                        pbx.logger.info(
+                            f"Refreshed bridged endpoint for call {call_id} on relay "
+                            f"{call.bridged_peer_call_id}"
+                        )
+                        return
+                    caller_endpoint = (
+                        (call.caller_rtp["address"], call.caller_rtp["port"])
+                        if call.caller_rtp
+                        else None
+                    )
+                    if call.rtp_ports and caller_endpoint:
+                        pbx.rtp_relay.set_endpoints(call_id, caller_endpoint, callee_endpoint)
+                        pbx.logger.info(f"Updated RTP endpoints for re-INVITE on call {call_id}")
+            return
+
+        # Parse callee's SDP from 200 OK
+        callee_sdp = None
+        if response_message.body:
+            callee_sdp_obj = SDPSession()
+            callee_sdp_obj.parse(response_message.body)
+            callee_sdp = callee_sdp_obj.get_audio_info()
+
+            if callee_sdp:
+                pbx.logger.info(f"Callee RTP: {callee_sdp['address']}:{callee_sdp['port']}")
+                call.callee_rtp = callee_sdp
+                call.callee_addr = callee_addr
+
+        # Capture the callee's dialog identity (To header with their tag)
+        # for later PBX-originated in-dialog requests (re-INVITE, BYE).
+        call.callee_dialog_to = response_message.get_header("To")
+
+        # Now we have both endpoints, complete the RTP relay setup
+        # Cancel no-answer timer if it's running
+        if call is not None and call.no_answer_timer:
+            call.no_answer_timer.cancel()
+            pbx.logger.info(f"Cancelled no-answer timer for call {call_id}")
+
+        # If this is a transfer consultation call whose bridge was deferred
+        # (REFER arrived before the destination answered -- semi-attended,
+        # or a PBX-originated blind transfer leg), complete the bridge now
+        # instead of running the normal answer flow: the transferor is gone.
+        if call.is_transfer_consult:
+            for other_call in pbx.call_manager.get_active_calls():
+                if other_call.pending_transfer_consult_id == call_id:
+                    pbx.transfer_handler.bridge_attended_transfer(other_call, call)
+                    return
+
+        # Check if this is a WebRTC-originated call
+        webrtc_session_id = getattr(call, "webrtc_session_id", None)
+
+        if webrtc_session_id and call.callee_rtp and call.rtp_ports:
+            # --- WebRTC caller: start aiortc ↔ RTP media bridge ---
+            callee_endpoint = (call.callee_rtp["address"], call.callee_rtp["port"])
+
+            if hasattr(pbx, "webrtc_signaling") and pbx.webrtc_signaling:
+                session = pbx.webrtc_signaling.get_session(webrtc_session_id)
+                if session:
+                    pbx.webrtc_signaling.start_media_bridge(
+                        session, call.rtp_ports[0], callee_endpoint
+                    )
+                    pbx.logger.info(f"WebRTC media bridge started for call {call_id}")
+
+            # Mark call as connected
+            call.connect()
+            pbx.cdr_system.mark_answered(call_id)
+            pbx.logger.info(f"WebRTC call {call_id} connected")
+            return
+
+        # --- Regular SIP-to-SIP path ---
+        # Note: caller endpoint (A) was already set when INVITE was received
+        if call.caller_rtp and call.callee_rtp and call.rtp_ports:
+            caller_endpoint = (call.caller_rtp["address"], call.caller_rtp["port"])
+            callee_endpoint = (call.callee_rtp["address"], call.callee_rtp["port"])
+
+            # set both endpoints (caller was already set, but setting again is safe)
+            # This ensures callee endpoint (B) is now known for bidirectional
+            # relay
+            pbx.rtp_relay.set_endpoints(call_id, caller_endpoint, callee_endpoint)
+            pbx.logger.info(f"RTP relay connected for call {call_id}")
+
+        # Mark call as connected
+        call.connect()
+
+        # Mark CDR as answered for analytics
+        pbx.cdr_system.mark_answered(call_id)
+
+        # Send 200 OK back to caller with PBX's RTP endpoint
+        server_ip = pbx._get_server_ip()
+
+        if call.rtp_ports and call.caller_addr:
+            # Extract the callee's answered codecs from their 200 OK SDP.
+            # The callee's 200 OK contains the codec(s) they actually selected,
+            # so we must reflect those back to the caller to ensure both sides
+            # use the same codec. The RTP relay does not transcode — if we offer
+            # the caller their original full codec list they may pick a different
+            # codec than the callee chose, resulting in no audio.
+            callee_answered_codecs: list[str] | None = None
+            if callee_sdp:
+                callee_answered_codecs = callee_sdp.get("formats", None)
+                if callee_answered_codecs:
+                    pbx.logger.info(f"Callee answered with codecs: {callee_answered_codecs}")
+
+            # Get caller's phone model for any model-specific filtering
+            caller_user_agent = pbx._get_phone_user_agent(call.from_extension)
+            caller_phone_model = pbx._detect_phone_model(caller_user_agent)
+
+            # Use the callee's answered codecs so both sides agree on the codec.
+            # Fall back to the caller's original codecs only if the callee's
+            # 200 OK had no SDP (shouldn't happen in practice).
+            caller_codecs = call.caller_rtp.get("formats", None) if call.caller_rtp else None
+            answered_codecs = callee_answered_codecs or caller_codecs
+
+            # For phones with model-specific codec requirements, compute the
+            # intersection of the callee's answered codecs and the phone model's
+            # supported codecs.  This ensures the caller gets a codec it supports
+            # that the callee has already committed to.
+            codecs_for_caller = pbx._get_compatible_codecs(caller_phone_model, answered_codecs)
+
+            if caller_phone_model:
+                pbx.logger.info(
+                    f"Detected caller phone model: {caller_phone_model}, "
+                    f"offering codecs in 200 OK: {codecs_for_caller}"
+                )
+
+            # Build SDP for caller (with PBX RTP endpoint)
+            # Get DTMF payload type from config
+            dtmf_payload_type = pbx._get_dtmf_payload_type()
+            ilbc_mode = pbx._get_ilbc_mode()
+
+            # Preserve the caller's original media protocol and SRTP crypto
+            # attributes.  The caller's INVITE specified whether it wants SRTP
+            # (RTP/SAVP) or plain RTP (RTP/AVP).  The 200 OK must use the same
+            # protocol or the caller will reject the SDP and produce no audio.
+            caller_protocol = "RTP/AVP"
+            caller_crypto: list[str] | None = None
+            if call.caller_rtp:
+                caller_protocol = call.caller_rtp.get("protocol", "RTP/AVP")
+                caller_crypto = call.caller_rtp.get("crypto") or None
+
+            # Omit rtpmap for static PTs on Zultys phones to avoid codec name
+            # mismatch errors in their RTP engine.
+            skip_rtpmap = pbx._should_skip_static_rtpmap(caller_phone_model)
+
+            caller_response_sdp = SDPBuilder.build_audio_sdp(
+                server_ip,
+                call.rtp_ports[0],
+                session_id=call_id,
+                codecs=codecs_for_caller,
+                dtmf_payload_type=dtmf_payload_type,
+                ilbc_mode=ilbc_mode,
+                protocol=caller_protocol,
+                crypto=caller_crypto,
+                skip_static_rtpmap=skip_rtpmap,
+            )
+
+            # Build 200 OK for caller using original INVITE
+            if call.original_invite:
+                ok_response = SIPMessageBuilder.build_response(
+                    200, "OK", call.original_invite, body=caller_response_sdp
+                )
+                ok_response.set_header("Content-type", "application/sdp")
+
+                # Build Contact header
+                sip_port = pbx.config.get("server.sip_port", 5060)
+                contact_uri = f"<sip:{call.to_extension}@{server_ip}:{sip_port}>"
+                ok_response.set_header("Contact", contact_uri)
+
+                # Capture the tagged To header actually sent to the caller --
+                # build_response() mints this tag fresh; it's the caller's own
+                # dialog identity for any later PBX-originated request toward
+                # it (e.g. a bridge-teardown BYE), and cannot be recovered from
+                # original_invite (whose To header predates this tag).
+                call.caller_dialog_to = ok_response.get_header("To")
+
+                # Send to caller
+                pbx.sip_server._send_message(ok_response.build(), call.caller_addr)
+                pbx.logger.info(f"Sent 200 OK to caller for call {call_id}")
 
     def _resolve_extension(self, to_ext: str) -> Any | None:
         """
@@ -851,7 +1077,7 @@ class CallRouter:
         if call.is_transfer_consult and any(
             c.pending_transfer_consult_id == call_id for c in pbx.call_manager.get_active_calls()
         ):
-            pbx.abort_pending_transfer(call, cancel_destination=True)
+            pbx.transfer_handler.abort_pending_transfer(call, cancel_destination=True)
             return
 
         call.routed_to_voicemail = True
@@ -973,7 +1199,7 @@ class CallRouter:
                 # Schedule voicemail completion after max duration
                 voicemail_timer = threading.Timer(
                     max_duration,
-                    pbx._voicemail_handler.complete_voicemail_recording,
+                    pbx.voicemail_handler.complete_voicemail_recording,
                     args=(call_id,),
                 )
                 voicemail_timer.daemon = True
@@ -982,7 +1208,7 @@ class CallRouter:
 
                 # Start DTMF monitoring thread to detect # key press
                 dtmf_monitor_thread = threading.Thread(
-                    target=pbx._voicemail_handler.monitor_voicemail_dtmf,
+                    target=pbx.voicemail_handler.monitor_voicemail_dtmf,
                     args=(call_id, call, recorder),
                 )
                 dtmf_monitor_thread.daemon = True

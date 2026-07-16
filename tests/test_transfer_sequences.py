@@ -1,18 +1,19 @@
 """Integration-level sequence tests for REFER-based call transfer.
 
 tests/test_refer_transfer.py exercises each transfer method in isolation,
-with the other PBXCore transfer methods left as bare MagicMocks. That style
-cannot catch bugs that only appear from the *interaction* between two real
-methods across a multi-step sequence (e.g. hold, transfer, transfer again,
-hang up in a different order than the happy path).
+with the other TransferHandler/CallRouter methods left as bare MagicMocks.
+That style cannot catch bugs that only appear from the *interaction* between
+two real methods across a multi-step sequence (e.g. hold, transfer, transfer
+again, hang up in a different order than the happy path).
 
-This file wires PBXCore's real transfer methods together (via a MagicMock
-`pbx` whose relevant attributes delegate to the real unbound methods) plus a
-real CallManager and a real RTPRelay (so a silently-missing relay entry -- a
-released relay being operated on -- shows up as an actual no-op, not just a
-mock call that "succeeded"). Each test drives a realistic (or deliberately
-adversarial) sequence of SIP events through the real SIPServer handlers and
-asserts on the resulting call/relay state.
+This file wires real TransferHandler and CallRouter instances onto a
+MagicMock `pbx` (the attributes SIPServer/CallRouter actually call, now that
+there is no PBXCore facade for this logic) plus a real CallManager and a real
+RTPRelay (so a silently-missing relay entry -- a released relay being
+operated on -- shows up as an actual no-op, not just a mock call that
+"succeeded"). Each test drives a realistic (or deliberately adversarial)
+sequence of SIP events through the real SIPServer handlers and asserts on the
+resulting call/relay state.
 """
 
 from typing import Any
@@ -21,7 +22,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from pbx.core.call import CallManager, CallState
-from pbx.core.pbx import PBXCore
+from pbx.core.call_router import CallRouter
+from pbx.core.transfer_handler import TransferHandler
 from pbx.rtp.handler import RTPRelay
 from pbx.sip.server import SIPServer
 
@@ -36,8 +38,8 @@ D_RTP = {"address": "192.168.10.141", "port": 40020}
 
 
 def _wire_pbx(cm: CallManager, relay: RTPRelay) -> MagicMock:
-    """Build a MagicMock PBXCore whose transfer methods delegate to the
-    real PBXCore implementations, with a real CallManager/RTPRelay so
+    """Build a MagicMock PBXCore whose transfer/routing handlers are real
+    TransferHandler/CallRouter instances, with a real CallManager/RTPRelay so
     relay-level bugs (a silent no-op on a released relay) are observable."""
     pbx = MagicMock()
     pbx.call_manager = cm
@@ -56,14 +58,14 @@ def _wire_pbx(cm: CallManager, relay: RTPRelay) -> MagicMock:
     pbx._get_ilbc_mode.return_value = 30
     pbx.extension_registry.is_registered.return_value = True
 
-    def real(name: str) -> Any:
-        return lambda *a, **kw: getattr(PBXCore, name)(pbx, *a, **kw)
-
-    pbx.bridge_attended_transfer.side_effect = real("bridge_attended_transfer")
-    pbx._send_bridge_reinvite.side_effect = real("_send_bridge_reinvite")
-    pbx.start_blind_refer_transfer.side_effect = real("start_blind_refer_transfer")
-    pbx.abort_pending_transfer.side_effect = real("abort_pending_transfer")
-    pbx.handle_callee_answer.side_effect = real("handle_callee_answer")
+    # There is no PBXCore facade for transfer/routing logic anymore -- callers
+    # (SIPServer, CallRouter) reach pbx.transfer_handler / pbx.call_router
+    # directly. This file wants full real behavior across a whole sequence,
+    # so both are wired as complete real instances bound to this mock pbx
+    # (unlike test_refer_transfer.py, which wires only individual methods to
+    # keep other assertions mock-based).
+    pbx.transfer_handler = TransferHandler(pbx)
+    pbx.call_router = CallRouter(pbx)
 
     def real_end_call(call_id: str) -> None:
         call = cm.get_call(call_id)
@@ -528,7 +530,7 @@ class TestOverlappingTransferAttempts:
         )
         response.get_header.side_effect = {"To": "<sip:1517@192.168.1.14>;tag=z"}.get
 
-        pbx.handle_callee_answer("call2", response, C_ADDR)
+        pbx.call_router.handle_callee_answer("call2", response, C_ADDR)
 
         assert original.bridged_peer_call_id == "call2"
 
@@ -666,7 +668,7 @@ class TestBlindTransferSequences:
         )
         response.get_header.side_effect = {"To": "<sip:1517@192.168.1.14>;tag=answered"}.get
 
-        pbx.handle_callee_answer(consult_id, response, C_ADDR)
+        pbx.call_router.handle_callee_answer(consult_id, response, C_ADDR)
 
         original = cm.get_call("call1")
         assert original.bridged_peer_call_id == consult_id
@@ -731,7 +733,7 @@ class TestBlindTransferSequences:
             f"m=audio {D_RTP['port']} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n"
         )
         response.get_header.side_effect = {"To": "<sip:1519@192.168.1.14>;tag=answered"}.get
-        pbx.handle_callee_answer(consult_id, response, D_ADDR)
+        pbx.call_router.handle_callee_answer(consult_id, response, D_ADDR)
 
         original = cm.get_call("call1")
         assert original.bridged_peer_call_id == consult_id

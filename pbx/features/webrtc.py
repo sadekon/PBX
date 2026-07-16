@@ -1586,7 +1586,7 @@ class WebRTCGateway:
             # (voicemail, auto attendant, conference, etc.)
             is_valid_dialplan = False
             if not target_ext_obj:
-                is_valid_dialplan = self.pbx_core._check_dialplan(target_extension)
+                is_valid_dialplan = self.pbx_core.call_router._check_dialplan(target_extension)
 
             if not target_ext_obj and not is_valid_dialplan:
                 self.logger.error(
@@ -1777,8 +1777,8 @@ class WebRTCGateway:
                     message=invite.build(),
                     dest_addr=dest_ext_obj.address,
                     send_fn=self.pbx_core.sip_server._send_message,
-                    on_timeout=lambda cid=call_id: (
-                        self.pbx_core._call_router._handle_invite_timeout(cid)
+                    on_timeout=lambda cid=call_id: self.pbx_core.call_router._handle_invite_timeout(
+                        cid
                     ),
                 )
                 invite_txn.start()
@@ -1791,7 +1791,7 @@ class WebRTCGateway:
                 no_answer_timeout = self.pbx_core.config.get("voicemail.no_answer_timeout", 30)
                 call.no_answer_timer = threading.Timer(
                     no_answer_timeout,
-                    self.pbx_core._call_router._handle_no_answer,
+                    self.pbx_core.call_router._handle_no_answer,
                     args=(call_id,),
                 )
                 call.no_answer_timer.daemon = True
@@ -1938,7 +1938,7 @@ class WebRTCGateway:
                         call.aa_session = aa_session
 
                         aa_thread = threading.Thread(
-                            target=self.pbx_core._auto_attendant_handler._auto_attendant_session,
+                            target=self.pbx_core.auto_attendant_handler._auto_attendant_session,
                             args=(call_id, call, aa_session),
                             daemon=True,
                             name=f"WebRTC-AA-{call_id[:8]}",

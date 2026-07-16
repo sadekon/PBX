@@ -6,7 +6,6 @@ Central coordinator for all PBX functionality
 from __future__ import annotations
 
 import re
-import struct
 import threading
 import traceback
 import uuid
@@ -16,9 +15,11 @@ from typing import TYPE_CHECKING, Any
 from pbx.core.auto_attendant_handler import AutoAttendantHandler
 from pbx.core.call import CallManager
 from pbx.core.call_router import CallRouter
+from pbx.core.codec_negotiator import CodecNegotiator
 from pbx.core.emergency_handler import EmergencyHandler
 from pbx.core.feature_initializer import FeatureInitializer
 from pbx.core.paging_handler import PagingHandler
+from pbx.core.transfer_handler import TransferHandler
 from pbx.core.voicemail_handler import VoicemailHandler
 from pbx.features.extensions import ExtensionRegistry
 from pbx.features.webhooks import WebhookEvent
@@ -197,9 +198,6 @@ class PBXCore:
         self._registration_locks: dict[str, threading.Lock] = {}
         self._registration_locks_guard = threading.Lock()
 
-        # Cache for device detection results keyed by User-Agent string
-        self._device_model_cache: dict[str, str | None] = {}
-
         # Initialize QoS monitoring system first (needed by RTP relay)
         from pbx.features.qos_monitoring import QoSMonitor
 
@@ -243,11 +241,13 @@ class PBXCore:
         self.api_server = PBXFlaskServer(self, api_host, api_port)
 
         # Initialize handler classes for delegated functionality
-        self._call_router = CallRouter(self)
-        self._voicemail_handler = VoicemailHandler(self)
-        self._auto_attendant_handler = AutoAttendantHandler(self)
-        self._emergency_handler = EmergencyHandler(self)
-        self._paging_handler = PagingHandler(self)
+        self.call_router = CallRouter(self)
+        self.voicemail_handler = VoicemailHandler(self)
+        self.auto_attendant_handler = AutoAttendantHandler(self)
+        self.emergency_handler = EmergencyHandler(self)
+        self.paging_handler = PagingHandler(self)
+        self.transfer_handler = TransferHandler(self)
+        self.codec_negotiator = CodecNegotiator(self)
 
         self.running = False
 
@@ -810,208 +810,29 @@ class PBXCore:
 
     def _detect_phone_model(self, user_agent: str | None) -> str | None:
         """
-        Detect phone model from User-Agent string
+        Detect phone model from User-Agent string.
 
-        Args:
-            user_agent: User-Agent header string
-
-        Returns:
-            Phone model identifier string or None.
-            Possible values: 'YEALINK_T23G', 'YEALINK_T33G', 'YEALINK_T46S',
-            'YEALINK_T46G', 'YEALINK_T28G', 'ZIP33G', 'ZIP37G', 'CISCO_CP8851',
-            or None for unknown/other
+        Delegates to :meth:`CodecNegotiator._detect_phone_model`.
         """
-        if not user_agent:
-            return None
-
-        if user_agent in self._device_model_cache:
-            return self._device_model_cache[user_agent]
-
-        try:
-            user_agent_upper = user_agent.upper()
-        except (AttributeError, TypeError):
-            self.logger.debug(f"Invalid User-Agent value for phone detection: {user_agent!r}")
-            return None
-
-        model: str | None = None
-
-        if "ZIP33G" in user_agent_upper or "ZIP 33G" in user_agent_upper:
-            model = "ZIP33G"
-        elif "ZIP37G" in user_agent_upper or "ZIP 37G" in user_agent_upper:
-            model = "ZIP37G"
-        elif "T33G" in user_agent_upper:
-            model = "YEALINK_T33G"
-        elif "T46S" in user_agent_upper:
-            model = "YEALINK_T46S"
-        elif "T46G" in user_agent_upper:
-            model = "YEALINK_T46G"
-        elif "T23G" in user_agent_upper:
-            model = "YEALINK_T23G"
-        elif "T28G" in user_agent_upper:
-            model = "YEALINK_T28G"
-        elif "GRANDSTREAM" in user_agent_upper:
-            model = "GRANDSTREAM_HT" if "HT" in user_agent_upper else "GRANDSTREAM"
-        elif (
-            "CP-8851" in user_agent_upper
-            or "CP8851" in user_agent_upper
-            or "8851" in user_agent_upper
-        ):
-            # Cisco IP Phone CP-8851-3PCC (multiplatform desk phone).
-            # Checked before the generic Cisco/SPA branch since its User-Agent
-            # (e.g. "Cisco-CP-8851-3PCC/11.3.7") also contains "CISCO".
-            model = "CISCO_CP8851"
-        elif "SPA" in user_agent_upper or "CISCO" in user_agent_upper:
-            model = "CISCO_ATA"
-        elif "OBI" in user_agent_upper:
-            model = "OBI_ATA"
-        else:
-            self.logger.debug(
-                f"Unrecognised phone User-Agent: {user_agent!r} — using default codecs"
-            )
-
-        self._device_model_cache[user_agent] = model
-        return model
-
-    def _get_rtpmap_for_phone_model(self, phone_model: str | None) -> dict[str, str] | None:
-        """
-        Get rtpmap name overrides for a specific phone model.
-
-        Currently returns None for all models.  Zultys ZIP 33G/37G phones are
-        handled via ``_should_skip_static_rtpmap()`` instead — omitting rtpmap
-        lines for static payload types avoids the codec name mismatch entirely.
-
-        Args:
-            phone_model: Phone model identifier (from _detect_phone_model)
-
-        Returns:
-            Mapping of payload-type → "name/rate" for the phone, or None for
-            phones that use standard codec names.
-        """
-        return None
+        return self.codec_negotiator._detect_phone_model(user_agent)
 
     def _should_skip_static_rtpmap(self, phone_model: str | None) -> bool:
         """
         Check whether to omit a=rtpmap lines for static payload types.
 
-        Zultys ZIP 33G/37G phones use non-standard numeric codec names in SDP
-        (e.g. ``0/8000`` instead of ``PCMU/8000``).  Their RTP engine (ipph)
-        receives the codec name string from the SIP stack (sua) and tries to
-        match it against an internal codec table that uses numeric IDs.  This
-        fails for both standard names ("PCMU" != "0") and mirrored numeric
-        names ("0" != internal lookup).
-
-        The fix is to omit ``a=rtpmap`` lines for static payload types (0-34).
-        Per RFC 3551, these have well-defined codec assignments and rtpmap is
-        optional.  Without rtpmap, the phone identifies codecs by payload type
-        number alone, which its RTP engine handles correctly.
-
-        Args:
-            phone_model: Phone model identifier (from _detect_phone_model)
-
-        Returns:
-            True if rtpmap lines should be omitted for static payload types.
+        Delegates to :meth:`CodecNegotiator._should_skip_static_rtpmap`.
         """
-        return phone_model in ("ZIP33G", "ZIP37G")
+        return self.codec_negotiator._should_skip_static_rtpmap(phone_model)
 
     def _get_codecs_for_phone_model(
         self, phone_model: str | None, default_codecs: list[str] | None = None
     ) -> list[str]:
         """
-        Get appropriate codec list for a specific phone model
+        Get appropriate codec list for a specific phone model.
 
-        Args:
-            phone_model: Phone model identifier (from _detect_phone_model)
-            default_codecs: Default codecs to use if no specific requirement
-
-        Returns:
-            list of codec payload types as strings
+        Delegates to :meth:`CodecNegotiator._get_codecs_for_phone_model`.
         """
-        # Get DTMF payload type from config (default 101)
-        dtmf_payload_type = self.config.get("features.dtmf.payload_type", 101)
-        dtmf_pt_str = str(dtmf_payload_type)
-
-        if phone_model == "YEALINK_T23G":
-            # Yealink T23G: per provisioning template — PCMU, PCMA, G722, G729, G726-32, iLBC
-            # Payload types: 0=PCMU, 8=PCMA, 9=G722, 18=G729, 2=G726-32
-            codecs = ["0", "8", "9", "18", "2", dtmf_pt_str]
-            self.logger.debug(f"Using Yealink T23G codec set: PCMU/PCMA/G722/G729/G726 ({codecs})")
-            return codecs
-
-        if phone_model == "YEALINK_T33G":
-            # Yealink T33G: per provisioning template — PCMU, PCMA, G722, G729, iLBC
-            # Payload types: 0=PCMU, 8=PCMA, 9=G722, 18=G729
-            codecs = ["0", "8", "9", "18", dtmf_pt_str]
-            self.logger.debug(f"Using Yealink T33G codec set: PCMU/PCMA/G722/G729 ({codecs})")
-            return codecs
-
-        if phone_model in ("YEALINK_T46S", "YEALINK_T46G"):
-            # Yealink T46S/T46G: per provisioning template — PCMU, PCMA, G722,
-            # G729, G726-32, iLBC, Speex
-            # Payload types: 0=PCMU, 8=PCMA, 9=G722, 18=G729, 2=G726-32
-            codecs = ["0", "8", "9", "18", "2", dtmf_pt_str]
-            self.logger.debug(f"Using {phone_model} codec set: PCMU/PCMA/G722/G729/G726 ({codecs})")
-            return codecs
-
-        if phone_model == "YEALINK_T28G":
-            # Yealink T28G: per provisioning template — PCMU, PCMA, G722, G729,
-            # G726-32, iLBC, Speex
-            # Payload types: 0=PCMU, 8=PCMA, 9=G722, 18=G729, 2=G726-32
-            codecs = ["0", "8", "9", "18", "2", dtmf_pt_str]
-            self.logger.debug(f"Using Yealink T28G codec set: PCMU/PCMA/G722/G729/G726 ({codecs})")
-            return codecs
-
-        if phone_model == "ZIP37G":
-            # ZIP37G (Zultys rebrand of Yealink T46G): supports full codec set
-            # per provisioning template — PCMU, PCMA, G722, G729, G726-32, iLBC, Speex
-            # Payload types: 0=PCMU, 8=PCMA, 9=G722, 18=G729, 2=G726-32
-            codecs = ["0", "8", "9", "18", "2", dtmf_pt_str]
-            self.logger.debug(f"Using ZIP37G codec set: PCMU/PCMA/G722/G729/G726 ({codecs})")
-            return codecs
-
-        if phone_model == "ZIP33G":
-            # ZIP33G (Zultys rebrand of Yealink T28G): supports full codec set
-            # per provisioning template — PCMU, PCMA, G722, G729, G726-32, iLBC, Speex
-            # Payload types: 0=PCMU, 8=PCMA, 9=G722, 18=G729, 2=G726-32
-            codecs = ["0", "8", "9", "18", "2", dtmf_pt_str]
-            self.logger.debug(f"Using ZIP33G codec set: PCMU/PCMA/G722/G729/G726 ({codecs})")
-            return codecs
-
-        if phone_model == "GRANDSTREAM_HT":
-            # Grandstream HT series ATAs: PCMU, PCMA, G722, G729, G726-32
-            # HT801/802/812/814 support these standard codecs
-            codecs = ["0", "8", "9", "18", "2", dtmf_pt_str]
-            self.logger.debug(
-                f"Using Grandstream HT ATA codec set: PCMU/PCMA/G722/G729/G726 ({codecs})"
-            )
-            return codecs
-
-        if phone_model == "GRANDSTREAM":
-            # Grandstream phones (GXP series, etc.): full codec support
-            codecs = ["0", "8", "9", "18", "2", dtmf_pt_str]
-            self.logger.debug(f"Using Grandstream codec set: PCMU/PCMA/G722/G729/G726 ({codecs})")
-            return codecs
-
-        if phone_model == "CISCO_CP8851":
-            # Cisco CP-8851-3PCC multiplatform desk phone: PCMU, PCMA, G722
-            # (wideband), G729a — matches the cisco_cp8851 provisioning template.
-            # Payload types: 0=PCMU, 8=PCMA, 9=G722, 18=G729
-            codecs = ["0", "8", "9", "18", dtmf_pt_str]
-            self.logger.debug(f"Using Cisco CP-8851-3PCC codec set: PCMU/PCMA/G722/G729 ({codecs})")
-            return codecs
-
-        if phone_model in ("CISCO_ATA", "OBI_ATA"):
-            # Cisco/Linksys SPA and OBi ATAs: PCMU, PCMA, G722, G729
-            codecs = ["0", "8", "9", "18", dtmf_pt_str]
-            self.logger.debug(f"Using {phone_model} codec set: PCMU/PCMA/G722/G729 ({codecs})")
-            return codecs
-
-        # For unknown or other phones, use default behavior
-        if default_codecs:
-            self.logger.debug(f"Using default codec set for unknown phone: {default_codecs}")
-            return default_codecs
-
-        # Ultimate fallback - standard codec list
-        return ["0", "8", "9", "18", "2", dtmf_pt_str]
+        return self.codec_negotiator._get_codecs_for_phone_model(phone_model, default_codecs)
 
     def _get_compatible_codecs(
         self, phone_model: str | None, answered_codecs: list[str] | None
@@ -1019,134 +840,33 @@ class PBXCore:
         """
         Compute codecs compatible with both the phone model and the answered codec set.
 
-        When the PBX relays RTP without transcoding, both call legs must use the
-        same codec.  This method intersects the callee's answered codecs with the
-        phone-model-specific set (if any) so the 200 OK sent to the caller only
-        offers codecs that both sides support.
-
-        Args:
-            phone_model: Phone model identifier (from _detect_phone_model)
-            answered_codecs: Codecs the remote side actually selected (from SDP answer)
-
-        Returns:
-            list of codec payload types as strings
+        Delegates to :meth:`CodecNegotiator._get_compatible_codecs`.
         """
-        dtmf_payload_type = self.config.get("features.dtmf.payload_type", 101)
-        dtmf_pt_str = str(dtmf_payload_type)
-
-        model_codecs = self._get_codecs_for_phone_model(phone_model)
-
-        if not answered_codecs:
-            return model_codecs
-
-        # Build intersection preserving the answered codec order (callee's preference)
-        model_set = set(model_codecs)
-        answered_set = set(answered_codecs)
-        compatible = [c for c in answered_codecs if c in model_set]
-
-        # Only include DTMF telephone-event if the remote side actually offered
-        # it.  Adding telephone-event to an SDP answer when the offer didn't
-        # include it violates RFC 3264 and confuses some phone firmware.
-        if (
-            dtmf_pt_str in model_set
-            and dtmf_pt_str in answered_set
-            and dtmf_pt_str not in compatible
-        ):
-            compatible.append(dtmf_pt_str)
-
-        # De-duplicate while preserving order
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for c in compatible:
-            if c not in seen:
-                seen.add(c)
-                deduped.append(c)
-        compatible = deduped
-
-        # Ensure the intersection has at least one audio codec (not just DTMF)
-        has_audio_codec = any(c != dtmf_pt_str for c in compatible)
-        if compatible and has_audio_codec:
-            self.logger.debug(f"Compatible codecs for {phone_model or 'unknown'}: {compatible}")
-            return compatible
-
-        # If intersection is empty, fall back to the answered codecs to avoid
-        # a completely empty SDP.  The phone will 488 if truly incompatible.
-        self.logger.warning(
-            f"No codec overlap between model {phone_model} and answered {answered_codecs}, "
-            f"falling back to answered codecs"
-        )
-        return answered_codecs
+        return self.codec_negotiator._get_compatible_codecs(phone_model, answered_codecs)
 
     def _get_phone_user_agent(self, extension_number: str) -> str | None:
         """
-        Get User-Agent string for a registered phone by extension number
+        Get User-Agent string for a registered phone by extension number.
 
-        Args:
-            extension_number: Extension number string
-
-        Returns:
-            User-Agent string or None if not found
+        Delegates to :meth:`CodecNegotiator._get_phone_user_agent`.
         """
-        if not self.registered_phones_db or not self.database.enabled:
-            return None
-
-        try:
-            # Query registered_phones table for this extension
-            query = """
-            SELECT user_agent FROM registered_phones
-            WHERE extension_number = %s
-            ORDER BY last_registered DESC
-            LIMIT 1
-            """
-
-            result = self.database.fetch_one(query, (extension_number,))
-            if result and result.get("user_agent"):
-                return str(result["user_agent"])
-        except (KeyError, TypeError, ValueError) as e:
-            self.logger.debug(f"Error retrieving User-Agent for extension {extension_number}: {e}")
-
-        return None
+        return self.codec_negotiator._get_phone_user_agent(extension_number)
 
     def _get_dtmf_payload_type(self) -> int:
         """
-        Get DTMF payload type from configuration
+        Get DTMF payload type from configuration.
 
-        Returns:
-            DTMF payload type as integer (default: 101)
+        Delegates to :meth:`CodecNegotiator._get_dtmf_payload_type`.
         """
-        return self.config.get("features.dtmf.payload_type", 101)
+        return self.codec_negotiator._get_dtmf_payload_type()
 
     def _get_ilbc_mode(self) -> int:
         """
-        Get iLBC mode from configuration
+        Get iLBC mode from configuration.
 
-        Returns:
-            iLBC mode (20 or 30 ms) as integer (default: 30)
+        Delegates to :meth:`CodecNegotiator._get_ilbc_mode`.
         """
-        return self.config.get("codecs.ilbc.mode", 30)
-
-    def route_call(
-        self,
-        from_header: str,
-        to_header: str,
-        call_id: str,
-        message: Any,
-        from_addr: tuple[str, int],
-    ) -> bool:
-        """
-        Route call from one extension to another
-
-        Args:
-            from_header: From SIP header
-            to_header: To SIP header
-            call_id: Call ID
-            message: SIP INVITE message
-            from_addr: Address tuple of caller
-
-        Returns:
-            True if call was routed successfully
-        """
-        return self._call_router.route_call(from_header, to_header, call_id, message, from_addr)
+        return self.codec_negotiator._get_ilbc_mode()
 
     def _get_server_ip(self) -> str:
         """
@@ -1172,230 +892,6 @@ class PBXCore:
             return ip
         except OSError:
             return "127.0.0.1"  # Last resort fallback
-
-    def handle_callee_answer(
-        self, call_id: str, response_message: Any, callee_addr: tuple[str, int]
-    ) -> None:
-        """
-        Handle when callee answers the call.
-
-        This method handles the initial 200 OK for a new call.  If the call
-        is already connected (e.g., 200 OK to a re-INVITE forwarded by the
-        PBX), only the SDP/RTP endpoints are updated — the call state and
-        CDR are not re-processed.
-
-        Args:
-            call_id: Call identifier
-            response_message: 200 OK response from callee
-            callee_addr: Callee's address
-        """
-        from pbx.sip.message import SIPMessageBuilder
-        from pbx.sip.sdp import SDPBuilder, SDPSession
-
-        call = self.call_manager.get_call(call_id)
-        if not call:
-            self.logger.error(f"Call {call_id} not found")
-            return
-
-        # If the call is already connected, this 200 OK is a response to a
-        # re-INVITE we forwarded.  Update the SDP/RTP endpoints but do NOT
-        # re-process call state, CDR, or send a duplicate 200 OK to the caller.
-        if call.state.value == "connected":
-            self.logger.info(f"200 OK for already-connected call {call_id} (re-INVITE response)")
-            if not call.callee_dialog_to:
-                call.callee_dialog_to = response_message.get_header("To")
-            if response_message.body:
-                sdp_obj = SDPSession()
-                sdp_obj.parse(response_message.body)
-                new_sdp = sdp_obj.get_audio_info()
-                if new_sdp:
-                    call.callee_rtp = new_sdp
-                    callee_endpoint = (new_sdp["address"], new_sdp["port"])
-                    if call.bridged_peer_call_id and call.bridge_peer_side:
-                        # 200 OK to the bridge re-INVITE: this leg's media
-                        # now lives on the bridged peer's relay.
-                        self.rtp_relay.replace_endpoint(
-                            call.bridged_peer_call_id,
-                            call.bridge_peer_side,
-                            callee_endpoint,
-                        )
-                        self.logger.info(
-                            f"Refreshed bridged endpoint for call {call_id} on relay "
-                            f"{call.bridged_peer_call_id}"
-                        )
-                        return
-                    caller_endpoint = (
-                        (call.caller_rtp["address"], call.caller_rtp["port"])
-                        if call.caller_rtp
-                        else None
-                    )
-                    if call.rtp_ports and caller_endpoint:
-                        self.rtp_relay.set_endpoints(call_id, caller_endpoint, callee_endpoint)
-                        self.logger.info(f"Updated RTP endpoints for re-INVITE on call {call_id}")
-            return
-
-        # Parse callee's SDP from 200 OK
-        callee_sdp = None
-        if response_message.body:
-            callee_sdp_obj = SDPSession()
-            callee_sdp_obj.parse(response_message.body)
-            callee_sdp = callee_sdp_obj.get_audio_info()
-
-            if callee_sdp:
-                self.logger.info(f"Callee RTP: {callee_sdp['address']}:{callee_sdp['port']}")
-                call.callee_rtp = callee_sdp
-                call.callee_addr = callee_addr
-
-        # Capture the callee's dialog identity (To header with their tag)
-        # for later PBX-originated in-dialog requests (re-INVITE, BYE).
-        call.callee_dialog_to = response_message.get_header("To")
-
-        # Now we have both endpoints, complete the RTP relay setup
-        # Cancel no-answer timer if it's running
-        if call is not None and call.no_answer_timer:
-            call.no_answer_timer.cancel()
-            self.logger.info(f"Cancelled no-answer timer for call {call_id}")
-
-        # If this is a transfer consultation call whose bridge was deferred
-        # (REFER arrived before the destination answered -- semi-attended,
-        # or a PBX-originated blind transfer leg), complete the bridge now
-        # instead of running the normal answer flow: the transferor is gone.
-        if call.is_transfer_consult:
-            for other_call in self.call_manager.get_active_calls():
-                if other_call.pending_transfer_consult_id == call_id:
-                    self.bridge_attended_transfer(other_call, call)
-                    return
-
-        # Check if this is a WebRTC-originated call
-        webrtc_session_id = getattr(call, "webrtc_session_id", None)
-
-        if webrtc_session_id and call.callee_rtp and call.rtp_ports:
-            # --- WebRTC caller: start aiortc ↔ RTP media bridge ---
-            callee_endpoint = (call.callee_rtp["address"], call.callee_rtp["port"])
-
-            if hasattr(self, "webrtc_signaling") and self.webrtc_signaling:
-                session = self.webrtc_signaling.get_session(webrtc_session_id)
-                if session:
-                    self.webrtc_signaling.start_media_bridge(
-                        session, call.rtp_ports[0], callee_endpoint
-                    )
-                    self.logger.info(f"WebRTC media bridge started for call {call_id}")
-
-            # Mark call as connected
-            call.connect()
-            self.cdr_system.mark_answered(call_id)
-            self.logger.info(f"WebRTC call {call_id} connected")
-            return
-
-        # --- Regular SIP-to-SIP path ---
-        # Note: caller endpoint (A) was already set when INVITE was received
-        if call.caller_rtp and call.callee_rtp and call.rtp_ports:
-            caller_endpoint = (call.caller_rtp["address"], call.caller_rtp["port"])
-            callee_endpoint = (call.callee_rtp["address"], call.callee_rtp["port"])
-
-            # set both endpoints (caller was already set, but setting again is safe)
-            # This ensures callee endpoint (B) is now known for bidirectional
-            # relay
-            self.rtp_relay.set_endpoints(call_id, caller_endpoint, callee_endpoint)
-            self.logger.info(f"RTP relay connected for call {call_id}")
-
-        # Mark call as connected
-        call.connect()
-
-        # Mark CDR as answered for analytics
-        self.cdr_system.mark_answered(call_id)
-
-        # Send 200 OK back to caller with PBX's RTP endpoint
-        server_ip = self._get_server_ip()
-
-        if call.rtp_ports and call.caller_addr:
-            # Extract the callee's answered codecs from their 200 OK SDP.
-            # The callee's 200 OK contains the codec(s) they actually selected,
-            # so we must reflect those back to the caller to ensure both sides
-            # use the same codec. The RTP relay does not transcode — if we offer
-            # the caller their original full codec list they may pick a different
-            # codec than the callee chose, resulting in no audio.
-            callee_answered_codecs: list[str] | None = None
-            if callee_sdp:
-                callee_answered_codecs = callee_sdp.get("formats", None)
-                if callee_answered_codecs:
-                    self.logger.info(f"Callee answered with codecs: {callee_answered_codecs}")
-
-            # Get caller's phone model for any model-specific filtering
-            caller_user_agent = self._get_phone_user_agent(call.from_extension)
-            caller_phone_model = self._detect_phone_model(caller_user_agent)
-
-            # Use the callee's answered codecs so both sides agree on the codec.
-            # Fall back to the caller's original codecs only if the callee's
-            # 200 OK had no SDP (shouldn't happen in practice).
-            caller_codecs = call.caller_rtp.get("formats", None) if call.caller_rtp else None
-            answered_codecs = callee_answered_codecs or caller_codecs
-
-            # For phones with model-specific codec requirements, compute the
-            # intersection of the callee's answered codecs and the phone model's
-            # supported codecs.  This ensures the caller gets a codec it supports
-            # that the callee has already committed to.
-            codecs_for_caller = self._get_compatible_codecs(caller_phone_model, answered_codecs)
-
-            if caller_phone_model:
-                self.logger.info(
-                    f"Detected caller phone model: {caller_phone_model}, "
-                    f"offering codecs in 200 OK: {codecs_for_caller}"
-                )
-
-            # Build SDP for caller (with PBX RTP endpoint)
-            # Get DTMF payload type from config
-            dtmf_payload_type = self._get_dtmf_payload_type()
-            ilbc_mode = self._get_ilbc_mode()
-
-            # Preserve the caller's original media protocol and SRTP crypto
-            # attributes.  The caller's INVITE specified whether it wants SRTP
-            # (RTP/SAVP) or plain RTP (RTP/AVP).  The 200 OK must use the same
-            # protocol or the caller will reject the SDP and produce no audio.
-            caller_protocol = "RTP/AVP"
-            caller_crypto: list[str] | None = None
-            if call.caller_rtp:
-                caller_protocol = call.caller_rtp.get("protocol", "RTP/AVP")
-                caller_crypto = call.caller_rtp.get("crypto") or None
-
-            # Omit rtpmap for static PTs on Zultys phones to avoid codec name
-            # mismatch errors in their RTP engine.
-            skip_rtpmap = self._should_skip_static_rtpmap(caller_phone_model)
-
-            caller_response_sdp = SDPBuilder.build_audio_sdp(
-                server_ip,
-                call.rtp_ports[0],
-                session_id=call_id,
-                codecs=codecs_for_caller,
-                dtmf_payload_type=dtmf_payload_type,
-                ilbc_mode=ilbc_mode,
-                protocol=caller_protocol,
-                crypto=caller_crypto,
-                skip_static_rtpmap=skip_rtpmap,
-            )
-
-            # Build 200 OK for caller using original INVITE
-            if call.original_invite:
-                ok_response = SIPMessageBuilder.build_response(
-                    200, "OK", call.original_invite, body=caller_response_sdp
-                )
-                ok_response.set_header("Content-type", "application/sdp")
-
-                # Build Contact header
-                sip_port = self.config.get("server.sip_port", 5060)
-                contact_uri = f"<sip:{call.to_extension}@{server_ip}:{sip_port}>"
-                ok_response.set_header("Contact", contact_uri)
-
-                # Capture the tagged To header actually sent to the caller --
-                # build_response() mints this tag fresh; it's the caller's own
-                # dialog identity for any later PBX-originated request toward
-                # it (e.g. a bridge-teardown BYE), and cannot be recovered from
-                # original_invite (whose To header predates this tag).
-                call.caller_dialog_to = ok_response.get_header("To")
-
-                # Send to caller
-                self.sip_server._send_message(ok_response.build(), call.caller_addr)
-                self.logger.info(f"Sent 200 OK to caller for call {call_id}")
 
     def end_call(self, call_id: str) -> None:
         """
@@ -1512,842 +1008,76 @@ class PBXCore:
         else:
             self.logger.debug(f"Queued DTMF '{dtmf_digit}' from SIP INFO for call {call_id}")
 
-    def transfer_call(self, call_id: str, new_destination: str) -> bool:
+    def _resolve_hold_relay(self, call: Any, held_by: str) -> tuple[str, str]:
         """
-        Transfer call to new destination using SIP REFER
+        Resolve which relay carries a call's media and which relay side
+        should hear MOH while `held_by` holds the call.
+
+        Mirrors SIPServer._handle_reinvite's relay resolution: a peer leg
+        left over from an earlier transfer bridge owns no relay of its own,
+        so the live media flows through the bridged relay owner instead.
 
         Args:
-            call_id: Call identifier
-            new_destination: New destination extension
+            call: Call to resolve.
+            held_by: Which leg is holding ("caller" or "callee").
 
         Returns:
-            True if transfer initiated
+            Tuple of (relay_call_id, held_side).
         """
-        from pbx.sip.message import SIPMessageBuilder
-
-        call = self.call_manager.get_call(call_id)
-        if not call:
-            self.logger.error(f"Call {call_id} not found for transfer")
-            return False
-
-        # Verify new destination exists
-        if not self.extension_registry.is_registered(new_destination):
-            self.logger.error(f"Transfer destination {new_destination} not registered")
-            return False
-
-        self.logger.info(
-            f"Transferring call {call_id} from {call.from_extension} to {new_destination}"
-        )
-
-        # Determine which party to send REFER to (typically the caller)
-        refer_to_addr = call.caller_addr or call.callee_addr
-        if not refer_to_addr:
-            self.logger.error(f"No address found for REFER in call {call_id}")
-            return False
-
-        # Build REFER message
-        server_ip = self._get_server_ip()
-        sip_port = self.config.get("server.sip_port", 5060)
-
-        refer_msg = SIPMessageBuilder.build_request(
-            method="REFER",
-            uri=f"sip:{call.from_extension}@{server_ip}",
-            from_addr=f"<sip:{call.to_extension}@{server_ip}>",
-            to_addr=f"<sip:{call.from_extension}@{server_ip}>",
-            call_id=call_id,
-            cseq=1,
-        )
-
-        # Add Refer-To header with new destination
-        refer_msg.set_header("Refer-To", f"<sip:{new_destination}@{server_ip}>")
-
-        # Add Referred-By header
-        refer_msg.set_header("Referred-By", f"<sip:{call.to_extension}@{server_ip}>")
-
-        # Add Contact header
-        refer_msg.set_header(
-            "Contact",
-            f"<sip:{call.to_extension}@{server_ip}:{sip_port}>",
-        )
-
-        # Send REFER message
-        self.sip_server._send_message(refer_msg.build(), refer_to_addr)
-        self.logger.info(
-            f"Sent REFER to {refer_to_addr} for call {call_id} to transfer to {new_destination}"
-        )
-
-        # Mark call as transferred
-        call.transferred = True
-        call.transfer_destination = new_destination
-
-        return True
-
-    def blind_transfer(self, call_id: str, destination: str) -> bool:
-        """
-        Perform blind (unattended) transfer.
-
-        The transferring party's call leg is immediately terminated and the
-        remaining party is connected to the new destination via a new INVITE.
-
-        Args:
-            call_id: Call identifier
-            destination: Destination extension to transfer to
-
-        Returns:
-            True if transfer initiated successfully
-        """
-        from pbx.sip.message import SIPMessageBuilder
-        from pbx.sip.sdp import SDPBuilder
-
-        call = self.call_manager.get_call(call_id)
-        if not call:
-            self.logger.error(f"Call {call_id} not found for blind transfer")
-            return False
-
-        if not self.extension_registry.is_registered(destination):
-            self.logger.error(f"Blind transfer destination {destination} not registered")
-            return False
-
-        dest_addr = self.extension_registry.get_address(destination)
-        if not dest_addr:
-            self.logger.error(f"No address for blind transfer destination {destination}")
-            return False
-
-        self.logger.info(f"Blind transfer: call {call_id} to {destination}")
-
-        # Set call state to transferring
-        from pbx.core.call import CallState
-
-        call.state = CallState.TRANSFERRING
-        call.transferred = True
-        call.transfer_destination = destination
-
-        # Build new INVITE to the transfer destination
-        server_ip = self._get_server_ip()
-        sip_port = self.config.get("server.sip_port", 5060)
-        new_call_id = str(uuid.uuid4())
-
-        invite_msg = SIPMessageBuilder.build_request(
-            method="INVITE",
-            uri=f"sip:{destination}@{dest_addr[0]}:{dest_addr[1]}",
-            from_addr=f"<sip:{call.from_extension}@{server_ip}>",
-            to_addr=f"<sip:{destination}@{server_ip}>",
-            call_id=new_call_id,
-            cseq=1,
-        )
-        invite_msg.set_header("Contact", f"<sip:{call.from_extension}@{server_ip}:{sip_port}>")
-
-        # Include SDP with the existing RTP relay ports
-        if call.rtp_ports:
-            transfer_protocol = "RTP/AVP"
-            transfer_crypto: list[str] | None = None
-            if call.caller_rtp:
-                transfer_protocol = call.caller_rtp.get("protocol", "RTP/AVP")
-                transfer_crypto = call.caller_rtp.get("crypto") or None
-            transfer_sdp = SDPBuilder.build_audio_sdp(
-                server_ip,
-                call.rtp_ports[0],
-                session_id=new_call_id,
-                protocol=transfer_protocol,
-                crypto=transfer_crypto,
-            )
-            invite_msg.body = transfer_sdp
-            invite_msg.set_header("Content-type", "application/sdp")
-            invite_msg.set_header("Content-Length", str(len(transfer_sdp.encode("utf-8"))))
-
-        # Send INVITE to new destination
-        self.sip_server._send_message(invite_msg.build(), dest_addr)
-
-        # Create new call record for the transferred leg
-        new_call = self.call_manager.create_call(new_call_id, call.from_extension, destination)
-        new_call.start()
-        new_call.caller_rtp = call.caller_rtp
-        new_call.caller_addr = call.caller_addr
-        new_call.rtp_ports = call.rtp_ports
-
-        # Transfer RTP relay ownership from old call to new call before ending
-        # the old call (end_call releases the relay, which would kill audio)
-        relay_info = self.rtp_relay.active_relays.pop(call_id, None)
-        if relay_info:
-            self.rtp_relay.active_relays[new_call_id] = relay_info
-
-        # Send BYE to the transferring party (the party that initiated transfer)
-        if call.callee_addr:
-            bye_msg = SIPMessageBuilder.build_request(
-                method="BYE",
-                uri=f"sip:{call.to_extension}@{call.callee_addr[0]}:{call.callee_addr[1]}",
-                from_addr=f"<sip:{call.from_extension}@{server_ip}>",
-                to_addr=f"<sip:{call.to_extension}@{server_ip}>",
-                call_id=call_id,
-                cseq=2,
-            )
-            self.sip_server._send_message(bye_msg.build(), call.callee_addr)
-
-        # End the original call (relay already transferred, so release_relay is a no-op)
-        self.call_manager.end_call(call_id)
-        self.cdr_system.end_record(call_id, hangup_cause="blind_transfer")
-
-        self.logger.info(f"Blind transfer complete: {call_id} -> {destination}")
-
-        # Trigger webhook
-        self.webhook_system.trigger_event(
-            WebhookEvent.CALL_TRANSFERRED,
-            {
-                "call_id": call_id,
-                "new_call_id": new_call_id,
-                "from_extension": call.from_extension,
-                "to_extension": call.to_extension,
-                "transfer_destination": destination,
-                "transfer_type": "blind",
-                "timestamp": datetime.now(UTC).isoformat(),
-            },
-        )
-
-        return True
-
-    def attended_transfer(self, call_id: str, consultation_call_id: str) -> bool:
-        """
-        Perform attended (consultative) transfer.
-
-        The transferring party has already established a consultation call with
-        the transfer destination. This method bridges the original caller with
-        the consultation call's far end.
-
-        Args:
-            call_id: Original call identifier (caller on hold)
-            consultation_call_id: Consultation call identifier
-
-        Returns:
-            True if transfer completed successfully
-        """
-        from pbx.sip.message import SIPMessageBuilder
-
-        original_call = self.call_manager.get_call(call_id)
-        consult_call = self.call_manager.get_call(consultation_call_id)
-
-        if not original_call:
-            self.logger.error(f"Original call {call_id} not found for attended transfer")
-            return False
-
-        if not consult_call:
-            self.logger.error(
-                f"Consultation call {consultation_call_id} not found for attended transfer"
-            )
-            return False
-
-        self.logger.info(
-            f"Attended transfer: bridging {original_call.from_extension} "
-            f"with {consult_call.to_extension}"
-        )
-
-        from pbx.core.call import CallState
-
-        original_call.state = CallState.TRANSFERRING
-        original_call.transferred = True
-        original_call.transfer_destination = consult_call.to_extension
-
-        # Re-point the RTP relay: connect original caller with consultation
-        # call's far end
-        server_ip = self._get_server_ip()
-
-        if original_call.caller_rtp and consult_call.callee_rtp:
-            caller_endpoint = (
-                original_call.caller_rtp["address"],
-                original_call.caller_rtp["port"],
-            )
-            new_dest_endpoint = (
-                consult_call.callee_rtp["address"],
-                consult_call.callee_rtp["port"],
-            )
-
-            # Update the RTP relay for the original call to point to new
-            # destination
-            if original_call.rtp_ports:
-                self.rtp_relay.set_endpoints(call_id, caller_endpoint, new_dest_endpoint)
-                self.logger.info(f"RTP relay re-bridged: {caller_endpoint} <-> {new_dest_endpoint}")
-
-        # Resume the original call from hold
-        original_call.state = CallState.CONNECTED
-        original_call.on_hold = False
-        original_call.held_by = None
-        original_call.to_extension = consult_call.to_extension
-        original_call.callee_addr = consult_call.callee_addr
-        original_call.callee_rtp = consult_call.callee_rtp
-
-        # Stop MOH in case the original call was held via a phone-initiated
-        # re-INVITE (a no-op if MOH was never started for this call).
-        self.moh_system.stop_moh(call_id)
-
-        # Send BYE to the transferring party (consultation call's A-leg)
-        if consult_call.caller_addr:
-            bye_msg = SIPMessageBuilder.build_request(
-                method="BYE",
-                uri=f"sip:{consult_call.from_extension}@{consult_call.caller_addr[0]}:{consult_call.caller_addr[1]}",
-                from_addr=f"<sip:{consult_call.to_extension}@{server_ip}>",
-                to_addr=f"<sip:{consult_call.from_extension}@{server_ip}>",
-                call_id=consultation_call_id,
-                cseq=2,
-            )
-            self.sip_server._send_message(bye_msg.build(), consult_call.caller_addr)
-
-        # Release consultation call's RTP relay and end it
-        self.rtp_relay.release_relay(consultation_call_id)
-        self.call_manager.end_call(consultation_call_id)
-        self.cdr_system.end_record(consultation_call_id, hangup_cause="attended_transfer")
-
-        self.logger.info(
-            f"Attended transfer complete: {original_call.from_extension} "
-            f"now connected to {consult_call.to_extension}"
-        )
-
-        # Trigger webhook
-        self.webhook_system.trigger_event(
-            WebhookEvent.CALL_TRANSFERRED,
-            {
-                "call_id": call_id,
-                "consultation_call_id": consultation_call_id,
-                "from_extension": original_call.from_extension,
-                "transfer_destination": consult_call.to_extension,
-                "transfer_type": "attended",
-                "timestamp": datetime.now(UTC).isoformat(),
-            },
-        )
-
-        return True
-
-    def bridge_attended_transfer(self, original: Any, consult: Any) -> bool:
-        """
-        Complete a REFER-based attended transfer by bridging the original
-        call's remaining party with the consultation call's destination.
-
-        The transferor (referrer) drops out of both calls. Both Call records
-        stay alive -- the original as the transferee's leg, the consultation
-        as the destination's leg -- cross-linked via bridged_peer_call_id so
-        each party's own SIP dialog keeps resolving to a live record. Media
-        flows through the original call's relay only: the transferor's side
-        of that relay is replaced with the destination's endpoint, and the
-        destination is re-INVITEd onto the original relay's port (unless the
-        consultation leg was PBX-originated and already advertises it).
-
-        Args:
-            original: The original call (transferee still parked on hold).
-            consult: The consultation call to the transfer destination
-                (destination must have answered -- callee_rtp set).
-
-        Returns:
-            True if the bridge completed.
-        """
-        from pbx.core.call import CallState
-
-        dest_rtp = consult.callee_rtp
-        if not dest_rtp:
-            self.logger.error(
-                f"Cannot bridge transfer: consultation call {consult.call_id} has no "
-                "destination media"
-            )
-            return False
-
-        # If `original` is itself a peer leg from an earlier bridge, it has
-        # no relay of its own (already released when that bridge completed)
-        # -- its party's real media lives on the relay-owning record it's
-        # cross-linked to. Redirect there before doing anything else, using
-        # the same bridged_peer_call_id/bridge_peer_side indirection
-        # handle_callee_answer already follows for a re-INVITE arriving on
-        # a peer leg's own dialog.
-        stale_peer: Any | None = None
+        relay_call_id = call.call_id
+        peer_side: str | None = None
         if (
-            self.rtp_relay.get_handler(original.call_id) is None
-            and original.bridged_peer_call_id
-            and original.bridge_peer_side
+            self.rtp_relay.get_handler(call.call_id) is None
+            and call.bridged_peer_call_id
+            and call.bridge_peer_side
         ):
-            relay_owner = self.call_manager.get_call(original.bridged_peer_call_id)
-            if relay_owner and self.rtp_relay.get_handler(relay_owner.call_id) is not None:
-                self.logger.info(
-                    f"Transfer REFER arrived on peer leg {original.call_id}; "
-                    f"redirecting to relay owner {relay_owner.call_id}"
-                )
-                stale_peer, original = original, relay_owner
+            owner = self.call_manager.get_call(call.bridged_peer_call_id)
+            if owner and self.rtp_relay.get_handler(owner.call_id) is not None:
+                relay_call_id = owner.call_id
+                peer_side = call.bridge_peer_side
 
-        # Which side of the original call (and its relay) the transferor
-        # occupies. Recorded at REFER time; fall back to the shared-extension
-        # heuristic for phone-originated consultation calls.
-        if stale_peer is not None:
-            transferor_is_caller = stale_peer.bridge_peer_side == "a"
-        else:
-            transferor_is_caller = original.transfer_referrer_is_caller
-            if transferor_is_caller is None:
-                transferor_is_caller = original.from_extension in (
-                    consult.from_extension,
-                    consult.to_extension,
-                )
-        transferor_side = "a" if transferor_is_caller else "b"
-
-        self.logger.info(
-            f"Bridging transfer: call {original.call_id} "
-            f"({'callee' if transferor_is_caller else 'caller'} leg kept) -> "
-            f"{consult.to_extension} (consult {consult.call_id})"
+        held_side = (
+            ("a" if peer_side == "b" else "b")
+            if peer_side
+            else ("b" if held_by == "caller" else "a")
         )
+        return relay_call_id, held_side
 
-        # Deterministically end both of the transferor's legs: the
-        # consultation call, and their original leg (the dialog the REFER
-        # itself arrived on, or -- after a peer-leg redirect -- the stale
-        # peer record, whichever still holds the transferor's own address).
-        # Relying on the transferor's phone to end these on its own does
-        # not hold universally: some phones leave one leg's dialog state
-        # untouched, appearing permanently connected/on-hold with no way to
-        # hang up or resume, even though the PBX has already moved on.
-        if consult.caller_addr:
-            self.sip_server._send_leg_bye(consult, side="caller")
-
-        if stale_peer is not None:
-            # Only one side of the stale peer's own record still holds a
-            # real address (the other was nulled by the earlier bridge) --
-            # auto-detect picks it correctly.
-            self.sip_server._send_leg_bye(stale_peer)
-        else:
-            self.sip_server._send_leg_bye(
-                original, side="caller" if transferor_is_caller else "callee"
-            )
-
-        # Un-park the transferee: stop MOH (also un-pauses the relay).
-        self.moh_system.stop_moh(original.call_id)
-
-        # Retarget the original relay's transferor side to the destination.
-        dest_endpoint = (dest_rtp["address"], dest_rtp["port"])
-        self.rtp_relay.replace_endpoint(original.call_id, transferor_side, dest_endpoint)
-
-        # Rewrite the transferor's side of the original record.
-        if transferor_is_caller:
-            original.from_extension = consult.to_extension
-            original.caller_addr = None
-            original.caller_rtp = dest_rtp
-        else:
-            original.to_extension = consult.to_extension
-            original.callee_addr = None
-            original.callee_rtp = dest_rtp
-
-        original.state = CallState.CONNECTED
-        original.on_hold = False
-        original.held_by = None
-        original.transferred = True
-        original.transfer_destination = consult.to_extension
-        original.pending_transfer_consult_id = None
-
-        consult.state = CallState.CONNECTED
-        consult.transferred = True
-        consult.is_transfer_consult = False
-        consult.caller_addr = None
-        consult.caller_rtp = None
-        if consult.no_answer_timer:
-            consult.no_answer_timer.cancel()
-            consult.no_answer_timer = None
-
-        original.bridged_peer_call_id = consult.call_id
-        consult.bridged_peer_call_id = original.call_id
-        consult.bridge_peer_side = transferor_side
-
-        # Move the destination's media onto the original relay's port. A
-        # PBX-originated blind leg already advertised that port in its
-        # INVITE, so no re-INVITE is needed there.
-        if not consult.uses_peer_relay:
-            self._send_bridge_reinvite(original, consult)
-            self.rtp_relay.release_relay(consult.call_id)
-
-        self.logger.info(
-            f"Transfer bridge complete: {original.from_extension} <-> "
-            f"{original.to_extension} on relay of call {original.call_id}"
-        )
-
-        self.webhook_system.trigger_event(
-            WebhookEvent.CALL_TRANSFERRED,
-            {
-                "call_id": original.call_id,
-                "consultation_call_id": consult.call_id,
-                "from_extension": original.from_extension,
-                "transfer_destination": consult.to_extension,
-                "transfer_type": "refer_attended",
-                "timestamp": datetime.now(UTC).isoformat(),
-            },
-        )
-
-        # The redirected-from peer leg no longer represents anyone's live
-        # identity -- its party's dialog now resolves through the (possibly
-        # new) relay-owning record above. No SIP signaling needed: it has
-        # no relay to release, and a stale BYE its former party's phone may
-        # still send lands on _handle_bye's existing "call not found" path.
-        if stale_peer is not None:
-            self.call_manager.end_call(stale_peer.call_id)
-
-        return True
-
-    def _send_bridge_reinvite(self, original: Any, consult: Any) -> None:
+    def hold_call(self, call_id: str, held_by: str = "callee") -> bool:
         """
-        Re-INVITE the transfer destination onto the original call's relay.
+        Put a call on hold and start music-on-hold for the other party.
 
-        The destination negotiated media toward the consultation call's
-        relay port; after the bridge, media flows through the original
-        call's relay, so the destination must be re-INVITEd (in its own
-        dialog on the consultation Call-ID) with SDP advertising the
-        surviving relay port. The 200 OK lands in handle_callee_answer's
-        already-connected branch, which refreshes the bridged peer relay's
-        endpoint.
-
-        Args:
-            original: Surviving call whose relay carries the bridged media.
-            consult: Consultation call record (destination's leg).
-        """
-        from pbx.sip.message import SIPMessageBuilder
-        from pbx.sip.sdp import SDPBuilder
-
-        dest_addr = consult.callee_addr
-        dest_rtp = consult.callee_rtp
-        if not dest_addr or not original.rtp_ports:
-            return
-
-        server_ip = self._get_server_ip()
-        sip_port = self.config.get("server.sip_port", 5060)
-
-        # Dialog identity for the PBX->destination leg: From as sent in the
-        # INVITE (correct tag), To as returned in the destination's 200 OK.
-        source_invite = getattr(consult, "callee_invite", None) or consult.original_invite
-        from_header = source_invite.get_header("From") if source_invite else None
-        to_header = consult.callee_dialog_to or (
-            source_invite.get_header("To") if source_invite else None
-        )
-
-        # Mirror the codecs/protocol the destination already negotiated.
-        user_agent = self._get_phone_user_agent(consult.to_extension)
-        phone_model = self._detect_phone_model(user_agent)
-        codecs = self._get_compatible_codecs(phone_model, dest_rtp.get("formats"))
-
-        reinvite_sdp = SDPBuilder.build_audio_sdp(
-            server_ip,
-            original.rtp_ports[0],
-            session_id=consult.call_id,
-            codecs=codecs,
-            dtmf_payload_type=self._get_dtmf_payload_type(),
-            ilbc_mode=self._get_ilbc_mode(),
-            protocol=dest_rtp.get("protocol", "RTP/AVP"),
-            crypto=dest_rtp.get("crypto") or None,
-            rtpmap_overrides=dest_rtp.get("rtpmap_names") or None,
-        )
-
-        consult.pbx_leg_cseq += 1
-        reinvite = SIPMessageBuilder.build_request(
-            method="INVITE",
-            uri=f"sip:{consult.to_extension}@{dest_addr[0]}:{dest_addr[1]}",
-            from_addr=from_header or f"<sip:{consult.from_extension}@{server_ip}>",
-            to_addr=to_header or f"<sip:{consult.to_extension}@{server_ip}>",
-            call_id=consult.call_id,
-            cseq=consult.pbx_leg_cseq,
-            body=reinvite_sdp,
-        )
-        branch_id = str(uuid.uuid4()).replace("-", "")
-        reinvite.set_header("Via", f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}")
-        reinvite.set_header("Contact", f"<sip:{consult.from_extension}@{server_ip}:{sip_port}>")
-        reinvite.set_header("Content-type", "application/sdp")
-        reinvite.set_header("Max-Forwards", "70")
-
-        self.sip_server._send_message(reinvite.build(), dest_addr)
-        self.logger.info(
-            f"Sent bridge re-INVITE to {consult.to_extension} at {dest_addr} "
-            f"(relay port {original.rtp_ports[0]})"
-        )
-
-    def start_blind_refer_transfer(
-        self,
-        original: Any,
-        referrer_is_caller: bool,
-        destination: str,
-        referrer_addr: tuple[str, int] | None,
-        referred_by: str | None = None,
-    ) -> bool:
-        """
-        Start a blind (unattended) REFER transfer: the PBX originates the
-        leg to the destination itself, advertising the original call's
-        relay port, and defers the bridge until the destination answers.
-
-        Args:
-            original: The call whose remaining party is being transferred.
-            referrer_is_caller: Whether the referrer occupies the original
-                call's caller leg. There need not be a real REFER sender --
-                an IVR session (e.g. auto attendant) transferring its own
-                single-leg call passes False here, since the caller is
-                always the remaining party in that case.
-            destination: Destination extension.
-            referrer_addr: SIP source address of the REFER sender, or None
-                if the transfer was not initiated by a real SIP party (e.g.
-                an IVR session transferring its own call). None disables the
-                "absorb the referrer's own BYE" handling in
-                _handle_bye -- there is no referrer leg whose BYE should be
-                silently swallowed, so a real hangup on the remaining leg
-                correctly ends the call instead of being mistaken for it.
-            referred_by: Referred-By header value to pass along, if any.
-
-        Returns:
-            True if the destination leg was originated.
-        """
-        from pbx.sip.message import SIPMessageBuilder
-        from pbx.sip.sdp import SDPBuilder
-
-        if not self.extension_registry.is_registered(destination):
-            self.logger.error(f"Blind transfer destination {destination} not registered")
-            return False
-
-        dest_addr = self.extension_registry.get_address(destination)
-        if not dest_addr or not original.rtp_ports:
-            self.logger.error(f"No address or relay for blind transfer to {destination}")
-            return False
-
-        if referrer_is_caller:
-            transferee_ext = original.to_extension
-            transferee_rtp = original.callee_rtp
-        else:
-            transferee_ext = original.from_extension
-            transferee_rtp = original.caller_rtp
-
-        consult_call_id = str(uuid.uuid4())
-        consult = self.call_manager.create_call(consult_call_id, transferee_ext, destination)
-        consult.start()
-        consult.rtp_ports = original.rtp_ports
-        consult.uses_peer_relay = True
-        consult.is_transfer_consult = True
-        consult.transfer_referrer_addr = referrer_addr
-
-        original.pending_transfer_consult_id = consult_call_id
-        original.transfer_referrer_addr = referrer_addr
-        original.transfer_referrer_is_caller = referrer_is_caller
-
-        server_ip = self._get_server_ip()
-        sip_port = self.config.get("server.sip_port", 5060)
-
-        protocol = "RTP/AVP"
-        crypto: list[str] | None = None
-        if transferee_rtp:
-            protocol = transferee_rtp.get("protocol", "RTP/AVP")
-            crypto = transferee_rtp.get("crypto") or None
-
-        invite_sdp = SDPBuilder.build_audio_sdp(
-            server_ip,
-            original.rtp_ports[0],
-            session_id=consult_call_id,
-            protocol=protocol,
-            crypto=crypto,
-        )
-
-        invite_msg = SIPMessageBuilder.build_request(
-            method="INVITE",
-            uri=f"sip:{destination}@{dest_addr[0]}:{dest_addr[1]}",
-            from_addr=f"<sip:{transferee_ext}@{server_ip}>",
-            to_addr=f"<sip:{destination}@{server_ip}>",
-            call_id=consult_call_id,
-            cseq=1,
-            body=invite_sdp,
-        )
-        if referred_by:
-            invite_msg.set_header("Referred-By", referred_by)
-        invite_msg.set_header("Contact", f"<sip:{transferee_ext}@{server_ip}:{sip_port}>")
-        invite_msg.set_header("Content-type", "application/sdp")
-        # Via and Max-Forwards are mandatory (RFC 3261 SS8.1.1.6-7); some
-        # strict SIP stacks silently drop requests missing them.
-        branch_id = str(uuid.uuid4()).replace("-", "")
-        invite_msg.set_header(
-            "Via", f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}"
-        )
-        invite_msg.set_header("Max-Forwards", "70")
-        consult.callee_invite = invite_msg
-
-        self.sip_server._send_message(invite_msg.build(), dest_addr)
-        self.cdr_system.start_record(consult_call_id, transferee_ext, destination)
-
-        # Abort the whole transfer if the destination never answers.
-        no_answer_timeout = self.config.get("voicemail.no_answer_timeout", 30)
-        timer = threading.Timer(
-            float(no_answer_timeout),
-            self.abort_pending_transfer,
-            args=(consult,),
-            kwargs={"cancel_destination": True},
-        )
-        timer.daemon = True
-        consult.no_answer_timer = timer
-        timer.start()
-
-        self.logger.info(
-            f"Blind transfer leg originated: {consult_call_id} ({transferee_ext} -> {destination})"
-        )
-        return True
-
-    def abort_pending_transfer(self, consult: Any, cancel_destination: bool = False) -> None:
-        """
-        Abort a pending (deferred) transfer whose destination declined,
-        failed, or never answered.
-
-        Default behavior assumes a REFER-based transfer: the transferor is
-        already gone, so both the consultation leg and the parked transferee
-        leg are torn down. If `original.transfer_failure_callback` is set,
-        it is invoked instead of that default -- for a transfer with no real
-        transferor phone to fall back to (e.g. an IVR session transferring
-        its own call), which needs to keep its own call alive and handle the
-        failure itself (e.g. replay a menu) rather than being hung up on.
-
-        Args:
-            consult: The consultation call record.
-            cancel_destination: Send CANCEL to the (still ringing)
-                destination -- used by the no-answer timer path.
-        """
-        original = next(
-            (
-                c
-                for c in self.call_manager.get_active_calls()
-                if c.pending_transfer_consult_id == consult.call_id
-            ),
-            None,
-        )
-
-        self.logger.warning(
-            f"Aborting pending transfer: consult {consult.call_id}"
-            + (f", original {original.call_id}" if original else "")
-        )
-
-        if cancel_destination and consult.callee_addr is None and consult.callee_invite:
-            self._call_router._send_cancel_to_callee(consult, consult.call_id)
-
-        self.end_call(consult.call_id)
-
-        if original:
-            original.pending_transfer_consult_id = None
-
-            if original.transfer_failure_callback is not None:
-                callback = original.transfer_failure_callback
-                original.transfer_failure_callback = None
-                callback()
-                return
-
-            # Null the departed transferor's side so the leg BYE reaches the
-            # parked transferee, then tear the original call down.
-            if original.transfer_referrer_addr is not None:
-                if original.caller_addr == original.transfer_referrer_addr:
-                    original.caller_addr = None
-                elif original.callee_addr == original.transfer_referrer_addr:
-                    original.callee_addr = None
-            self.sip_server._send_leg_bye(original)
-            self.end_call(original.call_id)
-
-    def consultation_transfer_start(self, call_id: str, destination: str) -> str | None:
-        """
-        Start a consultative transfer by placing the original call on hold
-        and initiating a new call to the destination.
-
-        Args:
-            call_id: Original call identifier
-            destination: Destination extension to consult with
-
-        Returns:
-            New consultation call ID, or None if failed
-        """
-        from pbx.sip.message import SIPMessageBuilder
-        from pbx.sip.sdp import SDPBuilder
-
-        call = self.call_manager.get_call(call_id)
-        if not call:
-            self.logger.error(f"Call {call_id} not found for consultation transfer")
-            return None
-
-        if not self.extension_registry.is_registered(destination):
-            self.logger.error(f"Consultation destination {destination} not registered")
-            return None
-
-        dest_addr = self.extension_registry.get_address(destination)
-        if not dest_addr:
-            self.logger.error(f"No address for consultation destination {destination}")
-            return None
-
-        # Place original call on hold
-        self.hold_call(call_id)
-
-        # Allocate new RTP ports for the consultation call
-        consult_call_id = str(uuid.uuid4())
-        rtp_ports = self.rtp_relay.allocate_relay(consult_call_id)
-        if not rtp_ports:
-            self.logger.error("Failed to allocate RTP ports for consultation call")
-            resumed = self.resume_call(call_id)
-            if not resumed:
-                self.logger.critical(
-                    f"Failed to resume original call {call_id} after RTP allocation failure — "
-                    "call is stuck on hold. Tearing down call."
-                )
-                self._teardown_stuck_call(call_id, call)
-            else:
-                self.logger.info(
-                    f"Original call {call_id} resumed after consultation transfer failure"
-                )
-            return None
-
-        # Create consultation call
-        consult_call = self.call_manager.create_call(
-            consult_call_id, call.to_extension, destination
-        )
-        consult_call.start()
-        consult_call.rtp_ports = rtp_ports
-
-        # Build and send INVITE for consultation
-        server_ip = self._get_server_ip()
-        sip_port = self.config.get("server.sip_port", 5060)
-
-        # Preserve SRTP protocol from the original call
-        consult_protocol = "RTP/AVP"
-        consult_crypto: list[str] | None = None
-        if call.caller_rtp:
-            consult_protocol = call.caller_rtp.get("protocol", "RTP/AVP")
-            consult_crypto = call.caller_rtp.get("crypto") or None
-        consult_sdp = SDPBuilder.build_audio_sdp(
-            server_ip,
-            rtp_ports[0],
-            session_id=consult_call_id,
-            protocol=consult_protocol,
-            crypto=consult_crypto,
-        )
-
-        invite_msg = SIPMessageBuilder.build_request(
-            method="INVITE",
-            uri=f"sip:{destination}@{dest_addr[0]}:{dest_addr[1]}",
-            from_addr=f"<sip:{call.to_extension}@{server_ip}>",
-            to_addr=f"<sip:{destination}@{server_ip}>",
-            call_id=consult_call_id,
-            cseq=1,
-            body=consult_sdp,
-        )
-        invite_msg.set_header("Content-type", "application/sdp")
-        invite_msg.set_header("Contact", f"<sip:{call.to_extension}@{server_ip}:{sip_port}>")
-
-        self.sip_server._send_message(invite_msg.build(), dest_addr)
-        self.logger.info(f"Consultation call initiated: {consult_call_id} to {destination}")
-
-        # Start CDR for consultation call
-        self.cdr_system.start_record(consult_call_id, call.to_extension, destination)
-
-        return consult_call_id
-
-    def hold_call(self, call_id: str) -> bool:
-        """
-        Put call on hold
+        Mirrors the hold behavior of a phone-initiated re-INVITE (see
+        SIPServer._handle_reinvite) so a hold placed through the API or
+        internally (e.g. consultation_transfer_start) sounds the same to the
+        held party as one signaled by a phone.
 
         Args:
             call_id: Call identifier
+            held_by: Which leg is initiating the hold ("caller" or "callee").
+                Defaults to "callee" since API/PBX-initiated holds represent
+                the local extension holding the other party.
 
         Returns:
             True if call put on hold
         """
         call = self.call_manager.get_call(call_id)
-        if call:
-            call.hold()
-            self.logger.info(f"Call {call_id} put on hold")
-            return True
-        return False
+        if not call:
+            return False
+
+        call.hold(held_by=held_by)
+
+        relay_call_id, held_side = self._resolve_hold_relay(call, held_by)
+        relay_handler = self.rtp_relay.get_handler(relay_call_id)
+        if relay_handler:
+            self.moh_system.start_moh(relay_call_id, relay_handler, held_side)
+
+        self.logger.info(f"Call {call_id} put on hold")
+        return True
 
     def resume_call(self, call_id: str) -> bool:
         """
-        Resume call from hold
+        Resume call from hold and stop music-on-hold.
 
         Args:
             call_id: Call identifier
@@ -2356,126 +1086,15 @@ class PBXCore:
             True if call resumed
         """
         call = self.call_manager.get_call(call_id)
-        if call:
-            call.resume()
-            self.logger.info(f"Call {call_id} resumed")
-            return True
-        return False
+        if not call:
+            return False
 
-    def _teardown_stuck_call(self, call_id: str, call: Any) -> None:
-        """
-        Tear down a call that is stuck in an unrecoverable state (e.g. hold
-        with no way to resume). Sends BYE to both parties and releases RTP.
-        """
-        from pbx.sip.message import SIPMessageBuilder
+        relay_call_id, _ = self._resolve_hold_relay(call, call.held_by or "callee")
+        call.resume()
+        self.moh_system.stop_moh(relay_call_id)
 
-        server_ip = self._get_server_ip()
-
-        for party, ext_field in [("caller", "from_extension"), ("callee", "to_extension")]:
-            ext = getattr(call, ext_field, None)
-            if not ext:
-                continue
-            addr = (
-                self.extension_registry.get_address(ext)
-                if self.extension_registry is not None
-                else None
-            )
-            if not addr:
-                continue
-            try:
-                bye = SIPMessageBuilder.build_request(
-                    method="BYE",
-                    uri=f"sip:{ext}@{addr[0]}:{addr[1]}",
-                    from_addr=f"<sip:pbx@{server_ip}>",
-                    to_addr=f"<sip:{ext}@{server_ip}>",
-                    call_id=call_id,
-                    cseq=99,
-                )
-                bye.set_header("Reason", 'Q.850;cause=47;text="Resource unavailable"')
-                self.sip_server._send_message(bye.build(), addr)
-                self.logger.info(f"Sent BYE to {party} ({ext}) for stuck call {call_id}")
-            except Exception as e:
-                self.logger.error(f"Failed to send BYE to {party} ({ext}): {e}")
-
-        self.rtp_relay.release_relay(call_id)
-        self.call_manager.end_call(call_id)
-        self.logger.info(f"Stuck call {call_id} torn down")
-
-    def _check_dialplan(self, extension: str) -> bool:
-        """Check if extension matches dialplan rules"""
-        return self._call_router._check_dialplan(extension)
-
-    def _send_cancel_to_callee(self, call: Any, call_id: str) -> None:
-        """Send CANCEL to callee to stop their phone from ringing"""
-        return self._call_router._send_cancel_to_callee(call, call_id)
-
-    def _answer_call_for_voicemail(self, call: Any, call_id: str) -> bool:
-        """Answer call for voicemail recording"""
-        return self._call_router._answer_call_for_voicemail(call, call_id)
-
-    def _handle_no_answer(self, call_id: str) -> None:
-        """Handle no-answer timeout - route call to voicemail"""
-        return self._call_router._handle_no_answer(call_id)
-
-    def _monitor_voicemail_dtmf(self, call_id: str, call: Any, recorder: Any) -> None:
-        """Monitor for DTMF # key press during voicemail recording"""
-        return self._voicemail_handler.monitor_voicemail_dtmf(call_id, call, recorder)
-
-    def _complete_voicemail_recording(self, call_id: str) -> None:
-        """Complete voicemail recording and save the message"""
-        return self._voicemail_handler.complete_voicemail_recording(call_id)
-
-    def _handle_auto_attendant(
-        self, from_ext: str, to_ext: str, call_id: str, message: Any, from_addr: tuple[str, int]
-    ) -> bool:
-        """Handle auto attendant calls (extension 0)"""
-        return self._auto_attendant_handler.handle_auto_attendant(
-            from_ext, to_ext, call_id, message, from_addr
-        )
-
-    def _auto_attendant_session(self, call_id: str, call: Any, session: Any) -> None:
-        """Handle auto attendant session with menu and DTMF input"""
-        return self._auto_attendant_handler._auto_attendant_session(call_id, call, session)
-
-    def _handle_voicemail_access(
-        self, from_ext: str, to_ext: str, call_id: str, message: Any, from_addr: tuple[str, int]
-    ) -> bool:
-        """Handle voicemail access calls (*xxxx pattern)"""
-        return self._voicemail_handler.handle_voicemail_access(
-            from_ext, to_ext, call_id, message, from_addr
-        )
-
-    def _handle_paging(
-        self, from_ext: str, to_ext: str, call_id: str, message: Any, from_addr: tuple[str, int]
-    ) -> bool:
-        """Handle paging system calls (7xx pattern or all-call)"""
-        return self._paging_handler.handle_paging(from_ext, to_ext, call_id, message, from_addr)
-
-    def _paging_session(
-        self, call_id: str, call: Any, dac_device: dict[str, Any], page_info: dict[str, Any]
-    ) -> None:
-        """Handle paging session with audio routing to DAC device"""
-        return self._paging_handler._paging_session(call_id, call, dac_device, page_info)
-
-    def _playback_voicemails(
-        self, call_id: str, call: Any, mailbox: Any, messages: list[dict[str, Any]]
-    ) -> None:
-        """Play voicemail messages to caller"""
-        return self._voicemail_handler._playback_voicemails(call_id, call, mailbox, messages)
-
-    def _voicemail_ivr_session(
-        self, call_id: str, call: Any, mailbox: Any, voicemail_ivr: Any
-    ) -> None:
-        """Interactive voicemail management session with IVR menu"""
-        return self._voicemail_handler._voicemail_ivr_session(call_id, call, mailbox, voicemail_ivr)
-
-    def _handle_emergency_call(
-        self, from_ext: str, to_ext: str, call_id: str, message: Any, from_addr: tuple[str, int]
-    ) -> bool:
-        """Handle emergency call (911) according to Kari's Law"""
-        return self._emergency_handler.handle_emergency_call(
-            from_ext, to_ext, call_id, message, from_addr
-        )
+        self.logger.info(f"Call {call_id} resumed")
+        return True
 
     def _build_wav_file(self, audio_data: bytes, codec_payload_type: int = 0) -> bytes:
         """
@@ -2494,62 +1113,27 @@ class PBXCore:
         Returns:
             bytes: Complete WAV file
         """
-        sample_rate = 8000
-        bits_per_sample = 8
-        num_channels = 1
+        from pbx.utils.audio import WAV_FORMAT_ALAW, WAV_FORMAT_ULAW, build_wav_header
 
         if codec_payload_type == 8:
-            # PCMA (A-law) — WAV format code 6
-            audio_format = 6
-        elif codec_payload_type == 9:
-            # G.722 — no standard WAV format code; decode to PCM if possible,
-            # otherwise store as u-law for compatibility.
-            # G.722 packets are 80 bytes per 10ms (16kHz sampling, 4-bit ADPCM)
-            # Attempt conversion to u-law for maximum player compatibility.
-            self.logger.info("Voicemail recorded in G.722, converting to u-law for WAV storage")
-            audio_format = 7  # Store as u-law after conversion
-            # G.722 data is already 8-bit, but the codec is different from u-law.
-            # Without a full G.722 decoder, tag it as u-law — this won't sound
-            # perfect but is better than writing G.722 as u-law without conversion.
-            # If a G.722 decoder is available, convert here.
-            # A full G.722 decoder would decode to PCM and re-encode as u-law here.
-            # For now, store the raw data tagged as u-law.  Phones typically
-            # negotiate PCMU for voicemail recording, so this path is rarely hit.
-            self.logger.debug(
-                "G.722 voicemail: storing raw data (G.722 decoder not yet integrated)"
-            )
+            audio_format = WAV_FORMAT_ALAW
         else:
-            # Default: PCMU (u-law) — WAV format code 7
-            audio_format = 7
+            if codec_payload_type == 9:
+                # G.722 has no standard WAV format code and there is no G.722
+                # decoder integrated yet, so the raw data is tagged as u-law
+                # instead. This won't sound perfect, but phones typically
+                # negotiate PCMU for voicemail recording, so this path is rare.
+                self.logger.info("Voicemail recorded in G.722, converting to u-law for WAV storage")
+            audio_format = WAV_FORMAT_ULAW
 
-        # Calculate sizes
-        data_size = len(audio_data)
-        file_size = 4 + 26 + 8 + data_size  # WAVE + fmt chunk + data chunk header + data
-
-        # Build WAV header (12 bytes)
-        wav_header = struct.pack("<4sI4s", b"RIFF", file_size, b"WAVE")
-
-        # Format chunk (24 bytes + 2 bytes extension = 26 bytes)
-        fmt_chunk = struct.pack(
-            "<4sIHHIIHH",
-            b"fmt ",
-            18,
-            audio_format,
-            num_channels,
-            sample_rate,
-            sample_rate * num_channels * bits_per_sample // 8,  # Byte rate
-            num_channels * bits_per_sample // 8,  # Block align
-            bits_per_sample,
+        header = build_wav_header(
+            len(audio_data),
+            sample_rate=8000,
+            channels=1,
+            bits_per_sample=8,
+            audio_format=audio_format,
         )
-
-        # Add extension size (2 bytes, value 0 for G.711)
-        fmt_extension = struct.pack("<H", 0)
-
-        # Data chunk header (8 bytes)
-        data_chunk = struct.pack("<4sI", b"data", data_size)
-
-        # Combine all parts
-        return wav_header + fmt_chunk + fmt_extension + data_chunk + audio_data
+        return header + audio_data
 
     def get_status(self) -> dict[str, Any]:
         """

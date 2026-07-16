@@ -391,7 +391,7 @@ class TestAutoAttendantSession:
             "session": {"state": "TRANSFERRING"},
         }
         pbx.rtp_relay.adopt_existing_port.return_value = True
-        pbx.start_blind_refer_transfer.return_value = True
+        pbx.transfer_handler.start_blind_refer_transfer.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -410,7 +410,7 @@ class TestAutoAttendantSession:
 
         pbx.rtp_relay.adopt_existing_port.assert_called_once_with("call-1", 30000, 30001)
         pbx.rtp_relay.set_endpoints.assert_called_once_with("call-1", ("192.168.1.10", 40000), None)
-        pbx.start_blind_refer_transfer.assert_called_once_with(
+        pbx.transfer_handler.start_blind_refer_transfer.assert_called_once_with(
             call_obj, referrer_is_caller=False, destination="8001", referrer_addr=None
         )
         # Handed off: the session must not end the call or return the port
@@ -437,7 +437,7 @@ class TestAutoAttendantSession:
             "session": {"state": "TRANSFERRING"},
         }
         pbx.rtp_relay.adopt_existing_port.return_value = True
-        pbx.start_blind_refer_transfer.return_value = False  # synchronous failure
+        pbx.transfer_handler.start_blind_refer_transfer.return_value = False  # synchronous failure
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -490,7 +490,6 @@ class TestAutoAttendantSession:
             }
 
         pbx.auto_attendant.handle_dtmf.side_effect = mock_handle_dtmf
-        pbx.transfer_call.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -526,7 +525,7 @@ class TestAutoAttendantSession:
             "destination": "1001",
         }
         pbx.rtp_relay.adopt_existing_port.return_value = True
-        pbx.start_blind_refer_transfer.return_value = True
+        pbx.transfer_handler.start_blind_refer_transfer.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -544,7 +543,7 @@ class TestAutoAttendantSession:
         handler._auto_attendant_session("call-1", call_obj, session)
 
         pbx.auto_attendant.handle_timeout.assert_called()
-        pbx.start_blind_refer_transfer.assert_called_once_with(
+        pbx.transfer_handler.start_blind_refer_transfer.assert_called_once_with(
             call_obj, referrer_is_caller=False, destination="1001", referrer_addr=None
         )
 
@@ -566,7 +565,7 @@ class TestAutoAttendantSession:
             "destination": "1001",
         }
         pbx.rtp_relay.adopt_existing_port.return_value = True
-        pbx.start_blind_refer_transfer.return_value = False  # synchronous failure
+        pbx.transfer_handler.start_blind_refer_transfer.return_value = False  # synchronous failure
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -665,7 +664,6 @@ class TestAutoAttendantSession:
             "destination": "8001",
             "session": {"state": "TRANSFERRING"},
         }
-        pbx.transfer_call.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -704,7 +702,7 @@ class TestAutoAttendantSession:
             "session": {"state": "TRANSFERRING"},
         }
         pbx.rtp_relay.adopt_existing_port.return_value = True
-        pbx.start_blind_refer_transfer.return_value = True
+        pbx.transfer_handler.start_blind_refer_transfer.return_value = True
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -724,7 +722,7 @@ class TestAutoAttendantSession:
 
         # The transferring prompt file was played, then the transfer started.
         mock_player.play_file.assert_any_call("/audio/transferring.wav")
-        pbx.start_blind_refer_transfer.assert_called_once()
+        pbx.transfer_handler.start_blind_refer_transfer.assert_called_once()
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
@@ -792,7 +790,7 @@ class TestAutoAttendantSession:
         with patch.object(handler, "_return_to_menu") as mock_return:
             handler._auto_attendant_session("call-1", call_obj, session)
 
-        pbx.start_blind_refer_transfer.assert_not_called()
+        pbx.transfer_handler.start_blind_refer_transfer.assert_not_called()
         mock_return.assert_called_once_with("call-1", call_obj)
 
 

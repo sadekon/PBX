@@ -559,14 +559,14 @@ class TestHandleInvite:
     @patch("pbx.sip.server.get_logger")
     def test_invite_with_pbx_core_success(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
-        pbx.route_call.return_value = True
+        pbx.call_router.route_call.return_value = True
         server = SIPServer(pbx_core=pbx)
         server._send_response = MagicMock()
 
         msg = _make_request_message("INVITE")
         server._handle_invite(msg, ADDR)
 
-        pbx.route_call.assert_called_once_with(
+        pbx.call_router.route_call.assert_called_once_with(
             "<sip:1001@pbx.local>",
             "<sip:1002@pbx.local>",
             "test-call-id-123",
@@ -578,7 +578,7 @@ class TestHandleInvite:
     @patch("pbx.sip.server.get_logger")
     def test_invite_with_pbx_core_failure(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
-        pbx.route_call.return_value = False
+        pbx.call_router.route_call.return_value = False
         server = SIPServer(pbx_core=pbx)
         server._send_response = MagicMock()
 
@@ -1502,7 +1502,7 @@ class TestHandleResponse:
         }.get
         server._handle_response(msg, ADDR)
 
-        pbx.handle_callee_answer.assert_called_once_with("test-call-id-123", msg, ADDR)
+        pbx.call_router.handle_callee_answer.assert_called_once_with("test-call-id-123", msg, ADDR)
 
     @patch("pbx.sip.server.get_logger")
     def test_response_200_no_call_id(self, mock_get_logger: MagicMock) -> None:
@@ -1513,7 +1513,7 @@ class TestHandleResponse:
         msg.get_header.side_effect = lambda name: None
         server._handle_response(msg, ADDR)
 
-        pbx.handle_callee_answer.assert_not_called()
+        pbx.call_router.handle_callee_answer.assert_not_called()
 
     @patch("pbx.sip.server.get_logger")
     def test_response_without_pbx_core(self, mock_get_logger: MagicMock) -> None:
@@ -1531,7 +1531,7 @@ class TestHandleResponse:
         server._handle_response(msg, ADDR)
 
         # No specific handling for 486, just logs
-        pbx.handle_callee_answer.assert_not_called()
+        pbx.call_router.handle_callee_answer.assert_not_called()
 
     @patch("pbx.sip.server.get_logger")
     def test_response_302_redirect_acks_and_delegates_to_call_router(
@@ -1554,7 +1554,7 @@ class TestHandleResponse:
         server._send_ack_to_callee.assert_called_once_with(
             msg, ADDR, "test-call-id-123", use_invite_branch=True
         )
-        pbx._call_router.handle_redirect.assert_called_once_with(
+        pbx.call_router.handle_redirect.assert_called_once_with(
             "test-call-id-123", "<sip:1003@10.0.0.9:5060>"
         )
 
@@ -1573,7 +1573,7 @@ class TestHandleResponse:
         server._handle_response(msg, ADDR)
 
         server._send_ack_to_callee.assert_not_called()
-        pbx._call_router.handle_redirect.assert_not_called()
+        pbx.call_router.handle_redirect.assert_not_called()
 
     @patch("pbx.sip.server.get_logger")
     def test_response_3xx_no_call_id_ignored(self, mock_get_logger: MagicMock) -> None:
@@ -1586,7 +1586,7 @@ class TestHandleResponse:
         server._handle_response(msg, ADDR)
 
         server._send_ack_to_callee.assert_not_called()
-        pbx._call_router.handle_redirect.assert_not_called()
+        pbx.call_router.handle_redirect.assert_not_called()
 
 
 # ===========================================================================

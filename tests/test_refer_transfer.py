@@ -19,7 +19,8 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from pbx.core.call import Call, CallManager, CallState
-from pbx.core.pbx import PBXCore
+from pbx.core.call_router import CallRouter
+from pbx.core.transfer_handler import TransferHandler
 from pbx.sip.server import SIPServer
 
 A_ADDR = ("192.168.10.139", 5060)  # Transferor (referrer)
@@ -38,7 +39,7 @@ CAPTURE_REFER_TO = (
 
 def _make_pbx(call_manager: CallManager) -> MagicMock:
     """Build a MagicMock PBXCore stand-in with a real CallManager, suitable
-    for invoking PBXCore's unbound instance methods directly."""
+    for exercising CallRouter/TransferHandler logic bound to it directly."""
     pbx = MagicMock()
     pbx.call_manager = call_manager
     pbx.rtp_relay = MagicMock()
@@ -55,6 +56,15 @@ def _make_pbx(call_manager: CallManager) -> MagicMock:
     pbx._get_compatible_codecs.return_value = ["0", "8"]
     pbx._get_dtmf_payload_type.return_value = 101
     pbx._get_ilbc_mode.return_value = 30
+    # handle_callee_answer now lives on CallRouter; wire the mock's method to
+    # a real CallRouter instance so tests that call it directly (below)
+    # exercise the real answer-flow logic instead of a bare mock no-op. The
+    # rest of pbx.call_router stays a plain MagicMock for tests asserting
+    # other delegate calls on it. Likewise pbx.transfer_handler stays a bare
+    # MagicMock -- tests needing real TransferHandler behavior construct
+    # their own local TransferHandler(pbx) instance instead (see
+    # TestBridgeAttendedTransfer et al.).
+    pbx.call_router.handle_callee_answer.side_effect = CallRouter(pbx).handle_callee_answer
     return pbx
 
 
@@ -175,7 +185,7 @@ class TestParseReferTo:
 
 
 # ===========================================================================
-# PBXCore.bridge_attended_transfer
+# TransferHandler.bridge_attended_transfer
 # ===========================================================================
 
 
@@ -189,9 +199,10 @@ class TestBridgeAttendedTransfer:
         original.transfer_referrer_is_caller = True
 
         pbx = _make_pbx(cm)
-        pbx._send_bridge_reinvite = MagicMock()
+        handler = TransferHandler(pbx)
+        handler._send_bridge_reinvite = MagicMock()
 
-        result = PBXCore.bridge_attended_transfer(pbx, original, consult)
+        result = handler.bridge_attended_transfer(original, consult)
 
         assert result is True
         # Transferor (caller side "a") replaced with C on the original relay
@@ -216,7 +227,7 @@ class TestBridgeAttendedTransfer:
         assert cm.get_call("call1") is not None
         assert cm.get_call("call2") is not None
         # C is re-INVITEd onto the surviving relay; consult relay released
-        pbx._send_bridge_reinvite.assert_called_once_with(original, consult)
+        handler._send_bridge_reinvite.assert_called_once_with(original, consult)
         pbx.rtp_relay.release_relay.assert_called_once_with("call2")
         # BYE sent to the transferor's old consult leg AND their original
         # leg -- relying on the transferor's phone to end either on its own
@@ -253,9 +264,10 @@ class TestBridgeAttendedTransfer:
         original.transfer_referrer_is_caller = False
 
         pbx = _make_pbx(cm)
-        pbx._send_bridge_reinvite = MagicMock()
+        handler = TransferHandler(pbx)
+        handler._send_bridge_reinvite = MagicMock()
 
-        result = PBXCore.bridge_attended_transfer(pbx, original, consult)
+        result = handler.bridge_attended_transfer(original, consult)
 
         assert result is True
         pbx.rtp_relay.replace_endpoint.assert_called_once_with(
@@ -279,9 +291,10 @@ class TestBridgeAttendedTransfer:
         original.transfer_referrer_is_caller = None  # not recorded
 
         pbx = _make_pbx(cm)
-        pbx._send_bridge_reinvite = MagicMock()
+        handler = TransferHandler(pbx)
+        handler._send_bridge_reinvite = MagicMock()
 
-        result = PBXCore.bridge_attended_transfer(pbx, original, consult)
+        result = handler.bridge_attended_transfer(original, consult)
 
         assert result is True
         # 1513 (A) is from_extension of both calls -> caller side replaced
@@ -295,7 +308,7 @@ class TestBridgeAttendedTransfer:
 
         pbx = _make_pbx(cm)
 
-        result = PBXCore.bridge_attended_transfer(pbx, original, consult)
+        result = TransferHandler(pbx).bridge_attended_transfer(original, consult)
 
         assert result is False
         pbx.rtp_relay.replace_endpoint.assert_not_called()
@@ -307,17 +320,18 @@ class TestBridgeAttendedTransfer:
         consult.uses_peer_relay = True  # PBX-originated blind leg
 
         pbx = _make_pbx(cm)
-        pbx._send_bridge_reinvite = MagicMock()
+        handler = TransferHandler(pbx)
+        handler._send_bridge_reinvite = MagicMock()
 
-        result = PBXCore.bridge_attended_transfer(pbx, original, consult)
+        result = handler.bridge_attended_transfer(original, consult)
 
         assert result is True
-        pbx._send_bridge_reinvite.assert_not_called()
+        handler._send_bridge_reinvite.assert_not_called()
         pbx.rtp_relay.release_relay.assert_not_called()
 
 
 # ===========================================================================
-# PBXCore._send_bridge_reinvite
+# TransferHandler._send_bridge_reinvite
 # ===========================================================================
 
 
@@ -331,7 +345,7 @@ class TestSendBridgeReinvite:
 
         pbx = _make_pbx(cm)
 
-        PBXCore._send_bridge_reinvite(pbx, original, consult)
+        TransferHandler(pbx)._send_bridge_reinvite(original, consult)
 
         assert pbx.sip_server._send_message.call_count == 1
         raw, dest = pbx.sip_server._send_message.call_args[0]
@@ -353,7 +367,7 @@ class TestSendBridgeReinvite:
 
         pbx = _make_pbx(cm)
 
-        PBXCore._send_bridge_reinvite(pbx, original, consult)
+        TransferHandler(pbx)._send_bridge_reinvite(original, consult)
 
         pbx.sip_server._send_message.assert_not_called()
 
@@ -386,7 +400,7 @@ class TestHandleReferAttended:
         consult.call_id = "0_3666015387@192.168.10.139"
 
         pbx = _make_pbx(cm)
-        pbx.bridge_attended_transfer.return_value = True
+        pbx.transfer_handler.bridge_attended_transfer.return_value = True
         server = _make_server(pbx)
         server._send_transfer_notify = MagicMock()  # type: ignore[method-assign]
 
@@ -394,7 +408,7 @@ class TestHandleReferAttended:
 
         assert server._send_response.call_count == 1
         assert server._send_response.call_args[0][:2] == (202, "Accepted")
-        pbx.bridge_attended_transfer.assert_called_once_with(original, consult)
+        pbx.transfer_handler.bridge_attended_transfer.assert_called_once_with(original, consult)
         assert original.transfer_referrer_addr == A_ADDR
         assert original.transfer_referrer_is_caller is True
         assert consult.transfer_referrer_addr == A_ADDR
@@ -414,7 +428,7 @@ class TestHandleReferAttended:
 
         server._handle_refer(self._refer_message(), A_ADDR)
 
-        pbx.bridge_attended_transfer.assert_not_called()
+        pbx.transfer_handler.bridge_attended_transfer.assert_not_called()
         assert original.pending_transfer_consult_id == "0_3666015387@192.168.10.139"
         assert consult.is_transfer_consult is True
 
@@ -428,7 +442,7 @@ class TestHandleReferAttended:
 
         server._handle_refer(self._refer_message(), A_ADDR)
 
-        pbx.bridge_attended_transfer.assert_not_called()
+        pbx.transfer_handler.bridge_attended_transfer.assert_not_called()
         sipfrags = [c.args[2] for c in server._send_transfer_notify.call_args_list]
         assert "SIP/2.0 481 Call/Transaction Does Not Exist" in sipfrags
 
@@ -437,13 +451,13 @@ class TestHandleReferAttended:
         original, _consult = _attended_pair(cm)
 
         pbx = _make_pbx(cm)
-        pbx.start_blind_refer_transfer.return_value = True
+        pbx.transfer_handler.start_blind_refer_transfer.return_value = True
         server = _make_server(pbx)
         server._send_transfer_notify = MagicMock()  # type: ignore[method-assign]
 
         server._handle_refer(self._refer_message("<sip:1517@192.168.1.14:5060>"), A_ADDR)
 
-        pbx.start_blind_refer_transfer.assert_called_once_with(
+        pbx.transfer_handler.start_blind_refer_transfer.assert_called_once_with(
             original, True, "1517", A_ADDR, '"Test" <sip:1513@192.168.1.14:5060>'
         )
         sipfrags = [c.args[2] for c in server._send_transfer_notify.call_args_list]
@@ -461,7 +475,7 @@ class TestHandleReferAttended:
 
 
 # ===========================================================================
-# PBXCore.start_blind_refer_transfer
+# TransferHandler.start_blind_refer_transfer
 # ===========================================================================
 
 
@@ -481,8 +495,8 @@ class TestStartBlindReferTransfer:
 
         pbx = self._registered_pbx(cm)
 
-        result = PBXCore.start_blind_refer_transfer(
-            pbx, original, True, "1517", A_ADDR, referred_by="<sip:1513@pbx>"
+        result = TransferHandler(pbx).start_blind_refer_transfer(
+            original, True, "1517", A_ADDR, referred_by="<sip:1513@pbx>"
         )
 
         assert result is True
@@ -527,7 +541,7 @@ class TestStartBlindReferTransfer:
 
         pbx = self._registered_pbx(cm)
 
-        result = PBXCore.start_blind_refer_transfer(pbx, original, False, "1517", A_ADDR)
+        result = TransferHandler(pbx).start_blind_refer_transfer(original, False, "1517", A_ADDR)
 
         assert result is True
         consult = cm.get_call(original.pending_transfer_consult_id)
@@ -546,7 +560,7 @@ class TestStartBlindReferTransfer:
         pbx = _make_pbx(cm)
         pbx.extension_registry.is_registered.return_value = False
 
-        result = PBXCore.start_blind_refer_transfer(pbx, original, True, "1517", A_ADDR)
+        result = TransferHandler(pbx).start_blind_refer_transfer(original, True, "1517", A_ADDR)
 
         assert result is False
         assert original.pending_transfer_consult_id is None
@@ -578,9 +592,9 @@ class TestDeferredBridgeOnAnswer:
         response.body = "v=0\r\n"
         response.get_header.side_effect = {"To": "<sip:1517@192.168.1.14>;tag=3972643251"}.get
 
-        PBXCore.handle_callee_answer(pbx, "call2", response, C_ADDR)
+        pbx.call_router.handle_callee_answer("call2", response, C_ADDR)
 
-        pbx.bridge_attended_transfer.assert_called_once_with(original, consult)
+        pbx.transfer_handler.bridge_attended_transfer.assert_called_once_with(original, consult)
         # C's answer data captured before bridging
         assert consult.callee_rtp == C_RTP
         assert consult.callee_addr == C_ADDR
@@ -605,7 +619,7 @@ class TestDeferredBridgeOnAnswer:
         response.body = "v=0\r\n"
         response.get_header.side_effect = {"To": "<sip:1517@192.168.1.14>;tag=3972643251"}.get
 
-        PBXCore.handle_callee_answer(pbx, "call2", response, C_ADDR)
+        pbx.call_router.handle_callee_answer("call2", response, C_ADDR)
 
         pbx.rtp_relay.replace_endpoint.assert_called_once_with(
             "call1", "a", ("192.168.10.140", 3010)
@@ -757,7 +771,9 @@ class TestHandleByeBridged:
 
         server._handle_bye(self._bye("call1"), B_ADDR)
 
-        pbx.abort_pending_transfer.assert_called_once_with(consult, cancel_destination=True)
+        pbx.transfer_handler.abort_pending_transfer.assert_called_once_with(
+            consult, cancel_destination=True
+        )
         pbx.end_call.assert_called_once_with("call1")
         assert original.pending_transfer_consult_id is None
 
@@ -916,7 +932,7 @@ class TestAbortPendingTransfer:
         pbx = _make_pbx(cm)
         pbx.sip_server._send_leg_bye = MagicMock()
 
-        PBXCore.abort_pending_transfer(pbx, consult)
+        TransferHandler(pbx).abort_pending_transfer(consult)
 
         ended = {c.args[0] for c in pbx.end_call.call_args_list}
         assert ended == {"call1", "call2"}
@@ -933,9 +949,9 @@ class TestAbortPendingTransfer:
 
         pbx = _make_pbx(cm)
 
-        PBXCore.abort_pending_transfer(pbx, consult, cancel_destination=True)
+        TransferHandler(pbx).abort_pending_transfer(consult, cancel_destination=True)
 
-        pbx._call_router._send_cancel_to_callee.assert_called_once_with(consult, "call2")
+        pbx.call_router._send_cancel_to_callee.assert_called_once_with(consult, "call2")
 
     def test_error_response_aborts_pending_transfer(self) -> None:
         cm = CallManager()
@@ -958,7 +974,7 @@ class TestAbortPendingTransfer:
         server._handle_response(response, C_ADDR)
 
         server._send_ack_to_callee.assert_called_once()
-        pbx.abort_pending_transfer.assert_called_once_with(consult)
+        pbx.transfer_handler.abort_pending_transfer.assert_called_once_with(consult)
         pbx.end_call.assert_not_called()
 
 

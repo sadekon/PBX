@@ -10,7 +10,7 @@ to the build_audio_sdp function.
 from typing import Any
 from unittest.mock import MagicMock, Mock, call
 
-from pbx.core.pbx import PBXCore
+from pbx.core.codec_negotiator import CodecNegotiator
 from pbx.sip.sdp import SDPBuilder
 
 
@@ -129,14 +129,13 @@ class TestDTMFPayloadTypeIntegration:
         mock_config = Mock()
         mock_config.get.return_value = 100  # Return custom payload type
 
-        # Create a minimal PBX instance with just the method we need
-        pbx = Mock(spec=PBXCore)
+        # Create a minimal PBX instance with just the attribute we need
+        pbx = Mock()
         pbx.config = mock_config
-        # Bind the actual method to our mock
-        pbx._get_dtmf_payload_type = PBXCore._get_dtmf_payload_type.__get__(pbx)
+        negotiator = CodecNegotiator(pbx)
 
         # Test the method
-        payload_type = pbx._get_dtmf_payload_type()
+        payload_type = negotiator._get_dtmf_payload_type()
 
         # Verify it requested the correct config key
         mock_config.get.assert_called_once_with("features.dtmf.payload_type", 101)
@@ -150,12 +149,12 @@ class TestDTMFPayloadTypeIntegration:
         mock_config.get.return_value = 101  # Return default payload type
 
         # Create a minimal PBX instance
-        pbx = Mock(spec=PBXCore)
+        pbx = Mock()
         pbx.config = mock_config
-        pbx._get_dtmf_payload_type = PBXCore._get_dtmf_payload_type.__get__(pbx)
+        negotiator = CodecNegotiator(pbx)
 
         # Test the method
-        payload_type = pbx._get_dtmf_payload_type()
+        payload_type = negotiator._get_dtmf_payload_type()
 
         # Verify it returned the default value
         assert payload_type == 101
@@ -167,15 +166,13 @@ class TestDTMFPayloadTypeIntegration:
         mock_config.get.return_value = 100  # Custom DTMF payload type
 
         # Create a minimal PBX instance
-        pbx = Mock(spec=PBXCore)
+        pbx = Mock()
         pbx.config = mock_config
         pbx.logger = MagicMock()
-        # Bind the actual methods to our mock
-        pbx._get_codecs_for_phone_model = PBXCore._get_codecs_for_phone_model.__get__(pbx)
-        pbx._get_dtmf_payload_type = PBXCore._get_dtmf_payload_type.__get__(pbx)
+        negotiator = CodecNegotiator(pbx)
 
         # Test _get_codecs_for_phone_model for ZIP37G
-        codecs = pbx._get_codecs_for_phone_model("ZIP37G", ["0", "8", "9", "101"])
+        codecs = negotiator._get_codecs_for_phone_model("ZIP37G", ["0", "8", "9", "101"])
 
         # Verify it called config.get with the correct key
         # Should have called for 'features.dtmf.payload_type'
@@ -198,12 +195,12 @@ class TestDTMFPayloadTypeIntegration:
         mock_config.get = mock_get
 
         # Create a minimal PBX instance
-        pbx = Mock(spec=PBXCore)
+        pbx = Mock()
         pbx.config = mock_config
-        pbx._get_dtmf_payload_type = PBXCore._get_dtmf_payload_type.__get__(pbx)
+        negotiator = CodecNegotiator(pbx)
 
         # Get the DTMF payload type through the helper method
-        dtmf_payload_type = pbx._get_dtmf_payload_type()
+        dtmf_payload_type = negotiator._get_dtmf_payload_type()
 
         # Verify we got the custom value
         assert dtmf_payload_type == 100
@@ -229,15 +226,14 @@ class TestDTMFPayloadTypeIntegration:
         mock_config.get.return_value = 102
 
         # Create a minimal PBX instance
-        pbx = Mock(spec=PBXCore)
+        pbx = Mock()
         pbx.config = mock_config
         pbx.logger = MagicMock()
-        pbx._get_codecs_for_phone_model = PBXCore._get_codecs_for_phone_model.__get__(pbx)
-        pbx._get_dtmf_payload_type = PBXCore._get_dtmf_payload_type.__get__(pbx)
+        negotiator = CodecNegotiator(pbx)
 
         # Call both methods
-        payload_type = pbx._get_dtmf_payload_type()
-        codecs = pbx._get_codecs_for_phone_model("ZIP33G", ["0", "8", "9", "18", "2", "101"])
+        payload_type = negotiator._get_dtmf_payload_type()
+        codecs = negotiator._get_codecs_for_phone_model("ZIP33G", ["0", "8", "9", "18", "2", "101"])
 
         # Verify both methods used the same config key
         expected_calls = [

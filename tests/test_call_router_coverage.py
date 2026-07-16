@@ -122,10 +122,10 @@ def _make_pbx_core(
     pbx.webrtc_gateway = None
 
     # Voicemail handler and system
-    pbx._voicemail_handler = MagicMock()
-    pbx._emergency_handler = MagicMock()
-    pbx._auto_attendant_handler = MagicMock()
-    pbx._paging_handler = MagicMock()
+    pbx.voicemail_handler = MagicMock()
+    pbx.emergency_handler = MagicMock()
+    pbx.auto_attendant_handler = MagicMock()
+    pbx.paging_handler = MagicMock()
     pbx.voicemail_system = MagicMock()
 
     return pbx
@@ -317,7 +317,7 @@ class TestRouteCallEmergency:
     def test_emergency_call_routed_to_handler(self) -> None:
         pbx = _make_pbx_core()
         pbx.karis_law.is_emergency_number.return_value = True
-        pbx._emergency_handler.handle_emergency_call.return_value = True
+        pbx.emergency_handler.handle_emergency_call.return_value = True
 
         router = CallRouter(pbx)
         result = router.route_call(
@@ -329,7 +329,7 @@ class TestRouteCallEmergency:
         )
 
         assert result is True
-        pbx._emergency_handler.handle_emergency_call.assert_called_once()
+        pbx.emergency_handler.handle_emergency_call.assert_called_once()
 
 
 # ===========================================================================
@@ -344,7 +344,7 @@ class TestRouteCallAutoAttendant:
     def test_auto_attendant_call_routed(self) -> None:
         pbx = _make_pbx_core()
         pbx.auto_attendant.get_extension.return_value = "0"
-        pbx._auto_attendant_handler.handle_auto_attendant.return_value = True
+        pbx.auto_attendant_handler.handle_auto_attendant.return_value = True
 
         router = CallRouter(pbx)
         result = router.route_call(
@@ -356,7 +356,7 @@ class TestRouteCallAutoAttendant:
         )
 
         assert result is True
-        pbx._auto_attendant_handler.handle_auto_attendant.assert_called_once()
+        pbx.auto_attendant_handler.handle_auto_attendant.assert_called_once()
 
 
 # ===========================================================================
@@ -370,7 +370,7 @@ class TestRouteCallVoicemailAccess:
 
     def test_voicemail_access_star_4digits(self) -> None:
         pbx = _make_pbx_core()
-        pbx._voicemail_handler.handle_voicemail_access.return_value = True
+        pbx.voicemail_handler.handle_voicemail_access.return_value = True
 
         router = CallRouter(pbx)
         result = router.route_call(
@@ -382,11 +382,11 @@ class TestRouteCallVoicemailAccess:
         )
 
         assert result is True
-        pbx._voicemail_handler.handle_voicemail_access.assert_called_once()
+        pbx.voicemail_handler.handle_voicemail_access.assert_called_once()
 
     def test_voicemail_access_star_3digits(self) -> None:
         pbx = _make_pbx_core()
-        pbx._voicemail_handler.handle_voicemail_access.return_value = True
+        pbx.voicemail_handler.handle_voicemail_access.return_value = True
 
         router = CallRouter(pbx)
         result = router.route_call(
@@ -398,7 +398,7 @@ class TestRouteCallVoicemailAccess:
         )
 
         assert result is True
-        pbx._voicemail_handler.handle_voicemail_access.assert_called_once()
+        pbx.voicemail_handler.handle_voicemail_access.assert_called_once()
 
     def test_voicemail_access_too_short_not_routed(self) -> None:
         """*12 is too short (len < 4), not voicemail access."""
@@ -415,7 +415,7 @@ class TestRouteCallVoicemailAccess:
             CALLER_ADDR,
         )
 
-        pbx._voicemail_handler.handle_voicemail_access.assert_not_called()
+        pbx.voicemail_handler.handle_voicemail_access.assert_not_called()
 
     def test_voicemail_access_too_long_not_routed(self) -> None:
         """*12345 is too long (len > 5), not voicemail access."""
@@ -430,7 +430,7 @@ class TestRouteCallVoicemailAccess:
             CALLER_ADDR,
         )
 
-        pbx._voicemail_handler.handle_voicemail_access.assert_not_called()
+        pbx.voicemail_handler.handle_voicemail_access.assert_not_called()
 
 
 # ===========================================================================
@@ -445,7 +445,7 @@ class TestRouteCallPaging:
     def test_paging_call_routed(self) -> None:
         pbx = _make_pbx_core()
         pbx.paging_system.is_paging_extension.return_value = True
-        pbx._paging_handler.handle_paging.return_value = True
+        pbx.paging_handler.handle_paging.return_value = True
 
         router = CallRouter(pbx)
         result = router.route_call(
@@ -457,7 +457,7 @@ class TestRouteCallPaging:
         )
 
         assert result is True
-        pbx._paging_handler.handle_paging.assert_called_once()
+        pbx.paging_handler.handle_paging.assert_called_once()
 
 
 # ===========================================================================
@@ -1856,3 +1856,115 @@ class TestRouteCallSelfInviteGuard:
 
         self._route(pbx)
         pbx.extension_registry.unregister.assert_not_called()
+
+
+# ===========================================================================
+# CallRouter.handle_callee_answer
+# ===========================================================================
+
+
+@pytest.mark.unit
+class TestHandleCalleeAnswer:
+    """Tests for CallRouter.handle_callee_answer -- the answer-side twin of
+    route_call, handling the callee's 200 OK for a call route_call set up."""
+
+    def test_no_call_found(self) -> None:
+        """Returns early when call is not found."""
+        pbx = _make_pbx_core()
+        pbx.call_manager.get_call.return_value = None
+        router = CallRouter(pbx)
+
+        router.handle_callee_answer("nonexistent", MagicMock(), ("1.2.3.4", 5060))
+
+        pbx.logger.error.assert_called_once()
+
+    @patch("pbx.sip.message.SIPMessageBuilder.build_response")
+    @patch("pbx.sip.sdp.SDPBuilder.build_audio_sdp", return_value="v=0\r\n...")
+    @patch("pbx.sip.sdp.SDPSession")
+    def test_callee_answer_full_flow(
+        self,
+        mock_sdp_cls: MagicMock,
+        mock_build_sdp: MagicMock,
+        mock_build_response: MagicMock,
+    ) -> None:
+        """Full callee answer flow with SDP, RTP relay, and 200 OK."""
+        pbx = _make_pbx_core()
+
+        mock_call = MagicMock()
+        mock_call.call_id = "call-42"
+        mock_call.from_extension = "1001"
+        mock_call.to_extension = "1002"
+        mock_call.caller_rtp = {"address": "10.0.0.1", "port": 20000, "formats": ["0", "8"]}
+        mock_call.callee_rtp = None
+        mock_call.rtp_ports = (30000, 30001)
+        mock_call.caller_addr = ("10.0.0.1", 5060)
+        mock_call.no_answer_timer = MagicMock()
+        mock_call.original_invite = MagicMock()
+        mock_call.is_transfer_consult = False
+        mock_call.webrtc_session_id = None
+        pbx.call_manager.get_call.return_value = mock_call
+
+        response_msg = MagicMock()
+        response_msg.body = "v=0\r\no=- 0 0 IN IP4 10.0.0.2\r\n"
+
+        sdp_inst = MagicMock()
+        sdp_inst.get_audio_info.return_value = {"address": "10.0.0.2", "port": 20002}
+        mock_sdp_cls.return_value = sdp_inst
+
+        ok_msg = MagicMock()
+        mock_build_response.return_value = ok_msg
+
+        pbx.config.get.side_effect = lambda k, d=None: {
+            "server.external_ip": "10.0.0.100",
+            "server.sip_port": 5060,
+        }.get(k, d)
+        pbx._get_server_ip.return_value = "10.0.0.100"
+        pbx._get_phone_user_agent.return_value = None
+        pbx._detect_phone_model.return_value = None
+        pbx._get_compatible_codecs.return_value = ["0", "8", "101"]
+        pbx._get_dtmf_payload_type.return_value = 101
+        pbx._get_ilbc_mode.return_value = 30
+
+        router = CallRouter(pbx)
+        router.handle_callee_answer("call-42", response_msg, ("10.0.0.2", 5060))
+
+        # Call should be marked as connected via the regular SIP-to-SIP path
+        mock_call.connect.assert_called_once()
+        pbx.cdr_system.mark_answered.assert_called_once_with("call-42")
+        mock_call.no_answer_timer.cancel.assert_called_once()
+        pbx.rtp_relay.set_endpoints.assert_called_once_with(
+            "call-42", ("10.0.0.1", 20000), ("10.0.0.2", 20002)
+        )
+        mock_build_sdp.assert_called_once()
+        mock_build_response.assert_called_once()
+        # The tagged To header actually sent to the caller must be captured
+        # -- it's the caller's real dialog identity for any later
+        # PBX-originated request toward it (e.g. a transfer-bridge BYE),
+        # and can't be recovered from original_invite afterward.
+        assert mock_call.caller_dialog_to is ok_msg.get_header.return_value
+        pbx.sip_server._send_message.assert_called_once()
+
+    def test_callee_answer_no_body(self) -> None:
+        """Handle callee answer when response has no SDP body."""
+        pbx = _make_pbx_core()
+
+        mock_call = MagicMock()
+        mock_call.call_id = "call-99"
+        mock_call.caller_rtp = None
+        mock_call.callee_rtp = None
+        mock_call.rtp_ports = None
+        mock_call.no_answer_timer = None
+        mock_call.original_invite = None
+        mock_call.caller_addr = None
+        mock_call.is_transfer_consult = False
+        mock_call.webrtc_session_id = None
+        pbx.call_manager.get_call.return_value = mock_call
+
+        response_msg = MagicMock()
+        response_msg.body = None
+
+        router = CallRouter(pbx)
+        router.handle_callee_answer("call-99", response_msg, ("1.2.3.4", 5060))
+
+        mock_call.connect.assert_called_once()
+        pbx.cdr_system.mark_answered.assert_called_once_with("call-99")
