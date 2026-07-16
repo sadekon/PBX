@@ -21,10 +21,9 @@ def _make_pbx_core_shell() -> Any:
     Every attribute that __init__ would have created is set to a MagicMock
     so that the *methods* under test can be exercised in isolation.
     """
-    import threading
-
     from pbx.core.codec_negotiator import CodecNegotiator
     from pbx.core.pbx import PBXCore
+    from pbx.core.registration_handler import RegistrationHandler
 
     obj = object.__new__(PBXCore)
 
@@ -81,14 +80,12 @@ def _make_pbx_core_shell() -> Any:
     obj._metrics_running = False
     obj._metrics_thread = None
 
-    # Per-extension registration locks
-    obj._registration_locks = {}
-    obj._registration_locks_guard = threading.Lock()
-
-    # Codec/device negotiation still has real logic exercised directly through
-    # PBXCore's delegator methods below (unlike the other handlers, which are
-    # tested via mock assertions), so it needs a real instance bound to obj.
+    # Codec/device negotiation and registration handling still have real logic
+    # exercised directly through PBXCore's delegator methods below (unlike the
+    # other handlers, which are tested via mock assertions), so they need real
+    # instances bound to obj.
     obj.codec_negotiator = CodecNegotiator(obj)
+    obj.registration_handler = RegistrationHandler(obj)
 
     obj.running = False
     return obj

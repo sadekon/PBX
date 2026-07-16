@@ -5,9 +5,7 @@ Central coordinator for all PBX functionality
 
 from __future__ import annotations
 
-import re
 import threading
-import traceback
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -19,10 +17,10 @@ from pbx.core.codec_negotiator import CodecNegotiator
 from pbx.core.emergency_handler import EmergencyHandler
 from pbx.core.feature_initializer import FeatureInitializer
 from pbx.core.paging_handler import PagingHandler
+from pbx.core.registration_handler import RegistrationHandler
 from pbx.core.transfer_handler import TransferHandler
 from pbx.core.voicemail_handler import VoicemailHandler
 from pbx.features.extensions import ExtensionRegistry
-from pbx.features.webhooks import WebhookEvent
 from pbx.rtp.handler import RTPRelay
 from pbx.sip.server import SIPServer
 from pbx.utils.config import Config
@@ -71,12 +69,6 @@ if TYPE_CHECKING:
     from pbx.utils.prometheus_exporter import PBXMetricsExporter
     from pbx.utils.security import ThreatDetector
     from pbx.utils.security_monitor import SecurityMonitor
-
-_RE_SIP_EXT = re.compile(r"sip:(\d+)@")
-_RE_MAC_PARAM = re.compile(r"mac=([0-9a-fA-F:]{17}|[0-9a-fA-F-]{17})")
-_RE_SIP_INSTANCE = re.compile(r'sip\.instance="<urn:uuid:([0-9a-f-]+)>"', re.IGNORECASE)
-_RE_MAC_IN_UA = re.compile(r"([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}")
-
 
 class PBXCore:
     """Main PBX system coordinator"""
@@ -194,10 +186,6 @@ class PBXCore:
         )
         self.call_manager = CallManager()
 
-        # Per-extension locks to prevent race conditions during concurrent REGISTER
-        self._registration_locks: dict[str, threading.Lock] = {}
-        self._registration_locks_guard = threading.Lock()
-
         # Initialize QoS monitoring system first (needed by RTP relay)
         from pbx.features.qos_monitoring import QoSMonitor
 
@@ -248,6 +236,7 @@ class PBXCore:
         self.paging_handler = PagingHandler(self)
         self.transfer_handler = TransferHandler(self)
         self.codec_negotiator = CodecNegotiator(self)
+        self.registration_handler = RegistrationHandler(self)
 
         self.running = False
 
@@ -522,25 +511,10 @@ class PBXCore:
         return True
 
     def _start_registration_expiry_timer(self) -> None:
-        """Start periodic timer to clean up expired registrations."""
-        interval = self.config.get("sip.registration_expiry_check_interval", 60)
-        self._reg_expiry_timer = threading.Timer(interval, self._check_expired_registrations)
-        self._reg_expiry_timer.daemon = True
-        self._reg_expiry_timer.start()
+        self.registration_handler._start_registration_expiry_timer()
 
     def _check_expired_registrations(self) -> None:
-        """Unregister extensions whose registration has expired."""
-        try:
-            for ext in self.extension_registry.get_registered():
-                if ext.is_expired():
-                    self.logger.info(f"Extension {ext.number} registration expired, unregistering")
-                    self.extension_registry.unregister(ext.number)
-        except Exception as e:
-            self.logger.error(f"Error checking expired registrations: {e}")
-        finally:
-            # Reschedule if still running
-            if self.running:
-                self._start_registration_expiry_timer()
+        self.registration_handler._check_expired_registrations()
 
     def stop(self) -> None:
         """Stop PBX system"""
@@ -548,8 +522,7 @@ class PBXCore:
         self.running = False
 
         # Stop registration expiry timer
-        if hasattr(self, "_reg_expiry_timer") and self._reg_expiry_timer is not None:
-            self._reg_expiry_timer.cancel()
+        self.registration_handler.stop()
 
         # Stop Prometheus metrics collector
         self._stop_metrics_collector()
@@ -577,43 +550,7 @@ class PBXCore:
     def _extract_contact_address(
         self, contact: str | None, addr: tuple[str, int]
     ) -> tuple[str, int]:
-        """
-        Extract SIP address and port from Contact header.
-
-        SIP phones send their listening address in the Contact header during
-        REGISTER. This is more reliable than the UDP source address, which
-        might use an ephemeral port.
-
-        Args:
-            contact: Contact header value (e.g., "<sip:1501@192.168.1.100:5060>")
-            addr: Fallback address (UDP source address)
-
-        Returns:
-            Tuple of (ip_address, port) to use for phone registration
-        """
-        if not contact:
-            return addr
-
-        # Parse Contact header to extract SIP address and port
-        # Format: <sip:extension@ip:port[;params]> or <sip:extension@ip[;params]>
-        contact_match = re.search(r"sip:[^@]+@([^:;>]+)(?::(\d+))?", contact)
-        if contact_match:
-            ip_address = contact_match.group(1)
-            port_str = contact_match.group(2)
-            port = int(port_str) if port_str else 5060
-
-            # Validate the extracted address
-            if ip_address and port:
-                contact_addr = (ip_address, port)
-                # Log when we use Contact header address instead of UDP source
-                if contact_addr != addr:
-                    self.logger.debug(
-                        f"Using Contact address {contact_addr} instead of UDP source {addr}"
-                    )
-                return contact_addr
-
-        # If we can't parse the Contact header, fall back to UDP source address
-        return addr
+        return self.registration_handler._extract_contact_address(contact, addr)
 
     def register_extension(
         self,
@@ -623,249 +560,36 @@ class PBXCore:
         contact: str | None = None,
         expires: int = 3600,
     ) -> bool:
-        """
-        Register extension and store phone information
-
-        Args:
-            from_header: SIP From header
-            addr: Network address (host, port)
-            user_agent: User-Agent header from SIP REGISTER
-            contact: Contact header from SIP REGISTER
-            expires: Registration lifetime in seconds (from SIP Expires header)
-
-        Returns:
-            True if registration successful
-        """
-        # Parse extension number from header
-        # Format: "Display Name" <sip:1001@host>
-        match = _RE_SIP_EXT.search(from_header)
-        if match:
-            extension_number = match.group(1)
-
-            # Acquire per-extension lock to prevent race conditions
-            with self._registration_locks_guard:
-                if extension_number not in self._registration_locks:
-                    self._registration_locks[extension_number] = threading.Lock()
-                ext_lock = self._registration_locks[extension_number]
-
-            with ext_lock:
-                return self._register_extension_locked(
-                    extension_number, addr, user_agent, contact, expires
-                )
-
-        self.logger.warning(f"Could not parse extension from {from_header}")
-        return False
-
-    def _register_extension_locked(
-        self,
-        extension_number: str,
-        addr: tuple[str, int],
-        user_agent: str | None,
-        contact: str | None,
-        expires: int,
-    ) -> bool:
-        """Perform the actual registration under the per-extension lock."""
-        registered_addr = addr
-
-        # Verify extension exists - check database first, then config
-        extension_exists = False
-
-        # Check extensions database table first (if available)
-        if self.extension_db:
-            try:
-                db_extension = self.extension_db.get(extension_number)
-                if db_extension:
-                    extension_exists = True
-                    self.logger.debug(f"Extension {extension_number} found in database")
-
-                    # Ensure extension is loaded in registry (if not already)
-                    if not self.extension_registry.get(extension_number):
-                        extension_obj = ExtensionRegistry.create_extension_from_db(db_extension)
-                        self.extension_registry.extensions[extension_number] = extension_obj
-                        self.logger.debug(
-                            f"Loaded extension {extension_number} into registry from database"
-                        )
-            except (KeyError, TypeError, ValueError) as e:
-                self.logger.debug(f"Error checking extension in database: {e}")
-
-        # Fall back to config if not found in database or database not available
-        if not extension_exists:
-            extension = self.config.get_extension(extension_number)
-            if extension:
-                extension_exists = True
-                self.logger.debug(f"Extension {extension_number} found in config")
-
-        if extension_exists:
-            # Handle Expires: 0 as unregistration per RFC 3261 Section 10.2.2.
-            if expires == 0:
-                self.extension_registry.unregister(extension_number)
-                self.logger.info(f"Extension {extension_number} unregistered (Expires: 0)")
-            else:
-                # Extract the phone's listening address from Contact header
-                registered_addr = self._extract_contact_address(contact, addr)
-                self.extension_registry.register(extension_number, registered_addr, expires=expires)
-                self.logger.info(f"Extension {extension_number} registered from {registered_addr}")
-
-                # Store phone registration in database (skip for unregistration)
-            # Store phone registration in database (skip for unregistration)
-            if self.registered_phones_db and expires > 0:
-                ip_address = registered_addr[0]
-                mac_address = self._extract_mac_address(contact, user_agent)
-
-                try:
-                    _, stored_mac = self.registered_phones_db.register_phone(
-                        extension_number=extension_number,
-                        ip_address=ip_address,
-                        mac_address=mac_address,
-                        user_agent=user_agent,
-                        contact_uri=contact,
-                    )
-
-                    if stored_mac:
-                        self.logger.info(
-                            f"Stored phone registration: ext={extension_number}, ip={ip_address}, mac={stored_mac}"
-                        )
-                    else:
-                        self.logger.info(
-                            f"Stored phone registration: ext={extension_number}, ip={ip_address} (no MAC)"
-                        )
-                except Exception as e:
-                    self.logger.error(f"Failed to store phone registration in database: {e}")
-                    self.logger.error(f"  Extension: {extension_number}")
-                    self.logger.error(f"  IP Address: {ip_address}")
-                    self.logger.error(f"  MAC Address: {mac_address}")
-                    self.logger.error(f"  User Agent: {user_agent}")
-                    self.logger.error(f"  Contact URI: {contact}")
-                    self.logger.error(f"  Traceback: {traceback.format_exc()}")
-
-            # Record successful registration metric
-            if self.metrics_exporter:
-                event = "unregistration" if expires == 0 else "success"
-                self.metrics_exporter.record_extension_registration(event)
-
-            # Trigger webhook event for registrations (not unregistrations)
-            if expires > 0:
-                self.webhook_system.trigger_event(
-                    WebhookEvent.EXTENSION_REGISTERED,
-                    {
-                        "extension": extension_number,
-                        "ip_address": registered_addr[0],
-                        "port": registered_addr[1],
-                        "user_agent": user_agent,
-                        "timestamp": datetime.now(UTC).isoformat(),
-                    },
-                )
-
-            return True
-
-        # Record failed registration metric
-        if self.metrics_exporter:
-            self.metrics_exporter.record_extension_registration("failure")
-        self.logger.warning(f"Unknown extension {extension_number} attempted registration")
-        return False
+        return self.registration_handler.register_extension(
+            from_header, addr, user_agent, contact, expires
+        )
 
     def _extract_mac_address(self, contact: str | None, user_agent: str | None) -> str | None:
-        """
-        Extract MAC address from SIP headers
-
-        Args:
-            contact: Contact header
-            user_agent: User-Agent header
-
-        Returns:
-            MAC address string or None
-        """
-        try:
-            mac_address = None
-
-            # Try to extract from Contact header
-            if contact:
-                mac_match = _RE_MAC_PARAM.search(contact)
-                if mac_match:
-                    mac_address = mac_match.group(1).lower()
-
-                instance_match = _RE_SIP_INSTANCE.search(contact)
-                if not mac_address and instance_match:
-                    # Some devices use UUID derived from MAC
-                    uuid_str = instance_match.group(1).replace("-", "")
-                    # Last 12 chars might be MAC
-                    if len(uuid_str) >= 12:
-                        potential_mac = uuid_str[-12:]
-                        mac_address = ":".join([potential_mac[i : i + 2] for i in range(0, 12, 2)])
-
-            # Try to extract from User-Agent
-            if not mac_address and user_agent:
-                mac_match = _RE_MAC_IN_UA.search(user_agent)
-                if mac_match:
-                    mac_address = mac_match.group(0).lower()
-
-            # Normalize MAC address format (remove separators, lowercase)
-            if mac_address:
-                mac_address = mac_address.replace(":", "").replace("-", "").lower()
-
-            return mac_address
-        except (re.error, AttributeError, IndexError, TypeError) as e:
-            self.logger.debug(f"Failed to parse MAC address from SIP headers: {e}")
-            return None
+        return self.registration_handler._extract_mac_address(contact, user_agent)
 
     def _detect_phone_model(self, user_agent: str | None) -> str | None:
-        """
-        Detect phone model from User-Agent string.
-
-        Delegates to :meth:`CodecNegotiator._detect_phone_model`.
-        """
         return self.codec_negotiator._detect_phone_model(user_agent)
 
     def _should_skip_static_rtpmap(self, phone_model: str | None) -> bool:
-        """
-        Check whether to omit a=rtpmap lines for static payload types.
-
-        Delegates to :meth:`CodecNegotiator._should_skip_static_rtpmap`.
-        """
         return self.codec_negotiator._should_skip_static_rtpmap(phone_model)
 
     def _get_codecs_for_phone_model(
         self, phone_model: str | None, default_codecs: list[str] | None = None
     ) -> list[str]:
-        """
-        Get appropriate codec list for a specific phone model.
-
-        Delegates to :meth:`CodecNegotiator._get_codecs_for_phone_model`.
-        """
         return self.codec_negotiator._get_codecs_for_phone_model(phone_model, default_codecs)
 
     def _get_compatible_codecs(
         self, phone_model: str | None, answered_codecs: list[str] | None
     ) -> list[str]:
-        """
-        Compute codecs compatible with both the phone model and the answered codec set.
-
-        Delegates to :meth:`CodecNegotiator._get_compatible_codecs`.
-        """
         return self.codec_negotiator._get_compatible_codecs(phone_model, answered_codecs)
 
     def _get_phone_user_agent(self, extension_number: str) -> str | None:
-        """
-        Get User-Agent string for a registered phone by extension number.
-
-        Delegates to :meth:`CodecNegotiator._get_phone_user_agent`.
-        """
         return self.codec_negotiator._get_phone_user_agent(extension_number)
 
     def _get_dtmf_payload_type(self) -> int:
-        """
-        Get DTMF payload type from configuration.
-
-        Delegates to :meth:`CodecNegotiator._get_dtmf_payload_type`.
-        """
         return self.codec_negotiator._get_dtmf_payload_type()
 
     def _get_ilbc_mode(self) -> int:
-        """
-        Get iLBC mode from configuration.
-
-        Delegates to :meth:`CodecNegotiator._get_ilbc_mode`.
-        """
         return self.codec_negotiator._get_ilbc_mode()
 
     def _get_server_ip(self) -> str:

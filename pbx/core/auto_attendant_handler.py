@@ -506,6 +506,17 @@ class AutoAttendantHandler:
         caller_ep = (call.caller_rtp["address"], call.caller_rtp["port"])
         pbx.rtp_relay.set_endpoints(call_id, caller_ep, None)
 
+        # A real phone signals hold (a=sendonly re-INVITE) before REFERring,
+        # which is what normally starts MOH for the party being transferred
+        # (see SIPServer._handle_reinvite). The caller's leg here is never
+        # re-signaled, so nothing would otherwise trigger it -- start it
+        # explicitly so the caller hears hold music instead of silence while
+        # the destination rings. bridge_attended_transfer stops it on
+        # success; _return_to_menu stops it on failure.
+        relay_handler = pbx.rtp_relay.get_handler(call_id)
+        if relay_handler:
+            pbx.moh_system.start_moh(call_id, relay_handler, "a")
+
         # On no-answer / busy / reject, come back to the menu instead of the
         # default hangup (see PBXCore.abort_pending_transfer).
         call.transfer_failure_callback = lambda: self._return_to_menu(call_id, call)
@@ -544,6 +555,10 @@ class AutoAttendantHandler:
         import threading
 
         pbx = self.pbx_core
+
+        # Idempotent: stop_moh no-ops if _begin_transfer never started it
+        # (e.g. adopt_existing_port failed before reaching that point).
+        pbx.moh_system.stop_moh(call_id)
 
         # Idempotent if no relay is present (e.g. adopt_existing_port failed):
         # release_relay_keep_port returns None and the port is already free.
