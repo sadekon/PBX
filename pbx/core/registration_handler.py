@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 import threading
 import traceback
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -26,6 +27,11 @@ _RE_SIP_EXT = re.compile(r"sip:(\d+)@")
 _RE_MAC_PARAM = re.compile(r"mac=([0-9a-fA-F:]{17}|[0-9a-fA-F-]{17})")
 _RE_SIP_INSTANCE = re.compile(r'sip\.instance="<urn:uuid:([0-9a-f-]+)>"', re.IGNORECASE)
 _RE_MAC_IN_UA = re.compile(r"([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}")
+
+# Phones' own SIP listening port isn't persisted in registered_phones_db
+# (only ip_address is) -- 5060 is the near-universal default, including for
+# both Zultys ZIP models (see provisioning_templates/zultys_zip*.template).
+_DEFAULT_PHONE_SIP_PORT = 5060
 
 
 class RegistrationHandler:
@@ -239,6 +245,78 @@ class RegistrationHandler:
             pbx.metrics_exporter.record_extension_registration("failure")
         pbx.logger.warning(f"Unknown extension {extension_number} attempted registration")
         return False
+
+    def resync_known_phones(self) -> None:
+        """
+        Kick every previously-seen phone into re-registering immediately.
+
+        extension_registry is in-memory only, so it starts empty on every
+        process restart; a phone stays unreachable for inbound calls (see
+        is_registered / _handle_invite) until it sends a fresh REGISTER on
+        its own. Most phones notice a lost connection and do that right
+        away, but some (observed with the Zultys ZIP 37G) don't and just
+        wait out their full Expires interval -- up to an hour of being
+        unreachable after a routine restart, even though registered_phones_db
+        (which does survive restarts) already has their last-known address.
+
+        Sends a check-sync NOTIFY to each one, the same event phones already
+        honor as a "reload now" signal from reboot_phone(). Best-effort: an
+        unreachable or since-moved phone just doesn't answer.
+        """
+        from pbx.sip.message import SIPMessageBuilder
+
+        pbx = self.pbx_core
+
+        if not pbx.registered_phones_db:
+            return
+
+        try:
+            known_phones = list(pbx.registered_phones_db.list_all())
+        except Exception as e:
+            pbx.logger.error(f"Failed to load known phones for startup resync: {e}")
+            return
+
+        server_ip = pbx._get_server_ip()
+        server_sip_port = pbx.config.get("server.sip_port", 5060)
+        sent = 0
+
+        for phone in known_phones:
+            extension_number = phone.get("extension_number")
+            ip_address = phone.get("ip_address")
+            if not extension_number or not ip_address:
+                continue
+
+            try:
+                notify_msg = SIPMessageBuilder.build_request(
+                    method="NOTIFY",
+                    uri=f"sip:{extension_number}@{ip_address}:{_DEFAULT_PHONE_SIP_PORT}",
+                    from_addr=f"<sip:{server_ip}:{server_sip_port}>",
+                    to_addr=f"<sip:{extension_number}@{server_ip}>",
+                    call_id=f"notify-resync-{extension_number}-{uuid.uuid4()}",
+                    cseq=1,
+                )
+                notify_msg.set_header("Event", "check-sync")
+                notify_msg.set_header("Subscription-State", "terminated")
+                notify_msg.set_header("Content-Length", "0")
+                branch_id = str(uuid.uuid4()).replace("-", "")
+                notify_msg.set_header(
+                    "Via",
+                    f"SIP/2.0/UDP {server_ip}:{server_sip_port};branch=z9hG4bK{branch_id}",
+                )
+                notify_msg.set_header("Max-Forwards", "70")
+
+                pbx.sip_server._send_message(
+                    notify_msg.build(), (ip_address, _DEFAULT_PHONE_SIP_PORT)
+                )
+                sent += 1
+            except (KeyError, TypeError, ValueError, OSError) as e:
+                pbx.logger.debug(f"Failed to send resync NOTIFY to {extension_number}: {e}")
+
+        if sent:
+            pbx.logger.info(
+                f"Startup resync: sent check-sync NOTIFY to {sent} previously-registered "
+                "phone(s) to speed up re-registration after restart"
+            )
 
     def _extract_mac_address(self, contact: str | None, user_agent: str | None) -> str | None:
         """
