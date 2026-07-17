@@ -234,7 +234,7 @@ class OperatorConsole:
             # Use PBX core's blind_transfer to perform the actual SIP-level transfer.
             # blind_transfer sends a new INVITE to the target extension, re-points the
             # RTP relay, and sends BYE to the transferring party (operator).
-            success = self.pbx_core.blind_transfer(call_id, target_extension)
+            success = self.pbx_core.transfer_handler.blind_transfer(call_id, target_extension)
             if success:
                 self.logger.info(
                     f"Announced transfer completed for call {call_id} to {target_extension}"

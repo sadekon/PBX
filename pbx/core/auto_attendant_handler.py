@@ -201,7 +201,9 @@ class AutoAttendantHandler:
                 pbx.rtp_relay.port_pool.sort()
             return False
 
-    def _auto_attendant_session(self, call_id: str, call: Any, session: dict[str, Any]) -> None:
+    def _auto_attendant_session(
+        self, call_id: str, call: Any, session: dict[str, Any], reentry: bool = False
+    ) -> None:
         """
         Handle auto attendant session with menu and DTMF input
 
@@ -209,15 +211,24 @@ class AutoAttendantHandler:
             call_id: Call identifier
             call: Call object
             session: Auto attendant session
+            reentry: True when this session was restarted after a failed
+                transfer (see _return_to_menu). Skips the welcome greeting --
+                the caller already heard it -- and goes straight to the menu.
         """
         import tempfile
 
-        from pbx.rtp.handler import RTPDTMFListener, RTPPlayer
+        from pbx.rtp.dtmf_monitor import build_ivr_dtmf_channel
+        from pbx.rtp.handler import RTPPlayer
         from pbx.utils.audio import get_prompt_audio
 
         pbx = self.pbx_core
 
-        transferred = False
+        # Set once a transfer takes over the caller's port and call record
+        # (see _begin_transfer): this session relinquishes ownership, so it
+        # must not stop the player/recorder, return the port, or end the call
+        # in cleanup -- the relay (on success) or the restarted menu session
+        # (on failure) now owns them.
+        handed_off = False
         try:
             # Wait for RTP to stabilize
             time.sleep(0.5)
@@ -229,11 +240,11 @@ class AutoAttendantHandler:
             # ============================================================
             # RTP SETUP FOR AUTO ATTENDANT - BIDIRECTIONAL AUDIO
             # ============================================================
-            # This section sets up RTP for interactive auto attendant:
-            # 1. RTPPlayer: Sends audio prompts/menus to the caller (server -> client)
-            # 2. RTPDTMFListener: Receives audio and detects DTMF tones (client -> server)
-            # Both use the same local port (call.rtp_ports[0]) allocated by RTP relay.
-            # This creates a full-duplex audio channel for the auto attendant system.
+            # 1. RTPPlayer: Sends audio prompts/menus to the caller.
+            # 2. build_ivr_dtmf_channel: RTPRecorder + DTMFMonitor merging all
+            #    DTMF sources (RFC 2833 telephone-event, SIP INFO, in-band
+            #    G.711 tones) into one deduped digit queue.
+            # All share the local port (call.rtp_ports[0]) from the RTP pool.
             # ============================================================
 
             # Create RTP player for sending audio prompts to the caller
@@ -248,60 +259,72 @@ class AutoAttendantHandler:
                 pbx.logger.error(f"Failed to start RTP player for auto attendant {call_id}")
                 return
 
-            # Create DTMF listener for receiving and detecting user input
-            dtmf_listener = RTPDTMFListener(call.rtp_ports[0])
-            if not dtmf_listener.start():
-                pbx.logger.error(f"Failed to start DTMF listener for auto attendant {call_id}")
+            recorder, dtmf_monitor = build_ivr_dtmf_channel(pbx, call, call_id, call.rtp_ports[0])
+            if not recorder.start():
+                pbx.logger.error(f"Failed to start RTP recorder for auto attendant {call_id}")
                 player.stop()
                 return
             pbx.logger.info(
                 "Auto attendant RTP setup complete - bidirectional audio channel established"
             )
 
+            # Barge-in predicate for menu prompts: True as soon as a digit is
+            # pending from any source. has_digit() only *peeks* -- the digit
+            # stays queued so the loop below still pops it via get_digit() and
+            # feeds auto_attendant.handle_dtmf(), advancing the state machine.
+            # Lets callers dial their choice over the greeting/menu without
+            # waiting for it to finish.
+            _dtmf_pending = dtmf_monitor.has_digit
+
             # Play welcome greeting
             action = session.get("session")
-            audio_file: str | None = session.get("file")
+            audio_file: Path | None = session.get("file")
 
             pbx.logger.info(f"[Auto Attendant] Starting audio playback for call {call_id}")
             audio_played: bool = False
 
-            if audio_file and Path(audio_file).exists():
-                pbx.logger.info(f"[Auto Attendant] Playing welcome file: {audio_file}")
-                audio_played = player.play_file(audio_file)
-                if audio_played:
-                    pbx.logger.info("[Auto Attendant] ✓ Welcome audio played successfully")
-                else:
-                    pbx.logger.error("[Auto Attendant] ✗ Failed to play welcome audio")
-            else:
-                # Try to load from auto_attendant/welcome.wav, fallback to tone
-                # generation
-                pbx.logger.info("[Auto Attendant] Generating welcome prompt audio")
-                prompt_data = get_prompt_audio("welcome", prompt_dir="auto_attendant")
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                    temp_file.write(prompt_data)
-                    temp_file_path = temp_file.name
-                try:
-                    audio_played = player.play_file(temp_file_path)
+            # Welcome greeting -- skipped on re-entry after a failed transfer
+            # (the caller already heard it; go straight back to the menu).
+            if not reentry:
+                if audio_file and Path(audio_file).exists():
+                    pbx.logger.info(f"[Auto Attendant] Playing welcome file: {audio_file}")
+                    audio_played = player.play_file(audio_file, interrupt_check=_dtmf_pending)
                     if audio_played:
-                        pbx.logger.info(
-                            "[Auto Attendant] ✓ Generated welcome audio played successfully"
-                        )
+                        pbx.logger.info("[Auto Attendant] ✓ Welcome audio played successfully")
                     else:
-                        pbx.logger.error(
-                            "[Auto Attendant] ✗ Failed to play generated welcome audio"
+                        pbx.logger.error("[Auto Attendant] ✗ Failed to play welcome audio")
+                else:
+                    # Try to load from auto_attendant/welcome.wav, fallback to tone
+                    # generation
+                    pbx.logger.info("[Auto Attendant] Generating welcome prompt audio")
+                    prompt_data = get_prompt_audio("welcome", prompt_dir="auto_attendant")
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                        temp_file.write(prompt_data)
+                        temp_file_path = temp_file.name
+                    try:
+                        audio_played = player.play_file(
+                            temp_file_path, interrupt_check=_dtmf_pending
                         )
-                finally:
-                    with contextlib.suppress(OSError):
-                        Path(temp_file_path).unlink()
+                        if audio_played:
+                            pbx.logger.info(
+                                "[Auto Attendant] ✓ Generated welcome audio played successfully"
+                            )
+                        else:
+                            pbx.logger.error(
+                                "[Auto Attendant] ✗ Failed to play generated welcome audio"
+                            )
+                    finally:
+                        with contextlib.suppress(OSError):
+                            Path(temp_file_path).unlink()
 
-            time.sleep(0.5)
+                time.sleep(0.5)
 
             # Play main menu
             pbx.logger.info(f"[Auto Attendant] Playing main menu for call {call_id}")
-            menu_audio: str | None = pbx.auto_attendant._get_audio_file("main_menu")
+            menu_audio: Path | None = pbx.auto_attendant._get_audio_file("main_menu")
             if menu_audio and Path(menu_audio).exists():
                 pbx.logger.info(f"[Auto Attendant] Playing menu file: {menu_audio}")
-                audio_played = player.play_file(menu_audio)
+                audio_played = player.play_file(menu_audio, interrupt_check=_dtmf_pending)
                 if audio_played:
                     pbx.logger.info("[Auto Attendant] ✓ Menu audio played successfully")
                 else:
@@ -315,7 +338,7 @@ class AutoAttendantHandler:
                     temp_file.write(prompt_data)
                     temp_file_path = temp_file.name
                 try:
-                    audio_played = player.play_file(temp_file_path)
+                    audio_played = player.play_file(temp_file_path, interrupt_check=_dtmf_pending)
                     if audio_played:
                         pbx.logger.info(
                             "[Auto Attendant] ✓ Generated menu audio played successfully"
@@ -332,18 +355,9 @@ class AutoAttendantHandler:
             start_time: float = time.time()
 
             while session_active and (time.time() - start_time) < timeout:
-                # Check for DTMF input from SIP INFO or in-band
-                digit: str | None = None
-
-                # Priority 1: Check SIP INFO queue
-                if hasattr(call, "dtmf_info_queue") and call.dtmf_info_queue:
-                    digit = call.dtmf_info_queue.pop(0)
-                    pbx.logger.info(f"Auto attendant received DTMF from SIP INFO: {digit}")
-                else:
-                    # Priority 2: Check in-band DTMF
-                    digit = dtmf_listener.get_digit(timeout=1.0)
-                    if digit:
-                        pbx.logger.info(f"Auto attendant received DTMF from in-band audio: {digit}")
+                # One call covers every DTMF source (RFC 2833 telephone-event,
+                # SIP INFO, in-band G.711 tones), deduped by the monitor.
+                digit: str | None = dtmf_monitor.get_digit(timeout=1.0)
 
                 if digit:
                     pbx.logger.info(f"Auto attendant received DTMF: {digit}")
@@ -357,50 +371,18 @@ class AutoAttendantHandler:
                     if action == "transfer":
                         destination: str | None = result.get("destination")
                         pbx.logger.info(f"Auto attendant transferring to {destination}")
-
-                        # Play transfer message
-                        transfer_audio: str | None = pbx.auto_attendant._get_audio_file(
-                            "transferring"
-                        )
-                        if transfer_audio and Path(transfer_audio).exists():
-                            player.play_file(transfer_audio)
-                        else:
-                            # Try to load from auto_attendant/transferring.wav,
-                            # fallback to tone generation
-                            prompt_data = get_prompt_audio(
-                                "transferring", prompt_dir="auto_attendant"
-                            )
-                            with tempfile.NamedTemporaryFile(
-                                suffix=".wav", delete=False
-                            ) as temp_file:
-                                temp_file.write(prompt_data)
-                                temp_file_path = temp_file.name
-                            try:
-                                player.play_file(temp_file_path)
-                            finally:
-                                with contextlib.suppress(OSError):
-                                    Path(temp_file_path).unlink()
-
-                        time.sleep(0.5)
-
-                        # Transfer the call using existing transfer_call method
                         if call_id and destination:
-                            success = pbx.transfer_call(call_id, destination)
-                            if success:
-                                transferred = True
-                            else:
-                                pbx.logger.warning(
-                                    f"Failed to transfer call {call_id} to {destination}"
-                                )
+                            self._begin_transfer(call_id, call, destination, player, recorder)
+                            handed_off = True
                         else:
-                            pbx.logger.warning("Cannot transfer call: no call_id available")
+                            pbx.logger.warning("Cannot transfer call: no destination available")
                         session_active = False
 
                     elif action == "play":
                         # Play the requested audio
                         audio_file = result.get("file")
                         if audio_file and Path(audio_file).exists():
-                            player.play_file(audio_file)
+                            player.play_file(audio_file, interrupt_check=_dtmf_pending)
 
                         # Reset timeout
                         start_time = time.time()
@@ -409,8 +391,14 @@ class AutoAttendantHandler:
                     if "session" in result:
                         session["session"] = result["session"]
 
-            # Timeout - handle it
-            if time.time() - start_time >= timeout:
+                    # The AA never saves the recording; drop accumulated audio
+                    # so a long menu session doesn't grow memory. (In-band DTMF
+                    # detection buffers independently inside the DTMFMonitor.)
+                    if hasattr(recorder, "recorded_data"):
+                        recorder.recorded_data = []
+
+            # Timeout - handle it (but not if a transfer already handed off)
+            if not handed_off and time.time() - start_time >= timeout:
                 result = pbx.auto_attendant.handle_timeout(session["session"])
                 action = result.get("action")
 
@@ -418,24 +406,21 @@ class AutoAttendantHandler:
                     destination = result.get("destination")
                     pbx.logger.info(f"Auto attendant timeout, transferring to {destination}")
                     if call_id and destination:
-                        success = pbx.transfer_call(call_id, destination)
-                        if success:
-                            transferred = True
-                        else:
-                            pbx.logger.warning(
-                                f"Failed to transfer call {call_id} to {destination} on timeout"
-                            )
+                        self._begin_transfer(call_id, call, destination, player, recorder)
+                        handed_off = True
 
-            # Clean up
-            player.stop()
-            dtmf_listener.stop()
+            # Clean up -- skipped once a transfer handed off ownership of the
+            # port and call record to the relay or the restarted menu session.
+            if not handed_off:
+                player.stop()
+                recorder.stop()
 
-            # Return port to pool (thread-safe)
-            if hasattr(call, "aa_rtp_port"):
-                with pbx.rtp_relay._pool_lock:
-                    pbx.rtp_relay.port_pool.append(call.aa_rtp_port)
-                    pbx.rtp_relay.port_pool.sort()
-                pbx.logger.info(f"Returned RTP port {call.aa_rtp_port} to pool")
+                # Return port to pool (thread-safe)
+                if hasattr(call, "aa_rtp_port"):
+                    with pbx.rtp_relay._pool_lock:
+                        pbx.rtp_relay.port_pool.append(call.aa_rtp_port)
+                        pbx.rtp_relay.port_pool.sort()
+                    pbx.logger.info(f"Returned RTP port {call.aa_rtp_port} to pool")
 
         except (KeyError, OSError, TypeError, ValueError) as e:
             pbx.logger.error(f"Error in auto attendant session: {e}")
@@ -443,8 +428,9 @@ class AutoAttendantHandler:
 
             pbx.logger.error(traceback.format_exc())
 
-            # Ensure port is returned even on error (thread-safe)
-            if hasattr(call, "aa_rtp_port"):
+            # Ensure port is returned even on error (thread-safe), unless a
+            # transfer already handed the port off to another owner.
+            if not handed_off and hasattr(call, "aa_rtp_port"):
                 try:
                     with pbx.rtp_relay._pool_lock:
                         pbx.rtp_relay.port_pool.append(call.aa_rtp_port)
@@ -452,7 +438,139 @@ class AutoAttendantHandler:
                 except Exception as exc:
                     pbx.logger.error(f"Failed to return RTP port {call.aa_rtp_port}: {exc}")
         finally:
-            # Only end the call if it was not successfully transferred
-            if not transferred:
+            # End the call only if this session still owns it -- a transfer
+            # handoff leaves the call alive (bridged, or being re-served by a
+            # restarted menu session).
+            if not handed_off:
                 time.sleep(1)
                 pbx.end_call(call_id)
+
+    def _begin_transfer(
+        self, call_id: str, call: Any, destination: str, player: Any, recorder: Any
+    ) -> None:
+        """
+        Hand the caller off to `destination` via the shared blind-transfer
+        pipeline, keeping the PBX in the RTP path (the Asterisk-standard way
+        to transfer a trunk/inbound call: the caller's leg is never
+        re-signaled, only the far side of the relay changes).
+
+        Promotes the single-leg IVR port to a two-party relay -- the raw
+        RTPPlayer/RTPRecorder are stopped so the relay can rebind the same
+        port, the caller becomes side A -- then originates the destination
+        leg through TransferHandler.start_blind_refer_transfer (referrer_addr=None:
+        the AA has no real transferor phone). The bridge completes when the
+        destination answers (handle_callee_answer -> bridge_attended_transfer
+        sets side B). On any failure the registered failure callback returns
+        the caller to the menu (see _return_to_menu).
+
+        The caller must treat the call/port as handed off after this returns.
+        """
+        import tempfile
+
+        from pbx.utils.audio import get_prompt_audio
+
+        pbx = self.pbx_core
+
+        # Announce the transfer while the raw IVR audio path is still up.
+        transfer_audio: Path | None = pbx.auto_attendant._get_audio_file("transferring")
+        if transfer_audio and Path(transfer_audio).exists():
+            player.play_file(transfer_audio)
+        else:
+            prompt_data = get_prompt_audio("transferring", prompt_dir="auto_attendant")
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_file.write(prompt_data)
+                temp_file_path = temp_file.name
+            try:
+                player.play_file(temp_file_path)
+            finally:
+                with contextlib.suppress(OSError):
+                    Path(temp_file_path).unlink()
+        time.sleep(0.5)
+
+        # Release the raw IVR sockets so the relay can rebind the same port.
+        player.stop()
+        recorder.stop()
+
+        if not call.rtp_ports:
+            pbx.logger.error(f"No RTP port for auto attendant transfer of {call_id}")
+            self._return_to_menu(call_id, call)
+            return
+
+        rtp_port, rtcp_port = call.rtp_ports
+        if not pbx.rtp_relay.adopt_existing_port(call_id, rtp_port, rtcp_port):
+            pbx.logger.error(f"Failed to promote auto attendant port to relay for {call_id}")
+            self._return_to_menu(call_id, call)
+            return
+
+        # Caller occupies side A; the destination will fill side B on answer.
+        caller_ep = (call.caller_rtp["address"], call.caller_rtp["port"])
+        pbx.rtp_relay.set_endpoints(call_id, caller_ep, None)
+
+        # A real phone signals hold (a=sendonly re-INVITE) before REFERring,
+        # which is what normally starts MOH for the party being transferred
+        # (see SIPServer._handle_reinvite). The caller's leg here is never
+        # re-signaled, so nothing would otherwise trigger it -- start it
+        # explicitly so the caller hears hold music instead of silence while
+        # the destination rings. bridge_attended_transfer stops it on
+        # success; _return_to_menu stops it on failure.
+        relay_handler = pbx.rtp_relay.get_handler(call_id)
+        if relay_handler:
+            pbx.moh_system.start_moh(call_id, relay_handler, "a")
+
+        # On no-answer / busy / reject, come back to the menu instead of the
+        # default hangup (see PBXCore.abort_pending_transfer).
+        call.transfer_failure_callback = lambda: self._return_to_menu(call_id, call)
+
+        if not pbx.transfer_handler.start_blind_refer_transfer(
+            call,
+            referrer_is_caller=False,
+            destination=destination,
+            referrer_addr=None,
+        ):
+            # Synchronous failure (e.g. destination offline): no consult was
+            # created, so abort_pending_transfer never fires -- return to the
+            # menu directly.
+            call.transfer_failure_callback = None
+            pbx.logger.warning(
+                f"Auto attendant transfer to {destination} failed to start; returning to menu"
+            )
+            self._return_to_menu(call_id, call)
+
+    def _return_to_menu(self, call_id: str, call: Any) -> None:
+        """
+        Recover a caller whose transfer attempt failed by restarting the menu
+        on the same port, with no re-signaling toward the caller.
+
+        Reclaims the caller's port from the transfer relay WITHOUT returning
+        it to the pool (it was never in the normal allocate/release cycle --
+        the AA popped it directly), so a fresh IVR session can rebind the same
+        port. Runs on a new daemon thread because it is also invoked from the
+        SIP-response / no-answer-timer threads (via the failure callback),
+        which must not block on a full menu interaction.
+
+        TODO(transfer-fallback): interim behavior -- replays the main menu.
+        Revisit the desired UX (destination voicemail? apology + hangup?)
+        pending a product decision.
+        """
+        import threading
+
+        pbx = self.pbx_core
+
+        # Idempotent: stop_moh no-ops if _begin_transfer never started it
+        # (e.g. adopt_existing_port failed before reaching that point).
+        pbx.moh_system.stop_moh(call_id)
+
+        # Idempotent if no relay is present (e.g. adopt_existing_port failed):
+        # release_relay_keep_port returns None and the port is already free.
+        pbx.rtp_relay.release_relay_keep_port(call_id)
+
+        fresh_session = pbx.auto_attendant.start_session(call_id, call.from_extension)
+        call.aa_session = fresh_session
+
+        thread = threading.Thread(
+            target=self._auto_attendant_session,
+            args=(call_id, call, fresh_session),
+            kwargs={"reentry": True},
+        )
+        thread.daemon = True
+        thread.start()

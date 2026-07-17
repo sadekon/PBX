@@ -684,6 +684,12 @@ def _regenerate_voice_prompts(
         if custom_prompts:
             prompts.update(custom_prompts)
 
+        # Substitute company name placeholder in case custom prompts still
+        # contain the raw template (e.g. unedited text from the prompts GET endpoint)
+        for filename, text in prompts.items():
+            if "{company_name}" in text:
+                prompts[filename] = text.replace("{company_name}", company_name)
+
         # Get output directory
         audio_path = aa_config.get("audio_path", "auto_attendant")
         if not Path(audio_path).exists():

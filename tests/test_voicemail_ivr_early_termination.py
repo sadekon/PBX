@@ -89,7 +89,7 @@ class TestVoicemailIVREarlyTermination:
                 end_thread.start()
 
                 # Run the IVR session
-                pbx_core._voicemail_ivr_session(
+                pbx_core.voicemail_handler._voicemail_ivr_session(
                     "test-call-early-term", call, mock_mailbox, mock_ivr
                 )
 
@@ -165,7 +165,7 @@ class TestVoicemailIVREarlyTermination:
 
             with patch.object(pbx_core, "logger") as mock_logger:
                 # Run IVR session
-                pbx_core._voicemail_ivr_session(
+                pbx_core.voicemail_handler._voicemail_ivr_session(
                     "test-call-already-ended", call, mock_mailbox, mock_ivr
                 )
 

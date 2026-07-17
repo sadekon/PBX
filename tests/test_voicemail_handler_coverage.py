@@ -12,9 +12,10 @@ Covers:
   - complete_voicemail_recording (call not found, no recorder, audio present, no audio)
 """
 
+import contextlib
 import sys
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -22,6 +23,7 @@ import pytest
 # Pre-mock modules that use Python 3.12+ syntax and cannot be imported
 # ---------------------------------------------------------------------------
 _mock_rtp_handler = MagicMock()
+_mock_dtmf_monitor = MagicMock()
 _mock_utils_audio = MagicMock()
 _mock_utils_dtmf = MagicMock()
 _mock_sip_message = MagicMock()
@@ -36,6 +38,7 @@ from pbx.core.voicemail_handler import VoicemailHandler
 
 _MOCK_MODULES = {
     "pbx.rtp.handler": _mock_rtp_handler,
+    "pbx.rtp.dtmf_monitor": _mock_dtmf_monitor,
     "pbx.utils.audio": _mock_utils_audio,
     "pbx.utils.dtmf": _mock_utils_dtmf,
     "pbx.sip.message": _mock_sip_message,
@@ -56,6 +59,9 @@ def _install_mock_modules():
     """
     originals = {name: sys.modules.get(name) for name in _MOCK_MODULES}
     sys.modules.update(_MOCK_MODULES)
+    # Default DTMF-channel wiring so tests that don't call _setup_rtp_mocks()
+    # still get a well-formed (recorder, monitor) pair from the factory.
+    _wire_dtmf_channel()
     try:
         yield
     finally:
@@ -98,6 +104,41 @@ def _make_call(state_value: str = "connected") -> MagicMock:
     return call_obj
 
 
+def _wire_dtmf_channel(recorder_source=None) -> None:
+    """Wire the mocked build_ivr_dtmf_channel factory.
+
+    The factory returns (recorder, monitor) where the monitor's get_digit
+    drains the call's dtmf_info_queue (so tests keep driving digits through
+    call_obj.dtmf_info_queue as before), then any digits pre-seeded on
+    call_obj.test_inband_digits (simulating in-band detections), then None.
+
+    Args:
+        recorder_source: Zero-arg callable returning the recorder mock to
+            hand out (so assertions on a test's mock_recorder work). Defaults
+            to a fresh MagicMock per call.
+    """
+
+    def _factory(pbx_core, call, call_id, local_port):
+        monitor = MagicMock()
+        inband = list(getattr(call, "test_inband_digits", []) or [])
+
+        def _get_digit(timeout=1.0):
+            if call.dtmf_info_queue:
+                return call.dtmf_info_queue.pop(0)
+            if inband:
+                return inband.pop(0)
+            return None
+
+        monitor.get_digit.side_effect = _get_digit
+        monitor.has_digit.side_effect = lambda: bool(call.dtmf_info_queue) or bool(inband)
+        monitor.peek_digits.side_effect = lambda: tuple(call.dtmf_info_queue) + tuple(inband)
+        recorder = recorder_source() if recorder_source else MagicMock()
+        recorder.dtmf_monitor = monitor
+        return recorder, monitor
+
+    _mock_dtmf_monitor.build_ivr_dtmf_channel = MagicMock(side_effect=_factory)
+
+
 def _setup_rtp_mocks() -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
     """Reset and return fresh RTPPlayer, RTPRecorder, DTMFDetector, get_prompt_audio mocks."""
     mock_player_cls = MagicMock()
@@ -109,6 +150,10 @@ def _setup_rtp_mocks() -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
     _mock_rtp_handler.RTPRecorder = mock_recorder_cls
     _mock_utils_dtmf.DTMFDetector = mock_dtmf_cls
     _mock_utils_audio.get_prompt_audio = mock_get_prompt
+
+    # The handler obtains its recorder via build_ivr_dtmf_channel, so hand
+    # out this test's recorder mock from the mocked factory.
+    _wire_dtmf_channel(lambda: mock_recorder_cls.return_value)
 
     return mock_player_cls, mock_recorder_cls, mock_dtmf_cls, mock_get_prompt
 
@@ -499,6 +544,280 @@ class TestVoicemailIVRSession:
         pbx.end_call.assert_called()
 
     @patch("pbx.core.voicemail_handler.time")
+    def test_ivr_return_to_main_menu_replays_main_menu_prompt(self, mock_time) -> None:
+        """A play_prompt that lands the IVR back in the main menu (e.g. "no
+        more messages" after 2, or "message deleted" after 3) must be
+        followed by the main menu prompt so the caller hears their options
+        instead of silence.
+
+        Regression test: these fall-through-to-main-menu paths played only
+        their status prompt and left the caller stranded in MAIN_MENU with
+        no menu announcement.
+        """
+        from pbx.core.call import CallState
+
+        mock_time.time.return_value = 1000.0
+
+        mock_player_cls, mock_recorder_cls, _mock_dtmf_cls, mock_get_prompt = _setup_rtp_mocks()
+        mock_get_prompt.return_value = b"WAV_PROMPT"
+
+        mock_player = MagicMock()
+        mock_player.start.return_value = True
+        mock_player_cls.return_value = mock_player
+
+        mock_recorder = MagicMock()
+        mock_recorder.start.return_value = True
+        mock_recorder.recorded_data = []
+        mock_recorder_cls.return_value = mock_recorder
+
+        # play_file fires for: (1) priming PIN prompt, (2) the no_more_messages
+        # status prompt, (3) the follow-up main_menu prompt. End after #3.
+        play_count = 0
+
+        def play_file_side_effect(_path, interrupt_check=None):
+            nonlocal play_count
+            play_count += 1
+            if play_count >= 3:
+                call_obj.state = CallState.ENDED
+
+        mock_player.play_file.side_effect = play_file_side_effect
+
+        pbx = _make_pbx_core()
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+        call_obj.state = CallState.CONNECTED
+        call_obj.dtmf_info_queue = ["2"]
+
+        voicemail_ivr = MagicMock()
+        voicemail_ivr.STATE_MAIN_MENU = "main_menu"
+        call_count = 0
+
+        def handle_dtmf_side_effect(digit):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {"action": "play_prompt", "prompt": "enter_pin"}
+            # Pressing 2 at the end of the list lands back in the main menu.
+            voicemail_ivr.state = "main_menu"
+            return {"action": "play_prompt", "prompt": "no_more_messages"}
+
+        voicemail_ivr.handle_dtmf.side_effect = handle_dtmf_side_effect
+
+        handler._voicemail_ivr_session("call-1", call_obj, MagicMock(), voicemail_ivr)
+
+        # The status prompt plays, then the main menu prompt is replayed.
+        assert call("no_more_messages") in mock_get_prompt.call_args_list
+        assert call("main_menu") in mock_get_prompt.call_args_list
+        assert mock_get_prompt.call_args_list.index(
+            call("no_more_messages")
+        ) < mock_get_prompt.call_args_list.index(call("main_menu"))
+
+    @patch("pbx.core.voicemail_handler.time")
+    def test_ivr_greeting_recording_plays_prompt_beep_and_review_menu(self, mock_time) -> None:
+        """Full record-greeting flow: entering the state must play the
+        instructional prompt before the beep, and finishing recording (#)
+        must play the review menu prompt.
+
+        Regression test for two bugs where these action types
+        ("start_recording", "stop_recording") carried a "prompt" field that
+        the dispatcher silently ignored, leaving the caller with only a beep
+        (or dead silence) instead of the intended spoken prompt.
+        """
+        from pbx.core.call import CallState
+
+        # Use a constant real time so timeout comparisons in the recording
+        # sub-loop don't blow up on unconfigured MagicMock arithmetic.
+        mock_time.time.return_value = 1000.0
+
+        mock_player_cls, mock_recorder_cls, _mock_dtmf_cls, mock_get_prompt = _setup_rtp_mocks()
+        mock_get_prompt.return_value = b"WAV_PROMPT"
+
+        mock_player = MagicMock()
+        mock_player.start.return_value = True
+        mock_player_cls.return_value = mock_player
+
+        mock_recorder = MagicMock()
+        mock_recorder.start.return_value = True
+        mock_recorder.recorded_data = [b"\x00" * 10]
+        mock_recorder.detected_codec = 0
+        mock_recorder_cls.return_value = mock_recorder
+
+        pbx = _make_pbx_core()
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+        call_obj.state = CallState.CONNECTED
+        # "1" (options menu selection) starts recording; "#" (already queued)
+        # is picked up inside the recording sub-loop to stop it.
+        call_obj.dtmf_info_queue = ["1", "#"]
+
+        voicemail_ivr = MagicMock()
+        call_count = 0
+
+        def handle_dtmf_side_effect(digit):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Initial handle_dtmf("*") priming call the session makes
+                # before the main loop starts (see _voicemail_ivr_session).
+                return {"action": "play_prompt", "prompt": "enter_pin"}
+            if call_count == 2:
+                return {"action": "start_recording", "prompt": "record_greeting"}
+            call_obj.state = CallState.ENDED  # end the outer loop after this
+            return {"action": "stop_recording", "prompt": "greeting_review_menu"}
+
+        voicemail_ivr.handle_dtmf.side_effect = handle_dtmf_side_effect
+
+        handler._voicemail_ivr_session("call-1", call_obj, MagicMock(), voicemail_ivr)
+
+        # The instructional prompt must be fetched before the beep, and the
+        # review menu prompt must be fetched after recording stops.
+        prompt_calls = [c for c in mock_get_prompt.call_args_list if c != call("beep")]
+        assert call("record_greeting") in mock_get_prompt.call_args_list
+        assert call("greeting_review_menu") in mock_get_prompt.call_args_list
+        assert mock_get_prompt.call_args_list.index(
+            call("record_greeting")
+        ) < mock_get_prompt.call_args_list.index(call("beep"))
+        assert len(prompt_calls) >= 2  # record_greeting + greeting_review_menu
+
+    @patch("pbx.core.voicemail_handler.time")
+    def test_ivr_play_message_advances_to_message_menu(self, mock_time) -> None:
+        """After a voicemail message finishes playing, the handler must play
+        the message menu prompt and advance the IVR to the message-menu
+        state.
+
+        Regression test: the play_message branch played the audio then went
+        silent, leaving the IVR in PLAYING_MESSAGE. Because playback is
+        synchronous no key can be pressed during the message, so
+        _handle_playing_message never fired and the caller heard the message
+        followed by dead silence -- no replay/next/delete/main-menu options.
+        """
+        import tempfile
+        from pathlib import Path
+
+        from pbx.core.call import CallState
+
+        mock_time.time.return_value = 1000.0
+
+        mock_player_cls, mock_recorder_cls, _mock_dtmf_cls, mock_get_prompt = _setup_rtp_mocks()
+        mock_get_prompt.return_value = b"WAV_PROMPT"
+
+        # A real file so the handler's Path(file_path).exists() check passes.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as msg_file:
+            msg_file.write(b"RIFF_MESSAGE_AUDIO")
+            message_path = msg_file.name
+
+        mock_player = MagicMock()
+        mock_player.start.return_value = True
+        mock_player_cls.return_value = mock_player
+
+        mock_recorder = MagicMock()
+        mock_recorder.start.return_value = True
+        mock_recorder.recorded_data = []
+        mock_recorder_cls.return_value = mock_recorder
+
+        # play_file is called for: (1) the priming PIN prompt, (2) the message
+        # audio, (3) the message menu prompt. End the call after the menu
+        # prompt so the outer loop exits on its next iteration.
+        play_count = 0
+
+        def play_file_side_effect(_path, interrupt_check=None):
+            nonlocal play_count
+            play_count += 1
+            if play_count >= 3:
+                call_obj.state = CallState.ENDED
+
+        mock_player.play_file.side_effect = play_file_side_effect
+
+        pbx = _make_pbx_core()
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+        call_obj.state = CallState.CONNECTED
+        call_obj.dtmf_info_queue = ["1"]
+
+        # Use a real string for the state so the handler can assign the
+        # message-menu constant to it and we can assert on the result.
+        voicemail_ivr = MagicMock()
+        voicemail_ivr.STATE_MESSAGE_MENU = "message_menu"
+        call_count = 0
+
+        def handle_dtmf_side_effect(digit):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {"action": "play_prompt", "prompt": "enter_pin"}
+            return {
+                "action": "play_message",
+                "message_id": "msg-1",
+                "file_path": message_path,
+                "caller_id": "2001",
+            }
+
+        voicemail_ivr.handle_dtmf.side_effect = handle_dtmf_side_effect
+
+        try:
+            handler._voicemail_ivr_session("call-1", call_obj, MagicMock(), voicemail_ivr)
+        finally:
+            with contextlib.suppress(OSError):
+                Path(message_path).unlink()
+
+        # The message audio must have been played, then the message menu
+        # prompt fetched and played, and the IVR advanced to MESSAGE_MENU.
+        mock_player.play_file.assert_any_call(message_path, interrupt_check=ANY)
+        assert call("message_menu") in mock_get_prompt.call_args_list
+        assert voicemail_ivr.state == voicemail_ivr.STATE_MESSAGE_MENU
+
+    @patch("pbx.core.voicemail_handler.time")
+    def test_ivr_inband_digit_processed_via_monitor(self, mock_time) -> None:
+        """In-band digits surfaced by the DTMFMonitor drive the IVR exactly
+        like out-of-band digits.
+
+        The G.711-decode-before-detection regression (companded bytes misread
+        as PCM producing spurious digits) is now guarded inside the monitor by
+        tests/test_dtmf_monitor.py, which exercises real µ-law tone audio.
+        """
+        from pbx.core.call import CallState
+
+        mock_time.time.return_value = 1000.0
+
+        mock_player_cls, mock_recorder_cls, _mock_dtmf_cls, mock_get_prompt = _setup_rtp_mocks()
+        mock_get_prompt.return_value = b"WAV_PROMPT"
+
+        mock_player = MagicMock()
+        mock_player.start.return_value = True
+        mock_player_cls.return_value = mock_player
+
+        mock_recorder = MagicMock()
+        mock_recorder.start.return_value = True
+        mock_recorder.recorded_data = []
+        mock_recorder_cls.return_value = mock_recorder
+
+        pbx = _make_pbx_core()
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+        call_obj.state = CallState.CONNECTED
+        call_obj.dtmf_info_queue = []  # no out-of-band digits
+        call_obj.test_inband_digits = ["1"]  # digit arrives via in-band detection
+
+        call_count = 0
+
+        def handle_dtmf_side_effect(digit):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {"action": "play_prompt", "prompt": "enter_pin"}  # priming "*"
+            # First real in-band digit ends the session.
+            call_obj.state = CallState.ENDED
+            return {"action": "hangup"}
+
+        voicemail_ivr = MagicMock()
+        voicemail_ivr.handle_dtmf.side_effect = handle_dtmf_side_effect
+
+        handler._voicemail_ivr_session("call-1", call_obj, MagicMock(), voicemail_ivr)
+
+        # The in-band digit must reach the IVR state machine.
+        voicemail_ivr.handle_dtmf.assert_any_call("1")
+
+    @patch("pbx.core.voicemail_handler.time")
     def test_ivr_exception_logged_and_call_ended(self, mock_time) -> None:
         """On ValueError in IVR session, error should be logged and call ended."""
         from pbx.core.call import CallState
@@ -576,23 +895,27 @@ class TestVoicemailIVRSession:
 
 @pytest.mark.unit
 class TestMonitorVoicemailDTMF:
-    """Tests for monitor_voicemail_dtmf."""
+    """Tests for monitor_voicemail_dtmf (digits via the recorder's DTMFMonitor)."""
+
+    @staticmethod
+    def _recorder_with_monitor(digits: list[str], running: bool = True) -> MagicMock:
+        """Recorder mock whose attached monitor pops from `digits` then None."""
+        recorder = MagicMock()
+        recorder.running = running
+        pending = list(digits)
+        monitor = MagicMock()
+        monitor.get_digit.side_effect = lambda timeout=0.5: pending.pop(0) if pending else None
+        recorder.dtmf_monitor = monitor
+        return recorder
 
     @patch("pbx.core.voicemail_handler.time")
     def test_hash_detected_completes_recording(self, mock_time) -> None:
         """When # is detected, should call complete_voicemail_recording."""
-        _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
-        mock_detector = MagicMock()
-        mock_detector.detect_tone.return_value = "#"
-        mock_dtmf_cls.return_value = mock_detector
-
         pbx = _make_pbx_core()
         handler = VoicemailHandler(pbx)
         call_obj = _make_call()
 
-        recorder = MagicMock()
-        recorder.running = True
-        recorder.recorded_data = [b"\x80" * 2000]
+        recorder = self._recorder_with_monitor(["#"])
 
         with patch.object(handler, "complete_voicemail_recording") as mock_complete:
             handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
@@ -601,19 +924,21 @@ class TestMonitorVoicemailDTMF:
     @patch("pbx.core.voicemail_handler.time")
     def test_non_hash_digit_does_not_complete(self, mock_time) -> None:
         """Non-# digit should not trigger completion."""
-        _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
-        mock_detector = MagicMock()
-        mock_detector.detect_tone.return_value = "5"
-        mock_dtmf_cls.return_value = mock_detector
-
         pbx = _make_pbx_core()
         handler = VoicemailHandler(pbx)
         call_obj = _make_call()
-        call_obj.state.value = "ended"
 
-        recorder = MagicMock()
-        recorder.running = True
-        recorder.recorded_data = [b"\x80" * 2000]
+        recorder = self._recorder_with_monitor(["5"])
+        # Stop the loop after the non-# digit is consumed.
+        original_side_effect = recorder.dtmf_monitor.get_digit.side_effect
+
+        def _get_digit_then_stop(timeout=0.5):
+            digit = original_side_effect(timeout)
+            if digit is None:
+                recorder.running = False
+            return digit
+
+        recorder.dtmf_monitor.get_digit.side_effect = _get_digit_then_stop
 
         with patch.object(handler, "complete_voicemail_recording") as mock_complete:
             handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
@@ -622,15 +947,25 @@ class TestMonitorVoicemailDTMF:
     @patch("pbx.core.voicemail_handler.time")
     def test_recorder_not_running_exits(self, mock_time) -> None:
         """When recorder.running is False, monitoring loop should exit."""
-        _setup_rtp_mocks()
-
         pbx = _make_pbx_core()
         handler = VoicemailHandler(pbx)
         call_obj = _make_call()
 
-        recorder = MagicMock()
-        recorder.running = False
-        recorder.recorded_data = []
+        recorder = self._recorder_with_monitor([], running=False)
+
+        with patch.object(handler, "complete_voicemail_recording") as mock_complete:
+            handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
+            mock_complete.assert_not_called()
+
+    @patch("pbx.core.voicemail_handler.time")
+    def test_call_ended_exits(self, mock_time) -> None:
+        """When the call has ended, monitoring loop should exit without completing."""
+        pbx = _make_pbx_core()
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+        call_obj.state.value = "ended"
+
+        recorder = self._recorder_with_monitor(["#"])
 
         with patch.object(handler, "complete_voicemail_recording") as mock_complete:
             handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
@@ -639,59 +974,35 @@ class TestMonitorVoicemailDTMF:
     @patch("pbx.core.voicemail_handler.time")
     def test_error_in_monitoring_logged(self, mock_time) -> None:
         """Errors during monitoring should be logged without raising."""
-        _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
-        mock_dtmf_cls.side_effect = ValueError("detector init failed")
-
         pbx = _make_pbx_core()
         handler = VoicemailHandler(pbx)
         call_obj = _make_call()
 
         recorder = MagicMock()
         recorder.running = True
-        recorder.recorded_data = [b"\x80" * 2000]
+        recorder.dtmf_monitor = MagicMock()
+        recorder.dtmf_monitor.get_digit.side_effect = ValueError("monitor failure")
 
         handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
         pbx.logger.error.assert_called()
 
     @patch("pbx.core.voicemail_handler.time")
-    def test_no_recorded_data_continues(self, mock_time) -> None:
-        """When recorded_data is empty, loop should continue without crash."""
-        _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
-        mock_detector = MagicMock()
-        mock_dtmf_cls.return_value = mock_detector
-
+    def test_creates_monitor_when_recorder_has_none(self, mock_time) -> None:
+        """A recorder built without a monitor gets one created and attached."""
         pbx = _make_pbx_core()
         handler = VoicemailHandler(pbx)
         call_obj = _make_call()
-        call_obj.state.value = "ended"
 
         recorder = MagicMock()
-        recorder.running = True
-        recorder.recorded_data = []
+        recorder.running = False  # exit immediately; we only check the wiring
+        recorder.dtmf_monitor = None
 
-        with patch.object(handler, "complete_voicemail_recording") as mock_complete:
-            handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
-            mock_complete.assert_not_called()
+        handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
 
-    @patch("pbx.core.voicemail_handler.time")
-    def test_insufficient_audio_data_skips_detection(self, mock_time) -> None:
-        """When audio data is below the threshold, DTMF detection should be skipped."""
-        _, _, mock_dtmf_cls, _ = _setup_rtp_mocks()
-        mock_detector = MagicMock()
-        mock_dtmf_cls.return_value = mock_detector
-
-        pbx = _make_pbx_core()
-        handler = VoicemailHandler(pbx)
-        call_obj = _make_call()
-        call_obj.state.value = "ended"
-
-        recorder = MagicMock()
-        recorder.running = True
-        recorder.recorded_data = [b"\x80" * 100]
-
-        with patch.object(handler, "complete_voicemail_recording") as _mock_complete:
-            handler.monitor_voicemail_dtmf("call-1", call_obj, recorder)
-            mock_detector.detect_tone.assert_not_called()
+        # The handler imports DTMFMonitor from the (mocked) module and
+        # attaches the constructed instance to the recorder.
+        assert recorder.dtmf_monitor is _mock_dtmf_monitor.DTMFMonitor.return_value
+        _mock_dtmf_monitor.DTMFMonitor.assert_called_with(call_obj)
 
 
 # ---------------------------------------------------------------------------

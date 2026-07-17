@@ -316,17 +316,19 @@ def test_call_initiation() -> bool:
             # Return mock RTP ports (local and remote)
             return (10000, 10001)
 
+    class MockCallRouter:
+        def _check_dialplan(self, extension: str) -> bool:
+            # Simple dialplan check for test
+            return False
+
     class MockPBXCore:
         def __init__(self) -> None:
             self.extension_registry = MockExtensionRegistry()
             self.call_manager = MockCallManager()
             self.rtp_relay = MockRTPRelay()
+            self.call_router = MockCallRouter()
             self.auto_attendant = None  # No auto attendant in test
             self.voicemail_system = None  # No voicemail in test
-
-        def _check_dialplan(self, extension: str) -> bool:
-            # Simple dialplan check for test
-            return False
 
     class MockConfig:
         def get(self, key: str, default: Any = None) -> Any:

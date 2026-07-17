@@ -155,6 +155,7 @@ class RFC2833Receiver:
         pbx_core: PBXCore | None = None,
         call_id: str | None = None,
         payload_type: int = 101,
+        extra_payload_types: set[int] | None = None,
     ) -> None:
         """
         Initialize RFC 2833 receiver.
@@ -164,11 +165,16 @@ class RFC2833Receiver:
             pbx_core: Reference to PBX core for DTMF delivery.
             call_id: Call identifier for this receiver.
             payload_type: RTP payload type for telephone-event (default: 101).
+            extra_payload_types: Additional payload types to accept as
+                telephone-event.  Some phones send DTMF using the payload
+                type from their own SDP offer rather than the one in our
+                SDP answer, so the peer's offered PT belongs here.
         """
         self.local_port: int = local_port
         self.pbx_core: PBXCore | None = pbx_core
         self.call_id: str | None = call_id
         self.payload_type: int = payload_type
+        self.payload_types: set[int] = {payload_type} | (extra_payload_types or set())
         self.logger = get_logger()
         self.socket: socket.socket | None = None
         self.running: bool = False
@@ -252,8 +258,8 @@ class RFC2833Receiver:
             header[3]
             header[4]
 
-            # Only process configured payload type for telephone-event
-            if payload_type != self.payload_type:
+            # Only process configured payload type(s) for telephone-event
+            if payload_type not in self.payload_types:
                 return
 
             # Compute payload offset past CSRC entries and extension header

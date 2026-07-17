@@ -533,7 +533,7 @@ class AutoAttendant:
             self.logger.error(f"Error deleting menu: {e}")
             return False
 
-    def get_menu(self, menu_id: str) -> dict:
+    def get_menu(self, menu_id: str) -> dict | None:
         """
         Get menu details
 
@@ -724,7 +724,7 @@ class AutoAttendant:
             self.logger.error(f"Error getting menu items: {e}")
             return []
 
-    def get_menu_tree(self, menu_id: str = "main", depth: int = 0) -> dict:
+    def get_menu_tree(self, menu_id: str = "main", depth: int = 0) -> dict | None:
         """
         Get complete menu hierarchy as a tree
 
@@ -1097,7 +1097,7 @@ class AutoAttendant:
         session["state"] = AAState.INVALID
         return {"action": "play", "file": self._get_audio_file("invalid"), "session": session}
 
-    def _get_audio_file(self, prompt_type: str) -> str:
+    def _get_audio_file(self, prompt_type: str) -> Path | None:
         """
         Get path to audio file for prompt
 
@@ -1105,18 +1105,18 @@ class AutoAttendant:
             prompt_type: type of prompt (welcome, main_menu, invalid, menu_id, etc.)
 
         Returns:
-            str: Path to audio file, or None if not found
+            Path: Path to audio file, or None if not found
         """
         # For submenu, check if there's a custom audio file in the menu record
         if prompt_type not in ["welcome", "main_menu", "invalid", "timeout", "transferring"]:
             menu = self.get_menu(prompt_type)
             if menu and menu.get("audio_file") and Path(menu["audio_file"]).exists():
                 # Use custom audio file if specified
-                return menu["audio_file"]
+                return Path(menu["audio_file"])
 
         # Try to find recorded audio file first
         wav_file = Path(self.audio_path) / f"{prompt_type}.wav"
-        if Path(wav_file).exists():
+        if wav_file.exists():
             return wav_file
 
         # If no recorded file, we'll generate tone-based prompt
@@ -1203,7 +1203,7 @@ def generate_auto_attendant_prompts(output_dir: str = "auto_attendant") -> None:
 
 def generate_submenu_prompt(
     menu_id: str, prompt_text: str, output_dir: str = "auto_attendant"
-) -> str:
+) -> Path | None:
     """
     Generate voice prompt for a submenu
 
@@ -1213,7 +1213,7 @@ def generate_submenu_prompt(
         output_dir: Directory to save audio files
 
     Returns:
-        str: Path to generated audio file, or None if failed
+        Path: Path to generated audio file, or None if failed
     """
     tmp_mp3_path = None
     try:
@@ -1264,14 +1264,15 @@ def generate_submenu_prompt(
                 if tmp_mp3_path and Path(tmp_mp3_path).exists():
                     Path(tmp_mp3_path).unlink()
                 logger.info(f"Generated submenu prompt: {output_file}")
-                return output_file
+                return str(output_file)
             except (FileNotFoundError, subprocess.CalledProcessError):
                 # ffmpeg not available, just save MP3
                 import shutil
 
-                shutil.move(tmp_mp3_path, output_file.replace(".wav", ".mp3"))
-                logger.warning(f"ffmpeg not available, saved as MP3: {output_file}.mp3")
-                return output_file.replace(".wav", ".mp3")
+                mp3_path = output_file.with_suffix(".mp3")
+                shutil.move(tmp_mp3_path, mp3_path)
+                logger.warning(f"ffmpeg not available, saved as MP3: {mp3_path}")
+                return mp3_path
 
         except ImportError:
             logger = get_logger()

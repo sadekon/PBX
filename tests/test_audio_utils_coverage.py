@@ -127,6 +127,55 @@ class TestPcm16ToUlaw:
         result = pcm16_to_ulaw(pcm_data)
         assert len(result) > 0
 
+    def test_matches_reference_g711(self) -> None:
+        """Encoder must match the canonical ITU-T/Sun G.711 mu-law algorithm.
+
+        Guards against companding-exponent regressions that leave audio
+        intelligible but harsh/robotic (correct exponent segments matter for
+        quantization even when the words remain understandable).
+        """
+        from pbx.utils.audio import pcm16_to_ulaw
+
+        def reference_linear2ulaw(pcm_val: int) -> int:
+            bias = 0x84
+            clip = 32635
+            sign = 0x80 if pcm_val < 0 else 0x00
+            magnitude = min(abs(pcm_val), clip) + bias
+            exponent = 7
+            expmask = 0x4000
+            while exponent > 0 and not (magnitude & expmask):
+                expmask >>= 1
+                exponent -= 1
+            mantissa = (magnitude >> (exponent + 3)) & 0x0F
+            return (~(sign | (exponent << 4) | mantissa)) & 0xFF
+
+        # Cover the full 16-bit range at a stride that hits every exponent
+        # segment and both signs.
+        samples = list(range(-32768, 32768, 3))
+        pcm_data = struct.pack(f"<{len(samples)}h", *samples)
+        encoded = pcm16_to_ulaw(pcm_data)
+
+        assert len(encoded) == len(samples)
+        for value, actual in zip(samples, encoded, strict=True):
+            assert actual == reference_linear2ulaw(value), (
+                f"mu-law mismatch for sample {value}: "
+                f"got 0x{actual:02x}, expected 0x{reference_linear2ulaw(value):02x}"
+            )
+
+    def test_decoder_inverts_encoder(self) -> None:
+        """Every mu-law code round-trips back to itself (ignoring the +/-0 pair)."""
+        from pbx.utils.audio import _ulaw_byte_to_linear, pcm16_to_ulaw
+
+        for code in range(256):
+            linear = _ulaw_byte_to_linear(code)
+            reencoded = pcm16_to_ulaw(struct.pack("<h", linear))[0]
+            # 0x7F and 0xFF both decode to 0; 0 re-encodes to 0xFF (positive
+            # zero). That single mu-law +/-0 ambiguity is expected.
+            if linear == 0:
+                assert reencoded == 0xFF
+            else:
+                assert reencoded == code
+
 
 @pytest.mark.unit
 class TestPcm16ToG722:
@@ -559,7 +608,7 @@ class TestGenerateVoicePrompt:
             "timeout",
             "transferring",
             "invalid_pin",
-            "recording_greeting",
+            "record_greeting",
             "greeting_saved",
             "message_deleted",
             "end_of_messages",

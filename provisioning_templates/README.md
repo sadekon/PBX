@@ -93,7 +93,10 @@ For detailed ATA setup and configuration, see [ATA Support Guide](../docs/ATA_SU
 
 ## DTMF Configuration
 
-The PBX system supports multiple DTMF (touch-tone) signaling methods. Templates are pre-configured to use **SIP INFO** for DTMF transport, which is compatible with the PBX's voicemail IVR system.
+The PBX system supports multiple DTMF (touch-tone) signaling methods. Most templates are
+pre-configured to use **SIP INFO** for DTMF transport. The Zultys ZIP 33G/37G and Cisco
+ATA 191/192 templates use **RFC 2833/AVT** instead — SIP INFO produced phantom keypresses
+on those devices — so check the vendor's template before assuming SIP INFO.
 
 ### DTMF Transport Methods
 
@@ -107,8 +110,8 @@ The PBX system supports multiple DTMF (touch-tone) signaling methods. Templates 
 
 3. **SIP INFO**: DTMF sent as SIP INFO messages
    - Out-of-band signaling
-   - Most reliable method
-   - **Recommended for this PBX system**
+   - Reliable on most phone models, but caused phantom keypresses on Zultys
+     ZIP 33G/37G and Cisco ATA 191/192 — those templates use RFC 2833/AVT instead
 
 ### Template DTMF Settings
 
