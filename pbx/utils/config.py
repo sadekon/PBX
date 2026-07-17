@@ -272,6 +272,168 @@ class Config:
             logger.error("Error deleting extension: %s", e)
             return False
 
+    def get_sip_trunks(self) -> list[dict]:
+        """Get all configured SIP trunks"""
+        return self.config.get("sip_trunks", [])
+
+    def get_sip_trunk(self, trunk_id: str) -> dict | None:
+        """
+        Get SIP trunk by ID
+
+        Args:
+            trunk_id: Trunk identifier
+
+        Returns:
+            Trunk configuration or None
+        """
+        for trunk in self.get_sip_trunks():
+            if trunk.get("id") == trunk_id or trunk.get("trunk_id") == trunk_id:
+                return trunk
+        return None
+
+    def add_sip_trunk(
+        self,
+        trunk_id: str,
+        name: str,
+        host: str,
+        username: str,
+        password: str,
+        port: int = 5060,
+        codec_preferences: list | None = None,
+        priority: int = 100,
+        max_channels: int = 10,
+    ) -> bool:
+        """
+        Add a new SIP trunk to configuration
+
+        Args:
+            trunk_id: Trunk identifier
+            name: Trunk name
+            host: SIP provider host
+            username: SIP username
+            password: SIP password
+            port: SIP port
+            codec_preferences: list of preferred codecs
+            priority: Trunk priority (lower is better, for failover)
+            max_channels: Maximum concurrent channels
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            if "sip_trunks" not in self.config:
+                self.config["sip_trunks"] = []
+
+            if self.get_sip_trunk(trunk_id):
+                return False
+
+            new_trunk = {
+                "id": str(trunk_id),
+                "name": name,
+                "host": host,
+                "port": port,
+                "username": username,
+                "password": password,
+                "priority": priority,
+                "max_channels": max_channels,
+            }
+
+            if codec_preferences:
+                new_trunk["codec_preferences"] = codec_preferences
+
+            self.config["sip_trunks"].append(new_trunk)
+            return self.save()
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error("Error adding SIP trunk: %s", e)
+            return False
+
+    def update_sip_trunk(
+        self,
+        trunk_id: str,
+        name: str | None = None,
+        host: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        port: int | None = None,
+        codec_preferences: list | None = None,
+        priority: int | None = None,
+        max_channels: int | None = None,
+    ) -> bool:
+        """
+        Update an existing SIP trunk
+
+        Args:
+            trunk_id: Trunk identifier
+            name: New trunk name (optional)
+            host: New SIP provider host (optional)
+            username: New SIP username (optional)
+            password: New SIP password (optional)
+            port: New SIP port (optional)
+            codec_preferences: New codec preference list (optional)
+            priority: New trunk priority (optional)
+            max_channels: New maximum concurrent channels (optional)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            if "sip_trunks" not in self.config:
+                return False
+
+            for trunk in self.config["sip_trunks"]:
+                if trunk.get("id") == trunk_id or trunk.get("trunk_id") == trunk_id:
+                    if name is not None:
+                        trunk["name"] = name
+                    if host is not None:
+                        trunk["host"] = host
+                    if username is not None:
+                        trunk["username"] = username
+                    if password is not None:
+                        trunk["password"] = password
+                    if port is not None:
+                        trunk["port"] = port
+                    if codec_preferences is not None:
+                        trunk["codec_preferences"] = codec_preferences
+                    if priority is not None:
+                        trunk["priority"] = priority
+                    if max_channels is not None:
+                        trunk["max_channels"] = max_channels
+                    return self.save()
+
+            return False
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error("Error updating SIP trunk: %s", e)
+            return False
+
+    def delete_sip_trunk(self, trunk_id: str) -> bool:
+        """
+        Delete a SIP trunk from configuration
+
+        Args:
+            trunk_id: Trunk identifier
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            if "sip_trunks" not in self.config:
+                return False
+
+            original_length = len(self.config["sip_trunks"])
+            self.config["sip_trunks"] = [
+                trunk
+                for trunk in self.config["sip_trunks"]
+                if trunk.get("id") != trunk_id and trunk.get("trunk_id") != trunk_id
+            ]
+
+            if len(self.config["sip_trunks"]) < original_length:
+                return self.save()
+
+            return False
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error("Error deleting SIP trunk: %s", e)
+            return False
+
     def update_email_config(self, config_data: dict) -> bool:
         """
         Update email/SMTP configuration

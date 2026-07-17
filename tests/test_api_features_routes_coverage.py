@@ -804,8 +804,8 @@ class TestSIPTrunkRoutes:
 
     def test_add_sip_trunk_success(self, api_client: FlaskClient, mock_pbx_core: MagicMock) -> None:
         ts = MagicMock()
-        mock_pbx_core.trunk_system = ts
-
+        trunk_instance = MagicMock()
+        trunk_instance.name = "New Trunk"
         trunk_data = {
             "trunk_id": "t1",
             "name": "New Trunk",
@@ -813,18 +813,16 @@ class TestSIPTrunkRoutes:
             "username": "user",
             "password": "pass",
         }
+        trunk_instance.to_dict.return_value = trunk_data
+        # First call is the pre-add duplicate check (must be falsy), second call
+        # is the post-reload lookup used to build the response.
+        ts.get_trunk.side_effect = [None, trunk_instance]
+        mock_pbx_core.trunk_system = ts
 
-        with (
-            patch(
-                "pbx.api.utils.verify_authentication",
-                return_value=(True, {"extension": "1001", "is_admin": True}),
-            ),
-            patch("pbx.features.sip_trunk.SIPTrunk", create=True) as mock_sip_trunk,
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
         ):
-            trunk_instance = MagicMock()
-            trunk_instance.name = "New Trunk"
-            trunk_instance.to_dict.return_value = trunk_data
-            mock_sip_trunk.return_value = trunk_instance
             resp = api_client.post(
                 "/api/sip-trunks",
                 data=json.dumps(trunk_data),

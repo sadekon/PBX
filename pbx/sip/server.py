@@ -101,6 +101,10 @@ class SIPServer:
         # Bounded thread pool to prevent thread exhaustion under load
         self._thread_pool = ThreadPoolExecutor(max_workers=200, thread_name_prefix="sip-handler")
 
+        # Outbound trunk REGISTER transactions awaiting a response.
+        # Key: Call-ID, Value: {"trunk": SIPTrunk, "cseq": int, "retried": bool}
+        self._pending_trunk_registrations: dict[str, dict[str, Any]] = {}
+
     def start(self) -> bool:
         """
         Start SIP server.
@@ -426,6 +430,306 @@ class SIPServer:
 
         self.logger.warning(f"Digest auth failed for {username}")
         return False
+
+    def register_trunk(self, trunk: Any) -> None:
+        """
+        Send a SIP REGISTER to an upstream trunk provider (PBX acting as UAC).
+
+        Sends an initial unauthenticated REGISTER and tracks it in
+        ``_pending_trunk_registrations`` keyed by Call-ID. The provider's
+        response is handled asynchronously by ``_handle_response`` ->
+        ``_handle_trunk_register_response``, which retries with digest
+        credentials on a 401/407 challenge and updates ``trunk.status`` once
+        the exchange resolves (RFC 3261/RFC 2617 client-side flow).
+
+        Args:
+            trunk: SIPTrunk to register.
+        """
+        import uuid
+
+        call_id = str(uuid.uuid4())
+        cseq = 1
+        message = self._build_trunk_register(trunk, call_id, cseq)
+
+        self._pending_trunk_registrations[call_id] = {
+            "trunk": trunk,
+            "cseq": cseq,
+            "retried": False,
+        }
+
+        self.logger.info(f"Sending REGISTER for trunk {trunk.name} to {trunk.host}:{trunk.port}")
+        self._send_message(message.build(), (trunk.host, trunk.port))
+
+    def _build_trunk_register(
+        self,
+        trunk: Any,
+        call_id: str,
+        cseq: int,
+        authorization: str | None = None,
+    ) -> SIPMessage:
+        """Build a REGISTER request addressed to a trunk provider, optionally with an Authorization header for a digest-auth retry."""
+        server_ip = self.pbx_core._get_server_ip() if self.pbx_core else self.host
+        sip_port = self.pbx_core.config.get("server.sip_port", 5060) if self.pbx_core else self.port
+
+        from_to_addr = f"<sip:{trunk.username}@{trunk.host}>"
+        message = SIPMessageBuilder.build_request(
+            method="REGISTER",
+            uri=f"sip:{trunk.host}:{trunk.port}",
+            from_addr=from_to_addr,
+            to_addr=from_to_addr,
+            call_id=call_id,
+            cseq=cseq,
+        )
+        message.set_header("Contact", f"<sip:{trunk.username}@{server_ip}:{sip_port}>")
+        message.set_header("Expires", "3600")
+        message.set_header("Max-Forwards", "70")
+        if authorization:
+            message.set_header("Authorization", authorization)
+        return message
+
+    def _handle_trunk_register_response(
+        self, message: SIPMessage, addr: AddrTuple, call_id: str
+    ) -> None:
+        """
+        Process a response to an outbound trunk REGISTER.
+
+        Handles both the initial REGISTER (sent from ``register_trunk``) and
+        periodic refreshes (sent by ``SIPTrunkSystem._perform_reregistration_checks``
+        via the same ``register_trunk`` path) identically -- a refresh is just
+        another independent REGISTER transaction with a fresh Call-ID.
+
+        On 401/407, builds a digest Authorization header from the trunk's
+        credentials and resends with an incremented CSeq (one retry only).
+        On 200, marks the trunk REGISTERED/HEALTHY and schedules the next
+        refresh via ``trunk.mark_registered()``. Any other outcome (or a
+        second auth failure) marks the trunk FAILED and bumps
+        ``registration_failures``.
+        """
+        from pbx.features.sip_trunk import TrunkHealthStatus, TrunkStatus
+
+        entry = self._pending_trunk_registrations.get(call_id)
+        if not entry:
+            return
+
+        trunk = entry["trunk"]
+
+        if message.status_code in (401, 407) and not entry["retried"]:
+            challenge_header = (
+                "WWW-Authenticate" if message.status_code == 401 else ("Proxy-Authenticate")
+            )
+            challenge = message.get_header(challenge_header)
+            if not challenge:
+                self.logger.error(
+                    f"Trunk {trunk.name} REGISTER challenge missing {challenge_header}"
+                )
+                trunk.status = TrunkStatus.FAILED
+                trunk.registration_failures += 1
+                del self._pending_trunk_registrations[call_id]
+                return
+
+            params = self._parse_www_authenticate(challenge)
+            uri = f"sip:{trunk.host}:{trunk.port}"
+            response_hash, extra_params = self._compute_trunk_digest_response(trunk, params, uri)
+
+            auth_parts = [
+                f'username="{trunk.username}"',
+                f'realm="{params.get("realm", "")}"',
+                f'nonce="{params.get("nonce", "")}"',
+                f'uri="{uri}"',
+                f'response="{response_hash}"',
+                "algorithm=MD5",
+            ]
+            if params.get("qop"):
+                auth_parts.append(f"qop={extra_params['qop']}")
+                auth_parts.append(f"nc={extra_params['nc']}")
+                auth_parts.append(f'cnonce="{extra_params["cnonce"]}"')
+            authorization = "Digest " + ", ".join(auth_parts)
+
+            new_cseq = entry["cseq"] + 1
+            retry_message = self._build_trunk_register(trunk, call_id, new_cseq, authorization)
+            entry["cseq"] = new_cseq
+            entry["retried"] = True
+
+            self.logger.info(f"Retrying REGISTER for trunk {trunk.name} with credentials")
+            self._send_message(retry_message.build(), addr)
+            return
+
+        if message.status_code == 200:
+            # The provider may grant a shorter (or longer) lease than the
+            # 3600s requested, so schedule the refresh off what was actually
+            # granted rather than assuming the request was honored as-is.
+            expires_value = int(message.get_header("Expires") or "3600")
+            trunk.mark_registered(expires_seconds=expires_value)
+            self.logger.info(
+                f"Trunk {trunk.name} registered successfully (expires in {expires_value}s)"
+            )
+        else:
+            trunk.status = TrunkStatus.FAILED
+            trunk.health_status = TrunkHealthStatus.DOWN
+            trunk.registration_failures += 1
+            self.logger.error(
+                f"Trunk {trunk.name} registration failed: {message.status_code} {message.status_text}"
+            )
+
+        del self._pending_trunk_registrations[call_id]
+
+    def _parse_www_authenticate(self, header_value: str) -> dict[str, str]:
+        """Parse a WWW-Authenticate/Proxy-Authenticate Digest challenge header into its component parameters."""
+        import re
+
+        params: dict[str, str] = {}
+        for match in re.finditer(r'(\w+)="([^"]*)"', header_value):
+            params[match.group(1)] = match.group(2)
+        for match in re.finditer(r"(\w+)=([^,\s\"]+)", header_value):
+            key = match.group(1)
+            if key not in params:
+                params[key] = match.group(2)
+        return params
+
+    def _compute_trunk_digest_response(
+        self,
+        trunk: Any,
+        challenge_params: dict[str, str],
+        uri: str,
+        method: str = "REGISTER",
+    ) -> tuple[str, dict[str, str]]:
+        """
+        Compute the RFC 2617 digest "response" value for a trunk request using
+        the trunk's username/password against the provider's challenge.
+
+        Args:
+            trunk: SIPTrunk whose credentials to authenticate with.
+            challenge_params: Parsed WWW-Authenticate/Proxy-Authenticate params.
+            uri: The Request-URI being authenticated (must match the request
+                this digest is for -- REGISTER's or the INVITE's).
+            method: The SIP method being authenticated. HA2 = MD5(method:uri)
+                per RFC 2617, so this must match the request's actual method
+                (e.g. "INVITE" when re-challenging an outbound trunk INVITE,
+                not "REGISTER").
+
+        Returns:
+            Tuple of (response_hash, extra_params) where extra_params contains
+            qop/nc/cnonce when the challenge requested qop="auth".
+        """
+        import hashlib
+        import secrets
+
+        realm = challenge_params.get("realm", "")
+        nonce = challenge_params.get("nonce", "")
+        qop = challenge_params.get("qop")
+
+        ha1 = hashlib.md5(  # nosec B324 - MD5 required by SIP digest auth RFC 2617
+            f"{trunk.username}:{realm}:{trunk.password}".encode()
+        ).hexdigest()
+        ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()  # nosec B324
+
+        extra_params: dict[str, str] = {}
+        if qop:
+            nc = "00000001"
+            cnonce = secrets.token_hex(8)
+            response_hash = hashlib.md5(  # nosec B324
+                f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()
+            ).hexdigest()
+            extra_params = {"qop": qop, "nc": nc, "cnonce": cnonce}
+        else:
+            response_hash = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()  # nosec B324
+
+        return response_hash, extra_params
+
+    def _retry_trunk_invite_with_auth(
+        self, call: Any, challenge: SIPMessage, addr: AddrTuple, call_id: str
+    ) -> None:
+        """
+        Retry an outbound trunk INVITE with digest credentials after a 401/407.
+
+        Mirrors ``_handle_trunk_register_response``'s REGISTER-side retry
+        (one retry only, tracked via ``call.invite_auth_retried``), but reuses
+        ``call.callee_invite`` -- the already-built INVITE from
+        ``CallRouter._route_to_trunk`` -- rather than rebuilding a request
+        from scratch, so the SDP body and other headers can't drift from the
+        original offer. Per RFC 3261 Section 17.1.1.3, first ACKs the
+        challenge to properly close out that transaction, then sends the
+        credentialed retry as a new transaction (new branch and CSeq) on the
+        same Call-ID/dialog attempt.
+
+        Args:
+            call: The Call object for this trunk call.
+            challenge: The 401/407 SIPMessage received from the trunk.
+            addr: The trunk's address the challenge arrived from.
+            call_id: Call identifier.
+        """
+        import uuid as _uuid
+
+        from pbx.sip.transaction import InviteClientTransaction
+
+        if self.pbx_core is None:
+            return
+
+        trunk = call.trunk
+        callee_invite = getattr(call, "callee_invite", None)
+        if not trunk or not callee_invite:
+            return
+
+        # RFC 3261 13.2.2.4 / 17.1.1.3: a non-2xx final response must be ACKed
+        # to close out the challenged transaction, same construction as the
+        # 200 OK ACK (From/To-with-tag/Call-ID/CSeq echoed from the response).
+        self._send_ack_to_callee(challenge, addr, call_id)
+
+        challenge_header = (
+            "WWW-Authenticate" if challenge.status_code == 401 else "Proxy-Authenticate"
+        )
+        auth_header = "Authorization" if challenge.status_code == 401 else "Proxy-Authorization"
+        challenge_value = challenge.get_header(challenge_header)
+        if not challenge_value:
+            self.logger.error(
+                f"Trunk {trunk.name} INVITE challenge missing {challenge_header} for call {call_id}"
+            )
+            return
+
+        params = self._parse_www_authenticate(challenge_value)
+        uri = callee_invite.uri
+        response_hash, extra_params = self._compute_trunk_digest_response(
+            trunk, params, uri, method="INVITE"
+        )
+
+        auth_parts = [
+            f'username="{trunk.username}"',
+            f'realm="{params.get("realm", "")}"',
+            f'nonce="{params.get("nonce", "")}"',
+            f'uri="{uri}"',
+            f'response="{response_hash}"',
+            "algorithm=MD5",
+        ]
+        if params.get("qop"):
+            auth_parts.append(f"qop={extra_params['qop']}")
+            auth_parts.append(f"nc={extra_params['nc']}")
+            auth_parts.append(f'cnonce="{extra_params["cnonce"]}"')
+        authorization = "Digest " + ", ".join(auth_parts)
+
+        new_cseq = self._parse_cseq_number(callee_invite.get_header("CSeq")) + 1
+        callee_invite.set_header("CSeq", f"{new_cseq} INVITE")
+        callee_invite.set_header(auth_header, authorization)
+
+        server_ip = self.pbx_core._get_server_ip()
+        sip_port = self.pbx_core.config.get("server.sip_port", 5060)
+        branch_id = str(_uuid.uuid4()).replace("-", "")
+        callee_invite.set_header(
+            "Via", f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}"
+        )
+
+        call.invite_auth_retried = True
+
+        pbx_core = self.pbx_core
+        invite_txn = InviteClientTransaction(
+            message=callee_invite.build(),
+            dest_addr=call.callee_addr,
+            send_fn=self._send_message,
+            on_timeout=lambda: pbx_core.call_router._handle_invite_timeout(call_id),
+        )
+        invite_txn.start()
+        call.invite_transaction = invite_txn
+
+        self.logger.info(f"Retrying trunk INVITE for call {call_id} with credentials")
 
     def _handle_invite(self, message: SIPMessage, addr: AddrTuple) -> None:
         """
@@ -2027,9 +2331,17 @@ class SIPServer:
         """
         self.logger.debug(f"Received response {message.status_code} from {addr}")
 
+        # Handle responses to outbound trunk REGISTERs separately from
+        # call-related responses below, since they aren't tied to a Call object.
+        register_call_id = message.get_header("Call-ID")
+        if register_call_id and register_call_id in self._pending_trunk_registrations:
+            self._handle_trunk_register_response(message, addr, register_call_id)
+            return
+
         # Handle responses from callee
         if self.pbx_core and message.status_code:
             call_id = message.get_header("Call-ID")
+            cseq_header = message.get_header("CSeq") or ""
 
             # Cancel INVITE retransmission on any response from callee
             if call_id:
@@ -2078,7 +2390,6 @@ class SIPServer:
             elif message.status_code == 200:
                 # OK - only process as callee answer if this is a response to INVITE
                 # (200 OK is also sent for BYE, CANCEL, OPTIONS, etc.)
-                cseq_header = message.get_header("CSeq") or ""
                 if call_id and "INVITE" in cseq_header:
                     self.logger.info(f"Callee answered call {call_id}")
 
@@ -2116,6 +2427,22 @@ class SIPServer:
                 # header matches their transaction.  Forwarding the callee's
                 # raw response would have the PBX's Via, causing the caller's
                 # SIP stack to silently discard it.
+                if call_id:
+                    call = self.pbx_core.call_manager.get_call(call_id)
+                    if (
+                        call
+                        and "INVITE" in cseq_header
+                        and message.status_code in (401, 407)
+                        and getattr(call, "trunk", None)
+                        and not getattr(call, "invite_auth_retried", False)
+                    ):
+                        # Trunk provider is challenging the INVITE itself
+                        # (separately from REGISTER), e.g. some providers
+                        # require Digest auth on every request. Retry once
+                        # with credentials instead of failing the call.
+                        self._retry_trunk_invite_with_auth(call, message, addr, call_id)
+                        return
+
                 self.logger.warning(f"Callee error {message.status_code} for call {call_id}")
                 if call_id:
                     call = self.pbx_core.call_manager.get_call(call_id)

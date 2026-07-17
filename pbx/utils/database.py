@@ -1547,6 +1547,221 @@ class ExtensionDB:
         return self.db.execute(query, (key, str_value, config_type, datetime.now(UTC), updated_by))
 
 
+class TrunkDB:
+    """SIP trunk database operations"""
+
+    def __init__(self, db: DatabaseBackend) -> None:
+        """
+        Initialize trunk database
+
+        Args:
+            db: Database backend instance
+        """
+        self.db = db
+        self.logger = get_logger()
+
+    def add(
+        self,
+        trunk_id: str,
+        name: str,
+        host: str,
+        username: str,
+        password: str,
+        port: int = 5060,
+        codec_preferences: list | None = None,
+        priority: int = 100,
+        max_channels: int = 10,
+        health_check_interval: int = 60,
+        enabled: bool = True,
+    ) -> bool:
+        """
+        Add a new SIP trunk
+
+        Args:
+            trunk_id: Trunk identifier
+            name: Trunk name
+            host: SIP provider host
+            username: SIP username
+            password: SIP password
+            port: SIP port
+            codec_preferences: list of preferred codecs (stored as JSON)
+            priority: Trunk priority (lower is better, for failover)
+            max_channels: Maximum concurrent channels
+            health_check_interval: Seconds between health checks
+            enabled: Whether the trunk should be loaded/active
+
+        Returns:
+            bool: True if successful
+        """
+        query = """
+        INSERT INTO sip_trunks (trunk_id, name, host, port, username, password, codec_preferences, priority, max_channels, health_check_interval, enabled)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        return self.db.execute(
+            query,
+            (
+                trunk_id,
+                name,
+                host,
+                port,
+                username,
+                password,
+                json.dumps(codec_preferences) if codec_preferences is not None else None,
+                priority,
+                max_channels,
+                health_check_interval,
+                enabled,
+            ),
+        )
+
+    def get(self, trunk_id: str) -> dict | None:
+        """
+        Get trunk by trunk_id
+
+        Args:
+            trunk_id: Trunk identifier
+
+        Returns:
+            dict: Trunk data or None
+        """
+        query = """
+        SELECT id, trunk_id, name, host, port, username, password, codec_preferences, priority, max_channels, health_check_interval, enabled, created_at, updated_at FROM sip_trunks WHERE trunk_id = %s
+        """
+        return self._deserialize_row(self.db.fetch_one(query, (trunk_id,)))
+
+    def get_all(self) -> list[dict]:
+        """
+        Get all trunks
+
+        Returns:
+            list: list of all trunks
+        """
+        query = """
+        SELECT id, trunk_id, name, host, port, username, password, codec_preferences, priority, max_channels, health_check_interval, enabled, created_at, updated_at FROM sip_trunks ORDER BY trunk_id
+        """
+        return [row for row in (self._deserialize_row(r) for r in self.db.fetch_all(query)) if row]
+
+    def update(
+        self,
+        trunk_id: str,
+        name: str | None = None,
+        host: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        port: int | None = None,
+        codec_preferences: list | None = None,
+        priority: int | None = None,
+        max_channels: int | None = None,
+        health_check_interval: int | None = None,
+        enabled: bool | None = None,
+    ) -> bool:
+        """
+        Update a SIP trunk
+
+        Args:
+            trunk_id: Trunk identifier
+            name: Trunk name (optional)
+            host: SIP provider host (optional)
+            username: SIP username (optional)
+            password: SIP password (optional)
+            port: SIP port (optional)
+            codec_preferences: list of preferred codecs (optional)
+            priority: Trunk priority (optional)
+            max_channels: Maximum concurrent channels (optional)
+            health_check_interval: Seconds between health checks (optional)
+            enabled: Whether the trunk should be loaded/active (optional)
+
+        Returns:
+            bool: True if successful
+        """
+        updates = []
+        params: list[object] = []
+
+        if name is not None:
+            updates.append("name = %s")
+            params.append(name)
+
+        if host is not None:
+            updates.append("host = %s")
+            params.append(host)
+
+        if username is not None:
+            updates.append("username = %s")
+            params.append(username)
+
+        if password is not None:
+            updates.append("password = %s")
+            params.append(password)
+
+        if port is not None:
+            updates.append("port = %s")
+            params.append(port)
+
+        if codec_preferences is not None:
+            updates.append("codec_preferences = %s")
+            params.append(json.dumps(codec_preferences))
+
+        if priority is not None:
+            updates.append("priority = %s")
+            params.append(priority)
+
+        if max_channels is not None:
+            updates.append("max_channels = %s")
+            params.append(max_channels)
+
+        if health_check_interval is not None:
+            updates.append("health_check_interval = %s")
+            params.append(health_check_interval)
+
+        if enabled is not None:
+            updates.append("enabled = %s")
+            params.append(enabled)
+
+        if not updates:
+            return True  # Nothing to update
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(trunk_id)
+
+        query = f"""
+        UPDATE sip_trunks
+        SET {", ".join(updates)}
+        WHERE trunk_id = %s
+        """  # nosec B608 - updates are validated field names, placeholder is safe
+
+        return self.db.execute(query, tuple(params))
+
+    def delete(self, trunk_id: str) -> bool:
+        """
+        Delete a SIP trunk
+
+        Args:
+            trunk_id: Trunk identifier
+
+        Returns:
+            bool: True if successful
+        """
+        query = """
+        DELETE FROM sip_trunks WHERE trunk_id = %s
+        """
+        return self.db.execute(query, (trunk_id,))
+
+    def _deserialize_row(self, row: dict | None) -> dict | None:
+        """Decode the JSON-encoded ``codec_preferences`` column on a fetched row."""
+        if not row:
+            return row
+        codec_value = row.get("codec_preferences")
+        if codec_value:
+            try:
+                row["codec_preferences"] = json.loads(codec_value)
+            except (TypeError, ValueError):
+                self.logger.warning(
+                    f"Could not decode codec_preferences for trunk {row.get('trunk_id')}"
+                )
+                row["codec_preferences"] = None
+        return row
+
+
 class ProvisionedDevicesDB:
     """Provisioned devices database operations"""
 

@@ -1101,6 +1101,51 @@ class TestRouteCallNoAnswerTimer:
         assert mock_call.no_answer_timer is not None
 
 
+@pytest.mark.unit
+class TestRouteToTrunkNoAnswerTimer:
+    """Tests that _route_to_trunk does NOT start a no-answer timer.
+
+    Unlike route_call (internal calls), outbound trunk calls should ring
+    until the caller hangs up or the trunk responds -- see the comment in
+    _route_to_trunk just before its `return True`.
+    """
+
+    def test_no_timer_started_for_trunk_call(self) -> None:
+        pbx = _make_pbx_core()
+        mock_call = pbx.call_manager.create_call.return_value
+        mock_call.no_answer_timer = None
+
+        mock_trunk = MagicMock()
+        mock_trunk.host = "trunk.example.com"
+        mock_trunk.port = 5060
+        mock_trunk.name = "Test Trunk"
+        mock_trunk.codec_preferences = ["0", "8", "18"]
+        mock_trunk.allocate_channel.return_value = True
+        pbx.trunk_system = MagicMock()
+        pbx.trunk_system.route_outbound_with_failover.return_value = (
+            mock_trunk,
+            "12125551234",
+        )
+
+        router = CallRouter(pbx)
+        msg = _make_invite_message(to_ext="12125551234", body="")
+
+        with patch("threading.Timer") as mock_timer_cls:
+            result = router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
+
+            # InviteClientTransaction legitimately starts its own Timer A/B
+            # (SIP retransmission, RFC 3261), so we can't assert Timer was
+            # never called at all -- only that none of those calls target
+            # _handle_no_answer (the removed PBX-side no-answer timer).
+            no_answer_timer_calls = [
+                c for c in mock_timer_cls.call_args_list if c.args[1] == router._handle_no_answer
+            ]
+            assert no_answer_timer_calls == []
+
+        assert result is True
+        assert mock_call.no_answer_timer is None
+
+
 # ===========================================================================
 # CallRouter.route_call - CDR and webhooks
 # ===========================================================================
@@ -1278,6 +1323,89 @@ class TestAnswerCallForVoicemail:
 
 
 # ===========================================================================
+# CallRouter._end_unanswered_trunk_call
+# ===========================================================================
+
+
+@pytest.mark.unit
+class TestEndUnansweredTrunkCall:
+    """Tests for _end_unanswered_trunk_call()."""
+
+    def test_sends_480_and_releases_trunk_channel(self) -> None:
+        pbx = _make_pbx_core()
+
+        mock_trunk = MagicMock()
+        mock_call = MagicMock()
+        mock_call.original_invite = MagicMock()
+        mock_call.caller_addr = CALLER_ADDR
+        mock_call.trunk = mock_trunk
+
+        router = CallRouter(pbx)
+        router._end_unanswered_trunk_call(mock_call, "call-1")
+
+        pbx.sip_server._send_message.assert_called_once()
+        sent_message = pbx.sip_server._send_message.call_args[0][0]
+        assert "480 Temporarily Unavailable" in sent_message
+
+        mock_trunk.release_channel.assert_called_once()
+        mock_trunk.record_failed_call.assert_called_once_with(reason="no answer")
+
+        pbx.rtp_relay.release_relay.assert_called_once_with("call-1")
+        pbx.cdr_system.end_record.assert_called_once_with("call-1", hangup_cause="no_answer")
+        pbx.call_manager.end_call.assert_called_once_with("call-1")
+
+    def test_no_original_invite_skips_response_but_still_cleans_up(self) -> None:
+        pbx = _make_pbx_core()
+
+        mock_trunk = MagicMock()
+        mock_call = MagicMock()
+        mock_call.original_invite = None
+        mock_call.caller_addr = CALLER_ADDR
+        mock_call.trunk = mock_trunk
+
+        router = CallRouter(pbx)
+        router._end_unanswered_trunk_call(mock_call, "call-1")
+
+        pbx.sip_server._send_message.assert_not_called()
+        mock_trunk.release_channel.assert_called_once()
+        pbx.call_manager.end_call.assert_called_once_with("call-1")
+
+    def test_no_caller_addr_skips_response_but_still_cleans_up(self) -> None:
+        pbx = _make_pbx_core()
+
+        mock_trunk = MagicMock()
+        mock_call = MagicMock()
+        mock_call.original_invite = MagicMock()
+        mock_call.caller_addr = None
+        mock_call.trunk = mock_trunk
+
+        router = CallRouter(pbx)
+        router._end_unanswered_trunk_call(mock_call, "call-1")
+
+        pbx.sip_server._send_message.assert_not_called()
+        mock_trunk.release_channel.assert_called_once()
+        pbx.call_manager.end_call.assert_called_once_with("call-1")
+
+    def test_no_trunk_still_cleans_up_without_error(self) -> None:
+        """Defensive: if called on a call with no trunk, don't blow up trying
+        to release one -- just clean up the call/RTP/CDR as usual."""
+        pbx = _make_pbx_core()
+
+        mock_call = MagicMock()
+        mock_call.original_invite = MagicMock()
+        mock_call.caller_addr = CALLER_ADDR
+        mock_call.trunk = None
+
+        router = CallRouter(pbx)
+        router._end_unanswered_trunk_call(mock_call, "call-1")
+
+        pbx.sip_server._send_message.assert_called_once()
+        pbx.rtp_relay.release_relay.assert_called_once_with("call-1")
+        pbx.cdr_system.end_record.assert_called_once_with("call-1", hangup_cause="no_answer")
+        pbx.call_manager.end_call.assert_called_once_with("call-1")
+
+
+# ===========================================================================
 # CallRouter._handle_no_answer
 # ===========================================================================
 
@@ -1320,6 +1448,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = mock_call_state.CONNECTED
         mock_call.routed_to_voicemail = False
+        mock_call.trunk = None
         pbx.call_manager.get_call.return_value = mock_call
 
         router = CallRouter(pbx)
@@ -1364,6 +1493,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
         mock_call.caller_addr = CALLER_ADDR
@@ -1410,6 +1540,44 @@ class TestHandleNoAnswer:
     @patch("pbx.rtp.dtmf_monitor.RTPRecorder")
     @patch("pbx.rtp.handler.RTPPlayer")
     @patch("pbx.core.call.CallState")
+    def test_no_answer_trunk_call_ends_cleanly_not_voicemail(
+        self,
+        mock_call_state: MagicMock,
+        mock_rtp_player_cls: MagicMock,
+        mock_rtp_recorder_cls: MagicMock,
+        mock_get_prompt: MagicMock,
+    ) -> None:
+        """An unanswered outbound trunk call must not be answered into the
+        internal caller's voicemail -- it has no PBX-owned mailbox to route
+        to (see _end_unanswered_trunk_call)."""
+        pbx = _make_pbx_core()
+        mock_call = MagicMock()
+        mock_call.state = "RINGING"
+        mock_call.routed_to_voicemail = False
+        mock_call.trunk = MagicMock()
+        mock_call.caller_addr = CALLER_ADDR
+        mock_call.original_invite = MagicMock()
+        mock_call.from_extension = "1001"
+        mock_call.to_extension = "12125551234"
+        pbx.call_manager.get_call.return_value = mock_call
+
+        router = CallRouter(pbx)
+        router._send_cancel_to_callee = MagicMock()
+        router._answer_call_for_voicemail = MagicMock(return_value=True)
+        router._end_unanswered_trunk_call = MagicMock()
+
+        router._handle_no_answer("call-1")
+
+        assert mock_call.routed_to_voicemail is True
+        router._send_cancel_to_callee.assert_called_once()
+        router._end_unanswered_trunk_call.assert_called_once_with(mock_call, "call-1")
+        router._answer_call_for_voicemail.assert_not_called()
+        mock_get_prompt.assert_not_called()
+
+    @patch("pbx.utils.audio.get_prompt_audio")
+    @patch("pbx.rtp.handler.RTPRecorder")
+    @patch("pbx.rtp.handler.RTPPlayer")
+    @patch("pbx.core.call.CallState")
     def test_no_answer_answer_fails_returns_early(
         self,
         mock_call_state: MagicMock,
@@ -1421,6 +1589,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -1448,6 +1617,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.trunk = None
         mock_call.caller_rtp = None
         mock_call.caller_addr = CALLER_ADDR
         mock_call.original_invite = MagicMock()
@@ -1477,6 +1647,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
         mock_call.caller_addr = CALLER_ADDR
@@ -1527,6 +1698,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
         mock_call.caller_addr = CALLER_ADDR
@@ -1573,6 +1745,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
         mock_call.caller_addr = CALLER_ADDR
@@ -1630,6 +1803,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
         mock_call.caller_addr = CALLER_ADDR
@@ -1687,6 +1861,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
         mock_call.caller_addr = CALLER_ADDR

@@ -1932,6 +1932,7 @@ Content-Type: application/json
                             <tr>
                                 <th>Name</th>
                                 <th>Host</th>
+                                <th>Codecs</th>
                                 <th>Status</th>
                                 <th>Health</th>
                                 <th>Priority</th>
@@ -5110,16 +5111,13 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                     <div><strong>Codec Preferences:</strong></div>
                     <div style="margin-top: 8px;">
                         <label style="display: block; margin-bottom: 5px;">
-                            <input type="checkbox" name="trunk-codecs" value="G.711" checked> G.711 (PCMU/PCMA)
+                            <input type="checkbox" name="trunk-codecs" value="0,8" checked> G.711 (PCMU/PCMA)
                         </label>
                         <label style="display: block; margin-bottom: 5px;">
-                            <input type="checkbox" name="trunk-codecs" value="G.722"> G.722 HD Audio
+                            <input type="checkbox" name="trunk-codecs" value="9"> G.722 HD Audio
                         </label>
                         <label style="display: block; margin-bottom: 5px;">
-                            <input type="checkbox" name="trunk-codecs" value="Opus"> Opus
-                        </label>
-                        <label style="display: block; margin-bottom: 5px;">
-                            <input type="checkbox" name="trunk-codecs" value="G.729"> G.729
+                            <input type="checkbox" name="trunk-codecs" value="18"> G.729
                         </label>
                     </div>
                 </div>

@@ -83,6 +83,7 @@ def _wire_server(pbx: MagicMock) -> SIPServer:
     server.logger = MagicMock()
     server._send_message = MagicMock()  # type: ignore[method-assign]
     server._send_response = MagicMock()  # type: ignore[method-assign]
+    server._pending_trunk_registrations = {}
     pbx.sip_server = server
     return server
 

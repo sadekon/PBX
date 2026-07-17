@@ -155,23 +155,27 @@ def test_click_to_dial_with_mock_pbx() -> None:
     config = {"click_to_dial.enabled": True}
     db = MockDB()
 
-    # Create mock PBX core with call manager
+    # Create mock PBX core with a call_originator, mirroring the real
+    # PBXCore.call_originator wired up by CallOriginator.
     class MockCall:
         def __init__(self, call_id: str, from_ext: str, to_ext: str) -> None:
             self.call_id = call_id
             self.from_extension = from_ext
             self.to_extension = to_ext
 
-        def start(self) -> None:
-            pass
+    class MockCallOriginator:
+        def __init__(self) -> None:
+            self.bridge_calls: list[tuple[str, str]] = []
 
-    class MockCallManager:
-        def create_call(self, call_id: str, from_extension: str, to_extension: str) -> MockCall:
-            return MockCall(call_id, from_extension, to_extension)
+        def originate_and_bridge(
+            self, leg_a: str, leg_b: str, **kwargs: Any
+        ) -> tuple[MockCall, None]:
+            self.bridge_calls.append((leg_a, leg_b))
+            return MockCall("sip-call-1", leg_a, leg_b), None
 
     class MockPBXCore:
         def __init__(self) -> None:
-            self.call_manager = MockCallManager()
+            self.call_originator = MockCallOriginator()
 
     mock_pbx = MockPBXCore()
     engine = ClickToDialEngine(db, config, mock_pbx)
@@ -179,6 +183,7 @@ def test_click_to_dial_with_mock_pbx() -> None:
     # Initiate call with PBX integration
     call_id = engine.initiate_call("1001", "5551234", "web")
     assert call_id is not None
+    assert mock_pbx.call_originator.bridge_calls == [("1001", "5551234")]
 
     # Verify call history shows ringing status
     history = engine.get_call_history("1001")

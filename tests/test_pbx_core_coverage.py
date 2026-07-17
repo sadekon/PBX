@@ -848,6 +848,73 @@ class TestGetCodecsForPhoneModel:
 
 
 # =========================================================================
+# Tests for _get_compatible_trunk_codecs
+# =========================================================================
+@pytest.mark.unit
+class TestGetCompatibleTrunkCodecs:
+    """Tests for PBXCore._get_compatible_trunk_codecs."""
+
+    def test_no_trunk_codecs_returns_caller_codecs(self) -> None:
+        pbx = _make_pbx_core_shell()
+        result = pbx._get_compatible_trunk_codecs(None, ["0", "8"])
+        assert result == ["0", "8"]
+
+    def test_no_trunk_codecs_and_no_caller_codecs_returns_empty(self) -> None:
+        pbx = _make_pbx_core_shell()
+        assert pbx._get_compatible_trunk_codecs(None, None) == []
+
+    def test_no_caller_codecs_returns_trunk_codecs_unchanged(self) -> None:
+        pbx = _make_pbx_core_shell()
+        result = pbx._get_compatible_trunk_codecs(["0", "18"], None)
+        assert result == ["0", "18"]
+
+    def test_intersects_in_caller_order(self) -> None:
+        """trunk_codecs and caller_codecs are both numeric RTP payload-type
+        strings (matching the internal phone-model format), so this is a
+        plain intersection; the caller's offered order is preserved and
+        non-overlapping entries are dropped."""
+        pbx = _make_pbx_core_shell()
+        result = pbx._get_compatible_trunk_codecs(["18", "0"], ["0", "9", "18"])
+        assert result == ["0", "18"]
+
+    def test_no_overlap_falls_back_to_trunk_codecs_unchanged(self) -> None:
+        """Genuinely incompatible codec sets (e.g. a G.729-only trunk and a
+        caller that only offered G.722) fall back to the trunk's configured
+        preferences unchanged, same as offering them without restriction --
+        the trunk (or the caller, via a 488) rejects if truly incompatible."""
+        pbx = _make_pbx_core_shell()
+        result = pbx._get_compatible_trunk_codecs(["18"], ["9"])
+        assert result == ["18"]
+        pbx.logger.warning.assert_called_once()
+
+    def test_no_overlap_does_not_raise(self) -> None:
+        pbx = _make_pbx_core_shell()
+        pbx._get_compatible_trunk_codecs(["18"], ["9"])
+
+    def test_includes_dtmf_when_caller_offered_it(self) -> None:
+        """DTMF (telephone-event) is allowed into the intersection even
+        though it isn't literally listed in trunk.codec_preferences -- it's
+        a PBX-wide relay capability, not a per-trunk codec preference."""
+        pbx = _make_pbx_core_shell()
+        pbx.config.get.return_value = 101
+        result = pbx._get_compatible_trunk_codecs(["0", "18"], ["0", "101"])
+        assert result == ["0", "101"]
+
+    def test_excludes_dtmf_when_caller_did_not_offer_it(self) -> None:
+        pbx = _make_pbx_core_shell()
+        pbx.config.get.return_value = 101
+        result = pbx._get_compatible_trunk_codecs(["0", "18"], ["0", "18"])
+        assert result == ["0", "18"]
+        assert "101" not in result
+
+    def test_honors_configured_non_default_dtmf_payload_type(self) -> None:
+        pbx = _make_pbx_core_shell()
+        pbx.config.get.return_value = 96
+        result = pbx._get_compatible_trunk_codecs(["0"], ["0", "96"])
+        assert result == ["0", "96"]
+
+
+# =========================================================================
 # Tests for _get_phone_user_agent
 # =========================================================================
 @pytest.mark.unit

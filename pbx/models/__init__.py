@@ -8,6 +8,7 @@ from pbx.models.base import Base, TimestampMixin
 from pbx.models.call_record import CallRecord
 from pbx.models.extension import Extension
 from pbx.models.registered_phone import RegisteredPhone
+from pbx.models.sip_trunk import SipTrunk
 from pbx.models.voicemail import Voicemail
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "CallRecord",
     "Extension",
     "RegisteredPhone",
+    "SipTrunk",
     "TimestampMixin",
     "Voicemail",
 ]

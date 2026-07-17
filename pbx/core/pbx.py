@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from pbx.core.auto_attendant_handler import AutoAttendantHandler
 from pbx.core.call import CallManager
+from pbx.core.call_originator import CallOriginator
 from pbx.core.call_router import CallRouter
 from pbx.core.codec_negotiator import CodecNegotiator
 from pbx.core.emergency_handler import EmergencyHandler
@@ -149,13 +150,15 @@ class PBXCore:
         self.database = DatabaseBackend(self.config)
         self.registered_phones_db = None
         self.extension_db = None
+        self.trunk_db = None
         if self.database.connect():
             self._run_alembic_migrations()
             self.database.create_tables()
-            from pbx.utils.database import ExtensionDB
+            from pbx.utils.database import ExtensionDB, TrunkDB
 
             self.registered_phones_db = RegisteredPhonesDB(self.database)
             self.extension_db = ExtensionDB(self.database)
+            self.trunk_db = TrunkDB(self.database)
             self._log_startup(
                 f"Database backend initialized successfully ({self.database.db_type})"
             )
@@ -230,6 +233,7 @@ class PBXCore:
 
         # Initialize handler classes for delegated functionality
         self.call_router = CallRouter(self)
+        self.call_originator = CallOriginator(self)
         self.voicemail_handler = VoicemailHandler(self)
         self.auto_attendant_handler = AutoAttendantHandler(self)
         self.emergency_handler = EmergencyHandler(self)
@@ -499,6 +503,7 @@ class PBXCore:
 
         # Register SIP trunks
         self.trunk_system.register_all()
+        self.trunk_system.start_health_monitoring()
 
         # Start security runtime monitor
         if hasattr(self, "security_monitor"):
@@ -543,6 +548,9 @@ class PBXCore:
         # Stop DND scheduler
         if self.dnd_scheduler:
             self.dnd_scheduler.stop()
+
+        # Stop SIP trunk health monitoring
+        self.trunk_system.stop_health_monitoring()
 
         # Stop API server
         self.api_server.stop()
@@ -591,6 +599,62 @@ class PBXCore:
         self, phone_model: str | None, answered_codecs: list[str] | None
     ) -> list[str]:
         return self.codec_negotiator._get_compatible_codecs(phone_model, answered_codecs)
+
+    def _get_compatible_trunk_codecs(
+        self, trunk_codecs: list[str] | None, caller_codecs: list[str] | None
+    ) -> list[str]:
+        """
+        Compute codecs to offer a trunk, restricted to what the internal caller
+        actually offered.
+
+        Mirrors ``_get_compatible_codecs`` for the trunk-outbound leg: the RTP
+        relay does not transcode, so offering the trunk a codec the caller
+        never proposed can leave the two legs unable to agree on shared audio.
+
+        ``SIPTrunk.codec_preferences`` and ``caller_codecs`` are both numeric
+        RTP static payload-type strings (e.g. ``"0"``, ``"18"``) — the same
+        format used for internal extensions/phone models throughout this
+        module — so this is a plain set intersection, order-preserved by the
+        caller's offer. If a trunk is configured for a codec set that shares
+        nothing with what the caller offered (e.g. caller offers only G.722
+        while the trunk only supports G.711/G.729), the intersection is empty
+        and this falls back to the trunk's configured preferences unchanged,
+        same as offering them without restriction — the trunk (or the caller,
+        via a 488) will reject if truly incompatible.
+
+        DTMF (RFC 2833 telephone-event) is always allowed into the
+        intersection if the caller offered it, the same way
+        ``_get_codecs_for_phone_model`` always includes it for internal
+        calls — it's a PBX-wide relay capability, not a per-trunk codec
+        preference, so it doesn't need to be listed in
+        ``trunk.codec_preferences`` itself.
+
+        Args:
+            trunk_codecs: Trunk's configured ``codec_preferences``.
+            caller_codecs: Codecs the internal caller offered (from SDP), if any.
+
+        Returns:
+            list of codec identifiers to offer the trunk.
+        """
+        if not trunk_codecs:
+            return caller_codecs or []
+
+        if not caller_codecs:
+            return trunk_codecs
+
+        dtmf_pt_str = str(self._get_dtmf_payload_type())
+        trunk_set = set(trunk_codecs) | {dtmf_pt_str}
+        compatible = [c for c in caller_codecs if c in trunk_set]
+
+        if compatible:
+            self.logger.debug(f"Compatible trunk codecs: {compatible}")
+            return compatible
+
+        self.logger.warning(
+            f"No codec overlap between trunk preferences {trunk_codecs} and caller "
+            f"codecs {caller_codecs}; falling back to trunk preferences unchanged"
+        )
+        return trunk_codecs
 
     def _get_phone_user_agent(self, extension_number: str) -> str | None:
         return self.codec_negotiator._get_phone_user_agent(extension_number)
@@ -689,6 +753,17 @@ class PBXCore:
                     status="completed",
                     direction=getattr(call, "direction", "inbound"),
                 )
+
+            # Release the trunk channel and record the call outcome for
+            # health tracking, if this call went out via a SIP trunk
+            if hasattr(call, "trunk") and call.trunk:
+                from pbx.core.call import CallState
+
+                call.trunk.release_channel()
+                if call.state == CallState.CONNECTED:
+                    call.trunk.record_successful_call()
+                else:
+                    call.trunk.record_failed_call(reason="call ended before answer")
 
             self.call_manager.end_call(call_id)
             # Stop any hold music before releasing the relay it runs on

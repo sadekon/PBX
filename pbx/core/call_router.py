@@ -10,6 +10,7 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,12 @@ class CallRouter:
     # Cap on SIP 3xx redirects followed for a single call, to guard against
     # misconfigured phones that redirect back into a loop.
     MAX_REDIRECTS = 5
+
+    # Classifies a dialed string as an external PSTN number (vs. an internal
+    # extension) -- optional leading 1, then a 10-digit NANP number. Shared
+    # by route_call()'s inbound-INVITE dispatch and CallOriginator's
+    # PBX-initiated dial, so both resolve "internal vs. external" identically.
+    EXTERNAL_NUMBER_PATTERN = re.compile(r"^1?\d{10}$")
 
     def __init__(self, pbx_core: Any) -> None:
         """
@@ -108,6 +115,10 @@ class CallRouter:
             return bool(
                 pbx.paging_handler.handle_paging(from_ext, to_ext, call_id, message, from_addr)
             )
+
+        # Check if this is an external call (10-digit)
+        if pbx.trunk_system and self.EXTERNAL_NUMBER_PATTERN.match(to_ext):
+            return self._route_to_trunk(from_ext, to_ext, call_id, message, from_addr)
 
         # Check if destination extension is registered and not expired,
         # recovering its registration from the database if necessary.
@@ -346,6 +357,11 @@ class CallRouter:
         # Mark CDR as answered for analytics
         pbx.cdr_system.mark_answered(call_id)
 
+        # A PBX-originated leg (CallOriginator, no live caller to relay a
+        # 200 OK to) reports its answer through this callback instead.
+        if call.originate_callbacks and call.originate_callbacks.get("on_answer"):
+            call.originate_callbacks["on_answer"](call)
+
         # Send 200 OK back to caller with PBX's RTP endpoint
         server_ip = pbx._get_server_ip()
 
@@ -500,6 +516,56 @@ class CallRouter:
             return None
 
         return dest_ext
+
+    def _build_and_send_leg_invite(
+        self,
+        call: Any,
+        call_id: str,
+        invite_request: Any,
+        dest_addr: tuple[str, int],
+        server_ip: str,
+        on_timeout: Callable[[], None],
+    ) -> Any:
+        """
+        Attach the transport headers every outbound leg needs (Via with a
+        fresh branch, Content-type, Max-Forwards), start a retransmitting
+        InviteClientTransaction toward dest_addr, and record it on `call`.
+
+        Callers build the request line, From/To/Contact/CSeq, SDP body,
+        caller-ID headers, and any phone/carrier-specific quirks themselves
+        first -- those differ enough between the extension and trunk paths
+        (Contact identity semantics, Zultys SDP quirks, WebRTC short-circuit)
+        that pulling them in here would trade real duplication for a
+        parameter explosion that just moves the duplication into
+        conditional flags.
+
+        Returns:
+            The started InviteClientTransaction.
+        """
+        pbx = self.pbx_core
+        branch_id = str(uuid.uuid4()).replace("-", "")
+        sip_port = pbx.config.get("server.sip_port", 5060)
+        invite_request.set_header(
+            "Via",
+            f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}",
+        )
+        invite_request.set_header("Content-type", "application/sdp")
+        # Max-Forwards is mandatory per RFC 3261 Section 8.1.1.6.
+        # Some strict SIP stacks reject INVITEs without it.
+        invite_request.set_header("Max-Forwards", "70")
+
+        invite_txn = InviteClientTransaction(
+            message=invite_request.build(),
+            dest_addr=dest_addr,
+            send_fn=pbx.sip_server._send_message,
+            on_timeout=on_timeout,
+        )
+        invite_txn.start()
+        call.invite_transaction = invite_txn
+        call.callee_addr = dest_addr
+        call.callee_invite = invite_request
+
+        return invite_txn
 
     def _dial_extension_leg(
         self,
@@ -696,22 +762,15 @@ class CallRouter:
             body=callee_sdp_body,
         )
 
-        # Add required headers
-        # Generate PBX's own Via header so responses come back to the PBX
-        branch_id = str(uuid.uuid4()).replace("-", "")
+        # Add Contact header identifying the caller's extension. Via,
+        # Content-type, and Max-Forwards are attached by
+        # _build_and_send_leg_invite() below, along with the other
+        # transport mechanics every outbound leg needs.
         sip_port = pbx.config.get("server.sip_port", 5060)
-        invite_to_callee.set_header(
-            "Via",
-            f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}",
-        )
         invite_to_callee.set_header(
             "Contact",
             f"<sip:{from_ext}@{server_ip}:{sip_port}>",
         )
-        invite_to_callee.set_header("Content-type", "application/sdp")
-        # Max-Forwards is mandatory per RFC 3261 Section 8.1.1.6.
-        # Some strict SIP stacks reject INVITEs without it.
-        invite_to_callee.set_header("Max-Forwards", "70")
 
         # Add caller ID headers (P-Asserted-Identity and Remote-Party-ID)
         if pbx.config.get("sip.caller_id.send_p_asserted_identity", True) or pbx.config.get(
@@ -761,19 +820,14 @@ class CallRouter:
                 pbx.logger.debug(f"Added X-MAC-Address header: {mac_address}")
 
         # Send INVITE to destination with retransmission (RFC 3261)
-        invite_txn = InviteClientTransaction(
-            message=invite_to_callee.build(),
-            dest_addr=dest_ext_obj.address,
-            send_fn=pbx.sip_server._send_message,
+        self._build_and_send_leg_invite(
+            call,
+            call_id,
+            invite_to_callee,
+            dest_ext_obj.address,
+            server_ip,
             on_timeout=lambda: self._handle_invite_timeout(call_id),
         )
-        invite_txn.start()
-        call.invite_transaction = invite_txn
-
-        # Store callee address for later use (e.g., to send CANCEL if
-        # routing to voicemail)
-        call.callee_addr = dest_ext_obj.address
-        call.callee_invite = invite_to_callee  # Store the INVITE for CANCEL
 
         pbx.logger.info(f"Forwarded INVITE to {to_ext} at {dest_ext_obj.address}")
 
@@ -790,6 +844,180 @@ class CallRouter:
         call.no_answer_timer.daemon = True
         call.no_answer_timer.start()
         pbx.logger.info(f"Started no-answer timer ({no_answer_timeout}s) for call {call_id}")
+
+        return True
+
+    def _route_to_trunk(
+        self,
+        from_ext: str,
+        to_ext: str,
+        call_id: str,
+        message: Any,
+        from_addr: tuple[str, int],
+    ) -> bool:
+        """
+        Route an outbound call to an external number via a SIP trunk.
+
+        Mirrors the internal-extension path in ``route_call``: allocates an
+        RTP relay, builds an INVITE toward the trunk, and sends it with
+        retransmission. The trunk's response (180/183/200/4xx) is handled
+        by the existing call_id-keyed logic in ``SIPServer._handle_response``,
+        the same code path used for internal calls.
+
+        Args:
+            from_ext: Calling extension.
+            to_ext: Dialed (untransformed) external number.
+            call_id: SIP Call-ID.
+            message: Original INVITE message from the caller.
+            from_addr: Caller's address tuple.
+
+        Returns:
+            True if the call was routed to a trunk successfully.
+        """
+        from pbx.sip.message import SIPMessageBuilder
+        from pbx.sip.sdp import SDPBuilder
+
+        pbx = self.pbx_core
+
+        trunk, transformed_number = pbx.trunk_system.route_outbound_with_failover(to_ext)
+        if not trunk:
+            pbx.logger.warning(f"No outbound trunk route found for {to_ext}")
+            return False
+
+        # route_outbound_with_failover() (and its failover/priority-fallback
+        # helpers) already check can_make_call() -- the same check
+        # allocate_channel() makes -- before returning a trunk, and this
+        # runs synchronously with no yield point in between, so this should
+        # essentially never fail. No further trunk is tried if it does; the
+        # call fails cleanly rather than silently misbehaving.
+        if not trunk.allocate_channel():
+            pbx.logger.warning(f"Trunk {trunk.name} has no free channels for {to_ext}")
+            return False
+
+        # Parse caller's SDP offer (same as the internal-call path)
+        caller_sdp: dict[str, Any] | None = None
+        if message.body:
+            from pbx.sip.sdp import SDPSession
+
+            caller_sdp_obj = SDPSession()
+            caller_sdp_obj.parse(message.body)
+            caller_sdp = caller_sdp_obj.get_audio_info()
+
+        call = pbx.call_manager.create_call(call_id, from_ext, to_ext)
+        call.start()
+        call.original_invite = message
+        call.trunk = trunk  # so end_call() can release the channel / record outcome
+
+        pbx.cdr_system.start_record(call_id, from_ext, to_ext)
+        pbx.webhook_system.trigger_event(
+            WebhookEvent.CALL_STARTED,
+            {
+                "call_id": call_id,
+                "from_extension": from_ext,
+                "to_extension": to_ext,
+                "timestamp": call.start_time.isoformat() if call.start_time else None,
+            },
+        )
+
+        call.caller_addr = from_addr
+
+        rtp_ports = pbx.rtp_relay.allocate_relay(call_id)
+        if not rtp_ports:
+            pbx.logger.error(f"Failed to allocate RTP relay for call {call_id}")
+            trunk.release_channel()
+            pbx.cdr_system.end_record(call_id, hangup_cause="resource_unavailable")
+            pbx.call_manager.end_call(call_id)
+            return False
+
+        call.rtp_ports = rtp_ports
+
+        if caller_sdp:
+            call.caller_rtp = caller_sdp
+            caller_endpoint = (caller_sdp["address"], caller_sdp["port"])
+            relay_info = pbx.rtp_relay.active_relays.get(call_id)
+            if relay_info:
+                relay_info["handler"].set_endpoints(caller_endpoint, None)
+
+        server_ip = pbx._get_server_ip()
+        dtmf_payload_type = pbx._get_dtmf_payload_type()
+        ilbc_mode = pbx._get_ilbc_mode()
+
+        caller_protocol = "RTP/AVP"
+        caller_crypto: list[str] | None = None
+        caller_codecs: list[str] | None = None
+        if caller_sdp:
+            caller_protocol = caller_sdp.get("protocol", "RTP/AVP")
+            caller_crypto = caller_sdp.get("crypto") or None
+            caller_codecs = caller_sdp.get("formats", None)
+
+        # Only offer the trunk codecs the caller actually offered, so we never
+        # negotiate a codec on this leg that the caller-side leg can't produce
+        # (the RTP relay does not transcode between legs).
+        trunk_codecs = pbx._get_compatible_trunk_codecs(trunk.codec_preferences, caller_codecs)
+
+        trunk_sdp_body = SDPBuilder.build_audio_sdp(
+            server_ip,
+            rtp_ports[0],
+            session_id=call_id,
+            codecs=trunk_codecs,
+            dtmf_payload_type=dtmf_payload_type,
+            ilbc_mode=ilbc_mode,
+            protocol=caller_protocol,
+            crypto=caller_crypto,
+        )
+
+        trunk_addr = (trunk.host, trunk.port)
+        invite_to_trunk = SIPMessageBuilder.build_request(
+            method="INVITE",
+            uri=f"sip:{transformed_number}@{trunk.host}:{trunk.port}",
+            from_addr=f"<sip:{from_ext}@{server_ip}>",
+            to_addr=f"<sip:{transformed_number}@{trunk.host}>",
+            call_id=call_id,
+            cseq=int((message.get_header("CSeq") or "1 INVITE").split()[0]),
+            body=trunk_sdp_body,
+        )
+
+        # Add Contact header identifying the dialed number, per carrier
+        # convention. Via, Content-type, and Max-Forwards are attached by
+        # _build_and_send_leg_invite() below.
+        sip_port = pbx.config.get("server.sip_port", 5060)
+        invite_to_trunk.set_header("Contact", f"<sip:{transformed_number}@{server_ip}:{sip_port}>")
+
+        # If the trunk challenges this INVITE with a 401/407 (some providers
+        # require Digest auth on INVITE in addition to REGISTER),
+        # SIPServer._handle_response retries once with credentials via
+        # _retry_trunk_invite_with_auth() -- this initial INVITE is
+        # deliberately sent unauthenticated.
+
+        SIPMessageBuilder.add_caller_id_headers(invite_to_trunk, from_ext, from_ext, server_ip)
+
+        self._build_and_send_leg_invite(
+            call,
+            call_id,
+            invite_to_trunk,
+            trunk_addr,
+            server_ip,
+            on_timeout=lambda: self._handle_invite_timeout(call_id),
+        )
+
+        pbx.logger.info(
+            f"Routing call {call_id}: {from_ext} -> {transformed_number} via trunk "
+            f"{trunk.name} ({trunk_addr[0]}:{trunk_addr[1]})"
+        )
+
+        # Deliberately no PBX-initiated no-answer timer here, unlike the
+        # internal-call path. Standard PBX behavior (e.g. Asterisk's Dial()
+        # defaults to an effectively unlimited ring duration) lets an
+        # outbound call keep ringing once the callee's side has started
+        # ringing -- the PBX doesn't own the callee's voicemail, and
+        # carrier ring-to-voicemail timing varies and is often longer than
+        # a fixed internal timeout, so cutting the call off preemptively
+        # can sever it moments before the callee's own voicemail would
+        # have answered. The call ends when the caller hangs up, the
+        # trunk sends a final response, or -- if the trunk never responds
+        # to the INVITE at all -- when InviteClientTransaction's own
+        # RFC 3261 retry timeout fires via _handle_invite_timeout(), which
+        # still routes through _end_unanswered_trunk_call() below.
 
         return True
 
@@ -1044,9 +1272,71 @@ class CallRouter:
         call.connect()
         return True
 
+    def _end_unanswered_trunk_call(self, call: Any, call_id: str) -> None:
+        """
+        Cleanly end an outbound trunk call that did not complete.
+
+        Reached from ``_handle_no_answer`` only via ``_handle_invite_timeout``
+        (``_route_to_trunk`` starts no separate no-answer timer, so a trunk
+        call that started ringing keeps ringing indefinitely) -- i.e. this
+        only fires when the trunk never sent any response to the INVITE at
+        all within its own retry window.
+
+        Unlike an internal extension, a dialed external number has no PBX-owned
+        voicemail box, so falling through to ``_answer_call_for_voicemail()``
+        would incorrectly answer the *internal caller's* leg and record their
+        voice into a mailbox auto-created for the dialed PSTN number. Instead,
+        send a final 480 Temporarily Unavailable to the caller's original
+        INVITE -- the same response code this codebase already uses elsewhere
+        for "reachable but not currently available" -- and release resources.
+
+        Duplicates the trunk-channel-release/failure-recording lines from
+        ``PBXCore.end_call()`` rather than calling it, so this path can record
+        an accurate ``"no_answer"`` hangup_cause; ``end_call()`` hardcodes
+        ``"normal_clearing"`` with no way to override it.
+
+        Args:
+            call: The Call object for the unanswered trunk call.
+            call_id: Call identifier.
+        """
+        from pbx.sip.message import SIPMessageBuilder
+
+        pbx = self.pbx_core
+
+        if call.original_invite and call.caller_addr:
+            response = SIPMessageBuilder.build_response(
+                480, "Temporarily Unavailable", call.original_invite
+            )
+            pbx.sip_server._send_message(response.build(), call.caller_addr)
+            pbx.logger.info(
+                f"Sent 480 Temporarily Unavailable to caller for unanswered trunk call {call_id}"
+            )
+
+        if hasattr(call, "trunk") and call.trunk:
+            call.trunk.release_channel()
+            call.trunk.record_failed_call(reason="no answer")
+
+        pbx.rtp_relay.release_relay(call_id)
+        pbx.cdr_system.end_record(call_id, hangup_cause="no_answer")
+        pbx.call_manager.end_call(call_id)
+
     def _handle_no_answer(self, call_id: str) -> None:
         """
-        Handle no-answer timeout - route call to voicemail
+        Handle no-answer timeout.
+
+        Internal calls (the dialed extension has a PBX-owned voicemail box)
+        are answered into voicemail so the caller can leave a message, via
+        the ``voicemail.no_answer_timeout`` timer started in ``route_call``.
+
+        Outbound trunk calls (dialed an external number) have no such
+        destination -- see ``_end_unanswered_trunk_call``, which ends the
+        call cleanly instead of answering the internal caller into a bogus
+        mailbox keyed by the dialed PSTN number. Trunk calls have no
+        equivalent no-answer timer (``_route_to_trunk`` does not start one,
+        matching standard PBX behavior of letting an outbound call ring
+        indefinitely once the callee's side starts ringing), so this method
+        is only reached for a trunk call via ``_handle_invite_timeout`` --
+        i.e. only when the trunk never responded to the INVITE at all.
 
         Args:
             call_id: Call identifier
@@ -1068,7 +1358,7 @@ class CallRouter:
             return
 
         if call.routed_to_voicemail:
-            pbx.logger.debug(f"Call {call_id} already routed to voicemail")
+            pbx.logger.debug(f"Call {call_id} no-answer timeout already handled")
             return
 
         # A transfer consultation leg whose bridge is pending has no live
@@ -1080,16 +1370,25 @@ class CallRouter:
             pbx.transfer_handler.abort_pending_transfer(call, cancel_destination=True)
             return
 
+        # routed_to_voicemail is reused as a general "no-answer timeout
+        # already handled" guard, not only a voicemail flag -- also set on
+        # the trunk (no-voicemail) branch below to prevent double-handling.
         call.routed_to_voicemail = True
-        pbx.logger.info(f"No answer for call {call_id}, routing to voicemail")
 
         # Cancel INVITE retransmission if still running
         if hasattr(call, "invite_transaction") and call.invite_transaction:
             call.invite_transaction.cancel()
             call.invite_transaction = None
 
-        # Send CANCEL to the callee to stop their phone from ringing
+        # Send CANCEL to the callee (or trunk) to stop it from ringing
         self._send_cancel_to_callee(call, call_id)
+
+        if hasattr(call, "trunk") and call.trunk:
+            pbx.logger.info(f"No answer for outbound trunk call {call_id}, ending call")
+            self._end_unanswered_trunk_call(call, call_id)
+            return
+
+        pbx.logger.info(f"No answer for call {call_id}, routing to voicemail")
 
         # Answer the call to allow voicemail recording.
         # For WebRTC-originated calls, caller_addr is None (no SIP
