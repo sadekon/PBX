@@ -4,7 +4,9 @@
 > built, and what remains to finish, debug, and deploy every feature in this system.
 > Update the status tables here whenever feature work lands.
 >
-> **Last audited:** 2026-07-07, against branches `voicemail-fix` (current), `sip-trunk`, and `DEV`.
+> **Last audited:** 2026-07-17, against branches `auto-attendant` (current, open as
+> [PR #2](https://github.com/sadekon/PBX/pull/2)), `sip-trunk`, and `DEV`. `voicemail-fix`
+> merged to `DEV` via PR #1 and is no longer a live branch.
 
 ## How this document is organized
 
@@ -39,7 +41,7 @@ with a second gate says so in its row.
 | ID | Capability | Status | Built in | Finishing it unblocks |
 |----|-----------|--------|----------|----------------------|
 | **C1** | SIP signaling core — registration, dialogs, routing, transfer/hold | ✅ working (UDP-only) | `pbx/sip/`, `core/call_router.py` | Call-handling features work today; TLS/TCP transport is Phase-7 hardening. REFER transfer rewritten on `auto-attendant` (attended via Replaces per RFC 3891, blind via PBX-originated leg); pending field verification with Zultys ZIP phones |
-| **C2** | RTP media relay & IVR plumbing — relay, DTMF (RFC 2833 + in-band), prompt playback, recording tap | 🚧 solid, DTMF/prompt fixes landing on `voicemail-fix` | `pbx/rtp/`, `core/voicemail_handler.py`, `rtp/handler.py` | Voicemail, AA, MoH, recording, paging; codec expansion slots in here |
+| **C2** | RTP media relay & IVR plumbing — relay, DTMF (RFC 2833 + SIP INFO + in-band), prompt playback, recording tap | ✅ voicemail-fix merged to DEV; DTMF sources unified into one `DTMFMonitor` on `auto-attendant` | `pbx/rtp/`, `core/voicemail_handler.py`, `rtp/handler.py`, `rtp/dtmf_monitor.py` | Voicemail, AA, MoH, recording, paging; codec expansion slots in here |
 | **C3** | **Audio mixer (N-way media) — does not exist** | ❌ missing | (to build: sum/mix G.711 streams per participant, or bridge via Jitsi) | Conference audio, 3-way calling, barge/whisper/screening |
 | **C4** | **Call-originate primitive — does not exist** ("PBX creates a leg to X, then bridges") | ❌ missing | (to build in `core/` + SIP server) | Click-to-dial, callback completion, predictive dialing, emergency-notification calls, operator console actions |
 | **C5** | Trunk / PSTN connectivity | 🔶 outbound done on `sip-trunk` branch; **inbound (DID) missing** | `features/sip_trunk.py`, `sip/server.py`, `core/call_router.py` | DID routing, E911 stack, LCR, STIR/SHAKEN, DNS SRV failover, fraud detection on real traffic, SBC validation |
@@ -53,19 +55,29 @@ LDAP, CRM APIs, HTTPS/browser) carry no C-number — their gate is **Rig E** or 
 
 ## Tier 0 — Core platform
 
-The runtime is a single Python process: `main.py` → `PBXCore` (`pbx/core/pbx.py`, 2 255 lines)
+The runtime is a single Python process: `main.py` → `PBXCore` (`pbx/core/pbx.py`, ~1 025 lines)
 owns everything. `PBXCore.start()` boots, in order: security enforcement → SIP server →
 Flask API server → DND scheduler → trunk registration → security monitor → Prometheus
 collector → registration-expiry sweep.
 
+On `auto-attendant`, `PBXCore` was split into dedicated modules — `transfer_handler.py`
+(blind/attended/REFER transfer), `codec_negotiator.py` (phone-model detection + codec
+compatibility), and `registration_handler.py` (SIP registration) — cutting `pbx.py` from
+2 717 to ~1 025 lines. Internal handlers (`CallRouter`, `VoicemailHandler`, `TransferHandler`,
+`CodecNegotiator`, `RegistrationHandler`) are public attributes on `PBXCore` with no
+forwarding methods, so call sites use e.g. `pbx.transfer_handler.start_blind_refer_transfer(...)` directly.
+
 | Component | Files | Status | Notes / remaining work |
 |-----------|-------|--------|------------------------|
-| SIP server (C1) | `pbx/sip/server.py` (1 961 ln) | ✅ | **UDP only** — a single `SOCK_DGRAM` socket. No TCP or TLS transport, so no SIPS and no encrypted signaling to carriers/phones. Biggest core limitation. |
+| SIP server (C1) | `pbx/sip/server.py` (~2 257 ln) | ✅ | **UDP only** — a single `SOCK_DGRAM` socket. No TCP or TLS transport, so no SIPS and no encrypted signaling to carriers/phones. Biggest core limitation. REFER/Replaces transfer parsing and SIP 3xx redirect (call-forwarding) handling landed on `auto-attendant`. |
 | SIP message/SDP/transaction (C1) | `pbx/sip/message.py`, `sdp.py`, `transaction.py` | ✅ | Parser, SDP builder/negotiation, transaction state machine. |
-| RTP relay + media (C2) | `pbx/rtp/handler.py` (1 445 ln), `jitter_buffer.py`, `rfc2833.py`, `rtcp_monitor.py` | ✅ | In-process relay, ports 10000–20000, RFC 2833 DTMF send/receive, RTCP QoS feed. G.711 µ/A end-to-end; G.722 partially via `utils/audio`. No mixer (C3) and no originate primitive (C4) — the two missing core builds. |
-| Call state machine + router (C1) | `pbx/core/call.py`, `call_router.py` (853 ln) | ✅ | Dialplan patterns route to extensions, conference rooms (`2xxx`), parking (`7x`), queues (`8xxx`), voicemail, AA. Trunk routing added on `sip-trunk` branch. |
+| RTP relay + media (C2) | `pbx/rtp/handler.py` (~1 645 ln), `jitter_buffer.py`, `dtmf_monitor.py`, `rtcp_monitor.py` | ✅ | In-process relay, ports 10000–20000, RTCP QoS feed. G.711 µ/A end-to-end; G.722 partially via `utils/audio`. DTMF (RFC 2833 + SIP INFO + in-band) unified into one `DTMFMonitor` shared by AA and voicemail IVR (`auto-attendant`). No mixer (C3) and no originate primitive (C4) — the two missing core builds. |
+| Call transfer (C1) | `pbx/core/transfer_handler.py` (~862 ln) | ✅ | Blind + attended transfer via REFER/Replaces (RFC 3891); invite-based transfer detection; mandatory Via/Max-Forwards on teardown; auto-attendant calls transfer via the RTP relay instead of REFER (PBX stays in the media path) and are held with MOH during the transfer. Pending field verification with Zultys ZIP phones. |
+| Codec negotiation (C2) | `pbx/core/codec_negotiator.py` (~339 ln) | ✅ | Phone-model detection and codec compatibility, extracted out of `PBXCore`. |
+| Registration handling (C1) | `pbx/core/registration_handler.py` (~314 ln) | ✅ | SIP REGISTER handling, extracted out of `PBXCore`. |
+| Call state machine + router (C1) | `pbx/core/call.py`, `call_router.py` (~1 228 ln) | ✅ | Dialplan patterns route to extensions, conference rooms (`2xxx`), parking (`7x`), queues (`8xxx`), voicemail, AA. Trunk routing added on `sip-trunk` branch. SIP 3xx redirect (call forwarding, e.g. a phone's "always forward") routed here on `auto-attendant`. |
 | PBXCore + feature init | `pbx/core/pbx.py`, `feature_initializer.py` | ✅ | Static (not dynamic) initialization of ~30 Tier-1 features. |
-| IVR handlers (C2) | `core/voicemail_handler.py` (1 371 ln), `auto_attendant_handler.py`, `paging_handler.py`, `emergency_handler.py` | 🚧 | Voicemail/AA IVR under active repair on `voicemail-fix` (DTMF reliability, prompts, barge-in). |
+| IVR handlers (C2) | `core/voicemail_handler.py` (~1 159 ln), `auto_attendant_handler.py`, `paging_handler.py`, `emergency_handler.py` | ✅ | Voicemail IVR fixes (DTMF reliability, prompts, barge-in) merged via `voicemail-fix` (PR #1). AA transfer now RTP-relay-based with MOH hold (`auto-attendant`); a transfer-failure TODO remains (see below). |
 | REST API + admin UI | `pbx/api/` (22 route modules), `admin/` (19 TS pages) | ✅ | Flask app factory, auth, OpenAPI docs; Vite/TS frontend. Known debt: CSP `unsafe-inline` (≈130 inline `onclick`, ≈330 inline `style=` in `index.html`). |
 | Config / DB / migrations (C7) | `pbx/utils/config.py`, `database.py`, `migrations.py`, `alembic/` | ✅ | YAML + `.env`; PostgreSQL with SQLite fallback. Debt: only 2 Alembic migrations — feature tables use runtime `CREATE TABLE IF NOT EXISTS`. |
 | Security stack | `utils/security*.py`, `encryption.py`, `tls_support.py`, `audit_logger.py` | ✅ | FIPS-oriented encryption, threat detector, runtime security monitor (blocks startup on failed enforcement). TLS applies to the API, **not** SIP. |
@@ -98,12 +110,12 @@ flag. Grouped by gating capability.
 | Phone provisioning | `phone_provisioning.py`, `provisioning_templates/` | `provisioning.enabled` | 🔶 | Zultys, Cisco (incl. CP-8851-3PCC, ATAs), Polycom templates exist. Each new model = template + quirks (DTMF payload-type table in `config.yml`). Requires real hardware per model. | B |
 | Phone book | `phone_book.py` | `features.phone_book` | ✅ | AD auto-sync option; remote-phonebook URL consumed by provisioned phones. | B (+E for AD) |
 
-### C2 — Media & IVR (relay ✅, fixes landing 🚧)
+### C2 — Media & IVR (relay ✅, merged from `voicemail-fix`; transfer/DTMF unification on `auto-attendant`)
 
 | Feature | Module | Config gate | Status | Remaining work | Test rig |
 |---------|--------|------------|--------|----------------|----------|
-| Voicemail | `voicemail.py` + `core/voicemail_handler.py` | `features.voicemail` | 🚧 | Active on `voicemail-fix`: RFC 2833 + in-band DTMF in IVR, prompts, barge-in, greeting review. Finish: deployed test on real phones, merge to DEV. Email notify needs SMTP (Rig E); transcription needs a Vosk model on disk (Rig E). | A (+E) |
-| Auto attendant | `auto_attendant.py` + handler | `features.auto_attendant` | 🚧 | Same IVR/DTMF plumbing as voicemail (barge-in landed). Prompt text now config-driven (`auto_attendant.prompts` + `company_name`) via the single `generate_espeak_voices.py` generator. G.711 (PCMU) only — HD/G.722 prompt audio intentionally not supported. Needs prompt files generated on the box and deployed DTMF test across phone models. | A |
+| Voicemail | `voicemail.py` + `core/voicemail_handler.py` | `features.voicemail` | ✅ | RFC 2833 + in-band DTMF in IVR, prompts, barge-in, greeting review — merged to DEV via PR #1 (`voicemail-fix`). Remaining: deployed regression test on real phones. Email notify needs SMTP (Rig E); transcription needs a Vosk model on disk (Rig E). | A (+E) |
+| Auto attendant | `auto_attendant.py` + handler | `features.auto_attendant` | 🚧 | Same IVR/DTMF plumbing as voicemail (barge-in landed); DTMF now goes through the shared `DTMFMonitor`. Prompt text config-driven (`auto_attendant.prompts` + `company_name`) via the single `generate_espeak_voices.py` generator. G.711 (PCMU) only — HD/G.722 prompt audio intentionally not supported. Transfers now go via the RTP relay (not REFER) and hold with MOH; transfer-failure UX is still a TODO (`auto_attendant_handler.py` — interim behavior replays the main menu, pending a product decision on voicemail-on-failure vs. apology+hangup). Needs prompt files generated on the box and deployed DTMF/transfer test across phone models. | A |
 | Music on hold | `music_on_hold.py` | `features.music_on_hold` | ✅ | Needs audio files in `moh/`. | A |
 | Call recording | `call_recording.py` | `features.call_recording` | ✅ | Records from RTP relay. Retention (`recording_retention.py`) and announcements (`recording_announcements.py`) wired. Verify storage growth + retention sweeps on Rig F. | A |
 | Paging | `paging.py` + `core/paging_handler.py` | `features.paging` | 🔶 | Handler contains production-gap language; multicast paging needs real phones on a LAN segment that permits multicast. | B |
@@ -261,19 +273,51 @@ covers several). Each needs an explicit wire-or-cut decision before "finished" m
 
 ---
 
-## Branch: voicemail-fix (current)
+## Branch: voicemail-fix (merged)
 
-Capability C2 work. Recent commits: G.711 µ-law encoder fix, RFC 2833 + in-band DTMF
-into the voicemail IVR, greeting-review prompts, regenerated prompt audio, menu
-re-announcement, and DTMF barge-in (interrupt prompts by keypress) for both voicemail and AA.
-Barge-in only peeks the pending-DTMF source, so the existing DTMF loop still consumes the
-digit and drives the state machine; PIN entry is the one exception — it barges only on `#`,
-so the prompt keeps playing while the caller dials PIN digits.
+Capability C2 work, merged to `DEV` via [PR #1](https://github.com/sadekon/PBX/pull/1).
+G.711 µ-law encoder fix, RFC 2833 + in-band DTMF into the voicemail IVR, greeting-review
+prompts, regenerated prompt audio, menu re-announcement, and DTMF barge-in (interrupt
+prompts by keypress) for both voicemail and AA. Barge-in only peeks the pending-DTMF
+source, so the existing DTMF loop still consumes the digit and drives the state machine;
+PIN entry is the one exception — it barges only on `#`, so the prompt keeps playing while
+the caller dials PIN digits.
 
-**To finish:** deployed regression on real phones (Zultys + Cisco ATA are the tested
-targets per commit history) covering PIN entry (including barge-in-on-`#` only), greeting
-record/review, message playback/delete/save, and barge-in on every other prompt — then
-merge to DEV.
+**Still outstanding:** deployed regression on real phones (Zultys + Cisco ATA are the
+tested targets per commit history) covering PIN entry (including barge-in-on-`#` only),
+greeting record/review, message playback/delete/save, and barge-in on every other prompt.
+
+---
+
+## Branch: auto-attendant (current, open as [PR #2](https://github.com/sadekon/PBX/pull/2))
+
+Mostly a C1/C2 refactor-and-build branch, built on top of the merged `voicemail-fix` work.
+
+- **`PBXCore` split**: extracted `pbx/core/transfer_handler.py` (`TransferHandler` — all
+  blind/attended/REFER transfer logic), `pbx/core/codec_negotiator.py` (`CodecNegotiator`
+  — phone-model detection and codec compatibility), and `pbx/core/registration_handler.py`
+  (`RegistrationHandler` — SIP registration). `pbx.py` drops from 2 717 to ~1 025 lines;
+  internal handlers are now public attributes on `PBXCore` with no forwarding methods.
+- **Call transfer (C1)**: implemented REFER/Replaces-based blind and attended transfer
+  (RFC 3891) — invite-based transfer detection, mandatory Via/Max-Forwards headers on
+  teardown, fixes for second-transfer-from-peer-leg and malformed/overlapping REFERs,
+  BYE sent to the transferor for both legs on completion.
+- **Auto attendant transfer**: AA calls now transfer via the RTP relay instead of REFER
+  (the PBX stays in the media path — "the Asterisk-standard way to transfer a trunk/inbound
+  call") and are held with MOH while the transfer is in progress.
+- **Call forwarding**: SIP 3xx redirect handling for a phone's "always forward" configuration.
+- **DTMF unification**: consolidated RFC 2833, SIP INFO, and in-band DTMF detection into one
+  shared `rtp/dtmf_monitor.py::DTMFMonitor`, used by both auto attendant and voicemail IVR.
+- **MOH fixes**: fixed duplicate MOH playback during extended repeated holds; API-driven
+  hold/resume now drives MOH the same way phone-initiated holds do.
+- Deleted dead `transfer_call()` and `_get_rtpmap_for_phone_model()`; consolidated WAV-header
+  building into `utils/audio.py`; consolidated TTS prompt generator scripts.
+
+**Still outstanding:** field verification of REFER/attended transfer with real Zultys ZIP
+phones (Rig B); a product decision on AA transfer-failure UX (`auto_attendant_handler.py`
+currently replays the main menu as an interim behavior — voicemail-on-failure vs.
+apology+hangup is still an open TODO); deployed regression covering transfer + call
+forwarding across supported phone models before merge to `DEV`.
 
 ---
 
@@ -317,9 +361,12 @@ These constrain *every* feature's deployed testing and should be scheduled as pl
 
 Each phase names the capability it finishes and has an observable exit criterion.
 
-**Phase 1 — Land the IVR work (C2, Rig A).**
-Regression-test `voicemail-fix` on real phones; merge to DEV.
-*Exit: voicemail + AA fully driveable by DTMF from every supported phone model.*
+**Phase 1 — Land the IVR + transfer work (C1/C2, Rig A).**
+`voicemail-fix` merged to DEV (PR #1); regression-test on real phones still outstanding.
+Regression-test and merge `auto-attendant` (PR #2 — REFER/attended transfer, RTP-relay AA
+transfer with MOH, call forwarding, unified DTMF).
+*Exit: voicemail + AA fully driveable by DTMF from every supported phone model; blind and
+attended transfer, and call forwarding, verified on real phones.*
 
 **Phase 2 — Finish SIP trunking (C5, Rig C).** Implement inbound DID routing; remove the
 legacy outbound stub; NAT handling; validate against a low-cost carrier, then AT&T/Comcast
@@ -363,10 +410,11 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 |---|------|-----------|--------|
 | A1 | Inbound DID routing (finishes C5) | sip-trunk branch | ❌ not started |
 | A2 | NAT/public-IP handling for trunk SDP/Via/Contact + symmetric RTP | carrier account (B1) | ❌ untested |
-| A3 | Land `voicemail-fix` (hardware regression on Zultys/Cisco ATA, merge to DEV) | — | 🚧 |
+| A3 | `voicemail-fix` merged to DEV (PR #1); hardware regression on Zultys/Cisco ATA still outstanding | — | 🚧 |
 | A4 | Kari's Law on-site notification: wire `emergency_notification.py` email action to existing SMTP (`email_notification.py`) — legal requirement | SMTP creds | ❌ stubbed |
 | A5 | Merge sip-trunk → DEV; cut stabilization branch (dev continues on features, deploy runs frozen release + hotfixes) | A1–A2 | ❌ |
 | A6 | *(Conditional)* International dialing — outbound matcher is NANP-only (`^1?\d{10}$` in `call_router.py:110`) | office need? | ❌ |
+| A7 | Merge `auto-attendant` → DEV (PR #2 — REFER/attended transfer, RTP-relay AA transfer + MOH, call forwarding, unified DTMF); real-phone regression for transfer + forwarding first | — | 🚧 |
 
 ### B — Carrier & procurement (longest lead times — start first)
 
@@ -441,7 +489,8 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 
 - [ ] **Inbound DID routing** (C5) — recognize INVITEs from trunk hosts, DID → extension/AA/queue map (does not exist today)
 - [ ] Outbound trunk validation on test DID: registration, NAT/public-IP in SDP/Via/Contact, DTMF to external IVRs, codec negotiation
-- [ ] Finish + merge `voicemail-fix` (regression on office phone models)
+- [ ] `voicemail-fix` merged (PR #1); regression on office phone models still outstanding
+- [ ] Merge `auto-attendant` (PR #2 — REFER/attended transfer, RTP-relay AA transfer + MOH, call forwarding, unified DTMF); regression-test transfer + forwarding on office phone models
 - [ ] **Kari's Law notification** — replace `emergency_notification.py` "Would email…" stubs with real email (SMTP) and/or webhook minimum (call/page notify needs C4 — post-cutover)
 - [ ] E911: register dispatchable address with provider; verify karis_law/e911_location routing; validate via provider test number (933-style — never live 911; keep test-mode protection on until final check)
 - [ ] SIP exposure hardening: 5060/udp restricted to trunk provider IPs; no WAN registrations
