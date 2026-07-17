@@ -20,6 +20,7 @@ import pytest
 
 from pbx.core.call import CallState
 from pbx.core.voicemail_handler import VoicemailHandler
+from pbx.rtp.dtmf_monitor import DTMFMonitor
 from pbx.sip.server import SIPServer
 from pbx.utils.audio import g711_to_float_samples, pcm16_to_ulaw
 from pbx.utils.dtmf import DTMFDetector
@@ -81,6 +82,9 @@ class TestCalleeErrorAfterVoicemailAnswer:
     def test_487_ignored_when_routed_to_voicemail(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.routed_to_voicemail = True
         call.caller_addr = ("10.0.0.1", 5060)
         pbx.call_manager.get_call.return_value = call
@@ -108,6 +112,9 @@ class TestCalleeErrorAfterVoicemailAnswer:
         invite_via = "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKinvite-branch-42"
         pbx = MagicMock()
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.callee_invite.uri = "sip:1001@192.168.1.50:5060"
         call.callee_invite.get_header.side_effect = {"Via": invite_via}.get
         pbx.call_manager.get_call.return_value = call
@@ -131,6 +138,9 @@ class TestCalleeErrorAfterVoicemailAnswer:
     def test_4xx_ignored_when_call_connected(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.routed_to_voicemail = False
         call.state = CallState.CONNECTED
         pbx.call_manager.get_call.return_value = call
@@ -148,6 +158,9 @@ class TestCalleeErrorAfterVoicemailAnswer:
     def test_4xx_still_ends_unanswered_call(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.routed_to_voicemail = False
         call.state = CallState.RINGING
         call.caller_addr = None  # skip error forwarding, assert teardown only
@@ -219,6 +232,9 @@ class TestByeNotForwardedToCancelledCallee:
         caller_addr = ("192.168.1.10", 5060)
         pbx = MagicMock()
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.routed_to_voicemail = True
         call.voicemail_access = False
         call.caller_addr = caller_addr
@@ -247,6 +263,9 @@ class TestMonitorVoicemailDtmf:
 
     def _make_call(self) -> MagicMock:
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         state = MagicMock()
         state.value = "connected"
         call.state = state
@@ -278,6 +297,12 @@ class TestMonitorVoicemailDtmf:
         packets = [ulaw[i : i + 160] for i in range(0, len(ulaw), 160)]
         recorder = _FakeRecorder(recorded_data=packets)
 
+        # Mirror production wiring: the RTPRecorder feeds each audio payload
+        # to its attached DTMFMonitor, which monitor_voicemail_dtmf consumes.
+        recorder.dtmf_monitor = DTMFMonitor(call)
+        for packet in packets:
+            recorder.dtmf_monitor.on_audio_packet(0, packet)
+
         with patch("time.sleep"):
             handler.monitor_voicemail_dtmf(CALL_ID, call, recorder)
 
@@ -296,6 +321,9 @@ class TestCompleteRecordingSendsBye:
 
     def _make_call(self) -> MagicMock:
         call = MagicMock()
+        call.bridged_peer_call_id = None
+        call.pending_transfer_consult_id = None
+        call.is_transfer_consult = False
         call.from_extension = "2001"
         call.to_extension = "1001"
         call.caller_addr = ("192.168.1.10", 5060)

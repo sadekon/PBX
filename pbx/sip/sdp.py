@@ -125,6 +125,14 @@ class SDPSession:
                             pt = parts[0]
                             rtpmap_names[pt] = parts[1]  # e.g. "PCMA/8000" or "8/8000"
 
+                # Extract media direction (RFC 3264): sendrecv, sendonly,
+                # recvonly, or inactive. Defaults to sendrecv when absent.
+                direction = "sendrecv"
+                for attr in media.get("attributes", []):
+                    if attr in ("sendrecv", "sendonly", "recvonly", "inactive"):
+                        direction = attr
+                        break
+
                 return {
                     "address": address,
                     "port": media["port"],
@@ -132,6 +140,7 @@ class SDPSession:
                     "protocol": media.get("protocol", "RTP/AVP"),
                     "crypto": crypto_attrs,
                     "rtpmap_names": rtpmap_names,
+                    "direction": direction,
                 }
         return None
 
@@ -198,6 +207,7 @@ class SDPBuilder:
         crypto: list[str] | None = None,
         rtpmap_overrides: dict[str, str] | None = None,
         skip_static_rtpmap: bool = False,
+        direction: str = "sendrecv",
     ) -> str:
         """
         Build SDP for audio call.
@@ -230,6 +240,11 @@ class SDPBuilder:
                 of "PCMU/8000") and their RTP engine fails to match any codec name
                 string.  Omitting rtpmap forces the phone to identify codecs by
                 payload type number alone, which works correctly.
+            direction: Media direction attribute per RFC 3264 ("sendrecv",
+                "sendonly", "recvonly", or "inactive"). Used to answer a
+                hold offer (sendonly/inactive) with "recvonly" instead of
+                claiming "sendrecv" while the PBX is actually substituting
+                MOH for the relayed audio.
 
         Returns:
             SDP body as string.
@@ -346,7 +361,7 @@ class SDPBuilder:
         # it, some devices fall back to non-standard packetization, causing
         # choppy or one-way audio.  20ms is the standard for G.711/G.722.
         attributes.append("ptime:20")
-        attributes.append("sendrecv")
+        attributes.append(direction)
 
         # Add audio media
         media: dict[str, Any] = {

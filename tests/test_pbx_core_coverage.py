@@ -21,9 +21,9 @@ def _make_pbx_core_shell() -> Any:
     Every attribute that __init__ would have created is set to a MagicMock
     so that the *methods* under test can be exercised in isolation.
     """
-    import threading
-
+    from pbx.core.codec_negotiator import CodecNegotiator
     from pbx.core.pbx import PBXCore
+    from pbx.core.registration_handler import RegistrationHandler
 
     obj = object.__new__(PBXCore)
 
@@ -64,12 +64,13 @@ def _make_pbx_core_shell() -> Any:
     obj.qos_monitor = MagicMock()
     obj.phone_book = MagicMock()
 
-    # Handler delegates
-    obj._call_router = MagicMock()
-    obj._voicemail_handler = MagicMock()
-    obj._auto_attendant_handler = MagicMock()
-    obj._emergency_handler = MagicMock()
-    obj._paging_handler = MagicMock()
+    # Handlers (public: no facade delegators on PBXCore, callers use these directly)
+    obj.call_router = MagicMock()
+    obj.voicemail_handler = MagicMock()
+    obj.auto_attendant_handler = MagicMock()
+    obj.emergency_handler = MagicMock()
+    obj.paging_handler = MagicMock()
+    obj.transfer_handler = MagicMock()
 
     # Security
     obj.security_monitor = MagicMock()
@@ -79,12 +80,12 @@ def _make_pbx_core_shell() -> Any:
     obj._metrics_running = False
     obj._metrics_thread = None
 
-    # Per-extension registration locks
-    obj._registration_locks = {}
-    obj._registration_locks_guard = threading.Lock()
-
-    # Device model cache
-    obj._device_model_cache = {}
+    # Codec/device negotiation and registration handling still have real logic
+    # exercised directly through PBXCore's delegator methods below (unlike the
+    # other handlers, which are tested via mock assertions), so they need real
+    # instances bound to obj.
+    obj.codec_negotiator = CodecNegotiator(obj)
+    obj.registration_handler = RegistrationHandler(obj)
 
     obj.running = False
     return obj
@@ -950,34 +951,6 @@ class TestConfigGetters:
 
 
 # =========================================================================
-# Tests for route_call
-# =========================================================================
-@pytest.mark.unit
-class TestRouteCall:
-    """Tests for PBXCore.route_call."""
-
-    def test_route_call_delegates_to_call_router(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._call_router.route_call.return_value = True
-        msg = MagicMock()
-
-        result = pbx.route_call("from", "to", "call-1", msg, ("10.0.0.1", 5060))
-
-        assert result is True
-        pbx._call_router.route_call.assert_called_once_with(
-            "from", "to", "call-1", msg, ("10.0.0.1", 5060)
-        )
-
-    def test_route_call_returns_false_on_failure(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._call_router.route_call.return_value = False
-
-        result = pbx.route_call("from", "to", "c1", MagicMock(), ("1.2.3.4", 5060))
-
-        assert result is False
-
-
-# =========================================================================
 # Tests for _get_server_ip
 # =========================================================================
 @pytest.mark.unit
@@ -1016,116 +989,6 @@ class TestGetServerIp:
         result = pbx._get_server_ip()
 
         assert result == "127.0.0.1"
-
-
-# =========================================================================
-# Tests for handle_callee_answer
-# =========================================================================
-@pytest.mark.unit
-class TestHandleCalleeAnswer:
-    """Tests for PBXCore.handle_callee_answer."""
-
-    def test_no_call_found(self) -> None:
-        """Returns early when call is not found."""
-        pbx = _make_pbx_core_shell()
-        pbx.call_manager.get_call.return_value = None
-
-        pbx.handle_callee_answer("nonexistent", MagicMock(), ("1.2.3.4", 5060))
-
-        pbx.logger.error.assert_called_once()
-
-    @patch("pbx.core.pbx.SDPBuilder", create=True)
-    @patch("pbx.core.pbx.SDPSession", create=True)
-    @patch("pbx.core.pbx.SIPMessageBuilder", create=True)
-    def test_callee_answer_full_flow(
-        self,
-        mock_sip_builder: MagicMock,
-        mock_sdp_session: MagicMock,
-        mock_sdp_builder: MagicMock,
-    ) -> None:
-        """Full callee answer flow with SDP, RTP relay, and 200 OK."""
-        pbx = _make_pbx_core_shell()
-
-        mock_call = MagicMock()
-        mock_call.call_id = "call-42"
-        mock_call.from_extension = "1001"
-        mock_call.to_extension = "1002"
-        mock_call.caller_rtp = {"address": "10.0.0.1", "port": 20000, "formats": ["0", "8"]}
-        mock_call.callee_rtp = None
-        mock_call.rtp_ports = (30000, 30001)
-        mock_call.caller_addr = ("10.0.0.1", 5060)
-        mock_call.no_answer_timer = MagicMock()
-        mock_call.original_invite = MagicMock()
-        pbx.call_manager.get_call.return_value = mock_call
-
-        response_msg = MagicMock()
-        response_msg.body = "v=0\r\no=- 0 0 IN IP4 10.0.0.2\r\n"
-
-        # SDP parsing
-        with (
-            patch.dict(
-                "sys.modules",
-                {
-                    "pbx.sip.message": MagicMock(),
-                    "pbx.sip.sdp": MagicMock(),
-                },
-            ),
-            # Mock the SDP and SIP builder imports inside the method
-            patch("pbx.core.pbx.SDPSession", create=True) as mock_sdp_cls,
-            patch("pbx.core.pbx.SDPBuilder", create=True) as mock_sdp_build,
-            patch("pbx.core.pbx.SIPMessageBuilder", create=True) as mock_sip_build,
-        ):
-            sdp_inst = MagicMock()
-            sdp_inst.get_audio_info.return_value = {"address": "10.0.0.2", "port": 20002}
-            mock_sdp_cls.return_value = sdp_inst
-
-            mock_sdp_build.build_audio_sdp.return_value = "v=0\r\n..."
-
-            ok_msg = MagicMock()
-            mock_sip_build.build_response.return_value = ok_msg
-
-            pbx.config.get.side_effect = lambda k, d=None: {
-                "server.external_ip": "10.0.0.100",
-                "features.dtmf.payload_type": 101,
-                "codecs.ilbc.mode": 30,
-                "server.sip_port": 5060,
-            }.get(k, d)
-
-            pbx._get_phone_user_agent = MagicMock(return_value=None)
-            pbx._detect_phone_model = MagicMock(return_value=None)
-            pbx._get_codecs_for_phone_model = MagicMock(return_value=["0", "8", "101"])
-            pbx._get_dtmf_payload_type = MagicMock(return_value=101)
-            pbx._get_ilbc_mode = MagicMock(return_value=30)
-            pbx._get_server_ip = MagicMock(return_value="10.0.0.100")
-
-            pbx.handle_callee_answer("call-42", response_msg, ("10.0.0.2", 5060))
-
-        # Call should be marked as connected
-        mock_call.connect.assert_called_once()
-        pbx.cdr_system.mark_answered.assert_called_once_with("call-42")
-        mock_call.no_answer_timer.cancel.assert_called_once()
-
-    def test_callee_answer_no_body(self) -> None:
-        """Handle callee answer when response has no SDP body."""
-        pbx = _make_pbx_core_shell()
-
-        mock_call = MagicMock()
-        mock_call.call_id = "call-99"
-        mock_call.caller_rtp = None
-        mock_call.callee_rtp = None
-        mock_call.rtp_ports = None
-        mock_call.no_answer_timer = None
-        mock_call.original_invite = None
-        mock_call.caller_addr = None
-        pbx.call_manager.get_call.return_value = mock_call
-
-        response_msg = MagicMock()
-        response_msg.body = None
-
-        pbx.handle_callee_answer("call-99", response_msg, ("1.2.3.4", 5060))
-
-        mock_call.connect.assert_called_once()
-        pbx.cdr_system.mark_answered.assert_called_once_with("call-99")
 
 
 # =========================================================================
@@ -1306,87 +1169,29 @@ class TestHandleDtmfInfo:
 
 
 # =========================================================================
-# Tests for transfer_call
-# =========================================================================
-@pytest.mark.unit
-class TestTransferCall:
-    """Tests for PBXCore.transfer_call."""
-
-    def test_transfer_call_not_found(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx.call_manager.get_call.return_value = None
-
-        result = pbx.transfer_call("c1", "2001")
-
-        assert result is False
-
-    def test_transfer_destination_not_registered(self) -> None:
-        pbx = _make_pbx_core_shell()
-        mock_call = MagicMock()
-        pbx.call_manager.get_call.return_value = mock_call
-        pbx.extension_registry.is_registered.return_value = False
-
-        result = pbx.transfer_call("c1", "2001")
-
-        assert result is False
-
-    def test_transfer_no_address(self) -> None:
-        pbx = _make_pbx_core_shell()
-        mock_call = MagicMock()
-        mock_call.caller_addr = None
-        mock_call.callee_addr = None
-        mock_call.from_extension = "1001"
-        mock_call.to_extension = "1002"
-        pbx.call_manager.get_call.return_value = mock_call
-        pbx.extension_registry.is_registered.return_value = True
-
-        result = pbx.transfer_call("c1", "2001")
-
-        assert result is False
-
-    @patch("pbx.core.pbx.SIPMessageBuilder", create=True)
-    def test_transfer_success(self, mock_sip_builder: MagicMock) -> None:
-        pbx = _make_pbx_core_shell()
-        mock_call = MagicMock()
-        mock_call.caller_addr = ("10.0.0.1", 5060)
-        mock_call.from_extension = "1001"
-        mock_call.to_extension = "1002"
-        mock_call.call_id = "c1"
-        pbx.call_manager.get_call.return_value = mock_call
-        pbx.extension_registry.is_registered.return_value = True
-        pbx.config.get.return_value = 5060
-        pbx._get_server_ip = MagicMock(return_value="10.0.0.100")
-
-        refer_msg = MagicMock()
-        mock_sip_builder.build_request.return_value = refer_msg
-
-        with patch.dict(
-            "sys.modules", {"pbx.sip.message": MagicMock(SIPMessageBuilder=mock_sip_builder)}
-        ):
-            result = pbx.transfer_call("c1", "2001")
-
-        assert result is True
-        assert mock_call.transferred is True
-        assert mock_call.transfer_destination == "2001"
-        pbx.sip_server._send_message.assert_called_once()
-
-
-# =========================================================================
 # Tests for hold_call / resume_call
 # =========================================================================
 @pytest.mark.unit
 class TestHoldResume:
     """Tests for PBXCore.hold_call and PBXCore.resume_call."""
 
+    def _make_call(self, call_id: str = "c1") -> MagicMock:
+        call = MagicMock()
+        call.call_id = call_id
+        call.bridged_peer_call_id = None
+        call.bridge_peer_side = None
+        call.held_by = None
+        return call
+
     def test_hold_call_success(self) -> None:
         pbx = _make_pbx_core_shell()
-        mock_call = MagicMock()
+        mock_call = self._make_call()
         pbx.call_manager.get_call.return_value = mock_call
 
         result = pbx.hold_call("c1")
 
         assert result is True
-        mock_call.hold.assert_called_once()
+        mock_call.hold.assert_called_once_with(held_by="callee")
 
     def test_hold_call_not_found(self) -> None:
         pbx = _make_pbx_core_shell()
@@ -1396,9 +1201,68 @@ class TestHoldResume:
 
         assert result is False
 
+    def test_hold_call_starts_moh_on_the_other_leg(self) -> None:
+        """Default (callee-initiated) hold feeds MOH to the 'a' (caller) side."""
+        pbx = _make_pbx_core_shell()
+        mock_call = self._make_call()
+        pbx.call_manager.get_call.return_value = mock_call
+        relay_handler = MagicMock()
+        pbx.rtp_relay.get_handler.return_value = relay_handler
+
+        pbx.hold_call("c1")
+
+        pbx.rtp_relay.get_handler.assert_called_with("c1")
+        pbx.moh_system.start_moh.assert_called_once_with("c1", relay_handler, "a")
+
+    def test_hold_call_by_caller_starts_moh_on_the_callee_side(self) -> None:
+        pbx = _make_pbx_core_shell()
+        mock_call = self._make_call()
+        pbx.call_manager.get_call.return_value = mock_call
+        relay_handler = MagicMock()
+        pbx.rtp_relay.get_handler.return_value = relay_handler
+
+        pbx.hold_call("c1", held_by="caller")
+
+        pbx.moh_system.start_moh.assert_called_once_with("c1", relay_handler, "b")
+
+    def test_hold_call_no_relay_handler_skips_moh(self) -> None:
+        """Hold still succeeds even if the call has no active relay (e.g. mocked test call)."""
+        pbx = _make_pbx_core_shell()
+        mock_call = self._make_call()
+        pbx.call_manager.get_call.return_value = mock_call
+        pbx.rtp_relay.get_handler.return_value = None
+
+        result = pbx.hold_call("c1")
+
+        assert result is True
+        pbx.moh_system.start_moh.assert_not_called()
+
+    def test_hold_call_resolves_bridged_peer_relay(self) -> None:
+        """A transfer-bridged peer leg has no relay of its own; MOH must go
+        through the relay owner, on the flipped side."""
+        pbx = _make_pbx_core_shell()
+        peer_call = self._make_call("c1")
+        peer_call.bridged_peer_call_id = "owner-call"
+        peer_call.bridge_peer_side = "b"
+        owner_call = self._make_call("owner-call")
+        pbx.call_manager.get_call.side_effect = lambda cid: {
+            "c1": peer_call,
+            "owner-call": owner_call,
+        }[cid]
+        relay_handler = MagicMock()
+
+        def get_handler(cid: str) -> MagicMock | None:
+            return relay_handler if cid == "owner-call" else None
+
+        pbx.rtp_relay.get_handler.side_effect = get_handler
+
+        pbx.hold_call("c1")
+
+        pbx.moh_system.start_moh.assert_called_once_with("owner-call", relay_handler, "a")
+
     def test_resume_call_success(self) -> None:
         pbx = _make_pbx_core_shell()
-        mock_call = MagicMock()
+        mock_call = self._make_call()
         pbx.call_manager.get_call.return_value = mock_call
 
         result = pbx.resume_call("c1")
@@ -1414,99 +1278,14 @@ class TestHoldResume:
 
         assert result is False
 
-
-# =========================================================================
-# Tests for delegate methods (_check_dialplan, _send_cancel_to_callee, etc.)
-# =========================================================================
-@pytest.mark.unit
-class TestDelegateMethods:
-    """Tests for methods that delegate to handler classes."""
-
-    def test_check_dialplan(self) -> None:
+    def test_resume_call_stops_moh(self) -> None:
         pbx = _make_pbx_core_shell()
-        pbx._call_router._check_dialplan.return_value = True
-        assert pbx._check_dialplan("1001") is True
-        pbx._call_router._check_dialplan.assert_called_once_with("1001")
+        mock_call = self._make_call()
+        pbx.call_manager.get_call.return_value = mock_call
 
-    def test_send_cancel_to_callee(self) -> None:
-        pbx = _make_pbx_core_shell()
-        mock_call = MagicMock()
-        pbx._send_cancel_to_callee(mock_call, "c1")
-        pbx._call_router._send_cancel_to_callee.assert_called_once_with(mock_call, "c1")
+        pbx.resume_call("c1")
 
-    def test_answer_call_for_voicemail(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._call_router._answer_call_for_voicemail.return_value = True
-        mock_call = MagicMock()
-        result = pbx._answer_call_for_voicemail(mock_call, "c1")
-        assert result is True
-
-    def test_handle_no_answer(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._handle_no_answer("c1")
-        pbx._call_router._handle_no_answer.assert_called_once_with("c1")
-
-    def test_monitor_voicemail_dtmf(self) -> None:
-        pbx = _make_pbx_core_shell()
-        mock_call = MagicMock()
-        mock_rec = MagicMock()
-        pbx._monitor_voicemail_dtmf("c1", mock_call, mock_rec)
-        pbx._voicemail_handler.monitor_voicemail_dtmf.assert_called_once_with(
-            "c1", mock_call, mock_rec
-        )
-
-    def test_complete_voicemail_recording(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._complete_voicemail_recording("c1")
-        pbx._voicemail_handler.complete_voicemail_recording.assert_called_once_with("c1")
-
-    def test_handle_auto_attendant(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._auto_attendant_handler.handle_auto_attendant.return_value = True
-        msg = MagicMock()
-        result = pbx._handle_auto_attendant("1001", "0", "c1", msg, ("1.2.3.4", 5060))
-        assert result is True
-
-    def test_auto_attendant_session(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._auto_attendant_session("c1", MagicMock(), MagicMock())
-        pbx._auto_attendant_handler._auto_attendant_session.assert_called_once()
-
-    def test_handle_voicemail_access(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._voicemail_handler.handle_voicemail_access.return_value = True
-        msg = MagicMock()
-        result = pbx._handle_voicemail_access("1001", "*1002", "c1", msg, ("1.2.3.4", 5060))
-        assert result is True
-
-    def test_handle_paging(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._paging_handler.handle_paging.return_value = True
-        msg = MagicMock()
-        result = pbx._handle_paging("1001", "700", "c1", msg, ("1.2.3.4", 5060))
-        assert result is True
-
-    def test_paging_session(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._paging_session("c1", MagicMock(), {}, {})
-        pbx._paging_handler._paging_session.assert_called_once()
-
-    def test_playback_voicemails(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._playback_voicemails("c1", MagicMock(), MagicMock(), [])
-        pbx._voicemail_handler._playback_voicemails.assert_called_once()
-
-    def test_voicemail_ivr_session(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._voicemail_ivr_session("c1", MagicMock(), MagicMock(), MagicMock())
-        pbx._voicemail_handler._voicemail_ivr_session.assert_called_once()
-
-    def test_handle_emergency_call(self) -> None:
-        pbx = _make_pbx_core_shell()
-        pbx._emergency_handler.handle_emergency_call.return_value = True
-        msg = MagicMock()
-        result = pbx._handle_emergency_call("1001", "911", "c1", msg, ("1.2.3.4", 5060))
-        assert result is True
+        pbx.moh_system.stop_moh.assert_called_once_with("c1")
 
 
 # =========================================================================

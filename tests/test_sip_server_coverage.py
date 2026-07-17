@@ -559,14 +559,14 @@ class TestHandleInvite:
     @patch("pbx.sip.server.get_logger")
     def test_invite_with_pbx_core_success(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
-        pbx.route_call.return_value = True
+        pbx.call_router.route_call.return_value = True
         server = SIPServer(pbx_core=pbx)
         server._send_response = MagicMock()
 
         msg = _make_request_message("INVITE")
         server._handle_invite(msg, ADDR)
 
-        pbx.route_call.assert_called_once_with(
+        pbx.call_router.route_call.assert_called_once_with(
             "<sip:1001@pbx.local>",
             "<sip:1002@pbx.local>",
             "test-call-id-123",
@@ -578,7 +578,7 @@ class TestHandleInvite:
     @patch("pbx.sip.server.get_logger")
     def test_invite_with_pbx_core_failure(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
-        pbx.route_call.return_value = False
+        pbx.call_router.route_call.return_value = False
         server = SIPServer(pbx_core=pbx)
         server._send_response = MagicMock()
 
@@ -614,6 +614,9 @@ class TestHandleAck:
     def test_ack_with_pbx_core_forwards_to_callee(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.callee_addr = ("10.0.0.2", 5060)
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -643,6 +646,9 @@ class TestHandleAck:
     def test_ack_call_no_callee_addr(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.callee_addr = None
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -688,6 +694,9 @@ class TestHandleBye:
     def test_bye_from_caller_forwards_to_callee(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
         mock_call.state = "CONNECTED"
@@ -710,6 +719,9 @@ class TestHandleBye:
         pbx = MagicMock()
         callee_addr = ("10.0.0.2", 5060)
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.caller_addr = ("10.0.0.1", 5060)
         mock_call.callee_addr = callee_addr
         mock_call.state = "CONNECTED"
@@ -744,6 +756,9 @@ class TestHandleBye:
     def test_bye_forward_exception(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
         mock_call.state = "CONNECTED"
@@ -775,6 +790,9 @@ class TestHandleBye:
         """Test BYE handling with voicemail access attributes on call."""
         pbx = MagicMock()
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.voicemail_access = True
         mock_call.voicemail_extension = "1001"
         mock_call.caller_addr = ADDR
@@ -1423,6 +1441,9 @@ class TestHandleResponse:
     def test_response_180_ringing_forwards_to_caller(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.caller_addr = ("10.0.0.1", 5060)
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -1440,6 +1461,9 @@ class TestHandleResponse:
     def test_response_180_no_caller_addr(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         mock_call = MagicMock()
+        mock_call.bridged_peer_call_id = None
+        mock_call.pending_transfer_consult_id = None
+        mock_call.is_transfer_consult = False
         mock_call.caller_addr = None
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -1478,7 +1502,7 @@ class TestHandleResponse:
         }.get
         server._handle_response(msg, ADDR)
 
-        pbx.handle_callee_answer.assert_called_once_with("test-call-id-123", msg, ADDR)
+        pbx.call_router.handle_callee_answer.assert_called_once_with("test-call-id-123", msg, ADDR)
 
     @patch("pbx.sip.server.get_logger")
     def test_response_200_no_call_id(self, mock_get_logger: MagicMock) -> None:
@@ -1489,7 +1513,7 @@ class TestHandleResponse:
         msg.get_header.side_effect = lambda name: None
         server._handle_response(msg, ADDR)
 
-        pbx.handle_callee_answer.assert_not_called()
+        pbx.call_router.handle_callee_answer.assert_not_called()
 
     @patch("pbx.sip.server.get_logger")
     def test_response_without_pbx_core(self, mock_get_logger: MagicMock) -> None:
@@ -1507,7 +1531,62 @@ class TestHandleResponse:
         server._handle_response(msg, ADDR)
 
         # No specific handling for 486, just logs
-        pbx.handle_callee_answer.assert_not_called()
+        pbx.call_router.handle_callee_answer.assert_not_called()
+
+    @patch("pbx.sip.server.get_logger")
+    def test_response_302_redirect_acks_and_delegates_to_call_router(
+        self, mock_get_logger: MagicMock
+    ) -> None:
+        pbx = MagicMock()
+        server = SIPServer(pbx_core=pbx)
+        server._send_ack_to_callee = MagicMock()
+
+        msg = _make_response_message(302)
+        msg.get_header.side_effect = {
+            "Call-ID": "test-call-id-123",
+            "CSeq": "1 INVITE",
+            "Contact": "<sip:1003@10.0.0.9:5060>",
+        }.get
+        server._handle_response(msg, ADDR)
+
+        # ACK is mandatory for non-2xx final responses (RFC 3261 17.1.1.3)
+        # and must reuse the INVITE's Via branch.
+        server._send_ack_to_callee.assert_called_once_with(
+            msg, ADDR, "test-call-id-123", use_invite_branch=True
+        )
+        pbx.call_router.handle_redirect.assert_called_once_with(
+            "test-call-id-123", "<sip:1003@10.0.0.9:5060>"
+        )
+
+    @patch("pbx.sip.server.get_logger")
+    def test_response_3xx_non_invite_cseq_ignored(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        server = SIPServer(pbx_core=pbx)
+        server._send_ack_to_callee = MagicMock()
+
+        msg = _make_response_message(302)
+        msg.get_header.side_effect = {
+            "Call-ID": "test-call-id-123",
+            "CSeq": "1 BYE",
+            "Contact": "<sip:1003@10.0.0.9:5060>",
+        }.get
+        server._handle_response(msg, ADDR)
+
+        server._send_ack_to_callee.assert_not_called()
+        pbx.call_router.handle_redirect.assert_not_called()
+
+    @patch("pbx.sip.server.get_logger")
+    def test_response_3xx_no_call_id_ignored(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        server = SIPServer(pbx_core=pbx)
+        server._send_ack_to_callee = MagicMock()
+
+        msg = _make_response_message(302)
+        msg.get_header.side_effect = lambda name: None
+        server._handle_response(msg, ADDR)
+
+        server._send_ack_to_callee.assert_not_called()
+        pbx.call_router.handle_redirect.assert_not_called()
 
 
 # ===========================================================================

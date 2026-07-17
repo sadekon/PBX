@@ -53,8 +53,7 @@ See [README_SECURITY_COMPLIANCE.md](README_SECURITY_COMPLIANCE.md) for detailed 
 
 ## Voice Generation
 
-- `generate_espeak_voices.py` - Generate professional voice prompts using gTTS (recommended)
-- `generate_tts_prompts.py` - Generate TTS voice prompts using gTTS (compatibility alias)
+- `generate_espeak_voices.py` - Generate professional voice prompts using gTTS (auto attendant text is read from `config.yml`)
 - `generate_moh_music.py` - Generate music on hold tracks
 
 See [README_VOICE_GENERATION.md](README_VOICE_GENERATION.md) for full voice generation documentation.

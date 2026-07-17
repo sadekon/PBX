@@ -267,6 +267,52 @@ class RTPRelay:
             self.port_pool.insert(0, rtp_port)
         return None
 
+    def adopt_existing_port(self, call_id: str, rtp_port: int, rtcp_port: int) -> bool:
+        """
+        Register an already-allocated port pair as an active relay, without
+        drawing a new port from the pool.
+
+        For a call whose audio was being generated/consumed locally (e.g. an
+        IVR session playing prompts directly rather than bridging two
+        parties) and now needs to be handed off to a real two-party relay --
+        typically to transfer such a call while keeping the existing party's
+        RTP flowing to the same address it already knows, with no
+        re-signaling needed on that side. The caller must have already
+        released whatever was previously bound to `rtp_port` (e.g. stopped
+        an RTPPlayer/RTPRecorder using it) -- this rebinds the same port.
+
+        Thread-safe: uses the same lock as allocate_relay/release_relay.
+
+        Args:
+            call_id: Call identifier to register the relay under.
+            rtp_port: Already-allocated RTP port (not drawn from port_pool).
+            rtcp_port: Corresponding RTCP port.
+
+        Returns:
+            True if the relay was registered, False if a relay already
+            exists for `call_id` or the port failed to bind.
+        """
+        with self._pool_lock:
+            if call_id in self.active_relays:
+                self.logger.error(f"Relay already exists for call {call_id}, cannot adopt port")
+                return False
+
+        handler = RTPRelayHandler(rtp_port, call_id, qos_monitor=self.qos_monitor)
+        if not handler.start():
+            self.logger.error(f"Failed to bind adopted port {rtp_port} for call {call_id}")
+            return False
+
+        with self._pool_lock:
+            self.active_relays[call_id] = {
+                "rtp_port": rtp_port,
+                "rtcp_port": rtcp_port,
+                "handler": handler,
+            }
+        self.logger.info(
+            f"Adopted existing port {rtp_port}/{rtcp_port} as relay for call {call_id}"
+        )
+        return True
+
     def set_endpoints(
         self, call_id: str, endpoint_a: AddrTuple | None, endpoint_b: AddrTuple | None
     ) -> None:
@@ -282,6 +328,35 @@ class RTPRelay:
             handler: RTPRelayHandler = self.active_relays[call_id]["handler"]
             handler.set_endpoints(endpoint_a, endpoint_b)
             self.logger.info(f"RTP relay {call_id}: {endpoint_a} <-> {endpoint_b}")
+
+    def get_handler(self, call_id: str) -> RTPRelayHandler | None:
+        """
+        Return the relay handler for a call, or None if no relay is active.
+
+        Args:
+            call_id: Call identifier.
+        """
+        relay = self.active_relays.get(call_id)
+        return relay["handler"] if relay else None
+
+    def replace_endpoint(self, call_id: str, side: str, endpoint: AddrTuple) -> None:
+        """
+        Replace one endpoint of a relay with a new party (call transfer).
+
+        Unlike set_endpoints, this clears the learned source address for the
+        replaced side and re-opens the symmetric-RTP learning window, so
+        packets from the new party are accepted and forwarding stops
+        targeting the departed party's learned address.
+
+        Args:
+            call_id: Call identifier.
+            side: Which side to replace ("a" or "b").
+            endpoint: (host, port) of the new party from its SDP.
+        """
+        if call_id in self.active_relays:
+            handler: RTPRelayHandler = self.active_relays[call_id]["handler"]
+            handler.replace_endpoint(side, endpoint)
+            self.logger.info(f"RTP relay {call_id}: side {side} replaced with {endpoint}")
 
     def release_relay(self, call_id: str) -> None:
         """
@@ -301,6 +376,43 @@ class RTPRelay:
             self.port_pool.sort()
             del self.active_relays[call_id]
             self.logger.info(f"Released RTP relay for call {call_id}")
+
+    def release_relay_keep_port(self, call_id: str) -> tuple[int, int] | None:
+        """
+        Stop and deregister a relay WITHOUT returning its port to the pool.
+
+        The counterpart to adopt_existing_port: for a port that was adopted
+        from outside the normal allocate/release cycle (never drawn from
+        port_pool) and now needs to go back to being owned by a raw
+        RTPPlayer/RTPRecorder on the same port -- e.g. an IVR session
+        reclaiming its port after a transfer attempt failed, to keep serving
+        the same caller on the same port with no re-signaling. Returning the
+        port to the pool here would double-count it (it was never removed),
+        letting an unrelated call allocate the same port and collide.
+
+        The caller owns the returned port pair and is responsible for either
+        rebinding it (RTPPlayer/RTPRecorder) or returning it to the pool
+        itself once truly done.
+
+        Thread-safe: uses the same lock as allocate_relay/release_relay.
+
+        Args:
+            call_id: Call identifier.
+
+        Returns:
+            (rtp_port, rtcp_port) of the released relay, or None if no relay
+            existed for `call_id`.
+        """
+        with self._pool_lock:
+            relay = self.active_relays.pop(call_id, None)
+            if relay is None:
+                return None
+            relay["handler"].stop()
+            self.logger.info(
+                f"Released RTP relay for call {call_id}, keeping port "
+                f"{relay['rtp_port']} for caller reuse"
+            )
+            return (relay["rtp_port"], relay["rtcp_port"])
 
 
 class RTPRelayHandler:
@@ -340,6 +452,12 @@ class RTPRelayHandler:
         self._learning_timeout: float = 10.0  # Seconds to allow endpoint learning
         self._start_time: float | None = None  # Track when relay started for timeout
 
+        # When paused, the relay loop drops packets from both legs instead of
+        # forwarding them. A feature (e.g. music-on-hold) pauses the relay
+        # while it injects its own audio on this handler's socket, then
+        # resumes it. See pause_relay()/resume_relay().
+        self.paused: bool = False
+
         # Start QoS monitoring if monitor is available
         # We track each direction separately since they have independent RTP
         # sequence numbers
@@ -366,6 +484,29 @@ class RTPRelayHandler:
                 self.endpoint_a = endpoint_a
             if endpoint_b is not None:
                 self.endpoint_b = endpoint_b
+
+    def replace_endpoint(self, side: str, endpoint: AddrTuple) -> None:
+        """
+        Replace one side's endpoint with a new party (call transfer).
+
+        Clears the learned source for that side -- forwarding prefers
+        learned addresses over SDP endpoints, so without this the relay
+        would keep sending to the departed party and reject packets from
+        the new one -- and restarts the learning window so the new party's
+        actual source can be learned (symmetric RTP / NAT).
+
+        Args:
+            side: Which side to replace ("a" or "b").
+            endpoint: (host, port) of the new party from its SDP.
+        """
+        with self.lock:
+            if side == "a":
+                self.endpoint_a = endpoint
+                self.learned_a = None
+            else:
+                self.endpoint_b = endpoint
+                self.learned_b = None
+            self._start_time = time.time()  # Re-open the learning window
 
     def start(self) -> bool:
         """
@@ -498,6 +639,11 @@ class RTPRelayHandler:
                 if side is None:
                     continue
 
+                if self.paused:
+                    # A feature has paused relaying (e.g. hold music is being
+                    # injected on this socket instead); drop live audio.
+                    continue
+
                 # Snapshot target addresses (lock-free reads after learning)
                 target: AddrTuple | None = None
                 qos_metrics: QoSMetrics | None = None
@@ -537,6 +683,37 @@ class RTPRelayHandler:
                 if self.running:
                     self.logger.error(f"Error in RTP relay loop: {e}")
 
+    def pause_relay(self) -> None:
+        """
+        Stop forwarding packets between the two legs.
+
+        Used when a feature needs to take over one side's audio (e.g. hold
+        music) by injecting its own RTP on this handler's socket. Call
+        resume_relay() to restore normal bridging.
+        """
+        self.paused = True
+
+    def resume_relay(self) -> None:
+        """Resume forwarding packets between the two legs."""
+        self.paused = False
+
+    def get_endpoint(self, side: str) -> AddrTuple | None:
+        """
+        Return the current destination for a side, preferring the learned
+        source address (symmetric RTP) over the SDP-advertised one.
+
+        Args:
+            side: "a" or "b".
+
+        Returns:
+            (host, port) tuple, or None if not yet known / invalid side.
+        """
+        if side == "a":
+            return self.learned_a or self.endpoint_a
+        if side == "b":
+            return self.learned_b or self.endpoint_b
+        return None
+
 
 class RTPRecorder:
     """
@@ -553,6 +730,7 @@ class RTPRecorder:
         rfc2833_handler: RFC2833Receiver | None = None,
         dtmf_payload_type: int = 101,
         extra_dtmf_payload_types: set[int] | None = None,
+        dtmf_monitor: Any | None = None,
     ) -> None:
         """
         Initialize RTP recorder.
@@ -566,6 +744,8 @@ class RTPRecorder:
                 telephone-event.  Some phones send DTMF using the payload
                 type from their own SDP offer rather than the one in our
                 SDP answer, so the caller's offered PT belongs here.
+            dtmf_monitor: Optional DTMFMonitor fed each audio payload for
+                in-band tone detection (see pbx.rtp.dtmf_monitor).
         """
         self.local_port: int = local_port
         self.call_id: str = call_id
@@ -580,6 +760,7 @@ class RTPRecorder:
         self.dtmf_payload_types: set[int] = {dtmf_payload_type} | (
             extra_dtmf_payload_types or set()
         )
+        self.dtmf_monitor: Any | None = dtmf_monitor
         # Track the audio codec payload type from the first audio packet
         self.detected_codec: int | None = None
 
@@ -678,6 +859,11 @@ class RTPRecorder:
                             f"Detected audio codec PT {payload_type} for recording {self.call_id}"
                         )
 
+                    # Feed the DTMF monitor for in-band tone detection
+                    # (cheap append; detection runs in the consumer thread).
+                    if self.dtmf_monitor is not None:
+                        self.dtmf_monitor.on_audio_packet(payload_type, payload)
+
                     # Store only audio payloads (not telephone-events)
                     with self.lock:
                         self.recorded_data.append(payload)
@@ -737,22 +923,29 @@ class RTPPlayer:
         remote_host: str,
         remote_port: int,
         call_id: str | None = None,
+        external_socket: socket.socket | None = None,
     ) -> None:
         """
         Initialize RTP player.
 
         Args:
-            local_port: Local UDP port to send from.
+            local_port: Local UDP port to send from. Ignored when
+                external_socket is provided.
             remote_host: Remote host IP address.
             remote_port: Remote UDP port.
             call_id: Optional call identifier for logging.
+            external_socket: An already-bound socket to send on instead of
+                binding a new one (e.g. an RTPRelayHandler's socket, so MOH
+                packets can be injected on the same port a relay already
+                owns without a rebind).
         """
         self.local_port: int = local_port
         self.remote_host: str = remote_host
         self.remote_port: int = remote_port
         self.call_id: str = call_id or "unknown"
         self.logger = get_logger()
-        self.socket: socket.socket | None = None
+        self.socket: socket.socket | None = external_socket
+        self._owns_socket: bool = external_socket is None
         self.running: bool = False
         self.sequence_number: int = 0
         self.timestamp: int = 0
@@ -766,6 +959,11 @@ class RTPPlayer:
         Returns:
             True if the player started successfully, False otherwise.
         """
+        if not self._owns_socket:
+            # Reusing a caller-provided, already-bound socket.
+            self.running = self.socket is not None
+            return self.running
+
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -791,7 +989,7 @@ class RTPPlayer:
     def stop(self) -> None:
         """Stop RTP player."""
         self.running = False
-        if self.socket:
+        if self._owns_socket and self.socket:
             with contextlib.suppress(OSError):
                 self.socket.close()
             self.socket = None
@@ -822,9 +1020,10 @@ class RTPPlayer:
             interrupt_check: Optional predicate polled once per 20ms packet.
                 When it returns True, playback stops early (barge-in) and the
                 method returns True. Used by IVR menus so a caller can cut a
-                prompt short by pressing a key. The predicate must only peek at
-                the pending-DTMF source (never consume the digit) so the IVR
-                loop still pops it and drives the state machine.
+                prompt short by pressing a key, and by music-on-hold to stop
+                the moment hold ends. The predicate must only peek at its
+                source (never consume), so an IVR loop still pops the digit and
+                drives the state machine.
 
         Returns:
             True if successful (including an intentional barge-in stop).
@@ -849,13 +1048,14 @@ class RTPPlayer:
             num_packets = (len(audio_data) + bytes_per_packet - 1) // bytes_per_packet
 
             for i in range(num_packets):
-                # Barge-in: stop sending as soon as the caller presses a key.
-                # The digit stays queued (interrupt_check only peeks) so the
-                # IVR loop pops it next and advances the state machine.
+                # Barge-in: stop sending as soon as the predicate fires (a
+                # queued DTMF digit for IVR, or hold ending for MOH). The
+                # predicate only peeks, so any queued digit stays for the
+                # IVR loop to pop and advance the state machine.
                 if interrupt_check is not None and interrupt_check():
                     self.logger.info(
-                        f"Playback interrupted by caller input (barge-in) "
-                        f"after {i}/{num_packets} packets for call {self.call_id}"
+                        f"Playback interrupted (barge-in) after {i}/{num_packets} "
+                        f"packets for call {self.call_id}"
                     )
                     return True
 

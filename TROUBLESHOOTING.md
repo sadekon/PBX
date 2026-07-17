@@ -31,7 +31,7 @@ This guide covers all known issues, solutions, and troubleshooting procedures fo
 | ERR_SSL_PROTOCOL_ERROR | Set `api.ssl.enabled: false` in config.yml | [Admin Panel](#err_ssl_protocol_error-with-reverse-proxy) |
 | Email not sending | `python -c "import smtplib; s=smtplib.SMTP('localhost'); s.quit(); print('OK')"` | [Integration Problems](#integration-problems) |
 | Database errors | `python scripts/verify_database.py` | [Database Issues](#database-issues) |
-| Voice prompts missing | `python scripts/generate_tts_prompts.py` | [Audio Issues](#audio-issues) |
+| Voice prompts missing | `python scripts/generate_espeak_voices.py` | [Audio Issues](#audio-issues) |
 | Phone won't provision | Check DHCP Option 66 or manual server | [Phone Provisioning](#phone-provisioning) |
 | High CPU usage | Check active calls, restart service | [Performance](#performance--monitoring) |
 
@@ -122,7 +122,7 @@ All voicemail and auto attendant prompts have been regenerated at the correct 8k
 **If Issues Persist:**
 ```bash
 # Regenerate audio prompts at correct sample rate
-python scripts/generate_tts_prompts.py
+python scripts/generate_espeak_voices.py
 
 # Verify generated files
 file voicemail_prompts/*.wav
@@ -138,7 +138,7 @@ file auto_attendant/*.wav
 play voicemail_prompts/beep.wav
 
 # If distorted, regenerate:
-python scripts/generate_tts_prompts.py --sample-rate 8000
+python scripts/generate_espeak_voices.py --sample-rate 8000
 
 # Clear cache and restart
 sudo systemctl restart pbx
@@ -160,7 +160,7 @@ ls -lh voicemail_prompts/
 ls -lh auto_attendant/
 
 # Generate if missing
-python scripts/generate_tts_prompts.py
+python scripts/generate_espeak_voices.py
 
 # Verify files were created
 ls -lh voicemail_prompts/*.wav

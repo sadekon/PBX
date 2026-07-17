@@ -374,9 +374,9 @@ class VoicemailHandler:
         import tempfile
 
         from pbx.core.call import CallState
-        from pbx.rtp.handler import RTPPlayer, RTPRecorder
-        from pbx.utils.audio import g711_to_float_samples, get_prompt_audio
-        from pbx.utils.dtmf import DTMFDetector
+        from pbx.rtp.dtmf_monitor import build_ivr_dtmf_channel
+        from pbx.rtp.handler import RTPPlayer
+        from pbx.utils.audio import get_prompt_audio
 
         pbx = self.pbx_core
 
@@ -453,57 +453,14 @@ class VoicemailHandler:
                 return
             pbx.logger.info("[VM IVR] ✓ RTP player started successfully")
 
-            # Create DTMF detector for processing user input (menu selections,
-            # PIN, etc.)
-            pbx.logger.info("[VM IVR] Creating DTMF detector (sample_rate=8000Hz)...")
-            dtmf_detector = DTMFDetector(sample_rate=8000)
-            pbx.logger.info("[VM IVR] ✓ DTMF detector created")
-
-            # Create RTP recorder to receive audio from caller for DTMF detection
-            # This listens on the same port, captures incoming RTP packets, and
-            # extracts audio
+            # Build the receive side: RTPRecorder + DTMFMonitor merging every
+            # DTMF source (RFC 2833 telephone-event -- including the caller's
+            # own offered payload types -- SIP INFO, and in-band G.711 tones)
+            # into one deduped digit queue.
             pbx.logger.info(
-                f"[VM IVR] Creating RTP recorder for DTMF detection (port {call.rtp_ports[0]})..."
+                f"[VM IVR] Creating RTP recorder + DTMF monitor (port {call.rtp_ports[0]})..."
             )
-            # Wire in an RFC 2833 receiver (not started -- the recorder owns
-            # the socket and delegates telephone-event packets to it) so
-            # out-of-band DTMF (PIN digits, #, menu selections) sent via
-            # RTP telephone-event reaches call.dtmf_info_queue through
-            # handle_dtmf_info(). Without this, telephone-event packets are
-            # filtered out of the recording but silently dropped, so PIN
-            # entry never advances.
-            from pbx.rtp.rfc2833 import RFC2833Receiver
-
-            dtmf_pt = pbx._get_dtmf_payload_type()
-
-            # Also accept the telephone-event payload type(s) from the
-            # caller's own SDP offer: RFC 3264 says the caller should send
-            # using the PT from our answer, but many phones send using the
-            # PT they offered instead.
-            caller_dtmf_pts: set[int] = set()
-            rtpmap_names = (call.caller_rtp or {}).get("rtpmap_names") or {}
-            for pt_str, rtpmap_name in rtpmap_names.items():
-                if str(rtpmap_name).lower().startswith("telephone-event") and str(pt_str).isdigit():
-                    caller_dtmf_pts.add(int(pt_str))
-            pbx.logger.info(
-                f"[VM IVR] DTMF payload types for call {call_id}: "
-                f"{sorted({dtmf_pt} | caller_dtmf_pts)}"
-            )
-
-            rfc2833_rx = RFC2833Receiver(
-                local_port=call.rtp_ports[0],
-                pbx_core=pbx,
-                call_id=call_id,
-                payload_type=dtmf_pt,
-                extra_payload_types=caller_dtmf_pts,
-            )
-            recorder = RTPRecorder(
-                call.rtp_ports[0],
-                call_id,
-                rfc2833_handler=rfc2833_rx,
-                dtmf_payload_type=dtmf_pt,
-                extra_dtmf_payload_types=caller_dtmf_pts,
-            )
+            recorder, dtmf_monitor = build_ivr_dtmf_channel(pbx, call, call_id, call.rtp_ports[0])
             if not recorder.start():
                 pbx.logger.error("[VM IVR] ✗ Failed to start RTP recorder")
                 player.stop()
@@ -516,27 +473,24 @@ class VoicemailHandler:
             )
 
             try:
-                # Barge-in predicate for menu prompts: True the moment an
-                # out-of-band DTMF digit (RFC 2833 telephone-event via the
-                # RFC2833Receiver wired above, or SIP INFO) is delivered into
-                # call.dtmf_info_queue by handle_dtmf_info(). It only *peeks* --
-                # the digit stays queued so the main loop below still pops it
-                # and calls voicemail_ivr.handle_dtmf(), advancing the state
-                # machine exactly as if the prompt had played to the end. This
-                # lets callers skip ahead through menus without waiting.
+                # Barge-in predicate for menu prompts: True the moment a digit
+                # is pending from any source (RFC 2833, SIP INFO, in-band).
+                # It only *peeks* -- the digit stays queued so the main loop
+                # below still pops it and calls voicemail_ivr.handle_dtmf(),
+                # advancing the state machine exactly as if the prompt had
+                # played to the end. This lets callers skip ahead through menus
+                # without waiting.
                 #
                 # Exception: during PIN entry the prompt must keep playing while
                 # the caller dials their PIN digits and only stop on '#'
-                # (submit). So while in PIN entry we look for '#' anywhere in the
-                # queued digits rather than any digit -- the PIN digits keep
-                # queueing and are collected by the loop once the prompt ends.
+                # (submit). So while in PIN entry we look for '#' anywhere in
+                # the pending digits rather than any digit -- the PIN digits
+                # stay queued and are collected by the loop once the prompt
+                # ends.
                 def _dtmf_pending() -> bool:
-                    queue = getattr(call, "dtmf_info_queue", None)
-                    if not queue:
-                        return False
                     if voicemail_ivr.state == voicemail_ivr.STATE_PIN_ENTRY:
-                        return "#" in queue
-                    return True
+                        return "#" in dtmf_monitor.peek_digits()
+                    return dtmf_monitor.has_digit()
 
                 # Start the IVR flow - transition from WELCOME to PIN_ENTRY state
                 # Use '*' which won't be collected as part of PIN (only 0-9 are
@@ -607,105 +561,19 @@ class VoicemailHandler:
                 ivr_active: bool = True
                 last_audio_check: float = time.time()
 
-                # DTMF debouncing: track last detected digit and time to
-                # prevent duplicates
-                last_detected_digit: str | None = None
-                last_detection_time: float = 0.0
-                dtmf_debounce_seconds: float = 0.5  # Ignore same digit within 500ms
-
-                # Constants for DTMF detection
-                # ~0.5s of audio at 160 bytes per 20ms RTP packet
-                dtmf_detection_packets: int = 40  # 40 packets * 20ms = 0.8s of audio
-                # Minimum audio data needed for reliable DTMF detection
-                min_audio_bytes_for_dtmf: int = 1600
-
                 while ivr_active:
                     # Check if call is still active
                     if call.state == CallState.ENDED:
                         pbx.logger.info(f"[VM IVR] Call {call_id} ended - exiting IVR loop")
                         break
 
-                    # Detect DTMF from either SIP INFO (out-of-band) or in-band
-                    # audio
-                    digit: str | None = None
+                    # One call covers every DTMF source (RFC 2833
+                    # telephone-event, SIP INFO, in-band G.711 tones), with
+                    # debounce/dedupe handled inside the monitor.
+                    digit: str | None = dtmf_monitor.get_digit(timeout=0.2)
 
-                    # Priority 1: Check for DTMF from SIP INFO messages (most
-                    # reliable)
-                    if hasattr(call, "dtmf_info_queue") and call.dtmf_info_queue:
-                        digit = call.dtmf_info_queue.pop(0)
-                        pbx.logger.info(f"[VM IVR] >>> DTMF RECEIVED (SIP INFO): '{digit}' <<<")
-                    else:
-                        # Priority 2: Fall back to in-band DTMF detection from
-                        # audio
-                        time.sleep(0.1)
-
-                        # Check for recorded audio (DTMF tones from user)
-                        if (
-                            hasattr(recorder, "recorded_data")
-                            and recorder.recorded_data
-                            and len(recorder.recorded_data) > 0
-                        ):
-                            # Collect last portion of audio for DTMF
-                            # detection
-                            recent_audio = b"".join(
-                                recorder.recorded_data[-dtmf_detection_packets:]
-                            )
-
-                            if (
-                                len(recent_audio) > min_audio_bytes_for_dtmf
-                            ):  # Need sufficient audio for DTMF
-                                try:
-                                    # Decode G.711 to linear samples before
-                                    # tone detection. The recorder stores
-                                    # companded µ-law/A-law RTP payload;
-                                    # feeding those bytes to detect() (which
-                                    # parses 16-bit PCM) scrambles them into
-                                    # spurious DTMF hits -- e.g. false digits
-                                    # in the greeting-review state trigger
-                                    # endless invalid-option beeps.
-                                    codec_pt = getattr(recorder, "detected_codec", 0) or 0
-                                    samples = g711_to_float_samples(recent_audio, codec_pt)
-                                    # detect_tone() only inspects the first
-                                    # samples_per_frame (~25ms) samples of
-                                    # whatever it's given, so calling it
-                                    # directly on this ~0.8s window silently
-                                    # ignores almost all of the audio and
-                                    # misses tones that don't happen to start
-                                    # exactly at the window's leading edge.
-                                    # detect_sequence() slides a frame across
-                                    # the whole window instead.
-                                    detected_sequence = dtmf_detector.detect_sequence(samples)
-                                    digit = detected_sequence[-1] if detected_sequence else None
-                                except Exception as e:
-                                    pbx.logger.error(f"Error detecting DTMF: {e}")
-                                    digit = None
-
-                                if digit:
-                                    # Debounce: ignore duplicate detections
-                                    # of same digit within debounce period
-                                    current_time: float = time.time()
-                                    if (
-                                        digit == last_detected_digit
-                                        and (current_time - last_detection_time)
-                                        < dtmf_debounce_seconds
-                                    ):
-                                        # Same digit detected too soon,
-                                        # likely echo or lingering tone
-                                        pbx.logger.debug(
-                                            f"[VM IVR] DTMF '{digit}' debounced (duplicate within {dtmf_debounce_seconds}s)"
-                                        )
-                                        continue
-
-                                    # Update debounce tracking
-                                    last_detected_digit = digit
-                                    last_detection_time = current_time
-                                    pbx.logger.info(
-                                        f"[VM IVR] >>> DTMF RECEIVED (In-band audio): '{digit}' <<<"
-                                    )
-
-                    # Process detected DTMF digit (from either SIP INFO or
-                    # in-band)
                     if digit:
+                        pbx.logger.info(f"[VM IVR] >>> DTMF RECEIVED: '{digit}' <<<")
                         # Reset inactivity timer on any DTMF input
                         last_audio_check = time.time()
                         # Handle DTMF input through IVR
@@ -832,9 +700,7 @@ class VoicemailHandler:
                                     main_menu_file: str = temp_file.name
 
                                 try:
-                                    player.play_file(
-                                        main_menu_file, interrupt_check=_dtmf_pending
-                                    )
+                                    player.play_file(main_menu_file, interrupt_check=_dtmf_pending)
                                 finally:
                                     with contextlib.suppress(OSError):
                                         Path(main_menu_file).unlink()
@@ -940,53 +806,10 @@ class VoicemailHandler:
                                     recording = False
                                     break
 
-                                time.sleep(0.1)
-
-                                # Check for DTMF # to stop recording (SIP INFO
-                                # or in-band)
-                                stop_digit: str | None = None
-
-                                # Priority 1: Check SIP INFO queue
-                                if hasattr(call, "dtmf_info_queue") and call.dtmf_info_queue:
-                                    stop_digit = call.dtmf_info_queue.pop(0)
-                                    pbx.logger.info(
-                                        f"Received DTMF from SIP INFO during recording: {stop_digit}"
-                                    )
-                                # Priority 2: Check in-band audio
-                                elif hasattr(recorder, "recorded_data") and recorder.recorded_data:
-                                    recent_audio = b"".join(
-                                        recorder.recorded_data[-dtmf_detection_packets:]
-                                    )
-                                    if len(recent_audio) > min_audio_bytes_for_dtmf:
-                                        try:
-                                            # Decode companded G.711 to linear
-                                            # samples first (see main loop) --
-                                            # detect() would misread µ-law/A-law
-                                            # bytes as PCM and false-trigger.
-                                            codec_pt = getattr(recorder, "detected_codec", 0) or 0
-                                            samples = g711_to_float_samples(recent_audio, codec_pt)
-                                            # detect_tone() only looks at the
-                                            # leading ~25ms of the samples
-                                            # it's handed, so on this ~0.8s
-                                            # window it misses a "#" press
-                                            # unless it happens to start at
-                                            # the very front. detect_sequence()
-                                            # scans the whole window instead.
-                                            detected_sequence = dtmf_detector.detect_sequence(
-                                                samples
-                                            )
-                                            stop_digit = (
-                                                detected_sequence[-1] if detected_sequence else None
-                                            )
-                                            if stop_digit:
-                                                pbx.logger.info(
-                                                    f"Received DTMF from in-band audio during recording: {stop_digit}"
-                                                )
-                                        except Exception as e:
-                                            pbx.logger.error(
-                                                f"Error detecting DTMF during recording: {e}"
-                                            )
-                                            stop_digit = None
+                                # Check for DTMF # to stop recording -- the
+                                # monitor covers SIP INFO, RFC 2833, and
+                                # in-band tones in the recorded audio alike.
+                                stop_digit: str | None = dtmf_monitor.get_digit(timeout=0.1)
 
                                 if stop_digit == "#":
                                     pbx.logger.info("Recording stopped by user (#)")
@@ -1176,61 +999,26 @@ class VoicemailHandler:
         Args:
             call_id: Call identifier
             call: Call object
-            recorder: RTPRecorder instance
+            recorder: RTPRecorder instance (its dtmf_monitor is used if wired;
+                otherwise one is created and attached here)
         """
-        from pbx.utils.audio import g711_to_float_samples
-        from pbx.utils.dtmf import DTMFDetector
+        from pbx.rtp.dtmf_monitor import DTMFMonitor
 
         pbx = self.pbx_core
 
         try:
-            # Create DTMF detector
-            dtmf_detector = DTMFDetector(sample_rate=8000)
-
-            # Constants for DTMF detection
-            dtmf_detection_packets: int = 40  # 40 packets * 20ms = 0.8s of audio
-            # Minimum audio data needed for reliable DTMF detection
-            min_audio_bytes_for_dtmf: int = 1600
+            # Use the recorder's DTMFMonitor (merges RFC 2833 / SIP INFO /
+            # in-band tones); attach one if the recorder was built without it.
+            dtmf_monitor = getattr(recorder, "dtmf_monitor", None)
+            if dtmf_monitor is None:
+                dtmf_monitor = DTMFMonitor(call)
+                recorder.dtmf_monitor = dtmf_monitor
 
             pbx.logger.info(f"Started DTMF monitoring for voicemail recording on call {call_id}")
 
             # Monitor for # key press
             while recorder.running and call.state.value != "ended":
-                time.sleep(0.1)
-
-                digit: str | None = None
-
-                # Priority 1: out-of-band DTMF (SIP INFO or RFC 2833) queued
-                # on the call by handle_dtmf_info()
-                if getattr(call, "dtmf_info_queue", None):
-                    digit = call.dtmf_info_queue.pop(0)
-                    pbx.logger.info(
-                        f"Received out-of-band DTMF '{digit}' during voicemail "
-                        f"recording on call {call_id}"
-                    )
-
-                # Priority 2: in-band DTMF tones in the recorded audio
-                elif (
-                    hasattr(recorder, "recorded_data")
-                    and recorder.recorded_data
-                    and len(recorder.recorded_data) > 0
-                ):
-                    # Collect last portion of audio for DTMF detection
-                    recent_audio = b"".join(recorder.recorded_data[-dtmf_detection_packets:])
-
-                    if len(recent_audio) > min_audio_bytes_for_dtmf:
-                        # Decode G.711 to linear samples for tone detection --
-                        # companded bytes fed in as-is make the DTMF
-                        # frequencies unrecognizable to the detector.
-                        codec_pt: int = getattr(recorder, "detected_codec", 0) or 0
-                        samples: list[float] = g711_to_float_samples(recent_audio, codec_pt)
-                        # detect_tone() only examines the first
-                        # samples_per_frame samples it's handed, so calling
-                        # it on this whole ~0.8s window misses tones that
-                        # aren't at the very front. detect_sequence() slides
-                        # a frame across the entire window instead.
-                        detected_sequence = dtmf_detector.detect_sequence(samples)
-                        digit = detected_sequence[-1] if detected_sequence else None
+                digit: str | None = dtmf_monitor.get_digit(timeout=0.5)
 
                 if digit == "#":
                     pbx.logger.info(

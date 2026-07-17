@@ -835,16 +835,16 @@ class ProductionInstaller:
             return True
 
         if self.dry_run:
-            self._dry("python scripts/generate_tts_prompts.py")
+            self._dry("python scripts/generate_espeak_voices.py")
             return True
 
-        voice_script = self.project_root / "scripts" / "generate_tts_prompts.py"
+        voice_script = self.project_root / "scripts" / "generate_espeak_voices.py"
         if not voice_script.exists():
             self._warn("Voice prompt generation script not found")
             return True
 
         if not self._confirm("Generate voice prompts now? (required for voicemail/auto-attendant)"):
-            self._info("Skipped — generate later: python scripts/generate_tts_prompts.py")
+            self._info("Skipped — generate later: python scripts/generate_espeak_voices.py")
             return True
 
         python_bin = self.venv_path / "bin" / "python"
@@ -860,7 +860,7 @@ class ProductionInstaller:
         )
         if ret != 0:
             self._warn(f"Voice prompt generation failed: {stderr[:200]}")
-            self._info("Generate later: python scripts/generate_tts_prompts.py")
+            self._info("Generate later: python scripts/generate_espeak_voices.py")
         else:
             self._ok("Voice prompts generated")
 

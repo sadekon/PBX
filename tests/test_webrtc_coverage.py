@@ -1089,7 +1089,7 @@ class TestWebRTCGatewayInitiateCall:
         gw, signaling, pbx_core = self._make_gateway_and_signaling()
         session = signaling.create_session("1001")
         pbx_core.extension_registry.get_extension.return_value = None
-        pbx_core._check_dialplan.return_value = False
+        pbx_core.call_router._check_dialplan.return_value = False
         result = gw.initiate_call(session.session_id, "9999", webrtc_signaling=signaling)
         assert result is None
 
@@ -1097,7 +1097,7 @@ class TestWebRTCGatewayInitiateCall:
         gw, signaling, pbx_core = self._make_gateway_and_signaling(verbose=True)
         session = signaling.create_session("1001")
         pbx_core.extension_registry.get_extension.return_value = None
-        pbx_core._check_dialplan.return_value = False
+        pbx_core.call_router._check_dialplan.return_value = False
         pbx_core.extension_registry.extensions = ["1002"]
         result = gw.initiate_call(session.session_id, "9999", webrtc_signaling=signaling)
         assert result is None
@@ -1113,7 +1113,7 @@ class TestWebRTCGatewayInitiateCall:
             return None
 
         pbx_core.extension_registry.get_extension.side_effect = get_ext_side_effect
-        pbx_core._check_dialplan.return_value = True
+        pbx_core.call_router._check_dialplan.return_value = True
         result = gw.initiate_call(session.session_id, "9999", webrtc_signaling=signaling)
         assert result is not None
 
@@ -1189,7 +1189,7 @@ class TestWebRTCGatewayInitiateCallAutoAttendant:
         del pbx_core.webrtc_signaling
         pbx_core.extension_registry.get_extension.return_value = None
         pbx_core.extension_registry.get.return_value = None
-        pbx_core._check_dialplan.return_value = True
+        pbx_core.call_router._check_dialplan.return_value = True
         pbx_core.rtp_relay.allocate_relay.return_value = (10000, 10001)
         pbx_core.rtp_relay.port_pool = [30000, 30002]
         pbx_core.auto_attendant.get_extension.return_value = "0"
@@ -1279,7 +1279,7 @@ class TestWebRTCGatewayInitiateCallVoicemail:
 
         pbx_core.extension_registry.get_extension.return_value = None
         pbx_core.extension_registry.get.return_value = None
-        pbx_core._check_dialplan.return_value = True
+        pbx_core.call_router._check_dialplan.return_value = True
         pbx_core.rtp_relay.allocate_relay.return_value = (10000, 10001)
         pbx_core.rtp_relay.port_pool = [30000, 30002]
         pbx_core.auto_attendant = None

@@ -398,6 +398,9 @@ graph TD
         CallRouter["core/call_router.py<br/>(Routing)"]
         CallStateMachine["core/call.py<br/>(State Machine)"]
         FeatureInit["core/feature_initializer.py<br/>(Feature Loader)"]
+        TransferHandler["core/transfer_handler.py<br/>(Blind/Attended/REFER Transfer)"]
+        CodecNegotiator["core/codec_negotiator.py<br/>(Phone Model & Codec Compat)"]
+        RegistrationHandler["core/registration_handler.py<br/>(SIP Registration)"]
     end
 
     subgraph "Protocol Handlers"
@@ -406,7 +409,7 @@ graph TD
         SDP["sip/sdp.py<br/>(SDP Negotiation)"]
         RTPHandler["rtp/handler.py<br/>(RTP Relay)"]
         JitterBuffer["rtp/jitter_buffer.py"]
-        RFC2833["rtp/rfc2833.py<br/>(DTMF)"]
+        DTMFMonitor["rtp/dtmf_monitor.py<br/>(Unified DTMF: RFC2833/SIP INFO/in-band)"]
         RTCPMonitor["rtp/rtcp_monitor.py"]
     end
 
@@ -447,7 +450,7 @@ graph TD
         GracefulShutdown["utils/graceful_shutdown.py"]
         Audio["utils/audio.py"]
         TTS["utils/tts.py"]
-        DTMF["utils/dtmf.py"]
+        DTMF["utils/dtmf.py<br/>(In-band DTMFDetector)"]
     end
 
     Main -->|Load Config| EnvLoader
@@ -464,16 +467,23 @@ graph TD
 
     PBXCore -->|Own| CallRouter
     PBXCore -->|Own| FeatureInit
+    PBXCore -->|Own| TransferHandler
+    PBXCore -->|Own| CodecNegotiator
+    PBXCore -->|Own| RegistrationHandler
     CallRouter -->|Use| CallStateMachine
+    TransferHandler -->|Blind/Attended REFER| SIPServer
+    RegistrationHandler -->|REGISTER dialogs| SIPServer
 
     PBXCore -->|Start| SIPServer
     SIPServer -->|Parse| SIPMessage
     SIPMessage -->|Negotiate| SDP
     SIPServer -->|Route Messages| PBXCore
+    SIPServer -->|3xx Redirect Forwarding| CallRouter
 
     CallStateMachine -->|Handle Media| RTPHandler
     RTPHandler -->|Buffer| JitterBuffer
-    RTPHandler -->|Detect DTMF| RFC2833
+    RTPHandler -->|Detect DTMF| DTMFMonitor
+    DTMFMonitor -->|In-band fallback| DTMF
     RTPHandler -->|Monitor Quality| RTCPMonitor
 
     FeatureInit -->|Load| AutoAttendant

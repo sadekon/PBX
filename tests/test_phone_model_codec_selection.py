@@ -4,7 +4,7 @@ Tests for phone model-specific codec selection
 
 from unittest.mock import Mock
 
-from pbx.core.pbx import PBXCore
+from pbx.core.codec_negotiator import CodecNegotiator
 
 
 class TestPhoneModelDetection:
@@ -12,101 +12,96 @@ class TestPhoneModelDetection:
 
     def setup_method(self) -> None:
         """Set up test fixtures"""
-        # Create a minimal test instance with just the needed method
-        self.pbx = Mock(spec=PBXCore)
-        self.pbx.logger = Mock()  # Mock logger for unrecognised phone logging
-        # _device_model_cache is an instance attribute set in __init__, so it is
-        # not part of the spec; provide it for the cache lookups in the method.
-        self.pbx._device_model_cache = {}
-        # Copy the actual method from the class to our mock
-        self.pbx._detect_phone_model = PBXCore._detect_phone_model.__get__(self.pbx)
+        pbx = Mock()
+        pbx.logger = Mock()  # Mock logger for unrecognised phone logging
+        self.negotiator = CodecNegotiator(pbx)
 
     def test_detect_zip33g_uppercase(self) -> None:
         """Test detection of ZIP33G in uppercase"""
         user_agent = "Zultys ZIP33G 47.80.0.132"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "ZIP33G"
 
     def test_detect_zip33g_with_space(self) -> None:
         """Test detection of ZIP 33G with space"""
         user_agent = "Zultys ZIP 33G firmware 47.80"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "ZIP33G"
 
     def test_detect_zip37g_uppercase(self) -> None:
         """Test detection of ZIP37G in uppercase"""
         user_agent = "Zultys ZIP37G 47.85.0.140"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "ZIP37G"
 
     def test_detect_zip37g_with_space(self) -> None:
         """Test detection of ZIP 37G with space"""
         user_agent = "Zultys ZIP 37G firmware 47.85"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "ZIP37G"
 
     def test_detect_yealink_t33g(self) -> None:
         """Test detection of Yealink T33G"""
         user_agent = "Yealink SIP-T33G 124.86.0.40 00:15:65:AB:CD:EF"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "YEALINK_T33G"
 
     def test_detect_yealink_t46s(self) -> None:
         """Test detection of Yealink T46S"""
         user_agent = "Yealink SIP-T46S 66.85.0.5"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "YEALINK_T46S"
 
     def test_detect_yealink_t46g(self) -> None:
         """Test detection of Yealink T46G"""
         user_agent = "Yealink SIP-T46G 28.83.0.120"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "YEALINK_T46G"
 
     def test_detect_yealink_t28g(self) -> None:
         """Test detection of Yealink T28G"""
         user_agent = "Yealink SIP-T28G 2.73.0.130"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "YEALINK_T28G"
 
     def test_detect_cisco_cp8851_3pcc(self) -> None:
         """Test detection of Cisco CP-8851-3PCC from its multiplatform User-Agent"""
         user_agent = "Cisco-CP-8851-3PCC/11.3.7_MPP_0001"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "CISCO_CP8851"
 
     def test_detect_cisco_8851_by_model_number(self) -> None:
         """Test detection of Cisco 8851 when only the model number is present"""
         user_agent = "Cisco/8851 (SIP)"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "CISCO_CP8851"
 
     def test_detect_cisco_spa_ata_not_misclassified(self) -> None:
         """A Cisco SPA ATA is still the generic Cisco ATA, not the 8851 (regression)"""
         user_agent = "Cisco/SPA112-1.4.1 (SIP)"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "CISCO_ATA"
 
     def test_detect_other_phone(self) -> None:
         """Test detection of non-recognised phone"""
         user_agent = "Polycom VVX-450 5.9.6.2327"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model is None
 
     def test_detect_none_user_agent(self) -> None:
         """Test detection with None user agent"""
-        model = self.pbx._detect_phone_model(None)
+        model = self.negotiator._detect_phone_model(None)
         assert model is None
 
     def test_detect_empty_user_agent(self) -> None:
         """Test detection with empty user agent"""
-        model = self.pbx._detect_phone_model("")
+        model = self.negotiator._detect_phone_model("")
         assert model is None
 
     def test_detect_zip33g_case_insensitive(self) -> None:
         """Test detection is case-insensitive"""
         user_agent = "zultys zip33g firmware"
-        model = self.pbx._detect_phone_model(user_agent)
+        model = self.negotiator._detect_phone_model(user_agent)
         assert model == "ZIP33G"
 
 
@@ -115,17 +110,15 @@ class TestCodecSelection:
 
     def setup_method(self) -> None:
         """Set up test fixtures"""
-        # Create a minimal test instance with just the needed attributes and method
-        self.pbx = Mock(spec=PBXCore)
-        self.pbx.config = Mock()
-        self.pbx.config.get.return_value = 101  # DTMF payload type
-        self.pbx.logger = Mock()  # Mock logger
-        # Copy the actual method from the class to our mock
-        self.pbx._get_codecs_for_phone_model = PBXCore._get_codecs_for_phone_model.__get__(self.pbx)
+        pbx = Mock()
+        pbx.config = Mock()
+        pbx.config.get.return_value = 101  # DTMF payload type
+        pbx.logger = Mock()  # Mock logger
+        self.negotiator = CodecNegotiator(pbx)
 
     def test_zip37g_codecs(self) -> None:
         """Test that ZIP37G gets full codec set matching provisioning template"""
-        codecs = self.pbx._get_codecs_for_phone_model("ZIP37G")
+        codecs = self.negotiator._get_codecs_for_phone_model("ZIP37G")
         # Should contain PCMU (0), PCMA (8), G722 (9), G729 (18), G726-32 (2), and DTMF (101)
         # per the zultys_zip37g provisioning template
         assert "0" in codecs  # PCMU
@@ -139,7 +132,7 @@ class TestCodecSelection:
 
     def test_zip33g_codecs(self) -> None:
         """Test that ZIP33G gets full codec set matching provisioning template"""
-        codecs = self.pbx._get_codecs_for_phone_model("ZIP33G")
+        codecs = self.negotiator._get_codecs_for_phone_model("ZIP33G")
         # Should contain PCMU (0), PCMA (8), G722 (9), G729 (18), G726-32 (2), and DTMF (101)
         # per the zultys_zip33g provisioning template
         assert "0" in codecs  # PCMU
@@ -153,7 +146,7 @@ class TestCodecSelection:
 
     def test_yealink_t33g_codecs(self) -> None:
         """Test that Yealink T33G gets codec set matching provisioning template"""
-        codecs = self.pbx._get_codecs_for_phone_model("YEALINK_T33G")
+        codecs = self.negotiator._get_codecs_for_phone_model("YEALINK_T33G")
         # T33G is a lower-tier phone: PCMU, PCMA, G722, G729 (no G726-32)
         # per the yealink_t33g provisioning template
         assert set(codecs) == {"0", "8", "9", "18", "101"}
@@ -161,34 +154,34 @@ class TestCodecSelection:
 
     def test_yealink_t46s_codecs(self) -> None:
         """Test that Yealink T46S gets full codec set matching provisioning template"""
-        codecs = self.pbx._get_codecs_for_phone_model("YEALINK_T46S")
+        codecs = self.negotiator._get_codecs_for_phone_model("YEALINK_T46S")
         assert set(codecs) == {"0", "8", "9", "18", "2", "101"}
 
     def test_yealink_t46g_codecs(self) -> None:
         """Test that Yealink T46G gets full codec set matching provisioning template"""
-        codecs = self.pbx._get_codecs_for_phone_model("YEALINK_T46G")
+        codecs = self.negotiator._get_codecs_for_phone_model("YEALINK_T46G")
         assert set(codecs) == {"0", "8", "9", "18", "2", "101"}
 
     def test_yealink_t28g_codecs(self) -> None:
         """Test that Yealink T28G gets full codec set matching provisioning template"""
-        codecs = self.pbx._get_codecs_for_phone_model("YEALINK_T28G")
+        codecs = self.negotiator._get_codecs_for_phone_model("YEALINK_T28G")
         assert set(codecs) == {"0", "8", "9", "18", "2", "101"}
 
     def test_cisco_cp8851_codecs(self) -> None:
         """Test that Cisco CP-8851-3PCC gets PCMU/PCMA/G722/G729 + DTMF"""
-        codecs = self.pbx._get_codecs_for_phone_model("CISCO_CP8851")
+        codecs = self.negotiator._get_codecs_for_phone_model("CISCO_CP8851")
         # 0=PCMU, 8=PCMA, 9=G722 (wideband), 18=G729, 101=DTMF
         assert set(codecs) == {"0", "8", "9", "18", "101"}
 
     def test_unknown_phone_uses_defaults(self) -> None:
         """Test that unknown phones use default codecs"""
         default_codecs = ["0", "8", "9", "101"]
-        codecs = self.pbx._get_codecs_for_phone_model(None, default_codecs=default_codecs)
+        codecs = self.negotiator._get_codecs_for_phone_model(None, default_codecs=default_codecs)
         assert codecs == default_codecs
 
     def test_unknown_phone_no_defaults(self) -> None:
         """Test that unknown phones get standard codec list when no defaults"""
-        codecs = self.pbx._get_codecs_for_phone_model(None)
+        codecs = self.negotiator._get_codecs_for_phone_model(None)
         # Should get standard fallback list
         assert "0" in codecs  # PCMU
         assert "8" in codecs  # PCMA
@@ -199,7 +192,7 @@ class TestCodecSelection:
 
     def test_custom_dtmf_payload(self) -> None:
         """Test that custom DTMF payload type is used"""
-        self.pbx.config.get.return_value = 96  # Custom DTMF payload
-        codecs = self.pbx._get_codecs_for_phone_model("ZIP37G")
+        self.negotiator.pbx_core.config.get.return_value = 96  # Custom DTMF payload
+        codecs = self.negotiator._get_codecs_for_phone_model("ZIP37G")
         assert "96" in codecs
         assert "101" not in codecs

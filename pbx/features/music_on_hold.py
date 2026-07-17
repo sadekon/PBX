@@ -1,158 +1,210 @@
 """
 Music on Hold (MOH) System
-Plays audio while calls are on hold
+Streams looped hold audio to a held party while a call is on hold.
 """
 
+from __future__ import annotations
+
 import random
+import threading
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from pbx.utils.logger import get_logger
 
+if TYPE_CHECKING:
+    from pbx.rtp.handler import RTPRelayHandler
+
 
 class MusicOnHold:
-    """Manages music on hold"""
+    """Manages music on hold.
+
+    MOH drives an ``RTPRelayHandler`` it is handed: it pauses the relay so the
+    two legs stop hearing each other, then streams a looped WAV to the held
+    party over the relay's own socket via ``RTPPlayer``. Ending hold sets a
+    stop event that interrupts playback within one packet (~20ms) and resumes
+    normal relaying.
+    """
 
     def __init__(self, moh_directory: str = "moh", default_class: str = "default") -> None:
         """
-        Initialize MOH system
+        Initialize MOH system.
 
         Args:
-            moh_directory: Directory containing MOH files
-            default_class: Default MOH class name
+            moh_directory: Directory containing MOH files.
+            default_class: Default MOH class name.
         """
         self.moh_directory = moh_directory
         self.default_class = default_class
-        self.classes = {}  # class_name -> list of audio files
+        self.classes: dict[str, list[Path]] = {}  # class_name -> list of audio files
         self.logger = get_logger()
-        self.active_sessions = {}  # call_id -> current playing file
+        self.active_sessions: dict[str, dict[str, Any]] = {}  # call_id -> session state
+        self._session_lock = threading.RLock()
 
         Path(moh_directory).mkdir(parents=True, exist_ok=True)
         self._load_classes()
 
     def _load_classes(self) -> None:
-        """Load MOH classes and files"""
-        # Create default class if it doesn't exist
-        default_path = Path(self.moh_directory) / self.default_class
-        Path(default_path).mkdir(parents=True, exist_ok=True)
+        """Load MOH classes (one per subdirectory) and their audio files."""
+        # Ensure the default class directory exists.
+        (Path(self.moh_directory) / self.default_class).mkdir(parents=True, exist_ok=True)
 
-        # Scan for MOH classes (subdirectories)
-        if Path(self.moh_directory).exists():
-            for class_path in Path(self.moh_directory).iterdir():
-                item = class_path.name
-                if class_path.is_dir():
-                    audio_files = self._scan_audio_files(class_path)
-                    if audio_files:
-                        self.classes[item] = audio_files
-                        self.logger.info(f"Loaded MOH class '{item}' with {len(audio_files)} files")
+        for class_path in Path(self.moh_directory).iterdir():
+            if class_path.is_dir():
+                audio_files = self._scan_audio_files(class_path)
+                if audio_files:
+                    self.classes[class_path.name] = audio_files
+                    self.logger.info(
+                        f"Loaded MOH class '{class_path.name}' with {len(audio_files)} files"
+                    )
 
-    def _scan_audio_files(self, directory: str | Path) -> list:
+    def _scan_audio_files(self, directory: Path) -> list[Path]:
+        """Return the sorted audio files in a directory."""
+        audio_extensions = (".wav", ".mp3", ".ogg", ".flac", ".aac")
+        return sorted(
+            entry for entry in directory.iterdir() if entry.suffix.lower() in audio_extensions
+        )
+
+    def start_moh(
+        self,
+        call_id: str,
+        relay_handler: RTPRelayHandler,
+        held_side: str,
+        moh_class: str | None = None,
+    ) -> Path | None:
         """
-        Scan directory for audio files
+        Put a call on hold: pause its relay and stream looped hold music to
+        the held party.
+
+        The relay is paused even when no audio file is available, so the held
+        party never hears the other leg while on hold.
 
         Args:
-            directory: Directory to scan
+            call_id: Call identifier.
+            relay_handler: The call's relay handler to drive.
+            held_side: Which side ("a" or "b") should hear the music.
+            moh_class: MOH class to play (defaults to the configured default).
 
         Returns:
-            list of audio file paths
+            The audio file being looped, or None if none was available.
         """
-        audio_extensions = [".wav", ".mp3", ".ogg", ".flac", ".aac"]
-        audio_files = [
-            entry
-            for entry in Path(directory).iterdir()
-            if any(entry.name.lower().endswith(ext) for ext in audio_extensions)
-        ]
-
-        return sorted(audio_files)
-
-    def start_moh(self, call_id: str, moh_class: str | None = None) -> Path | None:
-        """
-        Start music on hold for call
-
-        Args:
-            call_id: Call identifier
-            moh_class: MOH class name (or None for default)
-
-        Returns:
-            Path to audio file or None
-        """
-        if moh_class is None:
-            moh_class = self.default_class
-
+        moh_class = moh_class or self.default_class
         audio_files = self.classes.get(moh_class, [])
 
-        if not audio_files:
-            self.logger.warning(f"No MOH files found for class '{moh_class}'")
-            return None
+        # A phone can repeat its hold re-INVITE.  Keep exactly one playback
+        # thread per relay: multiple RTPPlayers sharing the relay socket each
+        # generate their own RTP sequence/timestamp stream, which garbles
+        # hold audio and can continue after the call is resumed.
+        with self._session_lock:
+            previous = self.active_sessions.pop(call_id, None)
+            if previous is not None:
+                self._stop_session(
+                    previous, resume_relay=previous["relay_handler"] is not relay_handler
+                )
+                self.logger.warning(f"Replaced existing MOH session for call {call_id}")
 
-        # Select random file
-        audio_file = random.choice(audio_files)
-        self.active_sessions[call_id] = {
-            "class": moh_class,
-            "file": audio_file,
-            "files": audio_files,
-            "index": audio_files.index(audio_file),
-        }
+            relay_handler.pause_relay()
+            stop_event = threading.Event()
+            session: dict[str, Any] = {
+                "class": moh_class,
+                "relay_handler": relay_handler,
+                "stop_event": stop_event,
+                "thread": None,
+                "file": None,
+            }
+            self.active_sessions[call_id] = session
 
-        self.logger.debug(f"Started MOH for call {call_id}: {audio_file}")
-        return audio_file
+            if not audio_files:
+                self.logger.warning(
+                    f"No MOH files for class '{moh_class}'; holding call {call_id} in silence"
+                )
+                return None
+
+            audio_file = random.choice(audio_files)
+            session["file"] = audio_file
+            thread = threading.Thread(
+                target=self._stream_loop,
+                args=(relay_handler, held_side, audio_file, stop_event),
+                daemon=True,
+            )
+            session["thread"] = thread
+            thread.start()
+
+            self.logger.info(f"Started MOH for call {call_id}: {audio_file} -> side {held_side}")
+            return audio_file
 
     def stop_moh(self, call_id: str) -> None:
         """
-        Stop music on hold
+        End hold for a call: interrupt playback and resume normal relaying.
+
+        Idempotent -- safe to call for a call that is not on hold.
 
         Args:
-            call_id: Call identifier
+            call_id: Call identifier.
         """
-        if call_id in self.active_sessions:
-            del self.active_sessions[call_id]
-            self.logger.debug(f"Stopped MOH for call {call_id}")
+        with self._session_lock:
+            session = self.active_sessions.pop(call_id, None)
+            if session is None:
+                return
 
-    def get_next_file(self, call_id: str) -> Path | None:
-        """
-        Get next file in sequence for call
+            self._stop_session(session, resume_relay=True)
+            self.logger.info(f"Stopped MOH for call {call_id}")
 
-        Args:
-            call_id: Call identifier
+    @staticmethod
+    def _stop_session(session: dict[str, Any], resume_relay: bool) -> None:
+        """Stop one MOH playback session, optionally resuming its relay."""
+        session["stop_event"].set()
+        thread: threading.Thread | None = session.get("thread")
+        if thread and thread.is_alive():
+            thread.join(timeout=1.0)
+        if resume_relay:
+            session["relay_handler"].resume_relay()
 
-        Returns:
-            Path to next audio file
-        """
-        session = self.active_sessions.get(call_id)
+    def _stream_loop(
+        self,
+        relay_handler: RTPRelayHandler,
+        held_side: str,
+        moh_file: Path,
+        stop_event: threading.Event,
+    ) -> None:
+        """Loop ``moh_file`` to the held party until stop_event is set."""
+        from pbx.rtp.handler import RTPPlayer
 
-        if not session:
-            return None
+        sock = relay_handler.socket
+        if sock is None:
+            return
 
-        files = session["files"]
-        index = (session["index"] + 1) % len(files)
+        # Reuse the relay's already-bound socket so no second bind is needed
+        # on the same port.
+        player = RTPPlayer(
+            local_port=relay_handler.local_port,
+            remote_host="",
+            remote_port=0,
+            call_id=relay_handler.call_id,
+            external_socket=sock,
+        )
+        player.start()
 
-        session["index"] = index
-        session["file"] = files[index]
+        # Exit if the call is torn down (relay stopped) even without a resume.
+        while not stop_event.is_set() and relay_handler.running:
+            target = relay_handler.get_endpoint(held_side)
+            if target is None:
+                # Endpoint not learned yet; wait briefly and retry.
+                stop_event.wait(0.1)
+                continue
+            player.remote_host, player.remote_port = target
+            # Barge-in: is_set() only peeks, so hold ends within one packet.
+            player.play_file(moh_file, interrupt_check=stop_event.is_set)
 
-        return files[index]
-
-    def add_moh_class(self, class_name: str, files: list) -> None:
-        """
-        Add MOH class
-
-        Args:
-            class_name: Name of MOH class
-            files: list of audio file paths
-        """
+    def add_moh_class(self, class_name: str, files: list[Path]) -> None:
+        """Register a MOH class with an explicit list of files."""
         self.classes[class_name] = files
         self.logger.info(f"Added MOH class '{class_name}' with {len(files)} files")
 
-    def get_classes(self) -> list:
-        """Get list of available MOH classes"""
+    def get_classes(self) -> list[str]:
+        """Return the available MOH class names."""
         return list(self.classes)
 
-    def get_class_files(self, class_name: str) -> list:
-        """
-        Get files in MOH class
-
-        Args:
-            class_name: MOH class name
-
-        Returns:
-            list of file paths
-        """
+    def get_class_files(self, class_name: str) -> list[Path]:
+        """Return the files in a MOH class."""
         return self.classes.get(class_name, [])

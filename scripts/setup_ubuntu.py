@@ -535,11 +535,11 @@ DB_PASSWORD={self.db_config["DB_PASSWORD"]}
             self.print_warning(
                 "Skipping voice prompt generation. You can generate them later using:"
             )
-            self.print_info("  python scripts/generate_tts_prompts.py")
+            self.print_info("  python scripts/generate_espeak_voices.py")
             return True
 
         # Check for voice generation script
-        voice_script = self.project_root / "scripts" / "generate_tts_prompts.py"
+        voice_script = self.project_root / "scripts" / "generate_espeak_voices.py"
         if not voice_script.exists():
             self.print_warning("Voice prompt generation script not found")
             return True
@@ -555,7 +555,7 @@ DB_PASSWORD={self.db_config["DB_PASSWORD"]}
         if ret != 0:
             self.print_warning(f"Failed to generate voice prompts: {stderr}")
             self.print_info(
-                "You can generate them later using: python scripts/generate_tts_prompts.py"
+                "You can generate them later using: python scripts/generate_espeak_voices.py"
             )
             return True
 

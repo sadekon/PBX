@@ -62,11 +62,11 @@ def transfer_call(call_id: str) -> tuple[Response, int]:
             return send_json(
                 {"error": "consultation_call_id required for attended transfer"}, 400
             ), 400
-        success = pbx_core.attended_transfer(call_id, consultation_call_id)
+        success = pbx_core.transfer_handler.attended_transfer(call_id, consultation_call_id)
     elif transfer_type == "consultative":
         if not destination:
             return send_json({"error": "destination required for consultative transfer"}, 400), 400
-        new_call_id = pbx_core.consultation_transfer_start(call_id, destination)
+        new_call_id = pbx_core.transfer_handler.consultation_transfer_start(call_id, destination)
         if new_call_id:
             return send_json(
                 {
@@ -80,7 +80,7 @@ def transfer_call(call_id: str) -> tuple[Response, int]:
         # Default: blind transfer
         if not destination:
             return send_json({"error": "destination required"}, 400), 400
-        success = pbx_core.blind_transfer(call_id, destination)
+        success = pbx_core.transfer_handler.blind_transfer(call_id, destination)
 
     if success:
         return send_json(

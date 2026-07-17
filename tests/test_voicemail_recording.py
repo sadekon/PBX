@@ -97,7 +97,7 @@ def test_voicemail_recording_timer() -> None:
     pbx.call_manager.active_calls[call.call_id] = call
 
     # Trigger no-answer handler
-    pbx._handle_no_answer(call.call_id)
+    pbx.call_router._handle_no_answer(call.call_id)
 
     # Verify call is routed to voicemail
     assert call.routed_to_voicemail
@@ -208,7 +208,7 @@ def test_no_answer_answers_call() -> None:
     pbx.call_manager.active_calls[call.call_id] = call
 
     # Trigger no-answer handler
-    pbx._handle_no_answer(call.call_id)
+    pbx.call_router._handle_no_answer(call.call_id)
 
     # Verify call is connected (answered) not ended
     assert call.state == CallState.CONNECTED
