@@ -483,6 +483,12 @@ class PBXCore:
             self.logger.error("Failed to start SIP server")
             return False
 
+        # Kick previously-registered phones to re-register now instead of
+        # waiting out their Expires interval -- extension_registry starts
+        # empty on every restart, so they'd otherwise be unreachable for
+        # inbound calls until then (see RegistrationHandler.resync_known_phones)
+        self._resync_known_phones()
+
         # Start API server
         if not self.api_server.start():
             self.logger.warning("Failed to start API server (non-critical)")
@@ -509,6 +515,9 @@ class PBXCore:
 
         self.logger.info("PBX system started successfully")
         return True
+
+    def _resync_known_phones(self) -> None:
+        self.registration_handler.resync_known_phones()
 
     def _start_registration_expiry_timer(self) -> None:
         self.registration_handler._start_registration_expiry_timer()
