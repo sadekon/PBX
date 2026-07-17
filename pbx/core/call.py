@@ -114,6 +114,13 @@ class Call:
         # Count of SIP 3xx redirects followed for this call (loop guard)
         self.redirect_count: int = 0
 
+        # Set by CallOriginator for a PBX-placed call (no original_invite):
+        # {"on_answer": Callable[[Call], None] | None,
+        #  "on_failure": Callable[[Call, str], None] | None}. Dispatched from
+        # handle_callee_answer() and CallOriginator's own no-answer/failure
+        # paths. None for calls reacting to an inbound INVITE.
+        self.originate_callbacks: dict[str, Any] | None = None
+
     def start(self) -> None:
         """Start the call"""
         self.state = CallState.CALLING

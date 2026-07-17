@@ -3,7 +3,6 @@ Click-to-Dial Framework
 Web and application-based dialing with WebRTC integration
 """
 
-import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -117,8 +116,8 @@ class ClickToDialEngine:
 
     def initiate_call(self, extension: str, destination: str, source: str = "web") -> str | None:
         """
-        Initiate click-to-dial call
-        Integrates with PBX call handling to create actual SIP calls
+        Initiate click-to-dial call: rings `extension` first, then bridges
+        it to `destination` once answered, via CallOriginator.
 
         Args:
             extension: Calling extension
@@ -139,36 +138,29 @@ class ClickToDialEngine:
                 (extension, destination, call_id, source, "initiated"),
             )
 
-            # Integrate with PBX call handling if available
-            if self.pbx_core and hasattr(self.pbx_core, "call_manager"):
-                try:
-                    # Create SIP call through CallManager
-                    # This follows the same pattern as WebRTC call initiation
-                    sip_call_id = str(uuid.uuid4())
-                    call = self.pbx_core.call_manager.create_call(
-                        call_id=sip_call_id, from_extension=extension, to_extension=destination
-                    )
-
-                    # Start the call
-                    call.start()
-
-                    # Update call status to indicate PBX integration succeeded
-                    self.update_call_status(call_id, "ringing")
-
-                    self.logger.info(
-                        f"Click-to-dial call created via PBX: {extension} -> {destination} "
-                        f"(source: {source}, sip_call_id: {sip_call_id})"
-                    )
-                except (KeyError, TypeError, ValueError) as e:
-                    self.logger.warning(f"PBX call integration failed, using framework mode: {e}")
-                    # Fall back to framework logging only
-                    self.logger.info(
-                        f"Click-to-dial call initiated (framework mode): {extension} -> {destination} ({source})"
-                    )
-            else:
-                # Framework mode - log only, no actual call creation
+            if self.pbx_core:
+                self.pbx_core.call_originator.originate_and_bridge(
+                    extension,
+                    destination,
+                    on_leg_b_answer=lambda _call: self.update_call_status(
+                        call_id, "connected", connected_at=datetime.now(UTC)
+                    ),
+                    on_failure=lambda _call, reason: self.update_call_status(
+                        call_id, f"failed:{reason}"
+                    ),
+                    on_leg_b_failure=lambda _call, reason: self.update_call_status(
+                        call_id, f"failed:{reason}"
+                    ),
+                )
+                self.update_call_status(call_id, "ringing")
                 self.logger.info(
-                    f"Click-to-dial call initiated (framework mode): {extension} -> {destination} ({source})"
+                    f"Click-to-dial call originated: {extension} -> {destination} "
+                    f"(source: {source}, c2d call_id: {call_id})"
+                )
+            else:
+                self.logger.warning(
+                    f"Click-to-dial call not placed (no PBX core): {extension} -> {destination} "
+                    f"({source})"
                 )
 
             return call_id

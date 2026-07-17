@@ -10,6 +10,7 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,12 @@ class CallRouter:
     # Cap on SIP 3xx redirects followed for a single call, to guard against
     # misconfigured phones that redirect back into a loop.
     MAX_REDIRECTS = 5
+
+    # Classifies a dialed string as an external PSTN number (vs. an internal
+    # extension) -- optional leading 1, then a 10-digit NANP number. Shared
+    # by route_call()'s inbound-INVITE dispatch and CallOriginator's
+    # PBX-initiated dial, so both resolve "internal vs. external" identically.
+    EXTERNAL_NUMBER_PATTERN = re.compile(r"^1?\d{10}$")
 
     def __init__(self, pbx_core: Any) -> None:
         """
@@ -110,7 +117,7 @@ class CallRouter:
             )
 
         # Check if this is an external call (10-digit)
-        if pbx.trunk_system and re.match(r"^1?\d{10}$", to_ext):
+        if pbx.trunk_system and self.EXTERNAL_NUMBER_PATTERN.match(to_ext):
             return self._route_to_trunk(from_ext, to_ext, call_id, message, from_addr)
 
         # Check if destination extension is registered and not expired,
@@ -350,6 +357,11 @@ class CallRouter:
         # Mark CDR as answered for analytics
         pbx.cdr_system.mark_answered(call_id)
 
+        # A PBX-originated leg (CallOriginator, no live caller to relay a
+        # 200 OK to) reports its answer through this callback instead.
+        if call.originate_callbacks and call.originate_callbacks.get("on_answer"):
+            call.originate_callbacks["on_answer"](call)
+
         # Send 200 OK back to caller with PBX's RTP endpoint
         server_ip = pbx._get_server_ip()
 
@@ -504,6 +516,56 @@ class CallRouter:
             return None
 
         return dest_ext
+
+    def _build_and_send_leg_invite(
+        self,
+        call: Any,
+        call_id: str,
+        invite_request: Any,
+        dest_addr: tuple[str, int],
+        server_ip: str,
+        on_timeout: Callable[[], None],
+    ) -> Any:
+        """
+        Attach the transport headers every outbound leg needs (Via with a
+        fresh branch, Content-type, Max-Forwards), start a retransmitting
+        InviteClientTransaction toward dest_addr, and record it on `call`.
+
+        Callers build the request line, From/To/Contact/CSeq, SDP body,
+        caller-ID headers, and any phone/carrier-specific quirks themselves
+        first -- those differ enough between the extension and trunk paths
+        (Contact identity semantics, Zultys SDP quirks, WebRTC short-circuit)
+        that pulling them in here would trade real duplication for a
+        parameter explosion that just moves the duplication into
+        conditional flags.
+
+        Returns:
+            The started InviteClientTransaction.
+        """
+        pbx = self.pbx_core
+        branch_id = str(uuid.uuid4()).replace("-", "")
+        sip_port = pbx.config.get("server.sip_port", 5060)
+        invite_request.set_header(
+            "Via",
+            f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}",
+        )
+        invite_request.set_header("Content-type", "application/sdp")
+        # Max-Forwards is mandatory per RFC 3261 Section 8.1.1.6.
+        # Some strict SIP stacks reject INVITEs without it.
+        invite_request.set_header("Max-Forwards", "70")
+
+        invite_txn = InviteClientTransaction(
+            message=invite_request.build(),
+            dest_addr=dest_addr,
+            send_fn=pbx.sip_server._send_message,
+            on_timeout=on_timeout,
+        )
+        invite_txn.start()
+        call.invite_transaction = invite_txn
+        call.callee_addr = dest_addr
+        call.callee_invite = invite_request
+
+        return invite_txn
 
     def _dial_extension_leg(
         self,
@@ -700,22 +762,15 @@ class CallRouter:
             body=callee_sdp_body,
         )
 
-        # Add required headers
-        # Generate PBX's own Via header so responses come back to the PBX
-        branch_id = str(uuid.uuid4()).replace("-", "")
+        # Add Contact header identifying the caller's extension. Via,
+        # Content-type, and Max-Forwards are attached by
+        # _build_and_send_leg_invite() below, along with the other
+        # transport mechanics every outbound leg needs.
         sip_port = pbx.config.get("server.sip_port", 5060)
-        invite_to_callee.set_header(
-            "Via",
-            f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}",
-        )
         invite_to_callee.set_header(
             "Contact",
             f"<sip:{from_ext}@{server_ip}:{sip_port}>",
         )
-        invite_to_callee.set_header("Content-type", "application/sdp")
-        # Max-Forwards is mandatory per RFC 3261 Section 8.1.1.6.
-        # Some strict SIP stacks reject INVITEs without it.
-        invite_to_callee.set_header("Max-Forwards", "70")
 
         # Add caller ID headers (P-Asserted-Identity and Remote-Party-ID)
         if pbx.config.get("sip.caller_id.send_p_asserted_identity", True) or pbx.config.get(
@@ -765,19 +820,14 @@ class CallRouter:
                 pbx.logger.debug(f"Added X-MAC-Address header: {mac_address}")
 
         # Send INVITE to destination with retransmission (RFC 3261)
-        invite_txn = InviteClientTransaction(
-            message=invite_to_callee.build(),
-            dest_addr=dest_ext_obj.address,
-            send_fn=pbx.sip_server._send_message,
+        self._build_and_send_leg_invite(
+            call,
+            call_id,
+            invite_to_callee,
+            dest_ext_obj.address,
+            server_ip,
             on_timeout=lambda: self._handle_invite_timeout(call_id),
         )
-        invite_txn.start()
-        call.invite_transaction = invite_txn
-
-        # Store callee address for later use (e.g., to send CANCEL if
-        # routing to voicemail)
-        call.callee_addr = dest_ext_obj.address
-        call.callee_invite = invite_to_callee  # Store the INVITE for CANCEL
 
         pbx.logger.info(f"Forwarded INVITE to {to_ext} at {dest_ext_obj.address}")
 
@@ -927,15 +977,11 @@ class CallRouter:
             body=trunk_sdp_body,
         )
 
-        branch_id = str(uuid.uuid4()).replace("-", "")
+        # Add Contact header identifying the dialed number, per carrier
+        # convention. Via, Content-type, and Max-Forwards are attached by
+        # _build_and_send_leg_invite() below.
         sip_port = pbx.config.get("server.sip_port", 5060)
-        invite_to_trunk.set_header(
-            "Via",
-            f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{branch_id}",
-        )
         invite_to_trunk.set_header("Contact", f"<sip:{transformed_number}@{server_ip}:{sip_port}>")
-        invite_to_trunk.set_header("Content-type", "application/sdp")
-        invite_to_trunk.set_header("Max-Forwards", "70")
 
         # If the trunk challenges this INVITE with a 401/407 (some providers
         # require Digest auth on INVITE in addition to REGISTER),
@@ -945,17 +991,14 @@ class CallRouter:
 
         SIPMessageBuilder.add_caller_id_headers(invite_to_trunk, from_ext, from_ext, server_ip)
 
-        invite_txn = InviteClientTransaction(
-            message=invite_to_trunk.build(),
-            dest_addr=trunk_addr,
-            send_fn=pbx.sip_server._send_message,
+        self._build_and_send_leg_invite(
+            call,
+            call_id,
+            invite_to_trunk,
+            trunk_addr,
+            server_ip,
             on_timeout=lambda: self._handle_invite_timeout(call_id),
         )
-        invite_txn.start()
-        call.invite_transaction = invite_txn
-
-        call.callee_addr = trunk_addr
-        call.callee_invite = invite_to_trunk
 
         pbx.logger.info(
             f"Routing call {call_id}: {from_ext} -> {transformed_number} via trunk "

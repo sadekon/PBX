@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from pbx.core.auto_attendant_handler import AutoAttendantHandler
 from pbx.core.call import CallManager
+from pbx.core.call_originator import CallOriginator
 from pbx.core.call_router import CallRouter
 from pbx.core.codec_negotiator import CodecNegotiator
 from pbx.core.emergency_handler import EmergencyHandler
@@ -232,6 +233,7 @@ class PBXCore:
 
         # Initialize handler classes for delegated functionality
         self.call_router = CallRouter(self)
+        self.call_originator = CallOriginator(self)
         self.voicemail_handler = VoicemailHandler(self)
         self.auto_attendant_handler = AutoAttendantHandler(self)
         self.emergency_handler = EmergencyHandler(self)

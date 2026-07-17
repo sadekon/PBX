@@ -211,24 +211,29 @@ class TestInitiateCall:
         mock_db = MagicMock()
         mock_db.db_type = "postgresql"
         mock_pbx = MagicMock()
-        mock_call = MagicMock()
-        mock_pbx.call_manager.create_call.return_value = mock_call
         engine = ClickToDialEngine(db_backend=mock_db, config={}, pbx_core=mock_pbx)
         call_id = engine.initiate_call("1001", "5559999")
         assert call_id is not None
-        mock_pbx.call_manager.create_call.assert_called_once()
-        mock_call.start.assert_called_once()
+        mock_pbx.call_originator.originate_and_bridge.assert_called_once()
+        args, kwargs = mock_pbx.call_originator.originate_and_bridge.call_args
+        assert args[0] == "1001"
+        assert args[1] == "5559999"
+        assert "on_leg_b_answer" in kwargs
+        assert "on_failure" in kwargs
+        assert "on_leg_b_failure" in kwargs
 
     @patch("pbx.features.click_to_dial.get_logger")
     def test_initiate_call_pbx_core_error(self, mock_logger: MagicMock) -> None:
         mock_db = MagicMock()
         mock_db.db_type = "postgresql"
         mock_pbx = MagicMock()
-        mock_pbx.call_manager.create_call.side_effect = ValueError("Call creation failed")
+        mock_pbx.call_originator.originate_and_bridge.side_effect = ValueError(
+            "Origination failed"
+        )
         engine = ClickToDialEngine(db_backend=mock_db, config={}, pbx_core=mock_pbx)
         call_id = engine.initiate_call("1001", "5559999")
-        # Falls back to framework mode
-        assert call_id is not None
+        # Origination failures are no longer swallowed into a fake success.
+        assert call_id is None
 
     @patch("pbx.features.click_to_dial.get_logger")
     def test_initiate_call_db_error(self, mock_logger: MagicMock) -> None:
