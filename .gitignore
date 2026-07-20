@@ -158,6 +158,11 @@ dist/
 build/
 *.tgz
 
+# admin/dist is committed on purpose: Docker/production deploy copies the repo
+# as-is and does not run npm/vite, so the built admin bundle has to ship in git.
+!admin/dist/
+!admin/dist/**
+
 # =============================================================================
 # Generated documentation
 # =============================================================================
