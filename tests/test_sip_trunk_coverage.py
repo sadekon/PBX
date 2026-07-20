@@ -1,5 +1,6 @@
 """Comprehensive tests for pbx/features/sip_trunk.py module."""
 
+import socket
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -205,6 +206,32 @@ class TestSIPTrunkMarkRegistered:
             <= trunk.registration_refresh_at
             <= after + timedelta(seconds=60)
         )
+
+    @patch("pbx.features.sip_trunk.socket.gethostbyname")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_resolves_and_caches_host_ip(
+        self, mock_logger: MagicMock, mock_gethostbyname: MagicMock
+    ) -> None:
+        mock_gethostbyname.return_value = "203.0.113.10"
+        trunk = SIPTrunk("t1", "Primary", "sip.example.com", "user", "pass")
+
+        trunk.mark_registered()
+
+        mock_gethostbyname.assert_called_once_with("sip.example.com")
+        assert trunk.resolved_host_ip == "203.0.113.10"
+
+    @patch("pbx.features.sip_trunk.socket.gethostbyname")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_resolution_failure_does_not_block_registration(
+        self, mock_logger: MagicMock, mock_gethostbyname: MagicMock
+    ) -> None:
+        mock_gethostbyname.side_effect = socket.gaierror("nope")
+        trunk = SIPTrunk("t1", "Primary", "sip.example.com", "user", "pass")
+
+        trunk.mark_registered()
+
+        assert trunk.resolved_host_ip is None
+        assert trunk.status == TrunkStatus.REGISTERED
 
 
 @pytest.mark.unit
@@ -675,6 +702,58 @@ class TestSIPTrunkSystemTrunkManagement:
     def test_get_trunk_not_found(self, mock_logger: MagicMock, mock_e911: MagicMock) -> None:
         system = SIPTrunkSystem()
         assert system.get_trunk("nonexistent") is None
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_get_trunk_by_addr_matches_resolved_ip(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        system = SIPTrunkSystem()
+        trunk = _make_trunk("t1", "Primary")
+        trunk.resolved_host_ip = "203.0.113.10"
+        system.add_trunk(trunk)
+
+        # Port need not match the REGISTER target -- carriers commonly
+        # source INVITEs from a different port.
+        assert system.get_trunk_by_addr(("203.0.113.10", 9999)) is trunk
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_get_trunk_by_addr_no_match(self, mock_logger: MagicMock, mock_e911: MagicMock) -> None:
+        system = SIPTrunkSystem()
+        trunk = _make_trunk("t1", "Primary")
+        trunk.resolved_host_ip = "203.0.113.10"
+        system.add_trunk(trunk)
+
+        assert system.get_trunk_by_addr(("198.51.100.5", 5060)) is None
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_get_trunk_by_addr_unregistered_trunk_never_matches(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        """A trunk that has never registered has no resolved_host_ip and can't match."""
+        system = SIPTrunkSystem()
+        trunk = _make_trunk("t1", "Primary")
+        assert trunk.resolved_host_ip is None
+        system.add_trunk(trunk)
+
+        assert system.get_trunk_by_addr(("203.0.113.10", 5060)) is None
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_get_trunk_by_addr_picks_correct_trunk_among_several(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        system = SIPTrunkSystem()
+        t1 = _make_trunk("t1", "Primary")
+        t1.resolved_host_ip = "203.0.113.10"
+        t2 = _make_trunk("t2", "Secondary")
+        t2.resolved_host_ip = "203.0.113.20"
+        system.add_trunk(t1)
+        system.add_trunk(t2)
+
+        assert system.get_trunk_by_addr(("203.0.113.20", 5060)) is t2
 
     @patch("pbx.features.sip_trunk.E911Protection")
     @patch("pbx.features.sip_trunk.get_logger")

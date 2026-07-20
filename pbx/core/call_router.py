@@ -61,8 +61,6 @@ class CallRouter:
         Returns:
             True if call was routed successfully
         """
-        from pbx.sip.sdp import SDPSession
-
         pbx = self.pbx_core
 
         # Parse extension numbers - handle both regular extensions and special
@@ -78,6 +76,18 @@ class CallRouter:
 
         from_ext = from_match.group(1)
         to_ext = to_match.group(1)
+
+        # Calls arriving from a registered SIP trunk are inbound PSTN calls,
+        # not internal ones -- the From header is carrier caller ID, not a
+        # registry-validated extension, so none of the internal-origin
+        # checks below (emergency, auto attendant, voicemail access,
+        # dialplan) apply. Must run before all of them.
+        if pbx.trunk_system:
+            trunk = pbx.trunk_system.get_trunk_by_addr(from_addr)
+            if trunk:
+                return self._route_inbound_did(
+                    trunk, from_ext, to_ext, from_header, to_header, call_id, message, from_addr
+                )
 
         # Check if this is an emergency call (911) - Kari's Law compliance
         # Must be handled first for immediate routing
@@ -119,6 +129,34 @@ class CallRouter:
         # Check if this is an external call (10-digit)
         if pbx.trunk_system and self.EXTERNAL_NUMBER_PATTERN.match(to_ext):
             return self._route_to_trunk(from_ext, to_ext, call_id, message, from_addr)
+
+        return self._dial_to_internal_extension(
+            from_ext, to_ext, from_header, to_header, call_id, message, from_addr
+        )
+
+    def _dial_to_internal_extension(
+        self,
+        from_ext: str,
+        to_ext: str,
+        from_header: str,
+        to_header: str,
+        call_id: str,
+        message: Any,
+        from_addr: tuple[str, int],
+    ) -> bool:
+        """
+        Resolve `to_ext` as a live internal extension and dial it: dialplan
+        check, relay allocation, CDR, webhook, and INVITE construction --
+        exactly what route_call() has always done for an internal
+        destination. Extracted so _route_inbound_did() can give a DID that
+        resolves to an extension the same treatment as a directly-dialed one.
+
+        Returns:
+            True if the call was routed successfully.
+        """
+        from pbx.sip.sdp import SDPSession
+
+        pbx = self.pbx_core
 
         # Check if destination extension is registered and not expired,
         # recovering its registration from the database if necessary.
@@ -222,6 +260,85 @@ class CallRouter:
         )
 
         return True
+
+    def _route_inbound_did(
+        self,
+        trunk: Any,
+        from_ext: str,
+        to_ext: str,
+        from_header: str,
+        to_header: str,
+        call_id: str,
+        message: Any,
+        from_addr: tuple[str, int],
+    ) -> bool:
+        """
+        Dispatch an inbound call arriving from `trunk` to its configured
+        destination, looked up by the dialed DID (`to_ext`).
+
+        Args:
+            trunk: The SIPTrunk this INVITE arrived from.
+            from_ext: Caller-ID digits parsed from the From header (carrier
+                caller ID -- not a registry-validated internal extension).
+            to_ext: Dialed DID number, parsed from the To header.
+            from_header: Raw From header of the caller's INVITE.
+            to_header: Raw To header of the caller's INVITE.
+            call_id: SIP Call-ID.
+            message: The INVITE message.
+            from_addr: Address the INVITE arrived from.
+
+        Returns:
+            True if the call was dispatched. False if no inbound route
+            matches this DID -- SIPServer sends a 404 in that case, same as
+            any other route_call() failure.
+        """
+        pbx = self.pbx_core
+        route = pbx.inbound_routing.lookup(to_ext, trunk.trunk_id)
+        if not route:
+            pbx.logger.warning(f"No inbound route for DID {to_ext} on trunk {trunk.trunk_id}")
+            return False
+
+        destination_type = route["destination_type"]
+        destination_value = route["destination_value"]
+
+        if destination_type == "extension":
+            rewritten_to_header = re.sub(
+                r"sip:(\*?[^@]+)@", f"sip:{destination_value}@", to_header, count=1
+            )
+            return self._dial_to_internal_extension(
+                from_ext,
+                destination_value,
+                from_header,
+                rewritten_to_header,
+                call_id,
+                message,
+                from_addr,
+            )
+
+        if destination_type == "auto_attendant":
+            if not pbx.auto_attendant:
+                pbx.logger.warning(
+                    f"Inbound route for DID {to_ext} points to the auto attendant, "
+                    "but the auto attendant feature is not enabled"
+                )
+                return False
+            return bool(
+                pbx.auto_attendant_handler.handle_auto_attendant(
+                    from_ext, pbx.auto_attendant.get_extension(), call_id, message, from_addr
+                )
+            )
+
+        if destination_type == "voicemail":
+            return bool(
+                pbx.voicemail_handler.handle_voicemail_access(
+                    from_ext, f"*{destination_value}", call_id, message, from_addr
+                )
+            )
+
+        pbx.logger.error(
+            f"Inbound route for DID {to_ext} has unknown destination_type={destination_type!r}"
+        )
+        return False
 
     def handle_callee_answer(
         self, call_id: str, response_message: Any, callee_addr: tuple[str, int]

@@ -4,6 +4,7 @@ Allows external calls through SIP providers
 Includes health monitoring and automatic failover
 """
 
+import socket
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -85,6 +86,10 @@ class SIPTrunk:
         # PBXCore._get_codecs_for_phone_model's ultimate fallback).
         self.codec_preferences = codec_preferences or ["0", "8", "9", "18", "2"]
         self.status = TrunkStatus.UNREGISTERED
+        # host resolved to an IP, so inbound INVITEs can be matched against
+        # it without a DNS lookup per call. Refreshed on each successful
+        # registration; None until then.
+        self.resolved_host_ip: str | None = None
         self.priority = priority
         self.max_channels = max_channels
         self.channels_available = max_channels
@@ -228,6 +233,11 @@ class SIPTrunk:
         self.health_status = TrunkHealthStatus.HEALTHY
         self.registration_failures = 0
         self.consecutive_failures = 0
+
+        try:
+            self.resolved_host_ip = socket.gethostbyname(self.host)
+        except socket.gaierror as e:
+            self.logger.warning(f"Could not resolve trunk host {self.host}: {e}")
 
         now = datetime.now(UTC)
         self.registration_expires_at = now + timedelta(seconds=expires_seconds)
@@ -707,6 +717,29 @@ class SIPTrunkSystem:
     def get_trunk(self, trunk_id: str) -> Any | None:
         """Look up a registered ``SIPTrunk`` by its ``trunk_id``, or None if not found."""
         return self.trunks.get(trunk_id)
+
+    def get_trunk_by_addr(self, addr: tuple[str, int]) -> Any | None:
+        """
+        Identify the trunk an inbound INVITE arrived from, by matching its
+        source IP against each trunk's ``resolved_host_ip``.
+
+        Matches IP only, not port -- carriers commonly source INVITEs from a
+        different port than the REGISTER target. A trunk that has never
+        registered successfully has no resolved IP and cannot match.
+        Field-unverified against a real carrier.
+
+        Args:
+            addr: Source address the INVITE arrived from.
+
+        Returns:
+            The matching ``SIPTrunk``, or None if no trunk's resolved host
+            IP matches.
+        """
+        source_ip = addr[0]
+        for trunk in self.trunks.values():
+            if trunk.resolved_host_ip == source_ip:
+                return trunk
+        return None
 
     def register_all(self) -> None:
         """Call ``register()`` on every trunk currently managed by this system (e.g. on startup), routed through ``self.sip_server`` if one was provided."""

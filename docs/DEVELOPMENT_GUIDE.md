@@ -48,7 +48,7 @@ with a second gate says so in its row.
 | **C2** | RTP media relay & IVR plumbing — relay, DTMF (RFC 2833 + SIP INFO + in-band), prompt playback, recording tap | ✅ voicemail-fix merged to DEV; DTMF sources unified into one `DTMFMonitor` on `auto-attendant` | `pbx/rtp/`, `core/voicemail_handler.py`, `rtp/handler.py`, `rtp/dtmf_monitor.py` | Voicemail, AA, MoH, recording, paging; codec expansion slots in here |
 | **C3** | **Audio mixer (N-way media) — does not exist** | ❌ missing | (to build: sum/mix G.711 streams per participant, or bridge via Jitsi) | Conference audio, 3-way calling, barge/whisper/screening |
 | **C4** | Call-originate primitive ("PBX creates a leg to X, then bridges") | ✅ built on `sip-trunk` | `core/call_originator.py`, `core/call_router.py` (`_build_and_send_leg_invite`) | `CallOriginator.originate_call()`/`originate_and_bridge()`; click-to-dial wired onto it. Callback completion, predictive dialing, emergency-notification calls, operator console remain to be wired. Field-unverified against real phones. |
-| **C5** | Trunk / PSTN connectivity | 🔶 outbound done on `sip-trunk`; inbound (DID) **data layer done, call dispatch missing** | `features/sip_trunk.py`, `features/inbound_routing.py`, `sip/server.py`, `core/call_router.py` | DID routing, E911 stack, LCR, STIR/SHAKEN, DNS SRV failover, fraud detection on real traffic, SBC validation |
+| **C5** | Trunk / PSTN connectivity | 🔶 outbound + inbound DID routing built on `sip-trunk`; **field-unverified** (no carrier account) | `features/sip_trunk.py`, `features/inbound_routing.py`, `sip/server.py`, `core/call_router.py` | E911 stack, LCR, STIR/SHAKEN, DNS SRV failover, fraud detection on real traffic, SBC validation |
 | **C6** | Analytics tap — live audio/transcript/QoS feed into analysis engines | 🔶 recordings + RTCP QoS data exist; no live feed wiring | `features/call_recording.py`, `rtp/rtcp_monitor.py` | Speech analytics, voice biometrics, call tagging, quality prediction, recording analytics, conversational AI |
 | **C7** | Data & event plane — CDR, webhooks, DB persistence, migrations | ✅ working | `features/cdr.py`, `features/webhooks.py`, `utils/database.py` | BI export, compliance, retention, residency, geo-redundancy replication build on it |
 
@@ -270,6 +270,16 @@ covers several). Each needs an explicit wire-or-cut decision before "finished" m
 - **Trunk failure handling**: `_handle_trunk_failure()` now re-points affected outbound
   rules to the failover trunk and restores them when the trunk recovers (via the existing
   `_perform_health_checks()` loop). Notification remains log-only.
+- **Inbound DID routing — SIP dispatch**: `SIPTrunk.resolved_host_ip` (cached in
+  `mark_registered()`) + `SIPTrunkSystem.get_trunk_by_addr()` identify an inbound INVITE
+  as trunk-sourced (IP match only, not port). `CallRouter._route_inbound_did()` looks up
+  the dialed DID via `inbound_routing.lookup()` and dispatches to an extension (through a
+  new `_dial_to_internal_extension()`, extracted from `route_call()` so both paths share
+  identical relay/CDR/webhook handling), the auto attendant, or voicemail. The hook in
+  `route_call()` runs before the Kari's Law/emergency and dialplan checks, since a
+  carrier's From header is caller-ID digits, not an internal extension. Queue as a
+  destination type is deliberately out of scope for v1. **The IP-matching heuristic is
+  exactly what needs real-carrier field validation** — not treated as verified.
 - **Tests**: substantial coverage additions (`test_sip_server_coverage.py`,
   `test_sip_trunk_coverage.py`, `test_call_router_coverage.py`,
   `test_call_originator_coverage.py`, `test_click_to_dial_coverage.py`,
@@ -277,32 +287,16 @@ covers several). Each needs an explicit wire-or-cut decision before "finished" m
 
 ### Remaining to finish
 
-1. **Inbound DID routing — SIP dispatch is the missing half.** The data layer, API and
-   admin UI are done (above); nothing in the call path consumes them yet. Remaining:
-   - `SIPTrunkSystem.get_trunk_by_addr(addr)` — match an inbound INVITE's source against
-     registered trunks' resolved host IPs. Resolve+cache the hostname (trunk hosts are
-     hostnames in the AT&T/Comcast templates); match **IP only, not port** — carriers
-     commonly source INVITEs from a different port than the REGISTER target.
-   - `CallRouter._route_inbound_did()` — parse the DID from the To header, call
-     `inbound_routing.lookup()`, dispatch through the **existing internal handlers**
-     (`_dial_extension_leg()` / `auto_attendant_handler` / `voicemail_handler`).
-   - Hook in `route_call()` placed **before** the Kari's Law/emergency and dialplan checks —
-     a carrier's From header is caller-ID digits, not an internal extension, so none of the
-     internal-origin checks are meaningful for a trunk-sourced call.
-   - Queue as a destination type is deliberately out of scope for v1 (needs queue-addressing
-     research); extension/AA/voicemail cover it.
-   - **The IP-matching heuristic is exactly what needs real-carrier field validation** — do
-     not treat it as verified.
-2. **STIR/SHAKEN wiring** — `features/stir_shaken.py` is complete but called from nowhere.
-   Wire into the outbound trunk INVITE path (Identity header) and the inbound path once (1)
-   lands. Needs signing certs from carrier/STI-PA.
-3. **NAT/public-address handling** for SDP and Via/Contact toward the carrier (external IP
+1. **STIR/SHAKEN wiring** — `features/stir_shaken.py` is complete but called from nowhere.
+   Wire into the outbound trunk INVITE path (Identity header) and the inbound path (now
+   that DID dispatch exists). Needs signing certs from carrier/STI-PA.
+2. **NAT/public-address handling** for SDP and Via/Contact toward the carrier (external IP
    config, symmetric RTP) — untested until Rig C exists.
-4. **Carrier validation** against a real provider (config templates for AT&T and Comcast
+3. **Carrier validation** against a real provider (config templates for AT&T and Comcast
    exist: `config_att_sip.yml`, `config_comcast_sip.yml`; a cheap SIP provider like
-   VoIP.ms/Telnyx/Twilio is the low-risk first target). Gates (1)'s IP heuristic, (2)'s
-   certs, (3) entirely, and end-to-end PSTN in both directions.
-5. Follow-ons unlocked afterward: least-cost routing, DNS SRV failover, E911 via carrier,
+   VoIP.ms/Telnyx/Twilio is the low-risk first target). Gates the IP-matching heuristic,
+   (1)'s certs, (2) entirely, and end-to-end PSTN in both directions.
+4. Follow-ons unlocked afterward: least-cost routing, DNS SRV failover, E911 via carrier,
    FMFM-to-external, predictive dialing.
 
 ---
@@ -404,12 +398,11 @@ transfer with MOH, call forwarding, unified DTMF).
 *Exit: voicemail + AA fully driveable by DTMF from every supported phone model; blind and
 attended transfer, and call forwarding, verified on real phones.*
 
-**Phase 2 — Finish SIP trunking (C5, Rig C).** Inbound DID data layer, legacy outbound stub
-removal, and real trunk-failure handling are done; remaining is the inbound DID **SIP
-dispatch** (`get_trunk_by_addr()` + `_route_inbound_did()` + `route_call()` hook), then
-NAT handling and validation against a low-cost carrier, then AT&T/Comcast configs.
-*Exit: a PSTN caller reaches an extension via DID, and an extension dials out —
-reliably, with failover.*
+**Phase 2 — Finish SIP trunking (C5, Rig C).** Inbound DID routing (data layer + SIP
+dispatch), legacy outbound stub removal, and real trunk-failure handling are all code-
+complete; remaining is NAT handling and validation against a low-cost carrier, then
+AT&T/Comcast configs. *Exit: a PSTN caller reaches an extension via DID, and an
+extension dials out — reliably, with failover.*
 
 **Phase 3 — Emergency stack (C4-lite + C5, Rig C + E).** Replace `emergency_notification.py`
 stubs with real email/SMS/call/paging actions; E911 location flow through the trunk
@@ -447,7 +440,7 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 
 | # | Task | Depends on | Status |
 |---|------|-----------|--------|
-| A1 | Inbound DID routing (finishes C5) | sip-trunk branch | 🚧 data layer + API + admin UI done; SIP dispatch (`get_trunk_by_addr` / `_route_inbound_did` / `route_call` hook) remaining |
+| A1 | Inbound DID routing (finishes C5) | sip-trunk branch | ✅ code-complete (data layer + API + admin UI + SIP dispatch); field-unverified, no carrier account yet |
 | A2 | NAT/public-IP handling for trunk SDP/Via/Contact + symmetric RTP | carrier account (B1) | ❌ untested |
 | A3 | `voicemail-fix` merged to DEV (PR #1); hardware regression on Zultys/Cisco ATA still outstanding | — | 🚧 |
 | A4 | Kari's Law on-site notification: wire `emergency_notification.py` email action to existing SMTP (`email_notification.py`) — legal requirement | SMTP creds | ❌ stubbed |
@@ -526,7 +519,7 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 
 ### Code blockers (critical path)
 
-- [ ] **Inbound DID routing** (C5) — DID→destination map, API and admin UI exist; still need to recognize INVITEs from trunk hosts and dispatch them (`get_trunk_by_addr` / `_route_inbound_did` / `route_call` hook)
+- [ ] **Inbound DID routing** (C5) — code-complete (DID→destination map, API, admin UI, SIP dispatch); needs real-carrier validation of the trunk IP-matching heuristic
 - [ ] Outbound trunk validation on test DID: registration, NAT/public-IP in SDP/Via/Contact, DTMF to external IVRs, codec negotiation
 - [ ] `voicemail-fix` merged (PR #1); regression on office phone models still outstanding
 - [ ] Merge `auto-attendant` (PR #2 — REFER/attended transfer, RTP-relay AA transfer + MOH, call forwarding, unified DTMF); regression-test transfer + forwarding on office phone models
