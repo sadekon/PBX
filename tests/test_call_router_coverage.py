@@ -1147,6 +1147,100 @@ class TestRouteToTrunkNoAnswerTimer:
 
 
 # ===========================================================================
+# CallRouter._route_to_trunk - outbound caller ID
+# ===========================================================================
+
+
+def _trunk_pbx_with_extension(did_number: str | None) -> MagicMock:
+    """Build a mock PBXCore for trunk-routing tests with a configurable caller extension."""
+    pbx = _make_pbx_core()
+
+    mock_trunk = MagicMock()
+    mock_trunk.host = "trunk.example.com"
+    mock_trunk.port = 5060
+    mock_trunk.name = "Test Trunk"
+    mock_trunk.codec_preferences = ["0", "8", "18"]
+    mock_trunk.allocate_channel.return_value = True
+    pbx.trunk_system = MagicMock()
+    pbx.trunk_system.route_outbound_with_failover.return_value = (mock_trunk, "12125551234")
+
+    caller_ext = MagicMock()
+    caller_ext.name = "Jane Caller"
+    caller_ext.config = {"did_number": did_number}
+    pbx.extension_registry.get.return_value = caller_ext
+
+    return pbx
+
+
+@pytest.mark.unit
+class TestRouteToTrunkCallerID:
+    """Tests for outbound caller ID resolution in _route_to_trunk."""
+
+    def test_uses_extension_did_when_set(self) -> None:
+        pbx = _trunk_pbx_with_extension(did_number="19725550100")
+        router = CallRouter(pbx)
+        msg = _make_invite_message(to_ext="12125551234", body="")
+
+        with patch(
+            "pbx.sip.message.SIPMessageBuilder.add_caller_id_headers"
+        ) as mock_add_caller_id:
+            result = router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
+
+        assert result is True
+        _, number_arg, name_arg, _ = mock_add_caller_id.call_args[0]
+        assert number_arg == "19725550100"
+        assert name_arg == "Jane Caller"
+
+    def test_falls_back_to_extension_number_without_did(self) -> None:
+        pbx = _trunk_pbx_with_extension(did_number=None)
+        router = CallRouter(pbx)
+        msg = _make_invite_message(to_ext="12125551234", body="")
+
+        with patch(
+            "pbx.sip.message.SIPMessageBuilder.add_caller_id_headers"
+        ) as mock_add_caller_id:
+            result = router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
+
+        assert result is True
+        _, number_arg, name_arg, _ = mock_add_caller_id.call_args[0]
+        assert number_arg == "1001"
+        assert name_arg == "Jane Caller"
+
+    def test_falls_back_to_extension_number_when_extension_unknown(self) -> None:
+        pbx = _trunk_pbx_with_extension(did_number="19725550100")
+        pbx.extension_registry.get.return_value = None
+        router = CallRouter(pbx)
+        msg = _make_invite_message(to_ext="12125551234", body="")
+
+        with patch(
+            "pbx.sip.message.SIPMessageBuilder.add_caller_id_headers"
+        ) as mock_add_caller_id:
+            result = router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
+
+        assert result is True
+        _, number_arg, name_arg, _ = mock_add_caller_id.call_args[0]
+        assert number_arg == "1001"
+        assert name_arg == "1001"
+
+    def test_from_header_uses_extension_did(self) -> None:
+        pbx = _trunk_pbx_with_extension(did_number="19725550100")
+        router = CallRouter(pbx)
+        msg = _make_invite_message(to_ext="12125551234", body="")
+
+        captured: dict[str, Any] = {}
+
+        def _capture(call: Any, call_id: Any, invite_request: Any, *args: Any, **kwargs: Any) -> MagicMock:
+            captured["from_header"] = invite_request.get_header("From")
+            return MagicMock()
+
+        with patch.object(router, "_build_and_send_leg_invite", side_effect=_capture):
+            router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
+
+        assert "19725550100" in captured["from_header"]
+        assert "1001" not in captured["from_header"]
+
+
+# ===========================================================================
 # CallRouter.route_call - CDR and webhooks
 # ===========================================================================
 

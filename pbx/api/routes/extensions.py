@@ -48,6 +48,7 @@ def get_extensions() -> tuple[Response, int]:
                     "ad_synced": e.config.get("ad_synced", False),
                     "voicemail_enabled": e.config.get("voicemail_pin_hash") is not None,
                     "is_admin": e.config.get("is_admin", False),
+                    "did_number": e.config.get("did_number"),
                 }
                 for e in extensions
             ]
@@ -75,9 +76,17 @@ def add_extension() -> tuple[Response, int]:
         allow_external = body.get("allow_external", True)
         voicemail_pin = body.get("voicemail_pin")
         is_admin = body.get("is_admin", False)
+        did_number = body.get("did_number") or None
 
         if not all([number, name, password]):
             return send_json({"error": "Missing required fields"}, 400), 400
+
+        # Validate DID number format if provided (digits only)
+        if did_number and not str(did_number).isdigit():
+            return send_json({"error": "DID number must contain only digits"}, 400), 400
+
+        if did_number and pbx_core.extension_db and pbx_core.extension_db.get_by_did(did_number):
+            return send_json({"error": "DID number is already assigned to another extension"}, 400), 400
 
         # SECURITY: Validate voicemail PIN is provided
         if not voicemail_pin:
@@ -124,6 +133,7 @@ def add_extension() -> tuple[Response, int]:
                 ad_synced=False,
                 ad_username=None,
                 is_admin=is_admin,
+                did_number=did_number,
             )
         else:
             # Fall back to config.yml
@@ -154,11 +164,24 @@ def update_extension(number: str) -> tuple[Response, int]:
         allow_external = body.get("allow_external")
         voicemail_pin = body.get("voicemail_pin")
         is_admin = body.get("is_admin")
+        # "" explicitly clears the DID; absent/None leaves it untouched
+        did_number = body.get("did_number") if "did_number" in body else None
 
         # Check if extension exists
         extension = pbx_core.extension_registry.get(number)
         if not extension:
             return send_json({"error": "Extension not found"}, 404), 404
+
+        # Validate DID number format if provided (digits only)
+        if did_number and not str(did_number).isdigit():
+            return send_json({"error": "DID number must contain only digits"}, 400), 400
+
+        if did_number and pbx_core.extension_db:
+            existing = pbx_core.extension_db.get_by_did(did_number)
+            if existing and existing["number"] != number:
+                return send_json(
+                    {"error": "DID number is already assigned to another extension"}, 400
+                ), 400
 
         # Validate password strength if provided (minimum 8 characters)
         if password and len(password) < 8:
@@ -191,6 +214,7 @@ def update_extension(number: str) -> tuple[Response, int]:
                 allow_external=allow_external,
                 voicemail_pin=voicemail_pin,
                 is_admin=is_admin,
+                did_number=did_number,
             )
         else:
             # Fall back to config.yml

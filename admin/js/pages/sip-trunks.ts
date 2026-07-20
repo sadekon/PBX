@@ -88,6 +88,23 @@ interface LCRRatesResponse {
     time_rates?: LCRTimeRate[];
 }
 
+interface InboundRoute {
+    id?: number;
+    did_number: string;
+    trunk_id?: string | null;
+    destination_type: string;
+    destination_value: string;
+    enabled: boolean;
+    priority: number;
+    source: 'manual' | 'extension';
+    shadowed?: boolean;
+}
+
+interface InboundRoutesResponse {
+    routes?: InboundRoute[];
+    count?: number;
+}
+
 interface LCRDecision {
     timestamp: string;
     number: string;
@@ -393,6 +410,185 @@ export async function testTrunk(trunkId: string): Promise<void> {
     } catch (error: unknown) {
         console.error('Error testing trunk:', error);
         showNotification('Error testing trunk', 'error');
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inbound DID Routing
+// ---------------------------------------------------------------------------
+
+// Cache of the last-loaded effective routes, so editInboundRoute() can look
+// up a row's current values without a second request.
+let currentInboundRoutes: InboundRoute[] = [];
+
+function inboundRouteSourceLabel(route: InboundRoute): string {
+    if (route.source === 'manual') return 'Manual';
+    const shadowed = route.shadowed
+        ? ' <span class="badge" style="background:#6b7280;">shadowed by a manual route</span>'
+        : '';
+    return `via extension ${escapeHtml(route.destination_value)}${shadowed}`;
+}
+
+export async function loadInboundRoutes(): Promise<void> {
+    try {
+        const API_BASE = getApiBaseUrl();
+        const response = await fetchWithTimeout(`${API_BASE}/api/inbound-routes`, {
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const data: InboundRoutesResponse = await response.json();
+        currentInboundRoutes = data.routes ?? [];
+
+        const tbody = document.getElementById('inbound-routes-list') as HTMLElement | null;
+        if (!tbody) return;
+
+        if (currentInboundRoutes.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center;">No inbound routes configured</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = currentInboundRoutes.map(route => {
+            // Only manual routes are real inbound_routes rows with an id;
+            // extension-derived entries are synthesized and edited from the
+            // Extensions page instead.
+            const actions = route.source === 'manual' && route.id !== undefined
+                ? `
+                    <button class="btn-small btn-primary" onclick="editInboundRoute(${route.id})">Edit</button>
+                    <button class="btn-small btn-danger" onclick="deleteInboundRoute(${route.id}, '${escapeHtml(route.did_number)}')">Delete</button>
+                `
+                : '<small>Edit on Extensions page</small>';
+
+            return `
+                <tr>
+                    <td><strong>${escapeHtml(route.did_number)}</strong></td>
+                    <td>${route.trunk_id ? escapeHtml(route.trunk_id) : 'Any'}</td>
+                    <td>${escapeHtml(route.destination_type)}: ${escapeHtml(route.destination_value)}</td>
+                    <td>${route.priority}</td>
+                    <td>${route.enabled ? 'Yes' : 'No'}</td>
+                    <td>${inboundRouteSourceLabel(route)}</td>
+                    <td>${actions}</td>
+                </tr>
+            `;
+        }).join('');
+    } catch (error: unknown) {
+        console.error('Error loading inbound routes:', error);
+        const message = error instanceof Error ? error.message : String(error);
+        showNotification(`Error loading inbound routes: ${message}`, 'error');
+    }
+}
+
+export function showAddInboundRouteModal(): void {
+    const form = document.getElementById('inbound-route-form') as HTMLFormElement | null;
+    if (form) form.reset();
+    const idField = document.getElementById('inbound-route-id') as HTMLInputElement | null;
+    if (idField) idField.value = '';
+    const title = document.getElementById('inbound-route-modal-title') as HTMLElement | null;
+    if (title) title.textContent = '➕ Add Inbound Route';
+
+    const modal = document.getElementById('inbound-route-modal') as HTMLElement | null;
+    if (modal) modal.style.display = 'block';
+}
+
+export function editInboundRoute(routeId: number): void {
+    const route = currentInboundRoutes.find(r => r.id === routeId);
+    if (!route) return;
+
+    const idField = document.getElementById('inbound-route-id') as HTMLInputElement | null;
+    if (idField) idField.value = String(routeId);
+    const did = document.getElementById('inbound-route-did') as HTMLInputElement | null;
+    if (did) did.value = route.did_number;
+    const trunk = document.getElementById('inbound-route-trunk') as HTMLInputElement | null;
+    if (trunk) trunk.value = route.trunk_id ?? '';
+    const destType = document.getElementById('inbound-route-destination-type') as HTMLSelectElement | null;
+    if (destType) destType.value = route.destination_type;
+    const destValue = document.getElementById('inbound-route-destination-value') as HTMLInputElement | null;
+    if (destValue) destValue.value = route.destination_value;
+    const priority = document.getElementById('inbound-route-priority') as HTMLInputElement | null;
+    if (priority) priority.value = String(route.priority);
+    const enabled = document.getElementById('inbound-route-enabled') as HTMLInputElement | null;
+    if (enabled) enabled.checked = route.enabled;
+
+    const title = document.getElementById('inbound-route-modal-title') as HTMLElement | null;
+    if (title) title.textContent = `✏️ Edit Inbound Route (${route.did_number})`;
+
+    const modal = document.getElementById('inbound-route-modal') as HTMLElement | null;
+    if (modal) modal.style.display = 'block';
+}
+
+export function closeInboundRouteModal(): void {
+    const modal = document.getElementById('inbound-route-modal') as HTMLElement | null;
+    if (modal) modal.style.display = 'none';
+    const form = document.getElementById('inbound-route-form') as HTMLFormElement | null;
+    if (form) form.reset();
+}
+
+export async function saveInboundRoute(event: Event): Promise<void> {
+    event.preventDefault();
+
+    const val = (id: string): string => (document.getElementById(id) as HTMLInputElement)?.value ?? '';
+    const routeId = val('inbound-route-id');
+
+    const routeData = {
+        did_number: val('inbound-route-did'),
+        trunk_id: val('inbound-route-trunk'),
+        destination_type: val('inbound-route-destination-type'),
+        destination_value: val('inbound-route-destination-value'),
+        priority: parseInt(val('inbound-route-priority')) || 100,
+        enabled: (document.getElementById('inbound-route-enabled') as HTMLInputElement)?.checked ?? true,
+    };
+
+    try {
+        const API_BASE = getApiBaseUrl();
+        const url = routeId
+            ? `${API_BASE}/api/inbound-routes/${routeId}`
+            : `${API_BASE}/api/inbound-routes`;
+
+        const response = await fetchWithTimeout(url, {
+            method: routeId ? 'PUT' : 'POST',
+            headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify(routeData)
+        });
+
+        const data: ApiSuccessResponse = await response.json();
+        if (data.success) {
+            showNotification(`Inbound route for ${routeData.did_number} saved`, 'success');
+            closeInboundRouteModal();
+            loadInboundRoutes();
+        } else {
+            showNotification(data.error || 'Error saving inbound route', 'error');
+        }
+    } catch (error: unknown) {
+        console.error('Error saving inbound route:', error);
+        showNotification('Error saving inbound route', 'error');
+    }
+}
+
+export async function deleteInboundRoute(routeId: number, didNumber: string): Promise<void> {
+    if (!confirm(`Are you sure you want to delete the inbound route for "${didNumber}"?`)) {
+        return;
+    }
+
+    try {
+        const API_BASE = getApiBaseUrl();
+        const response = await fetchWithTimeout(`${API_BASE}/api/inbound-routes/${routeId}`, {
+            method: 'DELETE',
+            headers: getAuthHeaders()
+        });
+
+        const data: ApiSuccessResponse = await response.json();
+        if (data.success) {
+            showNotification(`Inbound route for ${didNumber} deleted`, 'success');
+            loadInboundRoutes();
+        } else {
+            showNotification(data.error || 'Error deleting inbound route', 'error');
+        }
+    } catch (error: unknown) {
+        console.error('Error deleting inbound route:', error);
+        showNotification('Error deleting inbound route', 'error');
     }
 }
 
@@ -807,6 +1003,12 @@ export async function clearLCRRates(): Promise<void> {
 (window as any).addSIPTrunk = addSIPTrunk;
 (window as any).deleteTrunk = deleteTrunk;
 (window as any).testTrunk = testTrunk;
+(window as any).loadInboundRoutes = loadInboundRoutes;
+(window as any).showAddInboundRouteModal = showAddInboundRouteModal;
+(window as any).editInboundRoute = editInboundRoute;
+(window as any).closeInboundRouteModal = closeInboundRouteModal;
+(window as any).saveInboundRoute = saveInboundRoute;
+(window as any).deleteInboundRoute = deleteInboundRoute;
 (window as any).loadLCRRates = loadLCRRates;
 (window as any).loadLCRStatistics = loadLCRStatistics;
 (window as any).showAddLCRRateModal = showAddLCRRateModal;

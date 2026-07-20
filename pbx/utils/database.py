@@ -555,6 +555,7 @@ class DatabaseBackend:
             password_changed_at TIMESTAMP,
             failed_login_attempts INTEGER DEFAULT 0,
             account_locked_until TIMESTAMP,
+            did_number VARCHAR(20) UNIQUE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -1243,6 +1244,7 @@ class ExtensionDB:
         ad_username: str | None = None,
         is_admin: bool = False,
         sip_password: str | None = None,
+        did_number: str | None = None,
     ) -> bool:
         """
         Add a new extension
@@ -1258,6 +1260,7 @@ class ExtensionDB:
             ad_username: Active Directory username (optional)
             is_admin: Whether extension has admin privileges (optional)
             sip_password: SIP authentication password for phone provisioning (optional)
+            did_number: Carrier-assigned DID this extension answers directly (optional)
 
         Returns:
             bool: True if successful
@@ -1271,8 +1274,8 @@ class ExtensionDB:
             return False
 
         query = """
-        INSERT INTO extensions (number, name, email, password_hash, allow_external, voicemail_pin_hash, voicemail_pin_salt, ad_synced, ad_username, is_admin, sip_password)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO extensions (number, name, email, password_hash, allow_external, voicemail_pin_hash, voicemail_pin_salt, ad_synced, ad_username, is_admin, sip_password, did_number)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         return self.db.execute(
@@ -1289,6 +1292,7 @@ class ExtensionDB:
                 ad_username,
                 is_admin,
                 sip_password,
+                did_number,
             ),
         )
 
@@ -1303,9 +1307,24 @@ class ExtensionDB:
             dict: Extension data or None
         """
         query = """
-        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password FROM extensions WHERE number = %s
+        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions WHERE number = %s
         """
         return self.db.fetch_one(query, (number,))
+
+    def get_by_did(self, did_number: str) -> dict | None:
+        """
+        Get the extension that directly answers a given DID number, if any.
+
+        Args:
+            did_number: Carrier-assigned DID number
+
+        Returns:
+            dict: Extension data or None
+        """
+        query = """
+        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions WHERE did_number = %s
+        """
+        return self.db.fetch_one(query, (did_number,))
 
     def get_all(self) -> list[dict]:
         """
@@ -1315,7 +1334,7 @@ class ExtensionDB:
             list: list of all extensions
         """
         query = """
-        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password FROM extensions ORDER BY number
+        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions ORDER BY number
         """
         return self.db.fetch_all(query)
 
@@ -1327,7 +1346,7 @@ class ExtensionDB:
             list: list of AD-synced extensions
         """
         query = """
-        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password FROM extensions WHERE ad_synced = %s ORDER BY number
+        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions WHERE ad_synced = %s ORDER BY number
         """
         return self.db.fetch_all(query, (True,))
 
@@ -1343,6 +1362,7 @@ class ExtensionDB:
         ad_username: str | None = None,
         is_admin: bool | None = None,
         sip_password: str | None = None,
+        did_number: str | None = None,
     ) -> bool:
         """
         Update an extension
@@ -1358,6 +1378,9 @@ class ExtensionDB:
             ad_username: Active Directory username (optional)
             is_admin: Whether extension has admin privileges (optional)
             sip_password: SIP authentication password for phone provisioning (optional)
+            did_number: Carrier-assigned DID this extension answers directly (optional).
+                An empty string clears it back to NULL; None leaves it untouched
+                (same convention every other field here uses).
 
         Returns:
             bool: True if successful
@@ -1412,6 +1435,10 @@ class ExtensionDB:
             updates.append("sip_password = %s")
             params.append(sip_password)
 
+        if did_number is not None:
+            updates.append("did_number = %s")
+            params.append(did_number if did_number != "" else None)
+
         if not updates:
             return True  # Nothing to update
 
@@ -1456,7 +1483,7 @@ class ExtensionDB:
         """
         search_pattern = f"%{query_str}%"
         query = """
-        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at FROM extensions
+        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, did_number FROM extensions
         WHERE number LIKE %s OR name LIKE %s OR email LIKE %s
         ORDER BY number
         """
@@ -1760,6 +1787,192 @@ class TrunkDB:
                 )
                 row["codec_preferences"] = None
         return row
+
+
+class InboundRouteDB:
+    """Inbound DID routing database operations"""
+
+    def __init__(self, db: DatabaseBackend) -> None:
+        """
+        Initialize inbound route database
+
+        Args:
+            db: Database backend instance
+        """
+        self.db = db
+        self.logger = get_logger()
+
+    def add(
+        self,
+        did_number: str,
+        destination_type: str,
+        destination_value: str,
+        trunk_id: str | None = None,
+        enabled: bool = True,
+        priority: int = 100,
+    ) -> bool:
+        """
+        Add a new inbound route
+
+        Args:
+            did_number: Carrier-assigned DID number
+            destination_type: One of "extension", "auto_attendant", "voicemail"
+            destination_value: Extension number, AA id, or mailbox, per destination_type
+            trunk_id: Scope this route to one trunk; None matches any trunk
+            enabled: Whether the route is active
+            priority: Lower priority value wins when multiple rows could match
+
+        Returns:
+            bool: True if successful
+        """
+        query = """
+        INSERT INTO inbound_routes (did_number, trunk_id, destination_type, destination_value, enabled, priority)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        return self.db.execute(
+            query,
+            (did_number, trunk_id, destination_type, destination_value, enabled, priority),
+        )
+
+    def get(self, route_id: int) -> dict | None:
+        """
+        Get an inbound route by id
+
+        Args:
+            route_id: Inbound route id
+
+        Returns:
+            dict: Route data or None
+        """
+        query = """
+        SELECT id, did_number, trunk_id, destination_type, destination_value, enabled, priority, created_at, updated_at FROM inbound_routes WHERE id = %s
+        """
+        return self.db.fetch_one(query, (route_id,))
+
+    def get_all(self) -> list[dict]:
+        """
+        Get all inbound routes
+
+        Returns:
+            list: list of all routes
+        """
+        query = """
+        SELECT id, did_number, trunk_id, destination_type, destination_value, enabled, priority, created_at, updated_at FROM inbound_routes ORDER BY did_number, priority
+        """
+        return self.db.fetch_all(query)
+
+    def get_by_did(self, did_number: str, trunk_id: str | None = None) -> dict | None:
+        """
+        Look up the effective enabled route for a DID, preferring a
+        trunk-specific match over a "matches any trunk" (NULL trunk_id) row.
+
+        Args:
+            did_number: Carrier-assigned DID number
+            trunk_id: Trunk the call arrived on, if known
+
+        Returns:
+            dict: The best-matching route, or None
+        """
+        if trunk_id is not None:
+            query = """
+            SELECT id, did_number, trunk_id, destination_type, destination_value, enabled, priority, created_at, updated_at
+            FROM inbound_routes
+            WHERE did_number = %s AND enabled = %s AND (trunk_id = %s OR trunk_id IS NULL)
+            ORDER BY trunk_id IS NULL, priority
+            LIMIT 1
+            """
+            return self.db.fetch_one(query, (did_number, True, trunk_id))
+
+        query = """
+        SELECT id, did_number, trunk_id, destination_type, destination_value, enabled, priority, created_at, updated_at
+        FROM inbound_routes
+        WHERE did_number = %s AND enabled = %s AND trunk_id IS NULL
+        ORDER BY priority
+        LIMIT 1
+        """
+        return self.db.fetch_one(query, (did_number, True))
+
+    def update(
+        self,
+        route_id: int,
+        did_number: str | None = None,
+        trunk_id: str | None = None,
+        destination_type: str | None = None,
+        destination_value: str | None = None,
+        enabled: bool | None = None,
+        priority: int | None = None,
+    ) -> bool:
+        """
+        Update an inbound route
+
+        Args:
+            route_id: Inbound route id
+            did_number: Carrier-assigned DID number (optional)
+            trunk_id: Trunk to scope this route to (optional). An empty string
+                clears it back to NULL (any trunk); None leaves it untouched.
+            destination_type: One of "extension", "auto_attendant", "voicemail" (optional)
+            destination_value: Extension number, AA id, or mailbox (optional)
+            enabled: Whether the route is active (optional)
+            priority: Lower priority value wins when multiple rows could match (optional)
+
+        Returns:
+            bool: True if successful
+        """
+        updates = []
+        params: list[object] = []
+
+        if did_number is not None:
+            updates.append("did_number = %s")
+            params.append(did_number)
+
+        if trunk_id is not None:
+            updates.append("trunk_id = %s")
+            params.append(trunk_id if trunk_id != "" else None)
+
+        if destination_type is not None:
+            updates.append("destination_type = %s")
+            params.append(destination_type)
+
+        if destination_value is not None:
+            updates.append("destination_value = %s")
+            params.append(destination_value)
+
+        if enabled is not None:
+            updates.append("enabled = %s")
+            params.append(enabled)
+
+        if priority is not None:
+            updates.append("priority = %s")
+            params.append(priority)
+
+        if not updates:
+            return True  # Nothing to update
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(route_id)
+
+        query = f"""
+        UPDATE inbound_routes
+        SET {", ".join(updates)}
+        WHERE id = %s
+        """  # nosec B608 - updates are validated field names, placeholder is safe
+
+        return self.db.execute(query, tuple(params))
+
+    def delete(self, route_id: int) -> bool:
+        """
+        Delete an inbound route
+
+        Args:
+            route_id: Inbound route id
+
+        Returns:
+            bool: True if successful
+        """
+        query = """
+        DELETE FROM inbound_routes WHERE id = %s
+        """
+        return self.db.execute(query, (route_id,))
 
 
 class ProvisionedDevicesDB:

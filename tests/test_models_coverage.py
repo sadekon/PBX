@@ -169,6 +169,12 @@ class TestExtensionModel:
         col = Extension.__table__.columns["caller_id"]
         assert col.nullable is True
 
+    def test_did_number_nullable_and_unique(self) -> None:
+        """did_number should be nullable and unique."""
+        col = Extension.__table__.columns["did_number"]
+        assert col.nullable is True
+        assert col.unique is True
+
     def test_voicemail_pin_hash_nullable(self) -> None:
         """voicemail_pin_hash should be nullable."""
         col = Extension.__table__.columns["voicemail_pin_hash"]
@@ -212,9 +218,9 @@ class TestExtensionModel:
 
     def test_column_count(self) -> None:
         """Extension table should have the expected number of columns."""
-        # 17 defined + 2 from TimestampMixin = 19
+        # 18 defined + 2 from TimestampMixin = 20
         col_names = {c.name for c in Extension.__table__.columns}
-        assert len(col_names) == 19
+        assert len(col_names) == 20
 
 
 # ---------------------------------------------------------------------------

@@ -108,6 +108,7 @@ class ExtensionRegistry:
             "voicemail_pin_hash": db_extension.get("voicemail_pin_hash", ""),
             "ad_synced": bool(db_extension.get("ad_synced", False)),
             "is_admin": bool(db_extension.get("is_admin", False)),
+            "did_number": db_extension.get("did_number"),
         }
 
         return Extension(number, name, ext_config)

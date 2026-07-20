@@ -972,6 +972,155 @@ def delete_sip_trunk(trunk_id: str) -> tuple[Response, int]:
 
 
 # ==========================================================================
+# Inbound DID Routing Routes
+# ==========================================================================
+
+_INBOUND_ROUTE_DESTINATION_TYPES = {"extension", "auto_attendant", "voicemail"}
+
+
+@features_bp.route("/api/inbound-routes", methods=["GET"])
+@require_auth
+def get_inbound_routes() -> tuple[Response, int]:
+    """Get the effective inbound DID routes (explicit routes plus extension-derived DIDs)."""
+    pbx_core = get_pbx_core()
+    if pbx_core and hasattr(pbx_core, "inbound_routing"):
+        try:
+            routes = pbx_core.inbound_routing.get_effective_routes()
+            return send_json({"routes": routes, "count": len(routes)}), 200
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error(f"Error getting inbound routes: {e}")
+            return send_json({"error": f"Error getting inbound routes: {e!s}"}, 500), 500
+    else:
+        return send_json({"error": "Inbound routing system not initialized"}, 500), 500
+
+
+@features_bp.route("/api/inbound-routes", methods=["POST"])
+@require_auth
+def add_inbound_route() -> tuple[Response, int]:
+    """Add a new inbound DID route."""
+    pbx_core = get_pbx_core()
+    if pbx_core and hasattr(pbx_core, "inbound_routing"):
+        try:
+            data = get_request_body()
+
+            required_fields = ["did_number", "destination_type", "destination_value"]
+            missing = [f for f in required_fields if not data.get(f)]
+            if missing:
+                return send_json(
+                    {"error": f"Missing required fields: {', '.join(missing)}"}, 400
+                ), 400
+
+            destination_type = data["destination_type"]
+            if destination_type not in _INBOUND_ROUTE_DESTINATION_TYPES:
+                return send_json(
+                    {
+                        "error": "destination_type must be one of: "
+                        + ", ".join(sorted(_INBOUND_ROUTE_DESTINATION_TYPES))
+                    },
+                    400,
+                ), 400
+
+            if not pbx_core.inbound_route_db:
+                return send_json({"error": "Database not available"}, 500), 500
+
+            success = pbx_core.inbound_route_db.add(
+                did_number=data["did_number"],
+                destination_type=destination_type,
+                destination_value=data["destination_value"],
+                trunk_id=data.get("trunk_id") or None,
+                enabled=data.get("enabled", True),
+                priority=data.get("priority", 100),
+            )
+
+            if not success:
+                return send_json({"error": "Failed to add inbound route"}, 500), 500
+
+            pbx_core.inbound_routing.reload_routes()
+            return send_json(
+                {"success": True, "message": f"Inbound route for {data['did_number']} added"}
+            ), 200
+
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error(f"Error adding inbound route: {e}")
+            return send_json({"error": f"Error adding inbound route: {e!s}"}, 500), 500
+    else:
+        return send_json({"error": "Inbound routing system not initialized"}, 500), 500
+
+
+@features_bp.route("/api/inbound-routes/<int:route_id>", methods=["PUT"])
+@require_auth
+def update_inbound_route(route_id: int) -> tuple[Response, int]:
+    """Update an existing inbound DID route."""
+    pbx_core = get_pbx_core()
+    if pbx_core and hasattr(pbx_core, "inbound_routing"):
+        try:
+            if not pbx_core.inbound_route_db or not pbx_core.inbound_route_db.get(route_id):
+                return send_json({"error": "Inbound route not found"}, 404), 404
+
+            data = get_request_body()
+
+            destination_type = data.get("destination_type")
+            if destination_type is not None and destination_type not in _INBOUND_ROUTE_DESTINATION_TYPES:
+                return send_json(
+                    {
+                        "error": "destination_type must be one of: "
+                        + ", ".join(sorted(_INBOUND_ROUTE_DESTINATION_TYPES))
+                    },
+                    400,
+                ), 400
+
+            success = pbx_core.inbound_route_db.update(
+                route_id,
+                did_number=data.get("did_number"),
+                trunk_id=data.get("trunk_id"),
+                destination_type=destination_type,
+                destination_value=data.get("destination_value"),
+                enabled=data.get("enabled"),
+                priority=data.get("priority"),
+            )
+
+            if not success:
+                return send_json({"error": "Failed to update inbound route"}, 500), 500
+
+            pbx_core.inbound_routing.reload_routes()
+            return send_json(
+                {"success": True, "message": f"Inbound route {route_id} updated"}
+            ), 200
+
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error(f"Error updating inbound route: {e}")
+            return send_json({"error": f"Error updating inbound route: {e!s}"}, 500), 500
+    else:
+        return send_json({"error": "Inbound routing system not initialized"}, 500), 500
+
+
+@features_bp.route("/api/inbound-routes/<int:route_id>", methods=["DELETE"])
+@require_auth
+def delete_inbound_route(route_id: int) -> tuple[Response, int]:
+    """Delete an inbound DID route."""
+    pbx_core = get_pbx_core()
+    if pbx_core and hasattr(pbx_core, "inbound_routing"):
+        try:
+            if not pbx_core.inbound_route_db or not pbx_core.inbound_route_db.get(route_id):
+                return send_json({"error": "Inbound route not found"}, 404), 404
+
+            success = pbx_core.inbound_route_db.delete(route_id)
+            if not success:
+                return send_json({"error": "Failed to delete inbound route"}, 500), 500
+
+            pbx_core.inbound_routing.reload_routes()
+            return send_json(
+                {"success": True, "message": f"Inbound route {route_id} removed"}
+            ), 200
+
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error(f"Error deleting inbound route: {e}")
+            return send_json({"error": f"Error deleting inbound route: {e!s}"}, 500), 500
+    else:
+        return send_json({"error": "Inbound routing system not initialized"}, 500), 500
+
+
+# ==========================================================================
 # LCR (Least-Cost Routing) Routes
 # ==========================================================================
 

@@ -966,11 +966,28 @@ class CallRouter:
             crypto=caller_crypto,
         )
 
+        # Resolve the calling extension's own DID as the outbound caller ID.
+        # The carrier needs a real E.164 number here, not the internal
+        # extension number -- carriers commonly reject or mangle a From/PAI
+        # user part that isn't dialable, and sending a number the account
+        # doesn't actually own conflicts with Truth-in-Caller-ID. Falls back
+        # to from_ext (previous behavior) if the extension has no DID set.
+        caller_ext_obj = pbx.extension_registry.get(from_ext)
+        caller_id_number = from_ext
+        caller_id_name = from_ext
+        if caller_ext_obj:
+            did_number = caller_ext_obj.config.get("did_number")
+            if did_number:
+                caller_id_number = did_number
+            name = getattr(caller_ext_obj, "name", None)
+            if name:
+                caller_id_name = name
+
         trunk_addr = (trunk.host, trunk.port)
         invite_to_trunk = SIPMessageBuilder.build_request(
             method="INVITE",
             uri=f"sip:{transformed_number}@{trunk.host}:{trunk.port}",
-            from_addr=f"<sip:{from_ext}@{server_ip}>",
+            from_addr=f"<sip:{caller_id_number}@{server_ip}>",
             to_addr=f"<sip:{transformed_number}@{trunk.host}>",
             call_id=call_id,
             cseq=int((message.get_header("CSeq") or "1 INVITE").split()[0]),
@@ -989,7 +1006,9 @@ class CallRouter:
         # _retry_trunk_invite_with_auth() -- this initial INVITE is
         # deliberately sent unauthenticated.
 
-        SIPMessageBuilder.add_caller_id_headers(invite_to_trunk, from_ext, from_ext, server_ip)
+        SIPMessageBuilder.add_caller_id_headers(
+            invite_to_trunk, caller_id_number, caller_id_name, server_ip
+        )
 
         self._build_and_send_leg_invite(
             call,

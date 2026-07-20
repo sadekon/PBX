@@ -13,6 +13,7 @@ class ExtensionCreate(BaseModel):
     voicemail_enabled: bool = True
     voicemail_pin: str | None = Field(default=None, min_length=4, max_length=10)
     is_admin: bool = False
+    did_number: str | None = Field(default=None, max_length=20)
 
     @field_validator("extension")
     @classmethod
@@ -42,6 +43,7 @@ class ExtensionUpdate(BaseModel):
     dnd_enabled: bool | None = None
     forward_enabled: bool | None = None
     forward_destination: str | None = Field(default=None, max_length=20)
+    did_number: str | None = Field(default=None, max_length=20)
 
 
 class ExtensionResponse(BaseModel):
@@ -57,3 +59,4 @@ class ExtensionResponse(BaseModel):
     dnd_enabled: bool = False
     forward_enabled: bool = False
     forward_destination: str | None = None
+    did_number: str | None = None

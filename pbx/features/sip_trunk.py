@@ -546,6 +546,10 @@ class SIPTrunkSystem:
         """
         self.trunks = {}
         self.outbound_rules = []
+        # rule_id -> trunk_id the rule pointed at before a failover re-pointed
+        # it elsewhere. Populated by _handle_trunk_failure, drained by
+        # _handle_trunk_recovery when the original trunk comes back healthy.
+        self.original_rule_trunk_ids: dict[str, str] = {}
         self.logger = get_logger()
         self.e911_protection = E911Protection(config)
         self.config = config
@@ -654,6 +658,13 @@ class SIPTrunkSystem:
                     # Trigger failover if trunk went down
                     if new_status == TrunkHealthStatus.DOWN and self.failover_enabled:
                         self._handle_trunk_failure(trunk)
+                    # Restore re-pointed rules if a previously-down trunk recovered
+                    elif (
+                        old_status == TrunkHealthStatus.DOWN
+                        and new_status in (TrunkHealthStatus.HEALTHY, TrunkHealthStatus.WARNING)
+                        and self.auto_recovery_enabled
+                    ):
+                        self._handle_trunk_recovery(trunk)
             except Exception as e:
                 self.logger.error(f"Error checking health of trunk {trunk.name}: {e}")
 
@@ -750,54 +761,15 @@ class SIPTrunkSystem:
         """Return ``to_dict()`` for every managed trunk, for use in status APIs/dashboards."""
         return [trunk.to_dict() for trunk in self.trunks.values()]
 
-    def make_outbound_call(self, from_extension: str, to_number: str) -> bool:
-        """
-        Resolve a route for ``to_number`` via ``route_outbound`` (no failover),
-        reserve a channel on the chosen trunk, and log the call. Does not yet
-        build/send the actual SIP INVITE to the trunk — that's left as a TODO
-        for the real signaling implementation.
-
-        Args:
-            from_extension: Calling extension
-            to_number: External number to call
-
-        Returns:
-            True if call initiated
-        """
-        # Block E911 calls in test mode
-        if self.e911_protection.block_if_e911(to_number, context="make_outbound_call"):
-            self.logger.error(
-                f"E911 call from {from_extension} to {to_number} blocked by protection system"
-            )
-            return False
-
-        trunk, transformed_number = self.route_outbound(to_number)
-
-        if not trunk:
-            return False
-
-        if trunk.allocate_channel():
-            self.logger.info(f"Making outbound call from {from_extension} to {transformed_number}")
-
-            # In a real implementation:
-            # 1. Build SIP INVITE to trunk
-            # 2. Include authentication
-            # 3. Bridge with internal extension
-            # 4. Handle call progress
-
-            return True
-
-        return False
-
     def _handle_trunk_failure(self, failed_trunk: SIPTrunk) -> None:
         """
         React to a trunk going DOWN: bump its failover counters, find which
-        outbound rules route through it, and identify the next-best alternative
-        trunk by priority for logging purposes. NOTE: this currently only logs
-        the intended failover — it does not actually reroute ``outbound_rules``
-        to the failover trunk or schedule recovery monitoring (see the TODO
-        comment below); live calls go through ``route_outbound_with_failover``
-        instead, which performs real per-call failover.
+        outbound rules route through it, and re-point those rules at the
+        next-best alternative trunk by priority. This keeps ``route_outbound()``
+        (the non-failover-aware lookup) reflecting the outage too, not just
+        ``route_outbound_with_failover()`` -- per-call failover already works
+        correctly independent of this. Notification is log-only for v1; there's
+        no ``WebhookEvent`` type for trunk failure yet.
 
         Args:
             failed_trunk: The trunk that failed
@@ -833,11 +805,46 @@ class SIPTrunkSystem:
             f"for {len(affected_rules)} routes"
         )
 
-        # In a full implementation, would:
-        # 1. Temporarily reroute affected rules to failover trunk
-        # 2. Notify administrators
-        # 3. Monitor for recovery of failed trunk
-        # 4. Automatically restore when recovered (if auto_recovery_enabled)
+        for rule in affected_rules:
+            # Only remember the trunk a rule pointed at before *any* failover,
+            # so a second failure (failover_trunk itself going down) doesn't
+            # overwrite the true original with an intermediate failover trunk.
+            self.original_rule_trunk_ids.setdefault(rule.rule_id, rule.trunk_id)
+            rule.trunk_id = failover_trunk.trunk_id
+
+    def _handle_trunk_recovery(self, recovered_trunk: SIPTrunk) -> None:
+        """
+        React to a previously-DOWN trunk becoming healthy again: restore any
+        outbound rules that were re-pointed away from it in
+        ``_handle_trunk_failure`` back to their original trunk, and drop the
+        shadow entry. Called from ``_perform_health_checks`` on the same cycle
+        that detects the recovery -- no separate timer/thread needed.
+
+        Args:
+            recovered_trunk: The trunk that just transitioned out of DOWN
+        """
+        restored_rule_ids = [
+            rule_id
+            for rule_id, original_trunk_id in self.original_rule_trunk_ids.items()
+            if original_trunk_id == recovered_trunk.trunk_id
+        ]
+
+        if not restored_rule_ids:
+            return
+
+        rules_by_id = {rule.rule_id: rule for rule in self.outbound_rules}
+
+        for rule_id in restored_rule_ids:
+            original_trunk_id = self.original_rule_trunk_ids.pop(rule_id)
+            rule = rules_by_id.get(rule_id)
+            if rule is None:
+                # Rule was deleted while its trunk was down; nothing to restore.
+                continue
+            self.logger.info(
+                f"Trunk {recovered_trunk.name} recovered: restoring rule "
+                f"{rule.rule_id} from {rule.trunk_id} back to {original_trunk_id}"
+            )
+            rule.trunk_id = original_trunk_id
 
     def _route_via_priority_fallback(self, number: str) -> tuple[SIPTrunk | None, str | None]:
         """

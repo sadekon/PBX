@@ -832,6 +832,7 @@
                             <th>Number</th>
                             <th>Name</th>
                             <th>Email</th>
+                            <th>DID Number</th>
                             <th>Status</th>
                             <th>External</th>
                             <th>VM PIN</th>
@@ -840,7 +841,7 @@
                     </thead>
                     <tbody id="extensions-table-body">
                         <tr>
-                            <td colspan="7" class="loading">Loading extensions...</td>
+                            <td colspan="8" class="loading">Loading extensions...</td>
                         </tr>
                     </tbody>
                 </table>
@@ -1954,6 +1955,36 @@ Content-Type: application/json
             <div class="config-section" id="trunk-health-section" style="display: none;">
                 <h3>📊 Trunk Health Monitoring</h3>
                 <div id="trunk-health-container"></div>
+            </div>
+
+            <!-- Inbound DID Routes -->
+            <div class="config-section" id="inbound-routes-section">
+                <h3>📞 Inbound DID Routes</h3>
+                <p>Maps carrier-assigned DID numbers to internal destinations. Rows marked "via extension" come from that extension's own DID Number field (Extensions page) and are edited there, not here.</p>
+                <div class="action-buttons" style="margin-bottom: 15px;">
+                    <button class="btn btn-primary" onclick="loadInboundRoutes()">🔄 Refresh</button>
+                    <button class="btn btn-success" onclick="showAddInboundRouteModal()">➕ Add Route</button>
+                </div>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>DID Number</th>
+                                <th>Trunk</th>
+                                <th>Destination</th>
+                                <th>Priority</th>
+                                <th>Enabled</th>
+                                <th>Source</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="inbound-routes-list">
+                            <tr>
+                                <td colspan="7" style="text-align: center;">Loading inbound routes...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 
             <!-- Info Box -->
@@ -4736,6 +4767,11 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                     <small>Required for voicemail security</small>
                 </div>
                 <div class="form-group">
+                    <label for="new-ext-did-number">DID Number (optional):</label>
+                    <input type="text" id="new-ext-did-number" pattern="[0-9]*" placeholder="e.g., 12125551234">
+                    <small>Carrier-assigned number that rings this extension directly</small>
+                </div>
+                <div class="form-group">
                     <label>
                         <input type="checkbox" id="new-ext-allow-external" checked>
                         Allow External Calls
@@ -4781,6 +4817,11 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                     <label for="edit-ext-voicemail-pin">Voicemail PIN:</label>
                     <input type="text" id="edit-ext-voicemail-pin" pattern="[0-9]{4,6}" maxlength="6" placeholder="4-6 digits (e.g., 1234)">
                     <small>Leave blank to keep current PIN</small>
+                </div>
+                <div class="form-group">
+                    <label for="edit-ext-did-number">DID Number (optional):</label>
+                    <input type="text" id="edit-ext-did-number" pattern="[0-9]*" placeholder="e.g., 12125551234">
+                    <small>Carrier-assigned number that rings this extension directly. Clear to remove.</small>
                 </div>
                 <div class="form-group">
                     <label>
@@ -5124,6 +5165,56 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                 <div class="modal-actions">
                     <button type="button" class="btn btn-secondary" onclick="closeAddTrunkModal()">Cancel</button>
                     <button type="submit" class="btn btn-success">Add Trunk</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Add/Edit Inbound Route Modal -->
+    <div id="inbound-route-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="inbound-route-modal-title">➕ Add Inbound Route</h3>
+                <span class="close" onclick="closeInboundRouteModal()">&times;</span>
+            </div>
+            <form id="inbound-route-form" onsubmit="saveInboundRoute(event)">
+                <input type="hidden" id="inbound-route-id">
+                <div class="form-group">
+                    <label for="inbound-route-did">DID Number:</label>
+                    <input type="text" id="inbound-route-did" required pattern="[0-9]+" placeholder="12125551234">
+                </div>
+                <div class="form-group">
+                    <label for="inbound-route-trunk">Trunk ID (optional):</label>
+                    <input type="text" id="inbound-route-trunk" placeholder="Leave blank to match any trunk">
+                    <small>Scopes this route to one trunk; blank matches the DID on any trunk</small>
+                </div>
+                <div class="form-group">
+                    <label for="inbound-route-destination-type">Destination Type:</label>
+                    <select id="inbound-route-destination-type">
+                        <option value="extension">Extension</option>
+                        <option value="auto_attendant">Auto Attendant</option>
+                        <option value="voicemail">Voicemail</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="inbound-route-destination-value">Destination Value:</label>
+                    <input type="text" id="inbound-route-destination-value" required placeholder="1001">
+                    <small>Extension number, auto attendant id, or mailbox number</small>
+                </div>
+                <div class="form-group">
+                    <label for="inbound-route-priority">Priority:</label>
+                    <input type="number" id="inbound-route-priority" value="100" min="1" max="999">
+                    <small>Lower number wins when multiple routes could match</small>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="inbound-route-enabled" checked>
+                        Enabled
+                    </label>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeInboundRouteModal()">Cancel</button>
+                    <button type="submit" class="btn btn-success">Save Route</button>
                 </div>
             </form>
         </div>

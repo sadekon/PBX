@@ -16,6 +16,7 @@ interface Extension {
     voicemail_enabled?: boolean;
     ad_synced?: boolean;
     is_admin?: boolean;
+    did_number?: string | null;
 }
 
 interface ErrorResponse {
@@ -27,7 +28,7 @@ const EXTENSION_LOAD_TIMEOUT = 10000;
 export async function loadExtensions(): Promise<void> {
     const tbody = document.getElementById('extensions-table-body') as HTMLElement | null;
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="7" class="loading">Loading extensions...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="loading">Loading extensions...</td></tr>';
 
     try {
         const API_BASE = getApiBaseUrl();
@@ -40,7 +41,7 @@ export async function loadExtensions(): Promise<void> {
         window.currentExtensions = extensions;
 
         if (extensions.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" class="loading">No extensions found.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" class="loading">No extensions found.</td></tr>';
             return;
         }
 
@@ -56,6 +57,7 @@ export async function loadExtensions(): Promise<void> {
                 <td><strong>${escapeHtml(ext.number)}</strong>${generateBadges(ext)}</td>
                 <td>${escapeHtml(ext.name)}</td>
                 <td>${ext.email ? escapeHtml(ext.email) : 'Not set'}</td>
+                <td>${ext.did_number ? escapeHtml(ext.did_number) : 'Not set'}</td>
                 <td class="${ext.registered ? 'status-online' : 'status-offline'}">
                     ${ext.registered ? 'Online' : 'Offline'}
                 </td>
@@ -74,7 +76,7 @@ export async function loadExtensions(): Promise<void> {
         const errorMsg = message === 'Request timed out'
             ? 'Request timed out. System may still be starting.'
             : 'Error loading extensions';
-        tbody.innerHTML = `<tr><td colspan="7" class="loading">${errorMsg}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="loading">${errorMsg}</td></tr>`;
     }
 }
 
@@ -98,6 +100,7 @@ export function editExtension(number: string): void {
     if (el('edit-ext-number')) (el('edit-ext-number') as HTMLInputElement).value = ext.number;
     if (el('edit-ext-name')) (el('edit-ext-name') as HTMLInputElement).value = ext.name;
     if (el('edit-ext-email')) (el('edit-ext-email') as HTMLInputElement).value = ext.email ?? '';
+    if (el('edit-ext-did-number')) (el('edit-ext-did-number') as HTMLInputElement).value = ext.did_number ?? '';
     if (el('edit-ext-allow-external')) (el('edit-ext-allow-external') as HTMLInputElement).checked = Boolean(ext.allow_external);
     if (el('edit-ext-is-admin')) (el('edit-ext-is-admin') as HTMLInputElement).checked = Boolean(ext.is_admin);
     if (el('edit-ext-password')) (el('edit-ext-password') as HTMLInputElement).value = '';
@@ -192,6 +195,7 @@ export function initExtensionForms(): void {
                 email: val('new-ext-email'),
                 password: val('new-ext-password'),
                 voicemail_pin: val('new-ext-voicemail-pin'),
+                did_number: val('new-ext-did-number'),
                 allow_external: chk('new-ext-allow-external'),
                 is_admin: chk('new-ext-is-admin'),
             };
@@ -232,6 +236,9 @@ export function initExtensionForms(): void {
             const data: Record<string, unknown> = {
                 name: val('edit-ext-name'),
                 email: val('edit-ext-email'),
+                // Always included (even empty) so an empty value explicitly
+                // clears the DID rather than being treated as "unchanged".
+                did_number: val('edit-ext-did-number'),
                 allow_external: chk('edit-ext-allow-external'),
                 is_admin: chk('edit-ext-is-admin'),
             };
