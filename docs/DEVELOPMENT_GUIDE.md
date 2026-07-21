@@ -48,7 +48,7 @@ with a second gate says so in its row.
 | **C2** | RTP media relay & IVR plumbing — relay, DTMF (RFC 2833 + SIP INFO + in-band), prompt playback, recording tap | ✅ voicemail-fix merged to DEV; DTMF sources unified into one `DTMFMonitor` on `auto-attendant` | `pbx/rtp/`, `core/voicemail_handler.py`, `rtp/handler.py`, `rtp/dtmf_monitor.py` | Voicemail, AA, MoH, recording, paging; codec expansion slots in here |
 | **C3** | **Audio mixer (N-way media) — does not exist** | ❌ missing | (to build: sum/mix G.711 streams per participant, or bridge via Jitsi) | Conference audio, 3-way calling, barge/whisper/screening |
 | **C4** | Call-originate primitive ("PBX creates a leg to X, then bridges") | ✅ built on `sip-trunk` | `core/call_originator.py`, `core/call_router.py` (`_build_and_send_leg_invite`) | `CallOriginator.originate_call()`/`originate_and_bridge()`; click-to-dial wired onto it. Callback completion, predictive dialing, emergency-notification calls, operator console remain to be wired. Field-unverified against real phones. |
-| **C5** | Trunk / PSTN connectivity | 🔶 outbound + inbound DID routing built on `sip-trunk`; **field-unverified** (no carrier account) | `features/sip_trunk.py`, `features/inbound_routing.py`, `sip/server.py`, `core/call_router.py` | E911 stack, LCR, STIR/SHAKEN, DNS SRV failover, fraud detection on real traffic, SBC validation |
+| **C5** | Trunk / PSTN connectivity | 🔶 outbound + inbound DID routing + STIR/SHAKEN inbound verification built on `sip-trunk`; **field-unverified** (no carrier account) | `features/sip_trunk.py`, `features/inbound_routing.py`, `features/stir_shaken.py`, `sip/server.py`, `core/call_router.py` | E911 stack, LCR, DNS SRV failover, fraud detection on real traffic, SBC validation |
 | **C6** | Analytics tap — live audio/transcript/QoS feed into analysis engines | 🔶 recordings + RTCP QoS data exist; no live feed wiring | `features/call_recording.py`, `rtp/rtcp_monitor.py` | Speech analytics, voice biometrics, call tagging, quality prediction, recording analytics, conversational AI |
 | **C7** | Data & event plane — CDR, webhooks, DB persistence, migrations | ✅ working | `features/cdr.py`, `features/webhooks.py`, `utils/database.py` | BI export, compliance, retention, residency, geo-redundancy replication build on it |
 
@@ -232,7 +232,6 @@ covers several). Each needs an explicit wire-or-cut decision before "finished" m
 
 | Module | Gated by | What it is | Recommended disposition |
 |--------|----------|-----------|------------------------|
-| `stir_shaken.py` | C5 | Caller-ID attestation/verification | **Wire** — `add_stir_shaken_to_invite()` into `_route_to_trunk()` (alongside the caller-ID headers), `verify_stir_shaken_invite()` into the inbound path. Complete but still called from nowhere; needs signing certs from carrier/STI-PA. Rig C. |
 | `least_cost_routing.py` | C5 | Multi-trunk cost-based route selection | **Wire** — natural extension of `SIPTrunkSystem.route_outbound()` once >1 trunk exists. Rig C. |
 | `operator_console.py` | C4 | Attendant console backend | Wire to admin UI + presence (originate now exists via `CallOriginator`); or defer. |
 | `advanced_call_features.py` | C3 | Call screening/whisper/barge | Same mixer investment as conference — schedule together. |
@@ -280,23 +279,34 @@ covers several). Each needs an explicit wire-or-cut decision before "finished" m
   carrier's From header is caller-ID digits, not an internal extension. Queue as a
   destination type is deliberately out of scope for v1. **The IP-matching heuristic is
   exactly what needs real-carrier field validation** — not treated as verified.
+- **STIR/SHAKEN — inbound verification only**: `features/stir_shaken.py`'s
+  `verify_stir_shaken_invite()` is wired into `CallRouter._route_inbound_did()`, checking
+  the Identity header a carrier attaches to inbound trunk INVITEs and recording the
+  verification status/attestation on the CDR (`CDRSystem.set_stir_shaken()`) once dispatch
+  succeeds; it never blocks the call. `pbx.stir_shaken_manager` is only instantiated when
+  `stir_shaken.enabled: true` is set in `config.yml` — verification needs no certificate of
+  our own, only an optional `ca_cert_path`. **Outbound signing (`add_stir_shaken_to_invite()`)
+  is deliberately not wired.** Since the FCC's 2025-09-18 Third-Party Signing Rule, only a
+  registered voice service provider (its own FCC Form 499 filer ID, OCN, and STI-PA-issued
+  certificate) may sign a call — a business buying a SIP trunk from a carrier doesn't
+  qualify, and the carrier itself signs the call before it reaches the PSTN. There's no
+  realistic path to ever exercising outbound signing from this PBX short of the business
+  becoming a registered originating carrier itself, so it wasn't built.
 - **Tests**: substantial coverage additions (`test_sip_server_coverage.py`,
   `test_sip_trunk_coverage.py`, `test_call_router_coverage.py`,
   `test_call_originator_coverage.py`, `test_click_to_dial_coverage.py`,
-  `test_inbound_routing_coverage.py`, `test_api_features_routes_coverage.py`).
+  `test_inbound_routing_coverage.py`, `test_api_features_routes_coverage.py`,
+  `test_feature_initializer_coverage.py`, `test_cdr_reporting_coverage.py`).
 
 ### Remaining to finish
 
-1. **STIR/SHAKEN wiring** — `features/stir_shaken.py` is complete but called from nowhere.
-   Wire into the outbound trunk INVITE path (Identity header) and the inbound path (now
-   that DID dispatch exists). Needs signing certs from carrier/STI-PA.
-2. **NAT/public-address handling** for SDP and Via/Contact toward the carrier (external IP
+1. **NAT/public-address handling** for SDP and Via/Contact toward the carrier (external IP
    config, symmetric RTP) — untested until Rig C exists.
-3. **Carrier validation** against a real provider (config templates for AT&T and Comcast
+2. **Carrier validation** against a real provider (config templates for AT&T and Comcast
    exist: `config_att_sip.yml`, `config_comcast_sip.yml`; a cheap SIP provider like
    VoIP.ms/Telnyx/Twilio is the low-risk first target). Gates the IP-matching heuristic,
-   (1)'s certs, (2) entirely, and end-to-end PSTN in both directions.
-4. Follow-ons unlocked afterward: least-cost routing, DNS SRV failover, E911 via carrier,
+   (1) entirely, and end-to-end PSTN in both directions.
+3. Follow-ons unlocked afterward: least-cost routing, DNS SRV failover, E911 via carrier,
    FMFM-to-external, predictive dialing.
 
 ---
@@ -425,9 +435,11 @@ first: call quality prediction (QoS data already flows), speech analytics (recor
 DNS SRV failover (trunk resilience). *Exit: every Tier-2 row in this doc is either ✅/🔶 or
 marked deferred.*
 
-**Phase 7 — Platform hardening & scale (Rig F, 2×F).** SIP TCP/TLS + SRTP; STIR/SHAKEN;
+**Phase 7 — Platform hardening & scale (Rig F, 2×F).** SIP TCP/TLS + SRTP;
 Alembic discipline; CSP cleanup; capacity testing; geographic redundancy replication;
-finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
+finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.* (STIR/SHAKEN
+inbound verification is already wired on `sip-trunk`, gated by `stir_shaken.enabled` in
+`config.yml`; outbound signing is out of scope entirely — see "The sip-trunk branch".)
 
 ---
 
@@ -546,7 +558,7 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 - [ ] Failure drills: server reboot, power pull, internet drop — documented 911 behavior for each
 - [ ] Cutover runbook: per-number port verification, day-of provider contact, rollback notes
 - [ ] User training + quick-reference cards; week-one escalation path
-- [ ] Accepted gaps recorded at cutover: no conference mixing (C3), no STIR/SHAKEN attestation, callbacks not yet wired to `CallOriginator`, no SIP-TLS/SRTP, WebRTC unhardened (click-to-dial is wired but field-unverified)
+- [ ] Accepted gaps recorded at cutover: no conference mixing (C3), no outbound STIR/SHAKEN attestation (out of scope — see "The sip-trunk branch"; inbound verification is wired), callbacks not yet wired to `CallOriginator`, no SIP-TLS/SRTP, WebRTC unhardened (click-to-dial is wired but field-unverified)
 
 ---
 

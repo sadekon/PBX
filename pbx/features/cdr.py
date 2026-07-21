@@ -46,6 +46,13 @@ class CDRRecord:
         self.recording_file = None
         self.hangup_cause = None
         self.user_agent = None
+        # STIR/SHAKEN (RFC 8224/8588) verification outcome for an inbound
+        # trunk call -- a VerificationStatus value, e.g. "verified_full",
+        # "no_signature", "not_verified" (no signing certificate configured).
+        # None for calls that never went through inbound-DID verification
+        # (internal calls, outbound trunk calls).
+        self.stir_shaken_status = None
+        self.stir_shaken_attestation = None  # "A"/"B"/"C" from the PASSporT, if verified
 
     def mark_answered(self) -> None:
         """Mark call as answered"""
@@ -86,6 +93,8 @@ class CDRRecord:
             "recording_file": self.recording_file,
             "hangup_cause": self.hangup_cause,
             "user_agent": self.user_agent,
+            "stir_shaken_status": self.stir_shaken_status,
+            "stir_shaken_attestation": self.stir_shaken_attestation,
         }
 
 
@@ -159,6 +168,22 @@ class CDRSystem:
         record = self.active_records.get(call_id)
         if record:
             record.recording_file = recording_file
+
+    def set_stir_shaken(
+        self, call_id: str, status: str, attestation: str | None = None
+    ) -> None:
+        """
+        Record the STIR/SHAKEN verification outcome for an inbound trunk call.
+
+        Args:
+            call_id: Call identifier
+            status: VerificationStatus value (e.g. "verified_full", "no_signature")
+            attestation: Attestation level ("A"/"B"/"C") from the verified PASSporT, if any
+        """
+        record = self.active_records.get(call_id)
+        if record:
+            record.stir_shaken_status = status
+            record.stir_shaken_attestation = attestation
 
     def _save_record(self, record: Any) -> None:
         """

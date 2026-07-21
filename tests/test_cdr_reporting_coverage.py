@@ -201,6 +201,34 @@ class TestCDRSystem:
 
     @patch("pbx.features.cdr.Path.mkdir")
     @patch("pbx.features.cdr.get_logger")
+    def test_set_stir_shaken(self, mock_get_logger: MagicMock, mock_mkdir: MagicMock) -> None:
+        """Test recording STIR/SHAKEN verification status and attestation."""
+        from pbx.features.cdr import CDRSystem
+
+        system = CDRSystem(storage_path="/tmp/test_cdr")
+        system.start_record("call-1", "1001", "12125551234")
+        system.set_stir_shaken("call-1", "verified_full", "A")
+
+        record = system.active_records["call-1"]
+        assert record.stir_shaken_status == "verified_full"
+        assert record.stir_shaken_attestation == "A"
+        assert record.to_dict()["stir_shaken_status"] == "verified_full"
+        assert record.to_dict()["stir_shaken_attestation"] == "A"
+
+    @patch("pbx.features.cdr.Path.mkdir")
+    @patch("pbx.features.cdr.get_logger")
+    def test_set_stir_shaken_nonexistent(
+        self, mock_get_logger: MagicMock, mock_mkdir: MagicMock
+    ) -> None:
+        """Test setting STIR/SHAKEN status for a nonexistent call."""
+        from pbx.features.cdr import CDRSystem
+
+        system = CDRSystem(storage_path="/tmp/test_cdr")
+        system.set_stir_shaken("nonexistent", "verified_full", "A")
+        # Should not raise
+
+    @patch("pbx.features.cdr.Path.mkdir")
+    @patch("pbx.features.cdr.get_logger")
     def test_end_record(self, mock_get_logger: MagicMock, mock_mkdir: MagicMock) -> None:
         """Test ending a CDR record."""
         from pbx.features.cdr import CDRSystem

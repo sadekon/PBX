@@ -76,6 +76,11 @@ def _make_pbx_core(
     pbx.trunk_system = MagicMock()
     pbx.trunk_system.get_trunk_by_addr.return_value = None
 
+    # STIR/SHAKEN -- default to "no certificate configured" (None), matching
+    # FeatureInitializer's default. Tests exercising signing/verification
+    # override this with a real or mock STIRSHAKENManager.
+    pbx.stir_shaken_manager = None
+
     # Call manager
     mock_call = MagicMock()
     mock_call.start_time = MagicMock()
@@ -1450,6 +1455,81 @@ class TestRouteInboundDID:
         )
 
         assert result is False
+
+
+@pytest.mark.unit
+class TestRouteInboundDidStirShaken:
+    """Tests for STIR/SHAKEN verification wired into _route_inbound_did."""
+
+    def test_no_manager_configured_records_not_verified(self) -> None:
+        """pbx.stir_shaken_manager is None by default (no certificate configured)."""
+        pbx = _trunk_pbx_with_route({"destination_type": "voicemail", "destination_value": "1001"})
+        router = CallRouter(pbx)
+        mock_trunk = MagicMock(trunk_id="t1")
+        msg = _make_invite_message(body="")
+
+        result = router._route_inbound_did(
+            mock_trunk,
+            "19725550100",
+            "12125551234",
+            "<sip:19725550100@carrier>",
+            "<sip:12125551234@pbx.local>",
+            "call-1",
+            msg,
+            ("203.0.113.10", 5060),
+        )
+
+        assert result is True
+        pbx.cdr_system.set_stir_shaken.assert_called_once_with("call-1", "not_verified", None)
+
+    def test_verified_status_and_attestation_recorded_on_dispatch(self) -> None:
+        from pbx.features.stir_shaken import VerificationStatus
+
+        pbx = _trunk_pbx_with_route({"destination_type": "voicemail", "destination_value": "1001"})
+        pbx.stir_shaken_manager = MagicMock()
+        router = CallRouter(pbx)
+        mock_trunk = MagicMock(trunk_id="t1")
+        msg = _make_invite_message(body="")
+
+        with patch(
+            "pbx.features.stir_shaken.verify_stir_shaken_invite",
+            return_value=(VerificationStatus.VERIFIED_FULL, {"attest": "A"}),
+        ) as mock_verify:
+            result = router._route_inbound_did(
+                mock_trunk,
+                "19725550100",
+                "12125551234",
+                "<sip:19725550100@carrier>",
+                "<sip:12125551234@pbx.local>",
+                "call-1",
+                msg,
+                ("203.0.113.10", 5060),
+            )
+
+        assert result is True
+        mock_verify.assert_called_once_with(msg, pbx.stir_shaken_manager)
+        pbx.cdr_system.set_stir_shaken.assert_called_once_with("call-1", "verified_full", "A")
+
+    def test_not_recorded_when_dispatch_fails(self) -> None:
+        pbx = _trunk_pbx_with_route({"destination_type": "auto_attendant", "destination_value": "x"})
+        pbx.auto_attendant = None
+        router = CallRouter(pbx)
+        mock_trunk = MagicMock(trunk_id="t1")
+        msg = _make_invite_message(body="")
+
+        result = router._route_inbound_did(
+            mock_trunk,
+            "19725550100",
+            "12125551234",
+            "<sip:19725550100@carrier>",
+            "<sip:12125551234@pbx.local>",
+            "call-1",
+            msg,
+            ("203.0.113.10", 5060),
+        )
+
+        assert result is False
+        pbx.cdr_system.set_stir_shaken.assert_not_called()
 
 
 # ===========================================================================

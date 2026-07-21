@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from pbx.features.sip_trunk import SIPTrunkSystem
     from pbx.features.skills_routing import SkillsBasedRouter
     from pbx.features.statistics import StatisticsEngine
+    from pbx.features.stir_shaken import STIRSHAKENManager
     from pbx.features.time_based_routing import TimeBasedRouting
     from pbx.features.voicemail import VoicemailSystem
     from pbx.features.webhooks import WebhookSystem
@@ -86,6 +87,7 @@ class PBXCore:
     moh_system: MusicOnHold
     trunk_system: SIPTrunkSystem
     inbound_routing: InboundRoutingSystem
+    stir_shaken_manager: STIRSHAKENManager | None
     statistics_engine: StatisticsEngine
     auto_attendant: AutoAttendant | None
     phone_provisioning: PhoneProvisioning | None

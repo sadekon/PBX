@@ -532,6 +532,25 @@ provisioning:
     url: http://192.168.1.14:9000/api/phone-book/export/xml  # URL to XML phone book (using HTTP for phone compatibility)
     refresh_interval: 60  # Refresh interval in minutes
 trunks: null
+
+# STIR/SHAKEN caller ID verification (RFC 8224/8588) -- checks the PASSporT
+# Identity header a carrier attaches to inbound trunk INVITEs. Verification-
+# only: needs no certificate of our own, just an optional CA bundle to
+# validate the carrier's certificate chain against. Outbound signing is
+# deliberately not offered here -- since the FCC's 2025-09-18 Third-Party
+# Signing Rule, only a registered voice service provider (its own FCC Form
+# 499 filer ID, OCN, and STI-PA-issued certificate) may sign a call, and a
+# business buying a SIP trunk from a carrier doesn't qualify; the carrier
+# does the signing before the call reaches the PSTN. See
+# docs/DEVELOPMENT_GUIDE.md.
+stir_shaken:
+  enabled: false
+  # Optional CA bundle to validate an inbound call's certificate chain
+  # against. Without it, any well-formed certificate is accepted as long as
+  # its own signature checks out -- fine for testing, not a production trust
+  # decision.
+  ca_cert_path: null
+
 integrations:
   # =============================================================================
   # 🆓 OPEN SOURCE INTEGRATIONS (FREE - Recommended)

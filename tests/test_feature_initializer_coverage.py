@@ -74,6 +74,7 @@ _TOP_LEVEL_PATCHES = {
     "RecordingRetentionManager": "pbx.core.feature_initializer.RecordingRetentionManager",
     "FraudDetectionSystem": "pbx.core.feature_initializer.FraudDetectionSystem",
     "PhoneProvisioning": "pbx.core.feature_initializer.PhoneProvisioning",
+    "STIRSHAKENManager": "pbx.core.feature_initializer.STIRSHAKENManager",
 }
 
 # These are lazy imports inside initialize() -- must be patched at their source
@@ -604,6 +605,33 @@ class TestFeatureInitializerInitialize:
         _run_initialize_with_all_patches(pbx_core)
         assert pbx_core.skills_router is None
 
+    def test_stir_shaken_disabled_by_default(self) -> None:
+        """No stir_shaken config at all -> manager stays None."""
+        pbx_core = _make_pbx_core()
+        mocks = _run_initialize_with_all_patches(pbx_core)
+
+        mocks["STIRSHAKENManager"].assert_not_called()
+        assert pbx_core.stir_shaken_manager is None
+
+    def test_stir_shaken_disabled_explicitly(self) -> None:
+        """enabled: false (or omitted) -> manager stays None even with other keys set."""
+        pbx_core = _make_pbx_core(
+            config_overrides={"stir_shaken": {"enabled": False, "ca_cert_path": "/certs/ca.pem"}}
+        )
+        mocks = _run_initialize_with_all_patches(pbx_core)
+
+        mocks["STIRSHAKENManager"].assert_not_called()
+        assert pbx_core.stir_shaken_manager is None
+
+    def test_stir_shaken_enabled(self) -> None:
+        """enabled: true instantiates the manager (verification-only, no certificate needed)."""
+        stir_shaken_config = {"enabled": True, "ca_cert_path": "/certs/ca.pem"}
+        pbx_core = _make_pbx_core(config_overrides={"stir_shaken": stir_shaken_config})
+        mocks = _run_initialize_with_all_patches(pbx_core)
+
+        mocks["STIRSHAKENManager"].assert_called_once_with(config=stir_shaken_config)
+        assert pbx_core.stir_shaken_manager == mocks["STIRSHAKENManager"].return_value
+
     # ------------------------------------------------------------------ #
     # Always-initialized lazy subsystems
     # ------------------------------------------------------------------ #
@@ -689,6 +717,7 @@ class TestFeatureInitializerInitialize:
         assert pbx_core.threat_detector is None
         assert pbx_core.dnd_scheduler is None
         assert pbx_core.skills_router is None
+        assert pbx_core.stir_shaken_manager is None
 
 
 @pytest.mark.unit

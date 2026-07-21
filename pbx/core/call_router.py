@@ -298,6 +298,22 @@ class CallRouter:
             pbx.logger.warning(f"No inbound route for DID {to_ext} on trunk {trunk.trunk_id}")
             return False
 
+        # STIR/SHAKEN (RFC 8224/8588): verify any Identity header the
+        # carrier attached to this inbound INVITE before dispatching.
+        # Unlike outbound signing (deliberately not wired -- see
+        # _route_to_trunk()), verifying a carrier's own signature requires
+        # no certificate or registration on our end. Verification never
+        # blocks the call in v1 -- there's no configured trust-anchor
+        # policy yet to decide reject/flag against -- the status is only
+        # recorded on the CDR for visibility once dispatch succeeds. Returns
+        # NOT_VERIFIED (not NO_SIGNATURE) when pbx.stir_shaken_manager is
+        # None, i.e. inbound verification isn't enabled.
+        from pbx.features.stir_shaken import verify_stir_shaken_invite
+
+        stir_shaken_status, stir_shaken_payload = verify_stir_shaken_invite(
+            message, pbx.stir_shaken_manager
+        )
+
         destination_type = route["destination_type"]
         destination_value = route["destination_value"]
 
@@ -305,7 +321,7 @@ class CallRouter:
             rewritten_to_header = re.sub(
                 r"sip:(\*?[^@]+)@", f"sip:{destination_value}@", to_header, count=1
             )
-            return self._dial_to_internal_extension(
+            dispatched = self._dial_to_internal_extension(
                 from_ext,
                 destination_value,
                 from_header,
@@ -314,31 +330,35 @@ class CallRouter:
                 message,
                 from_addr,
             )
-
-        if destination_type == "auto_attendant":
+        elif destination_type == "auto_attendant":
             if not pbx.auto_attendant:
                 pbx.logger.warning(
                     f"Inbound route for DID {to_ext} points to the auto attendant, "
                     "but the auto attendant feature is not enabled"
                 )
                 return False
-            return bool(
+            dispatched = bool(
                 pbx.auto_attendant_handler.handle_auto_attendant(
                     from_ext, pbx.auto_attendant.get_extension(), call_id, message, from_addr
                 )
             )
-
-        if destination_type == "voicemail":
-            return bool(
+        elif destination_type == "voicemail":
+            dispatched = bool(
                 pbx.voicemail_handler.handle_voicemail_access(
                     from_ext, f"*{destination_value}", call_id, message, from_addr
                 )
             )
+        else:
+            pbx.logger.error(
+                f"Inbound route for DID {to_ext} has unknown destination_type={destination_type!r}"
+            )
+            return False
 
-        pbx.logger.error(
-            f"Inbound route for DID {to_ext} has unknown destination_type={destination_type!r}"
-        )
-        return False
+        if dispatched:
+            attestation = stir_shaken_payload.get("attest") if stir_shaken_payload else None
+            pbx.cdr_system.set_stir_shaken(call_id, stir_shaken_status.value, attestation)
+
+        return dispatched
 
     def handle_callee_answer(
         self, call_id: str, response_message: Any, callee_addr: tuple[str, int]
@@ -1126,6 +1146,16 @@ class CallRouter:
         SIPMessageBuilder.add_caller_id_headers(
             invite_to_trunk, caller_id_number, caller_id_name, server_ip
         )
+
+        # No STIR/SHAKEN Identity header is attached here. Signing is the
+        # originating carrier's responsibility, not a trunk customer's --
+        # since the FCC's 2025-09-18 Third-Party Signing Rule, only a
+        # registered voice service provider (its own FCC Form 499 filer ID,
+        # OCN, and STI-PA-issued certificate) may sign a call, and a
+        # business buying a SIP trunk doesn't qualify. See
+        # docs/DEVELOPMENT_GUIDE.md. Verifying a carrier's own Identity
+        # header on *inbound* calls has no such restriction -- that's wired
+        # in _route_inbound_did() below.
 
         self._build_and_send_leg_invite(
             call,

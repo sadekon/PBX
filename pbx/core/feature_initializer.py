@@ -21,6 +21,7 @@ from pbx.features.phone_provisioning import PhoneProvisioning
 from pbx.features.presence import PresenceSystem
 from pbx.features.recording_retention import RecordingRetentionManager
 from pbx.features.sip_trunk import SIPTrunkSystem
+from pbx.features.stir_shaken import STIRSHAKENManager
 from pbx.features.time_based_routing import TimeBasedRouting
 from pbx.features.voicemail import VoicemailSystem
 
@@ -66,6 +67,21 @@ class FeatureInitializer:
         pbx_core.inbound_routing = InboundRoutingSystem(
             inbound_route_db=pbx_core.inbound_route_db, extension_db=pbx_core.extension_db
         )
+
+        # STIR/SHAKEN inbound caller ID verification (RFC 8224/8588) --
+        # checks the Identity header a carrier attaches to inbound trunk
+        # INVITEs. Deliberately verification-only: no certificate is needed
+        # for that (only an optional ca_cert_path to validate the carrier's
+        # certificate chain), and outbound signing isn't wired at all --
+        # only a registered voice service provider may sign a call under
+        # the FCC's 2025-09-18 Third-Party Signing Rule, which a trunk
+        # customer is not. See docs/DEVELOPMENT_GUIDE.md.
+        stir_shaken_config = config.get("stir_shaken", {}) or {}
+        if stir_shaken_config.get("enabled", False):
+            pbx_core.stir_shaken_manager = STIRSHAKENManager(config=stir_shaken_config)
+            logger.info("STIR/SHAKEN inbound verification initialized")
+        else:
+            pbx_core.stir_shaken_manager = None
 
         # Initialize statistics engine for analytics
         from pbx.features.statistics import StatisticsEngine
