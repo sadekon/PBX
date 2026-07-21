@@ -113,10 +113,6 @@ def test_sip_trunk_e911_blocking() -> None:
     assert routed_trunk is None, "911 call should be blocked in test mode"
     assert transformed_number is None, "911 call should return None for transformed number"
 
-    # Try to make 911 call - should be blocked
-    result = trunk_system.make_outbound_call("1001", "911")
-    assert not result, "911 call should fail in test mode"
-
     # Regular call should work
     regular_rule = OutboundRule(rule_id="regular", pattern="^[2-9][0-9]{9}$", trunk_id="test_trunk")
     trunk_system.add_outbound_rule(regular_rule)

@@ -664,3 +664,24 @@ def register_all_migrations(manager: MigrationManager) -> None:
         );
     """),
     )
+
+    # Migration 1012: Inbound DID Routing
+    manager.register_migration(
+        1012,
+        "Inbound DID Routing",
+        manager._build_migration_sql("""
+        -- DID -> internal destination mappings for calls arriving on a SIP trunk
+        CREATE TABLE IF NOT EXISTS inbound_routes (
+            id {SERIAL},
+            did_number VARCHAR(20) NOT NULL,
+            trunk_id VARCHAR(50),
+            destination_type VARCHAR(20) NOT NULL,
+            destination_value VARCHAR(50) NOT NULL,
+            enabled BOOLEAN DEFAULT {BOOLEAN_TRUE},
+            priority INTEGER DEFAULT 100,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (did_number, trunk_id)
+        );
+    """),
+    )

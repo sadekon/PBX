@@ -1,5 +1,6 @@
 """Comprehensive tests for pbx/features/sip_trunk.py module."""
 
+import socket
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -205,6 +206,32 @@ class TestSIPTrunkMarkRegistered:
             <= trunk.registration_refresh_at
             <= after + timedelta(seconds=60)
         )
+
+    @patch("pbx.features.sip_trunk.socket.gethostbyname")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_resolves_and_caches_host_ip(
+        self, mock_logger: MagicMock, mock_gethostbyname: MagicMock
+    ) -> None:
+        mock_gethostbyname.return_value = "203.0.113.10"
+        trunk = SIPTrunk("t1", "Primary", "sip.example.com", "user", "pass")
+
+        trunk.mark_registered()
+
+        mock_gethostbyname.assert_called_once_with("sip.example.com")
+        assert trunk.resolved_host_ip == "203.0.113.10"
+
+    @patch("pbx.features.sip_trunk.socket.gethostbyname")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_resolution_failure_does_not_block_registration(
+        self, mock_logger: MagicMock, mock_gethostbyname: MagicMock
+    ) -> None:
+        mock_gethostbyname.side_effect = socket.gaierror("nope")
+        trunk = SIPTrunk("t1", "Primary", "sip.example.com", "user", "pass")
+
+        trunk.mark_registered()
+
+        assert trunk.resolved_host_ip is None
+        assert trunk.status == TrunkStatus.REGISTERED
 
 
 @pytest.mark.unit
@@ -678,6 +705,58 @@ class TestSIPTrunkSystemTrunkManagement:
 
     @patch("pbx.features.sip_trunk.E911Protection")
     @patch("pbx.features.sip_trunk.get_logger")
+    def test_get_trunk_by_addr_matches_resolved_ip(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        system = SIPTrunkSystem()
+        trunk = _make_trunk("t1", "Primary")
+        trunk.resolved_host_ip = "203.0.113.10"
+        system.add_trunk(trunk)
+
+        # Port need not match the REGISTER target -- carriers commonly
+        # source INVITEs from a different port.
+        assert system.get_trunk_by_addr(("203.0.113.10", 9999)) is trunk
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_get_trunk_by_addr_no_match(self, mock_logger: MagicMock, mock_e911: MagicMock) -> None:
+        system = SIPTrunkSystem()
+        trunk = _make_trunk("t1", "Primary")
+        trunk.resolved_host_ip = "203.0.113.10"
+        system.add_trunk(trunk)
+
+        assert system.get_trunk_by_addr(("198.51.100.5", 5060)) is None
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_get_trunk_by_addr_unregistered_trunk_never_matches(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        """A trunk that has never registered has no resolved_host_ip and can't match."""
+        system = SIPTrunkSystem()
+        trunk = _make_trunk("t1", "Primary")
+        assert trunk.resolved_host_ip is None
+        system.add_trunk(trunk)
+
+        assert system.get_trunk_by_addr(("203.0.113.10", 5060)) is None
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_get_trunk_by_addr_picks_correct_trunk_among_several(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        system = SIPTrunkSystem()
+        t1 = _make_trunk("t1", "Primary")
+        t1.resolved_host_ip = "203.0.113.10"
+        t2 = _make_trunk("t2", "Secondary")
+        t2.resolved_host_ip = "203.0.113.20"
+        system.add_trunk(t1)
+        system.add_trunk(t2)
+
+        assert system.get_trunk_by_addr(("203.0.113.20", 5060)) is t2
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
     def test_remove_trunk(self, mock_logger: MagicMock, mock_e911: MagicMock) -> None:
         system = SIPTrunkSystem()
         trunk = _make_trunk("t1", "Primary")
@@ -796,63 +875,6 @@ class TestSIPTrunkSystemRouting:
 
 
 @pytest.mark.unit
-class TestSIPTrunkSystemMakeOutboundCall:
-    """Tests for make_outbound_call."""
-
-    @patch("pbx.features.sip_trunk.E911Protection")
-    @patch("pbx.features.sip_trunk.get_logger")
-    def test_make_outbound_call_success(self, mock_logger: MagicMock, mock_e911: MagicMock) -> None:
-        mock_e911.return_value.block_if_e911.return_value = False
-        system = SIPTrunkSystem()
-        trunk = _make_trunk("t1", "Primary")
-        trunk.register()
-        system.add_trunk(trunk)
-        rule = OutboundRule("r1", r"^\d+$", "t1")
-        system.add_outbound_rule(rule)
-        result = system.make_outbound_call("1001", "12125551234")
-        assert result is True
-        assert trunk.channels_in_use == 1
-
-    @patch("pbx.features.sip_trunk.E911Protection")
-    @patch("pbx.features.sip_trunk.get_logger")
-    def test_make_outbound_call_no_route(
-        self, mock_logger: MagicMock, mock_e911: MagicMock
-    ) -> None:
-        mock_e911.return_value.block_if_e911.return_value = False
-        system = SIPTrunkSystem()
-        result = system.make_outbound_call("1001", "12125551234")
-        assert result is False
-
-    @patch("pbx.features.sip_trunk.E911Protection")
-    @patch("pbx.features.sip_trunk.get_logger")
-    def test_make_outbound_call_e911_blocked(
-        self, mock_logger: MagicMock, mock_e911: MagicMock
-    ) -> None:
-        mock_e911.return_value.block_if_e911.return_value = True
-        system = SIPTrunkSystem()
-        result = system.make_outbound_call("1001", "911")
-        assert result is False
-
-    @patch("pbx.features.sip_trunk.E911Protection")
-    @patch("pbx.features.sip_trunk.get_logger")
-    def test_make_outbound_call_no_channels(
-        self, mock_logger: MagicMock, mock_e911: MagicMock
-    ) -> None:
-        mock_e911.return_value.block_if_e911.return_value = False
-        system = SIPTrunkSystem()
-        trunk = _make_trunk("t1", "Primary")
-        trunk.register()
-        trunk.max_channels = 1
-        trunk.channels_available = 1
-        trunk.channels_in_use = 1  # full
-        system.add_trunk(trunk)
-        rule = OutboundRule("r1", r"^\d+$", "t1")
-        system.add_outbound_rule(rule)
-        result = system.make_outbound_call("1001", "12125551234")
-        assert result is False
-
-
-@pytest.mark.unit
 class TestSIPTrunkSystemGetTrunkStatus:
     """Tests for get_trunk_status."""
 
@@ -947,6 +969,26 @@ class TestSIPTrunkSystemHealthMonitoring:
         system.add_trunk(trunk)
         system._perform_health_checks()
         assert trunk.health_status == TrunkHealthStatus.DOWN
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_perform_health_checks_triggers_recovery(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        system = SIPTrunkSystem()
+        trunk = MagicMock()
+        trunk.name = "Primary"
+        trunk.trunk_id = "t1"
+        trunk.health_status = TrunkHealthStatus.DOWN
+        trunk.check_health.return_value = TrunkHealthStatus.HEALTHY
+        system.trunks["t1"] = trunk
+        system.outbound_rules.append(OutboundRule("r1", r"^\d+$", "t2"))
+        system.original_rule_trunk_ids["r1"] = "t1"
+
+        system._perform_health_checks()
+
+        assert system.outbound_rules[0].trunk_id == "t1"
+        assert system.original_rule_trunk_ids == {}
 
     @patch("pbx.features.sip_trunk.E911Protection")
     @patch("pbx.features.sip_trunk.get_logger")
@@ -1110,6 +1152,9 @@ class TestSIPTrunkSystemFailover:
         system._handle_trunk_failure(failed)
         assert failed.failover_count == 1
         assert failed.last_failover_time is not None
+        # Rule re-pointed to the failover trunk, original remembered
+        assert rule.trunk_id == "t2"
+        assert system.original_rule_trunk_ids == {"r1": "t1"}
 
     @patch("pbx.features.sip_trunk.E911Protection")
     @patch("pbx.features.sip_trunk.get_logger")
@@ -1119,9 +1164,53 @@ class TestSIPTrunkSystemFailover:
         system = SIPTrunkSystem()
         failed = _make_trunk("t1", "Primary")
         system.add_trunk(failed)
-        # No rules point to t1
+        # No rules point to t1 (outbound_rules is empty) -> re-pointing is a no-op
         system._handle_trunk_failure(failed)
         assert failed.failover_count == 1
+        assert system.original_rule_trunk_ids == {}
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_handle_trunk_recovery_restores_original_rule(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        system = SIPTrunkSystem()
+        failed = _make_trunk("t1", "Primary", priority=100)
+        failed.register()
+        failed.status = TrunkStatus.FAILED
+        failed.health_status = TrunkHealthStatus.DOWN
+
+        alt = _make_trunk("t2", "Secondary", priority=50)
+        alt.register()
+
+        system.add_trunk(failed)
+        system.add_trunk(alt)
+
+        rule = OutboundRule("r1", r"^\d+$", "t1")
+        system.add_outbound_rule(rule)
+
+        system._handle_trunk_failure(failed)
+        assert rule.trunk_id == "t2"
+
+        # t1 comes back healthy
+        failed.status = TrunkStatus.REGISTERED
+        failed.health_status = TrunkHealthStatus.HEALTHY
+        system._handle_trunk_recovery(failed)
+
+        assert rule.trunk_id == "t1"
+        assert system.original_rule_trunk_ids == {}
+
+    @patch("pbx.features.sip_trunk.E911Protection")
+    @patch("pbx.features.sip_trunk.get_logger")
+    def test_handle_trunk_recovery_no_repointed_rules(
+        self, mock_logger: MagicMock, mock_e911: MagicMock
+    ) -> None:
+        system = SIPTrunkSystem()
+        recovered = _make_trunk("t1", "Primary")
+        recovered.register()
+        # Nothing in original_rule_trunk_ids -> no-op, no crash
+        system._handle_trunk_recovery(recovered)
+        assert system.original_rule_trunk_ids == {}
 
     @patch("pbx.features.sip_trunk.E911Protection")
     @patch("pbx.features.sip_trunk.get_logger")

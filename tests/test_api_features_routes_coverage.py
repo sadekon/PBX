@@ -899,6 +899,191 @@ class TestSIPTrunkRoutes:
 
 
 @pytest.mark.unit
+class TestInboundRouteRoutes:
+    """Tests for Inbound DID Routing endpoints."""
+
+    def test_get_inbound_routes_success(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        routing = MagicMock()
+        routing.get_effective_routes.return_value = [
+            {"did_number": "12125551234", "destination_value": "1001", "source": "manual"}
+        ]
+        mock_pbx_core.inbound_routing = routing
+
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        ):
+            resp = api_client.get("/api/inbound-routes")
+        assert resp.status_code == 200
+        data = json.loads(resp.data)
+        assert data["count"] == 1
+
+    def test_get_inbound_routes_not_initialized(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        if hasattr(mock_pbx_core, "inbound_routing"):
+            del mock_pbx_core.inbound_routing
+
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        ):
+            resp = api_client.get("/api/inbound-routes")
+        assert resp.status_code == 500
+
+    def test_add_inbound_route_success(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        mock_pbx_core.inbound_routing = MagicMock()
+        mock_pbx_core.inbound_route_db = MagicMock()
+        mock_pbx_core.inbound_route_db.add.return_value = True
+
+        route_data = {
+            "did_number": "12125551234",
+            "destination_type": "extension",
+            "destination_value": "1001",
+        }
+
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        ):
+            resp = api_client.post(
+                "/api/inbound-routes",
+                data=json.dumps(route_data),
+                content_type="application/json",
+            )
+        assert resp.status_code == 200
+        mock_pbx_core.inbound_routing.reload_routes.assert_called_once()
+
+    def test_add_inbound_route_missing_fields(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        mock_pbx_core.inbound_routing = MagicMock()
+        mock_pbx_core.inbound_route_db = MagicMock()
+
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        ):
+            resp = api_client.post(
+                "/api/inbound-routes",
+                data=json.dumps({"did_number": "12125551234"}),
+                content_type="application/json",
+            )
+        assert resp.status_code == 400
+
+    def test_add_inbound_route_invalid_destination_type(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        mock_pbx_core.inbound_routing = MagicMock()
+        mock_pbx_core.inbound_route_db = MagicMock()
+
+        route_data = {
+            "did_number": "12125551234",
+            "destination_type": "queue",
+            "destination_value": "1001",
+        }
+
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        ):
+            resp = api_client.post(
+                "/api/inbound-routes",
+                data=json.dumps(route_data),
+                content_type="application/json",
+            )
+        assert resp.status_code == 400
+
+    def test_update_inbound_route_success(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        mock_pbx_core.inbound_routing = MagicMock()
+        mock_pbx_core.inbound_route_db = MagicMock()
+        mock_pbx_core.inbound_route_db.get.return_value = {"id": 1, "did_number": "12125551234"}
+        mock_pbx_core.inbound_route_db.update.return_value = True
+
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        ):
+            resp = api_client.put(
+                "/api/inbound-routes/1",
+                data=json.dumps({"destination_value": "1002"}),
+                content_type="application/json",
+            )
+        assert resp.status_code == 200
+
+    def test_update_inbound_route_not_found(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        mock_pbx_core.inbound_routing = MagicMock()
+        mock_pbx_core.inbound_route_db = MagicMock()
+        mock_pbx_core.inbound_route_db.get.return_value = None
+
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        ):
+            resp = api_client.put(
+                "/api/inbound-routes/999",
+                data=json.dumps({"destination_value": "1002"}),
+                content_type="application/json",
+            )
+        assert resp.status_code == 404
+
+    def test_update_inbound_route_invalid_destination_type(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        mock_pbx_core.inbound_routing = MagicMock()
+        mock_pbx_core.inbound_route_db = MagicMock()
+        mock_pbx_core.inbound_route_db.get.return_value = {"id": 1, "did_number": "12125551234"}
+
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        ):
+            resp = api_client.put(
+                "/api/inbound-routes/1",
+                data=json.dumps({"destination_type": "queue"}),
+                content_type="application/json",
+            )
+        assert resp.status_code == 400
+
+    def test_delete_inbound_route_success(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        mock_pbx_core.inbound_routing = MagicMock()
+        mock_pbx_core.inbound_route_db = MagicMock()
+        mock_pbx_core.inbound_route_db.get.return_value = {"id": 1, "did_number": "12125551234"}
+        mock_pbx_core.inbound_route_db.delete.return_value = True
+
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        ):
+            resp = api_client.delete("/api/inbound-routes/1")
+        assert resp.status_code == 200
+
+    def test_delete_inbound_route_not_found(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        mock_pbx_core.inbound_routing = MagicMock()
+        mock_pbx_core.inbound_route_db = MagicMock()
+        mock_pbx_core.inbound_route_db.get.return_value = None
+
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        ):
+            resp = api_client.delete("/api/inbound-routes/999")
+        assert resp.status_code == 404
+
+
+@pytest.mark.unit
 class TestLCRRoutes:
     """Tests for LCR (Least-Cost Routing) endpoints."""
 

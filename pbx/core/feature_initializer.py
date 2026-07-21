@@ -15,6 +15,7 @@ from pbx.features.cdr import CDRSystem
 from pbx.features.conference import ConferenceSystem
 from pbx.features.find_me_follow_me import FindMeFollowMe
 from pbx.features.fraud_detection import FraudDetectionSystem
+from pbx.features.inbound_routing import InboundRoutingSystem
 from pbx.features.music_on_hold import MusicOnHold
 from pbx.features.phone_provisioning import PhoneProvisioning
 from pbx.features.presence import PresenceSystem
@@ -61,6 +62,9 @@ class FeatureInitializer:
         pbx_core.moh_system = MusicOnHold()
         pbx_core.trunk_system = SIPTrunkSystem(
             config=config, sip_server=pbx_core.sip_server, trunk_db=pbx_core.trunk_db
+        )
+        pbx_core.inbound_routing = InboundRoutingSystem(
+            inbound_route_db=pbx_core.inbound_route_db, extension_db=pbx_core.extension_db
         )
 
         # Initialize statistics engine for analytics

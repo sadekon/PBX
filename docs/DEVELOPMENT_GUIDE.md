@@ -4,9 +4,13 @@
 > built, and what remains to finish, debug, and deploy every feature in this system.
 > Update the status tables here whenever feature work lands.
 >
-> **Last audited:** 2026-07-17, against branches `auto-attendant` (current, open as
-> [PR #2](https://github.com/sadekon/PBX/pull/2)), `sip-trunk`, and `DEV`. `voicemail-fix`
-> merged to `DEV` via PR #1 and is no longer a live branch.
+> **Last audited:** 2026-07-20, against branches `auto-attendant` (open as
+> [PR #2](https://github.com/sadekon/PBX/pull/2)), `sip-trunk` (current), and `DEV`.
+> `voicemail-fix` merged to `DEV` via PR #1 and is no longer a live branch.
+>
+> Latest on `sip-trunk`: C4 call-originate primitive built and click-to-dial wired onto it;
+> outbound caller ID now sends the extension's DID; inbound DID routing data layer (model,
+> migrations, API, admin UI) landed — its SIP dispatch is the remaining piece.
 
 ## How this document is organized
 
@@ -43,8 +47,8 @@ with a second gate says so in its row.
 | **C1** | SIP signaling core — registration, dialogs, routing, transfer/hold | ✅ working (UDP-only) | `pbx/sip/`, `core/call_router.py` | Call-handling features work today; TLS/TCP transport is Phase-7 hardening. REFER transfer rewritten on `auto-attendant` (attended via Replaces per RFC 3891, blind via PBX-originated leg); pending field verification with Zultys ZIP phones |
 | **C2** | RTP media relay & IVR plumbing — relay, DTMF (RFC 2833 + SIP INFO + in-band), prompt playback, recording tap | ✅ voicemail-fix merged to DEV; DTMF sources unified into one `DTMFMonitor` on `auto-attendant` | `pbx/rtp/`, `core/voicemail_handler.py`, `rtp/handler.py`, `rtp/dtmf_monitor.py` | Voicemail, AA, MoH, recording, paging; codec expansion slots in here |
 | **C3** | **Audio mixer (N-way media) — does not exist** | ❌ missing | (to build: sum/mix G.711 streams per participant, or bridge via Jitsi) | Conference audio, 3-way calling, barge/whisper/screening |
-| **C4** | **Call-originate primitive — does not exist** ("PBX creates a leg to X, then bridges") | ❌ missing | (to build in `core/` + SIP server) | Click-to-dial, callback completion, predictive dialing, emergency-notification calls, operator console actions |
-| **C5** | Trunk / PSTN connectivity | 🔶 outbound done on `sip-trunk` branch; **inbound (DID) missing** | `features/sip_trunk.py`, `sip/server.py`, `core/call_router.py` | DID routing, E911 stack, LCR, STIR/SHAKEN, DNS SRV failover, fraud detection on real traffic, SBC validation |
+| **C4** | Call-originate primitive ("PBX creates a leg to X, then bridges") | ✅ built on `sip-trunk` | `core/call_originator.py`, `core/call_router.py` (`_build_and_send_leg_invite`) | `CallOriginator.originate_call()`/`originate_and_bridge()`; click-to-dial wired onto it. Callback completion, predictive dialing, emergency-notification calls, operator console remain to be wired. Field-unverified against real phones. |
+| **C5** | Trunk / PSTN connectivity | 🔶 outbound + inbound DID routing built on `sip-trunk`; **field-unverified** (no carrier account) | `features/sip_trunk.py`, `features/inbound_routing.py`, `sip/server.py`, `core/call_router.py` | E911 stack, LCR, STIR/SHAKEN, DNS SRV failover, fraud detection on real traffic, SBC validation |
 | **C6** | Analytics tap — live audio/transcript/QoS feed into analysis engines | 🔶 recordings + RTCP QoS data exist; no live feed wiring | `features/call_recording.py`, `rtp/rtcp_monitor.py` | Speech analytics, voice biometrics, call tagging, quality prediction, recording analytics, conversational AI |
 | **C7** | Data & event plane — CDR, webhooks, DB persistence, migrations | ✅ working | `features/cdr.py`, `features/webhooks.py`, `utils/database.py` | BI export, compliance, retention, residency, geo-redundancy replication build on it |
 
@@ -71,11 +75,12 @@ forwarding methods, so call sites use e.g. `pbx.transfer_handler.start_blind_ref
 |-----------|-------|--------|------------------------|
 | SIP server (C1) | `pbx/sip/server.py` (~2 257 ln) | ✅ | **UDP only** — a single `SOCK_DGRAM` socket. No TCP or TLS transport, so no SIPS and no encrypted signaling to carriers/phones. Biggest core limitation. REFER/Replaces transfer parsing and SIP 3xx redirect (call-forwarding) handling landed on `auto-attendant`. |
 | SIP message/SDP/transaction (C1) | `pbx/sip/message.py`, `sdp.py`, `transaction.py` | ✅ | Parser, SDP builder/negotiation, transaction state machine. |
-| RTP relay + media (C2) | `pbx/rtp/handler.py` (~1 645 ln), `jitter_buffer.py`, `dtmf_monitor.py`, `rtcp_monitor.py` | ✅ | In-process relay, ports 10000–20000, RTCP QoS feed. G.711 µ/A end-to-end; G.722 partially via `utils/audio`. DTMF (RFC 2833 + SIP INFO + in-band) unified into one `DTMFMonitor` shared by AA and voicemail IVR (`auto-attendant`). No mixer (C3) and no originate primitive (C4) — the two missing core builds. |
+| RTP relay + media (C2) | `pbx/rtp/handler.py` (~1 645 ln), `jitter_buffer.py`, `dtmf_monitor.py`, `rtcp_monitor.py` | ✅ | In-process relay, ports 10000–20000, RTCP QoS feed. G.711 µ/A end-to-end; G.722 partially via `utils/audio`. DTMF (RFC 2833 + SIP INFO + in-band) unified into one `DTMFMonitor` shared by AA and voicemail IVR (`auto-attendant`). No mixer (C3) — now the one remaining missing core build (C4 originate landed on `sip-trunk`). |
 | Call transfer (C1) | `pbx/core/transfer_handler.py` (~862 ln) | ✅ | Blind + attended transfer via REFER/Replaces (RFC 3891); invite-based transfer detection; mandatory Via/Max-Forwards on teardown; auto-attendant calls transfer via the RTP relay instead of REFER (PBX stays in the media path) and are held with MOH during the transfer. Pending field verification with Zultys ZIP phones. |
 | Codec negotiation (C2) | `pbx/core/codec_negotiator.py` (~339 ln) | ✅ | Phone-model detection and codec compatibility, extracted out of `PBXCore`. |
 | Registration handling (C1) | `pbx/core/registration_handler.py` (~314 ln) | ✅ | SIP REGISTER handling, extracted out of `PBXCore`. |
-| Call state machine + router (C1) | `pbx/core/call.py`, `call_router.py` (~1 228 ln) | ✅ | Dialplan patterns route to extensions, conference rooms (`2xxx`), parking (`7x`), queues (`8xxx`), voicemail, AA. Trunk routing added on `sip-trunk` branch. SIP 3xx redirect (call forwarding, e.g. a phone's "always forward") routed here on `auto-attendant`. |
+| Call state machine + router (C1) | `pbx/core/call.py`, `call_router.py` | ✅ | Dialplan patterns route to extensions, conference rooms (`2xxx`), parking (`7x`), queues (`8xxx`), voicemail, AA. Trunk routing added on `sip-trunk` branch. SIP 3xx redirect (call forwarding, e.g. a phone's "always forward") routed here on `auto-attendant`. Leg construction shared with `CallOriginator` via `_build_and_send_leg_invite()`. |
+| Call originator (C4) | `pbx/core/call_originator.py` | ✅ | PBX-initiated call legs: `originate_call()` / `originate_and_bridge()`. Shares destination classification (`EXTERNAL_NUMBER_PATTERN`) and leg building with `CallRouter`, but keeps its own call lifecycle (no `original_invite`, own no-answer timer, `Call.originate_callbacks`). Field-unverified against real phones. |
 | PBXCore + feature init | `pbx/core/pbx.py`, `feature_initializer.py` | ✅ | Static (not dynamic) initialization of ~30 Tier-1 features. |
 | IVR handlers (C2) | `core/voicemail_handler.py` (~1 159 ln), `auto_attendant_handler.py`, `paging_handler.py`, `emergency_handler.py` | ✅ | Voicemail IVR fixes (DTMF reliability, prompts, barge-in) merged via `voicemail-fix` (PR #1). AA transfer now RTP-relay-based with MOH hold (`auto-attendant`); a transfer-failure TODO remains (see below). |
 | REST API + admin UI | `pbx/api/` (22 route modules), `admin/` (19 TS pages) | ✅ | Flask app factory, auth, OpenAPI docs; Vite/TS frontend. Known debt: CSP `unsafe-inline` (≈130 inline `onclick`, ≈330 inline `style=` in `index.html`). |
@@ -127,14 +132,14 @@ flag. Grouped by gating capability.
 |---------|--------|------------|--------|----------------|----------|
 | Conference | `conference.py` | `features.conference` | 🔶 | **State machine only** — rooms, participants, mute all tracked, dialplan `2xxx` routes in. **No RTP audio mixer exists anywhere in `pbx/rtp/`**, so N-way audio does not actually mix. Build the mixer (sum G.711 per participant, minus own audio) or bridge via Jitsi. | A (3 phones) |
 
-### C4 — Originate-gated (originate primitive ❌ — blocked until built)
+### C4 — Originate-gated (primitive ✅ built on `sip-trunk`; consumers still to wire)
 
 | Feature | Module | Config gate | Status | Remaining work | Test rig |
 |---------|--------|------------|--------|----------------|----------|
-| Callback queue | `callback_queue.py` | config | 🔶 | Queue/persistence wired; *completing* a callback requires the PBX to originate a call leg. | A |
-| Emergency notification | `emergency_notification.py` | `features.emergency_notification` (default on) | 🔶 | **Stub actions**: logs "Would call/email/SMS …" (lines ~485–614). Calls/paging need C4; email/SMS need SMTP + SMS provider (Rig E). | A + E |
+| Callback queue | `callback_queue.py` | config | 🔶 | Queue/persistence wired; *completing* a callback now just needs wiring to `CallOriginator.originate_and_bridge()`. | A |
+| Emergency notification | `emergency_notification.py` | `features.emergency_notification` (default on) | 🔶 | **Stub actions**: logs "Would call/email/SMS …" (lines ~485–614). Call/page actions can now use `CallOriginator`; email/SMS still need SMTP + SMS provider (Rig E). | A + E |
 
-### C5 — Trunk-gated (outbound 🚧 on branch, inbound ❌)
+### C5 — Trunk-gated (outbound 🚧 on branch, inbound 🚧 data layer only)
 
 | Feature | Module | Config gate | Status | Remaining work | Test rig |
 |---------|--------|------------|--------|----------------|----------|
@@ -173,14 +178,14 @@ them**. `tests/test_planned_feature_frameworks.py` covers them as frameworks.
 2. Subscribe it to live events — call start/end, audio taps, DTMF, QoS.
 3. Integrate the real external dependency (ML model, speech engine, provider API).
 
-### C4 — Originate-gated
+### C4 — Originate-gated (primitive ✅ built; these are the consumers)
 
 | Feature | Module | What exists | Key missing piece | Test rig |
 |---------|--------|-------------|-------------------|----------|
-| Click-to-dial | `click_to_dial.py` + admin page | API + UI | Originate primitive (C4) | A |
-| Predictive dialing | `predictive_dialing.py` + `_db.py` | Statistical pacing engine | C4 to place calls + C5 trunk to reach PSTN; answer detection (C6) | C |
-| Predictive VM drop | `predictive_voicemail_drop.py` | Framework | C4 + answering-machine detection on live media (C6) | C |
-| Call blending | `call_blending.py` | Framework | C4 + queue integration | A + C |
+| Click-to-dial | `click_to_dial.py` + admin page | API + UI + **wired to `CallOriginator.originate_and_bridge()`** | Real-phone verification (Rig A) — the one end-to-end path testable today | A |
+| Predictive dialing | `predictive_dialing.py` + `_db.py` | Statistical pacing engine | Wire to `CallOriginator` + C5 trunk to reach PSTN; answer detection (C6) | C |
+| Predictive VM drop | `predictive_voicemail_drop.py` | Framework | Wire to `CallOriginator` + answering-machine detection on live media (C6) | C |
+| Call blending | `call_blending.py` | Framework | Wire to `CallOriginator` + queue integration | A + C |
 
 ### C6 — Analytics-tap-gated
 
@@ -227,9 +232,9 @@ covers several). Each needs an explicit wire-or-cut decision before "finished" m
 
 | Module | Gated by | What it is | Recommended disposition |
 |--------|----------|-----------|------------------------|
-| `stir_shaken.py` | C5 | Caller-ID attestation/verification | **Wire** — belongs in trunk INVITE path (Identity header) once sip-trunk lands; needs signing certs from carrier/STI-PA. Rig C. |
+| `stir_shaken.py` | C5 | Caller-ID attestation/verification | **Wire** — `add_stir_shaken_to_invite()` into `_route_to_trunk()` (alongside the caller-ID headers), `verify_stir_shaken_invite()` into the inbound path. Complete but still called from nowhere; needs signing certs from carrier/STI-PA. Rig C. |
 | `least_cost_routing.py` | C5 | Multi-trunk cost-based route selection | **Wire** — natural extension of `SIPTrunkSystem.route_outbound()` once >1 trunk exists. Rig C. |
-| `operator_console.py` | C4 | Attendant console backend | Wire to admin UI + presence once originate exists; or defer. |
+| `operator_console.py` | C4 | Attendant console backend | Wire to admin UI + presence (originate now exists via `CallOriginator`); or defer. |
 | `advanced_call_features.py` | C3 | Call screening/whisper/barge | Same mixer investment as conference — schedule together. |
 | `ai_call_routing.py` | C7 | ML route selection | Defer until call-volume data exists. |
 | `audio_processing.py` | C2 | Audio effects/normalization | Fold into recording pipeline or cut. |
@@ -251,25 +256,48 @@ covers several). Each needs an explicit wire-or-cut decision before "finished" m
 - **Registration**: `SIPServer.register_trunk()` → REGISTER with digest auth (`_build_trunk_register`, `_parse_www_authenticate`, `_compute_trunk_digest_response`), periodic re-REGISTER before Expires lapses.
 - **Outbound calls**: `CallRouter._route_to_trunk()` — 10/11-digit pattern detection, priority-fallback when no rules configured, capacity-aware failover, codec intersection with caller's SDP (numeric payload-type format), RFC 2833 telephone-event offered, 401/407 INVITE retry with credentials, 480 on no-answer (no bogus voicemail), channel release on end.
 - **Safety**: E911 protection blocks 911-pattern dialing in test mode.
-- **Tests**: substantial coverage additions (`test_sip_server_coverage.py` +337 ln, `test_sip_trunk_coverage.py` +324 ln, `test_call_router_coverage.py` +175 ln).
+- **Call-originate primitive (C4)**: `core/call_originator.py` — `originate_call()` /
+  `originate_and_bridge()`, sharing destination classification and leg construction with
+  `CallRouter` via `_build_and_send_leg_invite()`. Click-to-dial wired onto it.
+- **Outbound caller ID**: `_route_to_trunk()` sends the calling extension's `did_number`
+  (a real E.164 number) in From + P-Asserted-Identity/Remote-Party-ID, falling back to the
+  extension number. Previously it sent the raw internal extension (e.g. `1001`), which is
+  not carrier-dialable and conflicts with Truth-in-Caller-ID.
+- **Inbound DID routing — data layer**: `models/inbound_route.py`, migration `1012`,
+  `InboundRouteDB`, `features/inbound_routing.py` (`InboundRoutingSystem`), plus optional
+  `Extension.did_number` (Alembic `003`, auto-applied at startup). `/api/inbound-routes`
+  CRUD + merged effective-routes view; admin UI section on the SIP Trunks tab.
+- **Trunk failure handling**: `_handle_trunk_failure()` now re-points affected outbound
+  rules to the failover trunk and restores them when the trunk recovers (via the existing
+  `_perform_health_checks()` loop). Notification remains log-only.
+- **Inbound DID routing — SIP dispatch**: `SIPTrunk.resolved_host_ip` (cached in
+  `mark_registered()`) + `SIPTrunkSystem.get_trunk_by_addr()` identify an inbound INVITE
+  as trunk-sourced (IP match only, not port). `CallRouter._route_inbound_did()` looks up
+  the dialed DID via `inbound_routing.lookup()` and dispatches to an extension (through a
+  new `_dial_to_internal_extension()`, extracted from `route_call()` so both paths share
+  identical relay/CDR/webhook handling), the auto attendant, or voicemail. The hook in
+  `route_call()` runs before the Kari's Law/emergency and dialplan checks, since a
+  carrier's From header is caller-ID digits, not an internal extension. Queue as a
+  destination type is deliberately out of scope for v1. **The IP-matching heuristic is
+  exactly what needs real-carrier field validation** — not treated as verified.
+- **Tests**: substantial coverage additions (`test_sip_server_coverage.py`,
+  `test_sip_trunk_coverage.py`, `test_call_router_coverage.py`,
+  `test_call_originator_coverage.py`, `test_click_to_dial_coverage.py`,
+  `test_inbound_routing_coverage.py`, `test_api_features_routes_coverage.py`).
 
 ### Remaining to finish
 
-1. **Inbound calls (DID routing) — not implemented at all.** No inbound rule model,
-   no recognition of INVITEs arriving from a registered trunk's host, no DID→extension/AA/queue
-   mapping. Without it the trunk is outbound-only. Design: match source against trunk hosts →
-   look up To-user in an inbound-route table → hand to `CallRouter` as an internal destination.
-2. **`SIPTrunkSystem.make_outbound_call()` is a legacy stub** (TODO at `sip_trunk.py:757`) —
-   superseded by `CallRouter._route_to_trunk()`; delete or delegate to avoid two code paths.
-3. **`_handle_trunk_failure()` only logs** (TODO at `sip_trunk.py:798`) — per-call failover
-   works, but persistent rule re-pointing/recovery monitoring is unimplemented.
-4. **NAT/public-address handling** for SDP and Via/Contact toward the carrier (external IP
+1. **STIR/SHAKEN wiring** — `features/stir_shaken.py` is complete but called from nowhere.
+   Wire into the outbound trunk INVITE path (Identity header) and the inbound path (now
+   that DID dispatch exists). Needs signing certs from carrier/STI-PA.
+2. **NAT/public-address handling** for SDP and Via/Contact toward the carrier (external IP
    config, symmetric RTP) — untested until Rig C exists.
-5. **Carrier validation** against a real provider (config templates for AT&T and Comcast
+3. **Carrier validation** against a real provider (config templates for AT&T and Comcast
    exist: `config_att_sip.yml`, `config_comcast_sip.yml`; a cheap SIP provider like
-   VoIP.ms/Telnyx/Twilio is the low-risk first target).
-6. Follow-ons unlocked afterward: STIR/SHAKEN, least-cost routing, DNS SRV failover,
-   E911 via carrier, FMFM-to-external, predictive dialing.
+   VoIP.ms/Telnyx/Twilio is the low-risk first target). Gates the IP-matching heuristic,
+   (1)'s certs, (2) entirely, and end-to-end PSTN in both directions.
+4. Follow-ons unlocked afterward: least-cost routing, DNS SRV failover, E911 via carrier,
+   FMFM-to-external, predictive dialing.
 
 ---
 
@@ -330,8 +358,10 @@ These constrain *every* feature's deployed testing and should be scheduled as pl
    `utils/tls_support.py` exists for the API layer only.
 2. **No conference/N-way audio mixer** (C3) — blocks real conferencing, barge/whisper,
    and 3-way calling.
-3. **No call-originate primitive** (C4) — blocks click-to-dial, predictive dialing,
-   emergency-notification calls, callback completion. One build unblocks four-plus features.
+3. ~~**No call-originate primitive** (C4)~~ — **built** on `sip-trunk`
+   (`core/call_originator.py`); click-to-dial is wired onto it. Predictive dialing,
+   callback completion, emergency-notification calls and operator console still need
+   wiring, and the primitive itself is field-unverified against real phones.
 4. **Single-process, in-process RTP relay** — capacity ceiling; measure before scaling
    claims (see `docs/CAPACITY_PLANNING.md`).
 5. **Migration debt** (C7) — runtime `CREATE TABLE IF NOT EXISTS` everywhere; core-table
@@ -368,20 +398,22 @@ transfer with MOH, call forwarding, unified DTMF).
 *Exit: voicemail + AA fully driveable by DTMF from every supported phone model; blind and
 attended transfer, and call forwarding, verified on real phones.*
 
-**Phase 2 — Finish SIP trunking (C5, Rig C).** Implement inbound DID routing; remove the
-legacy outbound stub; NAT handling; validate against a low-cost carrier, then AT&T/Comcast
-configs. *Exit: a PSTN caller reaches an extension via DID, and an extension dials out —
-reliably, with failover.*
+**Phase 2 — Finish SIP trunking (C5, Rig C).** Inbound DID routing (data layer + SIP
+dispatch), legacy outbound stub removal, and real trunk-failure handling are all code-
+complete; remaining is NAT handling and validation against a low-cost carrier, then
+AT&T/Comcast configs. *Exit: a PSTN caller reaches an extension via DID, and an
+extension dials out — reliably, with failover.*
 
 **Phase 3 — Emergency stack (C4-lite + C5, Rig C + E).** Replace `emergency_notification.py`
 stubs with real email/SMS/call/paging actions; E911 location flow through the trunk
 (carrier test procedure, never live 911). *Exit: 911-test dial triggers correct trunk
 routing + on-site notifications.* Legal-compliance gate for any real deployment.
 
-**Phase 4 — Build the missing core primitives (C3 + C4, Rig A).** Call-originate
-primitive (unblocks click-to-dial, callbacks, notification calls, predictive dialing);
+**Phase 4 — Build the missing core primitives (C3, Rig A).** C4 originate is built —
+what remains here is verifying click-to-dial end-to-end on real phones and wiring the
+other consumers (callbacks, notification calls, predictive dialing). Still to build:
 conference audio mixer (or a deliberate Jitsi-bridge decision); Opus/G.729 negotiation (C2).
-*Exit: 3-way conference with mixed audio; click-to-dial works from admin UI.*
+*Exit: 3-way conference with mixed audio; click-to-dial verified working from admin UI.*
 
 **Phase 5 — Device & remote-worker surface (Rig B + D).** Provisioning per model,
 hot desking, paging, BLF; WebRTC deployment hardening; mobile push with real FCM/APNs.
@@ -408,7 +440,7 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 
 | # | Task | Depends on | Status |
 |---|------|-----------|--------|
-| A1 | Inbound DID routing (finishes C5) | sip-trunk branch | ❌ not started |
+| A1 | Inbound DID routing (finishes C5) | sip-trunk branch | ✅ code-complete (data layer + API + admin UI + SIP dispatch); field-unverified, no carrier account yet |
 | A2 | NAT/public-IP handling for trunk SDP/Via/Contact + symmetric RTP | carrier account (B1) | ❌ untested |
 | A3 | `voicemail-fix` merged to DEV (PR #1); hardware regression on Zultys/Cisco ATA still outstanding | — | 🚧 |
 | A4 | Kari's Law on-site notification: wire `emergency_notification.py` email action to existing SMTP (`email_notification.py`) — legal requirement | SMTP creds | ❌ stubbed |
@@ -487,11 +519,11 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 
 ### Code blockers (critical path)
 
-- [ ] **Inbound DID routing** (C5) — recognize INVITEs from trunk hosts, DID → extension/AA/queue map (does not exist today)
+- [ ] **Inbound DID routing** (C5) — code-complete (DID→destination map, API, admin UI, SIP dispatch); needs real-carrier validation of the trunk IP-matching heuristic
 - [ ] Outbound trunk validation on test DID: registration, NAT/public-IP in SDP/Via/Contact, DTMF to external IVRs, codec negotiation
 - [ ] `voicemail-fix` merged (PR #1); regression on office phone models still outstanding
 - [ ] Merge `auto-attendant` (PR #2 — REFER/attended transfer, RTP-relay AA transfer + MOH, call forwarding, unified DTMF); regression-test transfer + forwarding on office phone models
-- [ ] **Kari's Law notification** — replace `emergency_notification.py` "Would email…" stubs with real email (SMTP) and/or webhook minimum (call/page notify needs C4 — post-cutover)
+- [ ] **Kari's Law notification** — replace `emergency_notification.py` "Would email…" stubs with real email (SMTP) and/or webhook minimum (call/page notify can now use `CallOriginator`, but treat as post-cutover)
 - [ ] E911: register dispatchable address with provider; verify karis_law/e911_location routing; validate via provider test number (933-style — never live 911; keep test-mode protection on until final check)
 - [ ] SIP exposure hardening: 5060/udp restricted to trunk provider IPs; no WAN registrations
 
@@ -505,7 +537,7 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 - [ ] Provision every phone model on office network; per-model DTMF verification
 - [ ] Auto-attendant: menus, business-hours/night mode (time-based routing), generate prompt files; MoH audio in `moh/`
 - [ ] Voicemail boxes/PINs; optional voicemail-to-email (SMTP)
-- [ ] Outbound caller-ID mapping (station → DID) + CNAM registration; international-call blocking / fraud limits
+- [ ] Outbound caller-ID mapping (station → DID): set each extension's **DID Number** field (Extensions page) — `_route_to_trunk()` uses it as the outbound caller ID, falling back to the extension number if unset. Plus CNAM registration; international-call blocking / fraud limits
 - [ ] Monitoring: Prometheus/Grafana or health-check email alerts; NTP; log rotation
 
 ### Validation & cutover
@@ -514,7 +546,7 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 - [ ] Failure drills: server reboot, power pull, internet drop — documented 911 behavior for each
 - [ ] Cutover runbook: per-number port verification, day-of provider contact, rollback notes
 - [ ] User training + quick-reference cards; week-one escalation path
-- [ ] Accepted gaps recorded at cutover: no conference mixing (C3), no click-to-dial/callbacks (C4), no SIP-TLS/SRTP, WebRTC unhardened
+- [ ] Accepted gaps recorded at cutover: no conference mixing (C3), no STIR/SHAKEN attestation, callbacks not yet wired to `CallOriginator`, no SIP-TLS/SRTP, WebRTC unhardened (click-to-dial is wired but field-unverified)
 
 ---
 

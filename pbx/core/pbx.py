@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from pbx.features.find_me_follow_me import FindMeFollowMe
     from pbx.features.fraud_detection import FraudDetectionSystem
     from pbx.features.hot_desking import HotDeskingSystem
+    from pbx.features.inbound_routing import InboundRoutingSystem
     from pbx.features.karis_law import KarisLawCompliance
     from pbx.features.mfa import MFAManager
     from pbx.features.mobile_push import MobilePushNotifications
@@ -84,6 +85,7 @@ class PBXCore:
     cdr_system: CDRSystem
     moh_system: MusicOnHold
     trunk_system: SIPTrunkSystem
+    inbound_routing: InboundRoutingSystem
     statistics_engine: StatisticsEngine
     auto_attendant: AutoAttendant | None
     phone_provisioning: PhoneProvisioning | None
@@ -151,14 +153,16 @@ class PBXCore:
         self.registered_phones_db = None
         self.extension_db = None
         self.trunk_db = None
+        self.inbound_route_db = None
         if self.database.connect():
             self._run_alembic_migrations()
             self.database.create_tables()
-            from pbx.utils.database import ExtensionDB, TrunkDB
+            from pbx.utils.database import ExtensionDB, InboundRouteDB, TrunkDB
 
             self.registered_phones_db = RegisteredPhonesDB(self.database)
             self.extension_db = ExtensionDB(self.database)
             self.trunk_db = TrunkDB(self.database)
+            self.inbound_route_db = InboundRouteDB(self.database)
             self._log_startup(
                 f"Database backend initialized successfully ({self.database.db_type})"
             )

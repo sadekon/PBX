@@ -222,6 +222,7 @@ declare global {
         loadAutoAttendantConfig?: () => void;
         loadSIPTrunks?: () => void;
         loadTrunkHealth?: () => void;
+        loadInboundRoutes?: () => void;
         loadLCRRates?: () => void;
         loadLCRStatistics?: () => void;
         loadFMFMExtensions?: () => void;

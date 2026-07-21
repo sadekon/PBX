@@ -70,6 +70,12 @@ def _make_pbx_core(
     pbx.paging_system = MagicMock()
     pbx.paging_system.is_paging_extension.return_value = False
 
+    # Trunk system -- default to "this call didn't arrive from a trunk", so
+    # existing tests keep exercising the internal-dispatch path. Tests for
+    # inbound-DID routing override get_trunk_by_addr's return value.
+    pbx.trunk_system = MagicMock()
+    pbx.trunk_system.get_trunk_by_addr.return_value = None
+
     # Call manager
     mock_call = MagicMock()
     mock_call.start_time = MagicMock()
@@ -1144,6 +1150,306 @@ class TestRouteToTrunkNoAnswerTimer:
 
         assert result is True
         assert mock_call.no_answer_timer is None
+
+
+# ===========================================================================
+# CallRouter._route_to_trunk - outbound caller ID
+# ===========================================================================
+
+
+def _trunk_pbx_with_extension(did_number: str | None) -> MagicMock:
+    """Build a mock PBXCore for trunk-routing tests with a configurable caller extension."""
+    pbx = _make_pbx_core()
+
+    mock_trunk = MagicMock()
+    mock_trunk.host = "trunk.example.com"
+    mock_trunk.port = 5060
+    mock_trunk.name = "Test Trunk"
+    mock_trunk.codec_preferences = ["0", "8", "18"]
+    mock_trunk.allocate_channel.return_value = True
+    pbx.trunk_system = MagicMock()
+    pbx.trunk_system.route_outbound_with_failover.return_value = (mock_trunk, "12125551234")
+
+    caller_ext = MagicMock()
+    caller_ext.name = "Jane Caller"
+    caller_ext.config = {"did_number": did_number}
+    pbx.extension_registry.get.return_value = caller_ext
+
+    return pbx
+
+
+@pytest.mark.unit
+class TestRouteToTrunkCallerID:
+    """Tests for outbound caller ID resolution in _route_to_trunk."""
+
+    def test_uses_extension_did_when_set(self) -> None:
+        pbx = _trunk_pbx_with_extension(did_number="19725550100")
+        router = CallRouter(pbx)
+        msg = _make_invite_message(to_ext="12125551234", body="")
+
+        with patch(
+            "pbx.sip.message.SIPMessageBuilder.add_caller_id_headers"
+        ) as mock_add_caller_id:
+            result = router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
+
+        assert result is True
+        _, number_arg, name_arg, _ = mock_add_caller_id.call_args[0]
+        assert number_arg == "19725550100"
+        assert name_arg == "Jane Caller"
+
+    def test_falls_back_to_extension_number_without_did(self) -> None:
+        pbx = _trunk_pbx_with_extension(did_number=None)
+        router = CallRouter(pbx)
+        msg = _make_invite_message(to_ext="12125551234", body="")
+
+        with patch(
+            "pbx.sip.message.SIPMessageBuilder.add_caller_id_headers"
+        ) as mock_add_caller_id:
+            result = router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
+
+        assert result is True
+        _, number_arg, name_arg, _ = mock_add_caller_id.call_args[0]
+        assert number_arg == "1001"
+        assert name_arg == "Jane Caller"
+
+    def test_falls_back_to_extension_number_when_extension_unknown(self) -> None:
+        pbx = _trunk_pbx_with_extension(did_number="19725550100")
+        pbx.extension_registry.get.return_value = None
+        router = CallRouter(pbx)
+        msg = _make_invite_message(to_ext="12125551234", body="")
+
+        with patch(
+            "pbx.sip.message.SIPMessageBuilder.add_caller_id_headers"
+        ) as mock_add_caller_id:
+            result = router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
+
+        assert result is True
+        _, number_arg, name_arg, _ = mock_add_caller_id.call_args[0]
+        assert number_arg == "1001"
+        assert name_arg == "1001"
+
+    def test_from_header_uses_extension_did(self) -> None:
+        pbx = _trunk_pbx_with_extension(did_number="19725550100")
+        router = CallRouter(pbx)
+        msg = _make_invite_message(to_ext="12125551234", body="")
+
+        captured: dict[str, Any] = {}
+
+        def _capture(call: Any, call_id: Any, invite_request: Any, *args: Any, **kwargs: Any) -> MagicMock:
+            captured["from_header"] = invite_request.get_header("From")
+            return MagicMock()
+
+        with patch.object(router, "_build_and_send_leg_invite", side_effect=_capture):
+            router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
+
+        assert "19725550100" in captured["from_header"]
+        assert "1001" not in captured["from_header"]
+
+
+# ===========================================================================
+# CallRouter - inbound DID routing
+# ===========================================================================
+
+
+def _trunk_pbx_with_route(route: dict | None) -> MagicMock:
+    """Build a mock PBXCore for a trunk-sourced call whose DID lookup returns `route`."""
+    pbx = _make_pbx_core()
+
+    mock_trunk = MagicMock()
+    mock_trunk.trunk_id = "t1"
+    pbx.trunk_system.get_trunk_by_addr.return_value = mock_trunk
+
+    pbx.inbound_routing = MagicMock()
+    pbx.inbound_routing.lookup.return_value = route
+
+    return pbx
+
+
+@pytest.mark.unit
+class TestRouteCallInboundTrunkDetection:
+    """Tests that route_call() recognizes a trunk-sourced INVITE and hands off to _route_inbound_did()."""
+
+    def test_trunk_sourced_call_dispatched_to_inbound_did_routing(self) -> None:
+        pbx = _trunk_pbx_with_route({"destination_type": "voicemail", "destination_value": "1001"})
+        router = CallRouter(pbx)
+        msg = _make_invite_message(body="")
+
+        result = router.route_call(
+            "<sip:19725550100@carrier.example.com>",
+            "<sip:12125551234@pbx.local>",
+            "call-1",
+            msg,
+            ("203.0.113.10", 5060),
+        )
+
+        assert result is True
+        pbx.inbound_routing.lookup.assert_called_once_with("12125551234", "t1")
+        pbx.voicemail_handler.handle_voicemail_access.assert_called_once_with(
+            "19725550100", "*1001", "call-1", msg, ("203.0.113.10", 5060)
+        )
+
+    def test_trunk_sourced_call_bypasses_karis_law_check(self) -> None:
+        """A trunk-sourced INVITE must not go through the internal emergency-number check."""
+        pbx = _trunk_pbx_with_route({"destination_type": "voicemail", "destination_value": "1001"})
+        router = CallRouter(pbx)
+        msg = _make_invite_message(body="")
+
+        router.route_call(
+            "<sip:19725550100@carrier.example.com>",
+            "<sip:12125551234@pbx.local>",
+            "call-1",
+            msg,
+            ("203.0.113.10", 5060),
+        )
+
+        pbx.karis_law.is_emergency_number.assert_not_called()
+
+    def test_non_trunk_call_unaffected(self) -> None:
+        """A call with no matching trunk still goes through normal internal dispatch."""
+        pbx = _make_pbx_core()
+        router = CallRouter(pbx)
+        msg = _make_invite_message(body="")
+
+        result = router.route_call(
+            "<sip:1001@pbx.local>", "<sip:1002@pbx.local>", "call-1", msg, CALLER_ADDR
+        )
+
+        assert result is True
+        pbx.trunk_system.get_trunk_by_addr.assert_called_once_with(CALLER_ADDR)
+
+
+@pytest.mark.unit
+class TestRouteInboundDID:
+    """Tests for CallRouter._route_inbound_did()."""
+
+    def test_no_matching_route_returns_false(self) -> None:
+        pbx = _trunk_pbx_with_route(None)
+        router = CallRouter(pbx)
+        mock_trunk = MagicMock(trunk_id="t1")
+        msg = _make_invite_message(body="")
+
+        result = router._route_inbound_did(
+            mock_trunk,
+            "19725550100",
+            "12125551234",
+            "<sip:19725550100@carrier>",
+            "<sip:12125551234@pbx.local>",
+            "call-1",
+            msg,
+            ("203.0.113.10", 5060),
+        )
+
+        assert result is False
+
+    def test_extension_destination_rewrites_to_header_and_dials(self) -> None:
+        pbx = _trunk_pbx_with_route({"destination_type": "extension", "destination_value": "1001"})
+        router = CallRouter(pbx)
+        mock_trunk = MagicMock(trunk_id="t1")
+        msg = _make_invite_message(body="")
+
+        with patch.object(router, "_dial_to_internal_extension", return_value=True) as mock_dial:
+            result = router._route_inbound_did(
+                mock_trunk,
+                "19725550100",
+                "12125551234",
+                "<sip:19725550100@carrier>",
+                "<sip:12125551234@pbx.local>",
+                "call-1",
+                msg,
+                ("203.0.113.10", 5060),
+            )
+
+        assert result is True
+        mock_dial.assert_called_once()
+        args = mock_dial.call_args[0]
+        assert args[0] == "19725550100"  # from_ext (carrier caller ID)
+        assert args[1] == "1001"  # rewritten to the extension, not the dialed DID
+        assert "sip:1001@" in args[3]  # rewritten to_header
+
+    def test_auto_attendant_destination(self) -> None:
+        pbx = _trunk_pbx_with_route({"destination_type": "auto_attendant", "destination_value": "ignored"})
+        pbx.auto_attendant.get_extension.return_value = "0"
+        router = CallRouter(pbx)
+        mock_trunk = MagicMock(trunk_id="t1")
+        msg = _make_invite_message(body="")
+
+        result = router._route_inbound_did(
+            mock_trunk,
+            "19725550100",
+            "12125551234",
+            "<sip:19725550100@carrier>",
+            "<sip:12125551234@pbx.local>",
+            "call-1",
+            msg,
+            ("203.0.113.10", 5060),
+        )
+
+        assert result is True
+        pbx.auto_attendant_handler.handle_auto_attendant.assert_called_once_with(
+            "19725550100", "0", "call-1", msg, ("203.0.113.10", 5060)
+        )
+
+    def test_auto_attendant_destination_when_feature_disabled(self) -> None:
+        pbx = _trunk_pbx_with_route({"destination_type": "auto_attendant", "destination_value": "ignored"})
+        pbx.auto_attendant = None
+        router = CallRouter(pbx)
+        mock_trunk = MagicMock(trunk_id="t1")
+        msg = _make_invite_message(body="")
+
+        result = router._route_inbound_did(
+            mock_trunk,
+            "19725550100",
+            "12125551234",
+            "<sip:19725550100@carrier>",
+            "<sip:12125551234@pbx.local>",
+            "call-1",
+            msg,
+            ("203.0.113.10", 5060),
+        )
+
+        assert result is False
+        pbx.auto_attendant_handler.handle_auto_attendant.assert_not_called()
+
+    def test_voicemail_destination(self) -> None:
+        pbx = _trunk_pbx_with_route({"destination_type": "voicemail", "destination_value": "1001"})
+        router = CallRouter(pbx)
+        mock_trunk = MagicMock(trunk_id="t1")
+        msg = _make_invite_message(body="")
+
+        result = router._route_inbound_did(
+            mock_trunk,
+            "19725550100",
+            "12125551234",
+            "<sip:19725550100@carrier>",
+            "<sip:12125551234@pbx.local>",
+            "call-1",
+            msg,
+            ("203.0.113.10", 5060),
+        )
+
+        assert result is True
+        pbx.voicemail_handler.handle_voicemail_access.assert_called_once_with(
+            "19725550100", "*1001", "call-1", msg, ("203.0.113.10", 5060)
+        )
+
+    def test_unknown_destination_type_returns_false(self) -> None:
+        pbx = _trunk_pbx_with_route({"destination_type": "queue", "destination_value": "800"})
+        router = CallRouter(pbx)
+        mock_trunk = MagicMock(trunk_id="t1")
+        msg = _make_invite_message(body="")
+
+        result = router._route_inbound_did(
+            mock_trunk,
+            "19725550100",
+            "12125551234",
+            "<sip:19725550100@carrier>",
+            "<sip:12125551234@pbx.local>",
+            "call-1",
+            msg,
+            ("203.0.113.10", 5060),
+        )
+
+        assert result is False
 
 
 # ===========================================================================

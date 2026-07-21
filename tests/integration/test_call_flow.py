@@ -65,6 +65,7 @@ class TestCallRouterInternalRouting:
         pbx.paging_system = None
         pbx.webrtc_gateway = None
         pbx.registered_phones_db = None
+        pbx.trunk_system = None
 
         # Helper methods
         pbx._get_server_ip.return_value = "10.0.0.1"

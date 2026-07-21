@@ -164,7 +164,7 @@ export function showTab(tabName: string): void {
     const multiLoaderTabs: Record<string, ((() => void) | undefined)[]> = {
         'emergency':           [window.loadEmergencyContacts, window.loadEmergencyHistory],
         'codecs':              [window.loadCodecStatus, window.loadDTMFConfig],
-        'sip-trunks':          [window.loadSIPTrunks, window.loadTrunkHealth],
+        'sip-trunks':          [window.loadSIPTrunks, window.loadTrunkHealth, window.loadInboundRoutes],
         'least-cost-routing':  [window.loadLCRRates, window.loadLCRStatistics],
     };
 

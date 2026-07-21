@@ -32,11 +32,13 @@ class Extension(TimestampMixin, Base):
     ad_synced: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     registered: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     registered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    did_number: Mapped[str | None] = mapped_column(String(20), unique=True, nullable=True)
 
     __table_args__ = (
         Index("ix_extensions_number", "number"),
         Index("ix_extensions_email", "email"),
         Index("ix_extensions_ad_synced", "ad_synced"),
+        Index("ix_extensions_did_number", "did_number"),
     )
 
     def __repr__(self) -> str:
