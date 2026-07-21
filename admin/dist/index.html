@@ -16,7 +16,7 @@
     <link rel="icon" type="image/png" sizes="512x512" href="/admin/assets/favicon-512-BCF-tvk5.png">
     <!-- Debug logging utility -->
     <!-- Load Chart.js from CDN with automatic fallback -->
-  <script type="module" crossorigin src="/admin/assets/main-DBKjoPjG.js"></script>
+  <script type="module" crossorigin src="/admin/assets/main-l3v4ojJu.js"></script>
   <link rel="modulepreload" crossorigin href="/admin/assets/modulepreload-polyfill-Dezn_h7o.js">
   <link rel="stylesheet" crossorigin href="/admin/assets/main-DXfiKnwu.css">
 </head>
@@ -1396,10 +1396,17 @@
                 <button class="btn btn-primary" onclick="loadPagingData()">🔄 Refresh</button>
             </div>
 
+            <div id="paging-disabled-banner" class="info-box" style="display: none; border-left: 4px solid #e0a800;">
+                <h3>⚠️ Paging is disabled</h3>
+                <p>The paging feature is turned off, so zones and devices cannot be configured and paging extensions will not answer.</p>
+                <p>Set <code>features.paging.enabled: true</code> in <code>config.yml</code> and restart the PBX to enable it.</p>
+            </div>
+
             <div class="info-box">
                 <h3>ℹ️ About Paging System</h3>
                 <p>The paging system allows overhead announcements through digital-to-analog converters (DACs). Configure zones, devices, and monitor active paging sessions.</p>
-                <p><strong>Usage:</strong> Dial a zone extension (e.g., 701) to page that zone, or dial the all-call extension (default: 700) to page all zones.</p>
+                <p><strong>Usage:</strong> Dial a zone extension (e.g., 701) to page that zone, or dial the all-call extension (default: <span id="paging-all-call-ext">700</span>) to page all zones.</p>
+                <p><strong>Note:</strong> A multi-zone or all-call page currently reaches the first zone's device only; per-device fan-out is not yet implemented.</p>
             </div>
 
             <!-- Active Paging Sessions -->
@@ -1429,7 +1436,7 @@
             <div class="config-section">
                 <div class="section-header">
                     <h3>🗺️ Paging Zones</h3>
-                    <button class="btn btn-success" onclick="showAddZoneModal()">➕ Add Zone</button>
+                    <button id="add-paging-zone-btn" class="btn btn-success" onclick="showAddPagingZoneModal()">➕ Add Zone</button>
                 </div>
                 <div class="table-container">
                     <table class="data-table">
@@ -1455,7 +1462,7 @@
             <div class="config-section">
                 <div class="section-header">
                     <h3>🔌 DAC Devices</h3>
-                    <button class="btn btn-success" onclick="showAddDeviceModal()">➕ Add Device</button>
+                    <button id="add-paging-device-btn" class="btn btn-success" onclick="showAddPagingDeviceModal()">➕ Add Device</button>
                 </div>
                 <div class="info-box" style="margin-bottom: 15px;">
                     <p><strong>Supported Devices:</strong> SIP-to-analog gateways (Cisco VG series, Grandstream HT series, etc.)</p>
@@ -1469,7 +1476,7 @@
                                 <th>Name</th>
                                 <th>Type</th>
                                 <th>SIP Address</th>
-                                <th>Status</th>
+                                <th>Configured</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
@@ -1485,11 +1492,15 @@
             <!-- Test Paging -->
             <div class="config-section">
                 <h3>🧪 Test Paging</h3>
-                <form id="test-paging-form">
+                <div class="info-box" style="margin-bottom: 15px;">
+                    <p>The PBX rings the extension below. Answer it, and whatever you say is announced over the selected zone.</p>
+                </div>
+                <form id="test-paging-form" onsubmit="startTestPage(event)">
                     <div class="form-row">
                         <div class="form-group">
                             <label for="test-page-from">From Extension:</label>
-                            <input type="text" id="test-page-from" placeholder="1001" required>
+                            <input type="text" id="test-page-from" placeholder="1001" pattern="[0-9]+" required>
+                            <small>The phone that will ring and make the announcement</small>
                         </div>
                         <div class="form-group">
                             <label for="test-page-zone">Zone Extension:</label>
@@ -1498,7 +1509,7 @@
                             </select>
                         </div>
                     </div>
-                    <button type="submit" class="btn btn-primary">📢 Initiate Test Page</button>
+                    <button type="submit" id="test-page-submit" class="btn btn-primary">📢 Initiate Test Page</button>
                 </form>
             </div>
         </div>
@@ -5095,6 +5106,90 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                 <div class="modal-actions">
                     <button type="button" class="btn btn-secondary" onclick="closeTriggerEmergencyModal()">Cancel</button>
                     <button type="submit" class="btn btn-danger">🚨 Send Emergency Notification</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Add Paging Zone Modal -->
+    <div id="add-paging-zone-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>➕ Add Paging Zone</h3>
+                <span class="close" onclick="closeAddPagingZoneModal()">&times;</span>
+            </div>
+            <form id="add-paging-zone-form" onsubmit="addPagingZone(event)">
+                <div class="form-group">
+                    <label for="paging-zone-extension">Zone Extension:</label>
+                    <input type="text" id="paging-zone-extension" required pattern="[0-9]+" placeholder="701">
+                    <small>Dial this extension to page the zone. Must start with the paging prefix.</small>
+                </div>
+                <div class="form-group">
+                    <label for="paging-zone-name">Zone Name:</label>
+                    <input type="text" id="paging-zone-name" required placeholder="Warehouse">
+                </div>
+                <div class="form-group">
+                    <label for="paging-zone-description">Description:</label>
+                    <input type="text" id="paging-zone-description" placeholder="Loading dock and back racks">
+                </div>
+                <div class="form-group">
+                    <label for="paging-zone-dac-device">DAC Device:</label>
+                    <select id="paging-zone-dac-device">
+                        <option value="">None (zone answers but plays no audio)</option>
+                    </select>
+                    <small>The gateway that drives this zone's amplifier</small>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeAddPagingZoneModal()">Cancel</button>
+                    <button type="submit" class="btn btn-success">Add Zone</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Add DAC Device Modal -->
+    <div id="add-paging-device-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>➕ Add DAC Device</h3>
+                <span class="close" onclick="closeAddPagingDeviceModal()">&times;</span>
+            </div>
+            <form id="add-paging-device-form" onsubmit="addPagingDevice(event)">
+                <div class="form-group">
+                    <label for="paging-device-id">Device ID:</label>
+                    <input type="text" id="paging-device-id" required placeholder="dac-1">
+                    <small>Unique identifier; zones reference the device by this id</small>
+                </div>
+                <div class="form-group">
+                    <label for="paging-device-name">Name:</label>
+                    <input type="text" id="paging-device-name" placeholder="Main PA System">
+                    <small>Display label. Defaults to the device id.</small>
+                </div>
+                <div class="form-group">
+                    <label for="paging-device-type">Device Type:</label>
+                    <select id="paging-device-type" required>
+                        <option value="sip_gateway">SIP Gateway</option>
+                        <option value="cisco_vg">Cisco VG Series</option>
+                        <option value="grandstream_ht">Grandstream HT Series</option>
+                        <option value="analog_gateway">Analog Gateway</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="paging-device-ip">IP Address:</label>
+                    <input type="text" id="paging-device-ip" required placeholder="192.168.1.10">
+                </div>
+                <div class="form-group">
+                    <label for="paging-device-port">SIP Port:</label>
+                    <input type="number" id="paging-device-port" min="1" max="65535" value="5060">
+                </div>
+                <div class="form-group">
+                    <label for="paging-device-sip-uri">SIP URI:</label>
+                    <input type="text" id="paging-device-sip-uri" required placeholder="sip:paging@192.168.1.10">
+                    <small>Where the PBX sends the INVITE that opens the page</small>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeAddPagingDeviceModal()">Cancel</button>
+                    <button type="submit" class="btn btn-success">Add Device</button>
                 </div>
             </form>
         </div>

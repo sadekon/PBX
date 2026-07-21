@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from pbx.utils.security import ThreatDetector
     from pbx.utils.security_monitor import SecurityMonitor
 
+
 class PBXCore:
     """Main PBX system coordinator"""
 
@@ -768,6 +769,18 @@ class PBXCore:
                     call.trunk.record_successful_call()
                 else:
                     call.trunk.record_failed_call(reason="call ended before answer")
+
+            # Close out the paging session, if this call was one. Done here
+            # rather than in PagingHandler._paging_session so that pages to a
+            # zone with no DAC device -- which have no session thread watching
+            # for the call to end -- are also released on hangup instead of
+            # lingering in active_pages until the max-duration timer fires.
+            if (
+                self.paging_system
+                and getattr(call, "paging_active", False)
+                and getattr(call, "page_id", None)
+            ):
+                self.paging_system.end_page(call.page_id)
 
             self.call_manager.end_call(call_id)
             # Stop any hold music before releasing the relay it runs on

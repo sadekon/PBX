@@ -279,3 +279,96 @@ def test_paging_disabled() -> bool:
     assert len(paging.get_zones()) == 0, "Should return empty zones"
 
     return True
+
+
+def test_dac_device_removal() -> bool:
+    """Removing a DAC device should also unlink zones that referenced it"""
+
+    class MockConfig:
+        def get(self, key: str, default: Any = None) -> Any:
+            config_map: dict[str, Any] = {
+                "features.paging.enabled": True,
+                "features.paging.zones": [
+                    {"extension": "701", "name": "Office", "dac_device": "gw-1"},
+                    {"extension": "702", "name": "Warehouse", "dac_device": "gw-2"},
+                ],
+                "features.paging.dac_devices": [
+                    {"device_id": "gw-1", "device_type": "cisco_vg224"},
+                    {"device_id": "gw-2", "device_type": "cisco_vg224"},
+                ],
+            }
+            return config_map.get(key, default)
+
+    paging = PagingSystem(MockConfig())
+
+    assert paging.remove_dac_device("gw-1") is True, "Should remove a configured device"
+    assert len(paging.get_dac_devices()) == 1, "Should have 1 device left"
+
+    # The zone survives, but no longer points at a device that is gone -- a
+    # dangling reference would answer pages and silently route no audio.
+    office = paging.get_zone_for_extension("701")
+    assert office is not None, "Zone should still exist"
+    assert office["dac_device"] is None, "Zone's device reference should be cleared"
+
+    # Zones on other devices are untouched.
+    warehouse = paging.get_zone_for_extension("702")
+    assert warehouse is not None and warehouse["dac_device"] == "gw-2", "Other zone unaffected"
+
+    assert paging.remove_dac_device("nope") is False, "Unknown device should report failure"
+
+    return True
+
+
+def test_dac_device_removal_when_disabled() -> bool:
+    """Device removal should be refused while paging is disabled"""
+
+    class MockConfig:
+        def get(self, key: str, default: Any = None) -> Any:
+            config_map: dict[str, Any] = {"features.paging.enabled": False}
+            return config_map.get(key, default)
+
+    paging = PagingSystem(MockConfig())
+    assert paging.remove_dac_device("gw-1") is False, "Should refuse while disabled"
+
+    return True
+
+
+def test_get_status_reports_enabled_state() -> bool:
+    """get_status should report meaningfully in both enabled and disabled states"""
+
+    class EnabledConfig:
+        def get(self, key: str, default: Any = None) -> Any:
+            config_map: dict[str, Any] = {
+                "features.paging.enabled": True,
+                "features.paging.prefix": "7",
+                "features.paging.all_call_extension": "700",
+                "features.paging.max_duration": 90,
+                "features.paging.zones": [
+                    {"extension": "701", "name": "Office", "dac_device": "gw-1"}
+                ],
+                "features.paging.dac_devices": [
+                    {"device_id": "gw-1", "device_type": "cisco_vg224"}
+                ],
+            }
+            return config_map.get(key, default)
+
+    status = PagingSystem(EnabledConfig()).get_status()
+    assert status["enabled"] is True, "Should report enabled"
+    assert status["all_call_extension"] == "700", "Should report all-call extension"
+    assert status["max_duration"] == 90, "Should report max duration"
+    assert status["zone_count"] == 1, "Should count zones"
+    assert status["dac_device_count"] == 1, "Should count devices"
+    assert status["active_page_count"] == 0, "Should start with no active pages"
+
+    class DisabledConfig:
+        def get(self, key: str, default: Any = None) -> Any:
+            config_map: dict[str, Any] = {"features.paging.enabled": False}
+            return config_map.get(key, default)
+
+    # Unlike the other getters, this one still answers when disabled -- that is
+    # the whole point: it is how a client tells "off" from "on but empty".
+    disabled_status = PagingSystem(DisabledConfig()).get_status()
+    assert disabled_status["enabled"] is False, "Should report disabled"
+    assert disabled_status["zone_count"] == 0, "Should report no zones when disabled"
+
+    return True

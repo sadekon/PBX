@@ -184,19 +184,25 @@ class PagingSystem:
             import threading
 
             def _auto_end_page() -> None:
-                if page_id in self.active_pages:
-                    self.logger.warning(
-                        f"Page {page_id} exceeded max duration "
-                        f"({self.max_page_duration}s), ending automatically"
-                    )
-                    self.end_page(page_id)
-                    # Also end the associated call via PBX core if available
-                    if self.pbx_core:
-                        # Find and end the call associated with this page
-                        for call in self.pbx_core.call_manager.get_active_calls():
-                            if hasattr(call, "page_id") and call.page_id == page_id:
-                                self.pbx_core.end_call(call.call_id)
-                                break
+                if page_id not in self.active_pages:
+                    return
+
+                self.logger.warning(
+                    f"Page {page_id} exceeded max duration "
+                    f"({self.max_page_duration}s), ending automatically"
+                )
+
+                # Prefer ending the whole call: PBXCore.end_call() releases the
+                # page as part of teardown, so ending it here first would leave
+                # the caller connected to a page that no longer exists.
+                if self.pbx_core:
+                    for call in self.pbx_core.call_manager.get_active_calls():
+                        if getattr(call, "page_id", None) == page_id:
+                            self.pbx_core.end_call(call.call_id)
+                            return
+
+                # No PBX core, or no call still holding this page -- release it directly.
+                self.end_page(page_id)
 
             timer = threading.Timer(self.max_page_duration, _auto_end_page)
             timer.daemon = True
@@ -358,6 +364,7 @@ class PagingSystem:
         sip_uri: str | None = None,
         ip_address: str | None = None,
         port: int = 5060,
+        name: str | None = None,
     ) -> bool:
         """
         Configure a digital-to-analog converter device
@@ -368,6 +375,7 @@ class PagingSystem:
             sip_uri: SIP URI for the device
             ip_address: IP address of the device
             port: SIP port (default 5060)
+            name: Human-readable label for the admin UI; defaults to device_id
 
         Returns:
             bool: True if successful
@@ -377,6 +385,7 @@ class PagingSystem:
 
         device = {
             "device_id": device_id,
+            "name": name or device_id,
             "device_type": device_type,
             "sip_uri": sip_uri,
             "ip_address": ip_address,
@@ -395,6 +404,45 @@ class PagingSystem:
 
         return True
 
+    def remove_dac_device(self, device_id: str) -> bool:
+        """
+        Remove a digital-to-analog converter device
+
+        Any zone still pointing at the removed device has its ``dac_device``
+        reference cleared, so a zone never survives holding a dangling device
+        id -- a page to such a zone is answered but routes no audio, which is
+        far harder to diagnose than a zone that plainly has no device.
+
+        Args:
+            device_id: Device identifier
+
+        Returns:
+            bool: True if successful
+        """
+        if not self.enabled:
+            return False
+
+        for i, device in enumerate(self.dac_devices):
+            if device.get("device_id") == device_id:
+                self.dac_devices.pop(i)
+
+                orphaned = [z for z in self.zones if z.get("dac_device") == device_id]
+                for zone in orphaned:
+                    zone["dac_device"] = None
+                if orphaned:
+                    zone_names = ", ".join(str(z.get("extension")) for z in orphaned)
+                    self.logger.warning(
+                        f"DAC device {device_id} removed; cleared its reference from "
+                        f"{len(orphaned)} zone(s): {zone_names}. Those zones will "
+                        f"answer pages but route no audio until a device is assigned."
+                    )
+
+                self.logger.info(f"Removed DAC device: {device_id}")
+                return True
+
+        self.logger.warning(f"DAC device {device_id} not found")
+        return False
+
     def get_dac_devices(self) -> list[dict]:
         """
         Get all configured DAC devices
@@ -406,3 +454,25 @@ class PagingSystem:
             return []
 
         return self.dac_devices
+
+    def get_status(self) -> dict:
+        """
+        Get paging system status and dialing configuration.
+
+        Unlike every other getter here, this one reports meaningfully when the
+        system is disabled rather than returning an empty result -- it is what
+        lets a caller (the admin UI) tell "paging is off" apart from "paging is
+        on but nothing is configured yet", which are otherwise indistinguishable.
+
+        Returns:
+            dict: Status dictionary, always populated
+        """
+        return {
+            "enabled": self.enabled,
+            "prefix": self.paging_prefix,
+            "all_call_extension": self.all_call_extension,
+            "max_duration": self.max_page_duration,
+            "zone_count": len(self.zones) if self.enabled else 0,
+            "dac_device_count": len(self.dac_devices) if self.enabled else 0,
+            "active_page_count": len(self.active_pages) if self.enabled else 0,
+        }
