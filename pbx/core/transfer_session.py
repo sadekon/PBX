@@ -138,6 +138,14 @@ class ReferDialog:
     addr: tuple[str, int]
     notify_cseq: int = 1
     final_sent: bool = False
+    #: The Call record whose dialog this subscription rides on. NOTIFYs and
+    #: any PBX-originated BYE toward the transferor share that one dialog, so
+    #: they must draw CSeq from the record's single pbx_leg_cseq counter --
+    #: two independent counters collide (both produce "2" first), and the
+    #: phone rejects the second request as a CSeq violation. A direct
+    #: reference (not a registry lookup) so the final NOTIFY, sent after
+    #: end_call unregisters the record, still continues the same sequence.
+    call: Any = None
 
 
 @dataclass

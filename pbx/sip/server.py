@@ -1716,6 +1716,9 @@ class SIPServer:
                 dialog, "SIP/2.0 481 Call/Transaction Does Not Exist", terminated=True
             )
             return
+        # Pin the dialog-owning record so every NOTIFY draws CSeq from the
+        # same pbx_leg_cseq counter as any BYE sent on this dialog.
+        dialog.call = call
 
         consult = None
         mode = TransferMode.BLIND
@@ -1828,7 +1831,21 @@ class SIPServer:
         if terminated:
             dialog.final_sent = True
 
-        dialog.notify_cseq += 1
+        # NOTIFYs share a dialog with any BYE the PBX later sends the
+        # transferor on this same leg (same Call-ID, same direction), and
+        # RFC 3261 SS12.2.1.1 requires one strictly increasing CSeq across
+        # both -- not one sequence per method. Draw from the dialog-owning
+        # record's pbx_leg_cseq, the counter _send_leg_bye also uses. The
+        # record is pinned on the dialog so this works even for the final
+        # NOTIFY, sent after end_call has unregistered the record.
+        call = dialog.call
+        if call is None and self.pbx_core:
+            call = self.pbx_core.call_manager.get_call(dialog.call_id)
+        if call is not None:
+            call.pbx_leg_cseq = max(call.pbx_leg_cseq, dialog.notify_cseq) + 1
+            dialog.notify_cseq = call.pbx_leg_cseq
+        else:
+            dialog.notify_cseq += 1
         notify_msg = SIPMessageBuilder.build_request(
             method="NOTIFY",
             uri=f"sip:{dialog.addr[0]}:{dialog.addr[1]}",
@@ -2341,6 +2358,17 @@ class SIPServer:
                             ringing_response = SIPMessageBuilder.build_response(
                                 180, "Ringing", call.original_invite
                             )
+                            # The tag minted here establishes the caller's
+                            # early dialog with the PBX. Keep it stable across
+                            # provisionals and capture it: for a consultation
+                            # leg adopted by a transfer while still ringing,
+                            # no 200 OK is ever sent to the caller, so this is
+                            # the only tag a teardown BYE can be matched by
+                            # (the phone's REFER Replaces references it too).
+                            if call.caller_dialog_to:
+                                ringing_response.set_header("To", call.caller_dialog_to)
+                            else:
+                                call.caller_dialog_to = ringing_response.get_header("To")
                             self._send_message(ringing_response.build(), call.caller_addr)
 
             elif message.status_code == 183:
@@ -2353,6 +2381,11 @@ class SIPServer:
                         progress_response = SIPMessageBuilder.build_response(
                             183, "Session Progress", call.original_invite
                         )
+                        # Same early-dialog tag handling as the 180 above.
+                        if call.caller_dialog_to:
+                            progress_response.set_header("To", call.caller_dialog_to)
+                        else:
+                            call.caller_dialog_to = progress_response.get_header("To")
                         # Include SDP from callee's 183 for early media
                         if message.body:
                             progress_response.body = message.body
