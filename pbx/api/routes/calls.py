@@ -53,25 +53,46 @@ def transfer_call(call_id: str) -> tuple[Response, int]:
     if not data:
         return send_json({"error": "Request body required"}, 400), 400
 
+    from pbx.core.transfer_session import TransferMode
+
     transfer_type = data.get("type", "blind")
     destination = data.get("destination")
     consultation_call_id = data.get("consultation_call_id")
+
+    call = pbx_core.call_manager.get_call(call_id)
+    if not call:
+        return send_json({"error": f"Call {call_id} not found"}, 404), 404
+
+    # The API caller is an operator acting on the callee's behalf, so they
+    # occupy the callee side of the call being transferred.
+    transferor_side = "callee"
 
     if transfer_type == "attended":
         if not consultation_call_id:
             return send_json(
                 {"error": "consultation_call_id required for attended transfer"}, 400
             ), 400
-        success = pbx_core.transfer_handler.attended_transfer(call_id, consultation_call_id)
+        session = pbx_core.transfer_handler.session_for(call)
+        if session is None or session.target_call_id != consultation_call_id:
+            return send_json(
+                {"error": f"No consultation {consultation_call_id} in progress for {call_id}"},
+                409,
+            ), 409
+        success = pbx_core.transfer_handler.complete_transfer(session)
     elif transfer_type == "consultative":
         if not destination:
             return send_json({"error": "destination required for consultative transfer"}, 400), 400
-        new_call_id = pbx_core.transfer_handler.consultation_transfer_start(call_id, destination)
-        if new_call_id:
+        session = pbx_core.transfer_handler.start_transfer(
+            call,
+            destination,
+            mode=TransferMode.ATTENDED,
+            transferor_side=transferor_side,
+        )
+        if session and session.target_call_id:
             return send_json(
                 {
                     "success": True,
-                    "consultation_call_id": new_call_id,
+                    "consultation_call_id": session.target_call_id,
                     "message": f"Consultation call started to {destination}",
                 }
             ), 200
@@ -80,7 +101,15 @@ def transfer_call(call_id: str) -> tuple[Response, int]:
         # Default: blind transfer
         if not destination:
             return send_json({"error": "destination required"}, 400), 400
-        success = pbx_core.transfer_handler.blind_transfer(call_id, destination)
+        success = (
+            pbx_core.transfer_handler.start_transfer(
+                call,
+                destination,
+                mode=TransferMode.BLIND,
+                transferor_side=transferor_side,
+            )
+            is not None
+        )
 
     if success:
         return send_json(

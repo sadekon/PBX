@@ -113,8 +113,8 @@ class CallOriginator:
         server_ip = pbx._get_server_ip()
 
         # No caller SDP to intersect against -- offer the SDP builder's
-        # default codec set, same as start_blind_refer_transfer()'s
-        # PBX-originated leg (transfer_handler.py).
+        # default codec set, same as the PBX-originated transfer target leg
+        # (TransferHandler._originate_target).
         invite_sdp = SDPBuilder.build_audio_sdp(
             server_ip,
             call.rtp_ports[0],
@@ -262,8 +262,8 @@ class CallOriginator:
     def _complete_bridge(self, leg_a_call: Any, leg_b_call: Any, on_leg_b_answer: Callable[[Any], None] | None) -> None:
         """
         Cross-link two answered, PBX-originated legs and hand media on
-        leg_a's relay over to leg_b, mirroring
-        TransferHandler.bridge_attended_transfer()'s bridge-completion step.
+        leg_a's relay over to leg_b, mirroring TransferHandler.bridge()'s
+        bridge-completion step.
         """
         from pbx.core.call import CallState
 

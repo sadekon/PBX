@@ -226,22 +226,30 @@ class OperatorConsole:
             f"Announcement logged: '{announcement}' for transfer to {target_extension}"
         )
 
-        # Attempt the transfer via the PBX core's blind_transfer mechanism
+        # Attempt the transfer via the PBX core's transfer state machine
         try:
             # Resume the call from hold before transferring
             call.resume()
 
-            # Use PBX core's blind_transfer to perform the actual SIP-level transfer.
-            # blind_transfer sends a new INVITE to the target extension, re-points the
-            # RTP relay, and sends BYE to the transferring party (operator).
-            success = self.pbx_core.transfer_handler.blind_transfer(call_id, target_extension)
+            from pbx.core.transfer_session import TransferMode
+
+            # A blind transfer: the PBX invites the target on the caller's
+            # behalf, bridges them onto the existing relay when it answers, and
+            # drops the operator's leg. The operator occupies the callee side.
+            session = self.pbx_core.transfer_handler.start_transfer(
+                call,
+                target_extension,
+                mode=TransferMode.BLIND,
+                transferor_side="callee",
+            )
+            success = session is not None
             if success:
                 self.logger.info(
-                    f"Announced transfer completed for call {call_id} to {target_extension}"
+                    f"Announced transfer started for call {call_id} to {target_extension}"
                 )
             else:
                 self.logger.error(
-                    f"PBX core blind_transfer failed for call {call_id} to {target_extension}"
+                    f"Transfer failed to start for call {call_id} to {target_extension}"
                 )
             return success
         except Exception as e:

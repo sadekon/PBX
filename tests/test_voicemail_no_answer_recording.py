@@ -83,8 +83,7 @@ class TestCalleeErrorAfterVoicemailAnswer:
         pbx = MagicMock()
         call = MagicMock()
         call.bridged_peer_call_id = None
-        call.pending_transfer_consult_id = None
-        call.is_transfer_consult = False
+        call.transfer_session_id = None
         call.routed_to_voicemail = True
         call.caller_addr = ("10.0.0.1", 5060)
         pbx.call_manager.get_call.return_value = call
@@ -113,8 +112,7 @@ class TestCalleeErrorAfterVoicemailAnswer:
         pbx = MagicMock()
         call = MagicMock()
         call.bridged_peer_call_id = None
-        call.pending_transfer_consult_id = None
-        call.is_transfer_consult = False
+        call.transfer_session_id = None
         call.callee_invite.uri = "sip:1001@192.168.1.50:5060"
         call.callee_invite.get_header.side_effect = {"Via": invite_via}.get
         pbx.call_manager.get_call.return_value = call
@@ -139,8 +137,7 @@ class TestCalleeErrorAfterVoicemailAnswer:
         pbx = MagicMock()
         call = MagicMock()
         call.bridged_peer_call_id = None
-        call.pending_transfer_consult_id = None
-        call.is_transfer_consult = False
+        call.transfer_session_id = None
         call.routed_to_voicemail = False
         call.state = CallState.CONNECTED
         pbx.call_manager.get_call.return_value = call
@@ -159,8 +156,7 @@ class TestCalleeErrorAfterVoicemailAnswer:
         pbx = MagicMock()
         call = MagicMock()
         call.bridged_peer_call_id = None
-        call.pending_transfer_consult_id = None
-        call.is_transfer_consult = False
+        call.transfer_session_id = None
         call.routed_to_voicemail = False
         call.state = CallState.RINGING
         call.caller_addr = None  # skip error forwarding, assert teardown only
@@ -233,8 +229,7 @@ class TestByeNotForwardedToCancelledCallee:
         pbx = MagicMock()
         call = MagicMock()
         call.bridged_peer_call_id = None
-        call.pending_transfer_consult_id = None
-        call.is_transfer_consult = False
+        call.transfer_session_id = None
         call.routed_to_voicemail = True
         call.voicemail_access = False
         call.caller_addr = caller_addr
@@ -264,8 +259,7 @@ class TestMonitorVoicemailDtmf:
     def _make_call(self) -> MagicMock:
         call = MagicMock()
         call.bridged_peer_call_id = None
-        call.pending_transfer_consult_id = None
-        call.is_transfer_consult = False
+        call.transfer_session_id = None
         state = MagicMock()
         state.value = "connected"
         call.state = state
@@ -322,8 +316,7 @@ class TestCompleteRecordingSendsBye:
     def _make_call(self) -> MagicMock:
         call = MagicMock()
         call.bridged_peer_call_id = None
-        call.pending_transfer_consult_id = None
-        call.is_transfer_consult = False
+        call.transfer_session_id = None
         call.from_extension = "2001"
         call.to_extension = "1001"
         call.caller_addr = ("192.168.1.10", 5060)

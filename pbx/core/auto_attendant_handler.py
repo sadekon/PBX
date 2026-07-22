@@ -457,11 +457,12 @@ class AutoAttendantHandler:
         Promotes the single-leg IVR port to a two-party relay -- the raw
         RTPPlayer/RTPRecorder are stopped so the relay can rebind the same
         port, the caller becomes side A -- then originates the destination
-        leg through TransferHandler.start_blind_refer_transfer (referrer_addr=None:
-        the AA has no real transferor phone). The bridge completes when the
-        destination answers (handle_callee_answer -> bridge_attended_transfer
-        sets side B). On any failure the registered failure callback returns
-        the caller to the menu (see _return_to_menu).
+        leg through TransferHandler.start_transfer as a blind transfer. The
+        bridge completes when the destination answers (handle_callee_answer
+        hands the event to the transfer session, which sets side B). The AA has
+        no real transferor phone to hang up or recall, so it passes an
+        on_failure hook: any failure returns the caller to the menu instead of
+        applying the session's default failure policy (see _return_to_menu).
 
         The caller must treat the call/port as handed off after this returns.
         """
@@ -511,26 +512,28 @@ class AutoAttendantHandler:
         # (see SIPServer._handle_reinvite). The caller's leg here is never
         # re-signaled, so nothing would otherwise trigger it -- start it
         # explicitly so the caller hears hold music instead of silence while
-        # the destination rings. bridge_attended_transfer stops it on
-        # success; _return_to_menu stops it on failure.
+        # the destination rings. The transfer bridge stops it on success;
+        # _return_to_menu stops it on failure.
         relay_handler = pbx.rtp_relay.get_handler(call_id)
         if relay_handler:
             pbx.moh_system.start_moh(call_id, relay_handler, "a")
 
-        # On no-answer / busy / reject, come back to the menu instead of the
-        # default hangup (see PBXCore.abort_pending_transfer).
-        call.transfer_failure_callback = lambda: self._return_to_menu(call_id, call)
+        from pbx.core.transfer_session import TransferMode
 
-        if not pbx.transfer_handler.start_blind_refer_transfer(
+        # There is no transferor phone here to hang up or recall, so on
+        # no-answer / busy / reject the session hands the caller back to us
+        # instead of applying its default failure policy.
+        session = pbx.transfer_handler.start_transfer(
             call,
-            referrer_is_caller=False,
-            destination=destination,
-            referrer_addr=None,
-        ):
-            # Synchronous failure (e.g. destination offline): no consult was
-            # created, so abort_pending_transfer never fires -- return to the
-            # menu directly.
-            call.transfer_failure_callback = None
+            destination,
+            mode=TransferMode.BLIND,
+            transferor_side="callee",
+            on_failure=lambda: self._return_to_menu(call_id, call),
+        )
+
+        if session is None:
+            # Synchronous failure (e.g. destination offline): no session was
+            # created, so on_failure never fires -- return to the menu here.
             pbx.logger.warning(
                 f"Auto attendant transfer to {destination} failed to start; returning to menu"
             )
