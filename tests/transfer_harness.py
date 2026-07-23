@@ -68,6 +68,8 @@ def make_pbx(
     pbx.cdr_system = MagicMock()
     pbx.webhook_system = MagicMock()
     pbx.logger = MagicMock()
+    # No call queues configured: transfers never divert to queue adoption
+    pbx.queue_handler.is_queue_destination.return_value = False
     pbx._get_server_ip.return_value = SERVER_IP
     pbx._get_compatible_codecs.return_value = ["0", "8"]
     pbx._get_dtmf_payload_type.return_value = 101

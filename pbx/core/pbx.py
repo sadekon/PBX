@@ -18,6 +18,7 @@ from pbx.core.codec_negotiator import CodecNegotiator
 from pbx.core.emergency_handler import EmergencyHandler
 from pbx.core.feature_initializer import FeatureInitializer
 from pbx.core.paging_handler import PagingHandler
+from pbx.core.queue_handler import QueueCallHandler
 from pbx.core.registration_handler import RegistrationHandler
 from pbx.core.transfer_handler import TransferHandler
 from pbx.core.voicemail_handler import VoicemailHandler
@@ -243,6 +244,7 @@ class PBXCore:
         self.emergency_handler = EmergencyHandler(self)
         self.paging_handler = PagingHandler(self)
         self.transfer_handler = TransferHandler(self)
+        self.queue_handler = QueueCallHandler(self)
         self.codec_negotiator = CodecNegotiator(self)
         self.registration_handler = RegistrationHandler(self)
 
@@ -541,6 +543,9 @@ class PBXCore:
 
         # Stop registration expiry timer
         self.registration_handler.stop()
+
+        # Stop the queue sweep thread
+        self.queue_handler.shutdown()
 
         # Stop Prometheus metrics collector
         self._stop_metrics_collector()
@@ -962,7 +967,7 @@ class PBXCore:
             "active_recordings": len(self.recording_system.active_recordings),
             "active_conferences": len(self.conference_system.get_active_rooms()),
             "parked_calls": len(self.parking_system.get_parked_calls()),
-            "queued_calls": sum(len(q.queue) for q in self.queue_system.queues.values()),
+            "queued_calls": self.queue_system.total_waiting(),
         }
 
     def get_ad_integration_status(self) -> dict[str, Any]:

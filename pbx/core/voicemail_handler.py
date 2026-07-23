@@ -78,6 +78,11 @@ class VoicemailHandler:
         elif pbx.config.get_extension(target_ext):
             extension_exists = True
             pbx.logger.info(f"[VM Access] ✓ Extension {target_ext} found in config file")
+        # Call queue overflow mailboxes are keyed by the queue number, which
+        # is never a provisioned extension -- allow retrieval (e.g. *8001).
+        elif pbx.queue_system.get_queue(target_ext) is not None:
+            extension_exists = True
+            pbx.logger.info(f"[VM Access] ✓ {target_ext} is a call queue mailbox")
 
         if not extension_exists:
             pbx.logger.warning(

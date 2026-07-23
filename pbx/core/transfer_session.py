@@ -171,6 +171,11 @@ class TransferSession:
     target_call_id: str | None = None
     refer_dialog: ReferDialog | None = None
     on_failure: Callable[[], None] | None = None
+    on_complete: Callable[[], None] | None = None
+    #: Why abort() ran, for initiators whose on_failure needs to distinguish
+    #: causes (e.g. a call queue: "transferee_hangup" means the caller
+    #: abandoned and must not be offered to another agent).
+    abort_reason: str | None = None
     legs: dict[LegRole, list[LegRef]] = field(default_factory=dict)
     deadline_timer: threading.Timer | None = None
     recall_attempts: int = 0
@@ -192,6 +197,7 @@ class TransferSession:
         destination: str | None = None,
         refer_dialog: ReferDialog | None = None,
         on_failure: Callable[[], None] | None = None,
+        on_complete: Callable[[], None] | None = None,
     ) -> TransferSession:
         """
         Build a session for a transfer of `original`'s far party.
@@ -209,6 +215,9 @@ class TransferSession:
                 when the transfer fails -- used by a transfer initiator with no
                 real phone to recall (e.g. an auto attendant, which wants to
                 replay its menu rather than be hung up on).
+            on_complete: Invoked once after a successful bridge -- for
+                initiators tracking the outcome (e.g. a call queue recording
+                that the agent answered).
 
         Returns:
             The session, already registered on `original`.
@@ -228,6 +237,7 @@ class TransferSession:
             destination=destination,
             refer_dialog=refer_dialog,
             on_failure=on_failure,
+            on_complete=on_complete,
         )
         session.legs = {
             LegRole.TRANSFEROR: [
@@ -467,6 +477,19 @@ class TransferSession:
             self.state = TransferState.BRIDGED
             self._notify(NOTIFY_OK)
             self._close()
+
+            # One-shot success callback, after the session is fully closed so
+            # the callback sees a clean call record (transfer_session_id
+            # already cleared).
+            if self.on_complete is not None:
+                callback = self.on_complete
+                self.on_complete = None
+                try:
+                    callback()
+                except Exception as exc:
+                    self.pbx.logger.error(
+                        f"Transfer {self.session_id}: on_complete raised: {exc}"
+                    )
             return True
 
     # ------------------------------------------------------------------
@@ -497,6 +520,7 @@ class TransferSession:
 
             self._cancel_timer()
             self.state = TransferState.ABORTING
+            self.abort_reason = reason
             self.pbx.logger.warning(f"Transfer {self.session_id} aborting: {reason}")
 
             if self._transferor_live():

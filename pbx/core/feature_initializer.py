@@ -55,7 +55,11 @@ class FeatureInitializer:
         pbx_core.recording_system = CallRecordingSystem(
             auto_record=config.get("features.call_recording", False)
         )
-        pbx_core.queue_system = QueueSystem()
+        pbx_core.queue_system = QueueSystem(
+            database=database if database.enabled else None, config=config
+        )
+        if config.get("features.call_queues", True):
+            pbx_core.queue_system.load_or_seed()
         pbx_core.presence_system = PresenceSystem()
         pbx_core.parking_system = CallParkingSystem()
         pbx_core.cdr_system = CDRSystem()

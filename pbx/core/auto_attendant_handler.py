@@ -173,6 +173,11 @@ class AutoAttendantHandler:
             contact_uri = f"<sip:{to_ext}@{server_ip}:{sip_port}>"
             ok_response.set_header("Contact", contact_uri)
 
+            # Remember the dialog To header (with our to-tag) so downstream
+            # features that adopt this call (queue overflow voicemail) can
+            # send a proper in-dialog BYE to the caller.
+            call.voicemail_dialog_to = ok_response.get_header("To")
+
             # Send to caller
             pbx.sip_server._send_message(ok_response.build(), call.caller_addr)
             pbx.logger.info(f"Answered auto attendant call {call_id}")
@@ -517,6 +522,14 @@ class AutoAttendantHandler:
         relay_handler = pbx.rtp_relay.get_handler(call_id)
         if relay_handler:
             pbx.moh_system.start_moh(call_id, relay_handler, "a")
+
+        # Queue destination: the queue adopts the parked caller outright.
+        # Checked BEFORE start_transfer -- its queue divert returns None,
+        # which the code below would misread as failure and steal the caller
+        # back into the menu.
+        if pbx.queue_handler.is_queue_destination(destination):
+            pbx.queue_handler.adopt_parked_caller(call_id, call, destination)
+            return
 
         from pbx.core.transfer_session import TransferMode
 

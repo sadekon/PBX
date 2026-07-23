@@ -164,6 +164,20 @@ declare global {
         showAddDeviceModal: () => Promise<void>;
         deletePagingDevice: (deviceId: string) => Promise<void>;
 
+        // pages/queues.ts
+        loadQueuesData: () => Promise<void>;
+        loadQueues: () => Promise<void>;
+        loadQueueAgents: () => Promise<void>;
+        setQueueAgentState: (
+            extension: string,
+            state: { logged_in?: boolean; paused?: boolean }
+        ) => Promise<void>;
+        showAddQueueModal: () => Promise<void>;
+        showEditQueueModal: (queueNumber: string) => Promise<void>;
+        deleteQueue: (queueNumber: string) => Promise<void>;
+        showAddQueueAgentModal: (queueNumber: string) => Promise<void>;
+        removeQueueAgent: (queueNumber: string, extension: string) => Promise<void>;
+
         // pages/license.ts
         loadLicenseStatus: () => Promise<void>;
         loadLicenseFeatures: () => Promise<void>;

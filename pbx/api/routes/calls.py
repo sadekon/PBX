@@ -67,6 +67,19 @@ def transfer_call(call_id: str) -> tuple[Response, int]:
     # occupy the callee side of the call being transferred.
     transferor_side = "callee"
 
+    # Transfers to a call queue are adopted by the queue (start_transfer
+    # returns None by design); report success rather than a bogus failure.
+    if destination and pbx_core.queue_handler.is_queue_destination(destination):
+        pbx_core.transfer_handler.start_transfer(
+            call,
+            destination,
+            mode=TransferMode.BLIND,
+            transferor_side=transferor_side,
+        )
+        return send_json(
+            {"success": True, "message": f"Call {call_id} transferred to queue {destination}"}
+        ), 200
+
     if transfer_type == "attended":
         if not consultation_call_id:
             return send_json(

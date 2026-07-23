@@ -685,3 +685,54 @@ def register_all_migrations(manager: MigrationManager) -> None:
         );
     """),
     )
+
+    # Migration 1013: Call Queues (ACD)
+    manager.register_migration(
+        1013,
+        "Call Queues",
+        manager._build_migration_sql("""
+        -- Queue definitions (config.yml queues: section seeds this once;
+        -- the database is authoritative thereafter)
+        CREATE TABLE IF NOT EXISTS call_queues (
+            id {SERIAL},
+            queue_number VARCHAR(20) UNIQUE NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            strategy VARCHAR(20) NOT NULL DEFAULT 'round_robin',
+            ring_timeout INTEGER DEFAULT 15,
+            max_wait_time INTEGER DEFAULT 300,
+            max_queue_size INTEGER DEFAULT 10,
+            fallback_mailbox VARCHAR(20),
+            auto_pause_misses INTEGER DEFAULT 3,
+            enabled BOOLEAN DEFAULT {BOOLEAN_TRUE},
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Queue membership (which extensions serve which queue); kept
+        -- separate from runtime state so external sync (e.g. AD calendar)
+        -- can manage membership without touching login state
+        CREATE TABLE IF NOT EXISTS queue_agents (
+            id {SERIAL},
+            queue_number VARCHAR(20) NOT NULL,
+            extension VARCHAR(20) NOT NULL,
+            penalty INTEGER DEFAULT 0,
+            source VARCHAR(20) DEFAULT 'manual',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (queue_number, extension)
+        );
+
+        -- Global per-agent runtime state (login/pause survive restarts);
+        -- one row per extension, shared across all queues
+        CREATE TABLE IF NOT EXISTS queue_agent_state (
+            id {SERIAL},
+            extension VARCHAR(20) UNIQUE NOT NULL,
+            logged_in BOOLEAN DEFAULT {BOOLEAN_FALSE},
+            paused BOOLEAN DEFAULT {BOOLEAN_FALSE},
+            pause_reason VARCHAR(30),
+            consecutive_misses INTEGER DEFAULT 0,
+            calls_taken INTEGER DEFAULT 0,
+            last_call_time TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """),
+    )

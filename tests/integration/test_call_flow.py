@@ -19,6 +19,17 @@ from pbx.core.call_router import CallRouter
 class TestCallRouterInternalRouting:
     """Test that CallRouter correctly routes internal calls."""
 
+    @pytest.fixture(autouse=True)
+    def _no_retransmit_timers(self):
+        """Keep INVITE retransmission timers from leaking past the test.
+
+        route_call() starts a real SIPTransaction whose timer-A chain would
+        keep retransmitting (and re-scheduling) long after this test ends,
+        tripping pytest's unhandled-thread-exception check on later tests.
+        """
+        with patch("pbx.sip.transaction.InviteClientTransaction._schedule_timer_a"):
+            yield
+
     def _make_pbx_core(self, mock_config: MagicMock, mock_database: MagicMock) -> MagicMock:
         """Build a mock PBXCore with all subsystems wired up."""
         pbx = MagicMock()
@@ -66,6 +77,10 @@ class TestCallRouterInternalRouting:
         pbx.webrtc_gateway = None
         pbx.registered_phones_db = None
         pbx.trunk_system = None
+
+        # Queue handler: no queues configured, never divert
+        pbx.queue_handler = MagicMock()
+        pbx.queue_handler.is_queue_destination.return_value = False
 
         # Helper methods
         pbx._get_server_ip.return_value = "10.0.0.1"

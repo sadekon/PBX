@@ -77,6 +77,7 @@ class TransferHandler:
         existing_consult: Call | None = None,
         referred_by: str | None = None,
         on_failure: Callable[[], None] | None = None,
+        on_complete: Callable[[], None] | None = None,
     ) -> TransferSession | None:
         """
         Begin transferring `original`'s far party to `destination`.
@@ -99,6 +100,8 @@ class TransferHandler:
             referred_by: Referred-By header to pass to the target, if any.
             on_failure: Invoked instead of dropping the transferee if the
                 transfer fails -- for initiators with no phone to recall.
+            on_complete: Invoked once after a successful bridge -- for
+                initiators tracking the outcome (e.g. a call queue).
 
         Returns:
             The session, or None if the transfer could not be started (in
@@ -137,6 +140,30 @@ class TransferHandler:
                 transferor_side = "caller" if stale_peer.bridge_peer_side == "a" else "callee"
                 original = relay_owner
 
+        # A transfer to a call queue is not a point-to-point transfer: the
+        # queue adopts the transferee (sending the final NOTIFY itself) and
+        # no session is created. Placed after the stale-peer resolution so a
+        # REFER on a chained-transfer leg adopts the relay-owner record.
+        # Callers must not treat this None as a failure -- the AA and the
+        # REST API check for queue destinations before calling here; REFER
+        # handling ignores the return value.
+        if destination and pbx.queue_handler.is_queue_destination(destination):
+            if stale_peer is not None:
+                # The transferor's dialog lives on the stale record; hang it
+                # up and absorb via that record's addresses too.
+                side = "callee" if stale_peer.callee_addr else "caller"
+                try:
+                    pbx.sip_server._send_leg_bye(stale_peer, side=side)
+                except Exception as exc:
+                    pbx.logger.error(f"Failed to BYE stale transferor leg: {exc}")
+            pbx.queue_handler.adopt_transfer(
+                original,
+                destination,
+                transferor_side=transferor_side,
+                refer_dialog=refer_dialog,
+            )
+            return None
+
         session = TransferSession.create(
             pbx,
             original,
@@ -145,6 +172,7 @@ class TransferHandler:
             destination=destination,
             refer_dialog=refer_dialog,
             on_failure=on_failure,
+            on_complete=on_complete,
         )
 
         if stale_peer is not None:

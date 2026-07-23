@@ -16,7 +16,7 @@
     <link rel="icon" type="image/png" sizes="512x512" href="/admin/assets/favicon-512-BCF-tvk5.png">
     <!-- Debug logging utility -->
     <!-- Load Chart.js from CDN with automatic fallback -->
-  <script type="module" crossorigin src="/admin/assets/main-DBKjoPjG.js"></script>
+  <script type="module" crossorigin src="/admin/assets/main-BrmkTjKW.js"></script>
   <link rel="modulepreload" crossorigin href="/admin/assets/modulepreload-polyfill-Dezn_h7o.js">
   <link rel="stylesheet" crossorigin href="/admin/assets/main-DXfiKnwu.css">
 </head>
@@ -161,6 +161,10 @@
                     <button class="tab-button" data-tab="paging">
                         <span class="tab-icon">📢</span>
                         <span class="tab-text">Paging System</span>
+                    </button>
+                    <button class="tab-button" data-tab="call-queues">
+                        <span class="tab-icon">👥</span>
+                        <span class="tab-text">Call Queues</span>
                     </button>
                     <button class="tab-button" data-tab="codecs">
                         <span class="tab-icon">🎵</span>
@@ -1390,6 +1394,74 @@
         </div>
 
         <!-- Paging System Tab -->
+        <div id="call-queues" class="tab-content">
+            <div class="section-header">
+                <h2>👥 Call Queues (ACD)</h2>
+                <button class="btn btn-primary" onclick="loadQueuesData()">🔄 Refresh</button>
+            </div>
+
+            <div class="info-box">
+                <h3>ℹ️ About Call Queues</h3>
+                <p>Callers dialing a queue number (e.g., 8001) or transferred into it wait on hold music while calls are distributed to logged-in agents. Overflow (queue full, wait too long, or no agents) goes to the queue's voicemail box.</p>
+                <p><strong>Agent dial codes:</strong> *61 to log in, *62 to log out. Dial *<em>queue number</em> (e.g., *8001) to retrieve queue voicemail.</p>
+            </div>
+
+            <!-- Queues -->
+            <div class="config-section">
+                <div class="section-header">
+                    <h3>📋 Queues</h3>
+                    <button class="btn btn-success" onclick="showAddQueueModal()">➕ Add Queue</button>
+                </div>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Number</th>
+                                <th>Name</th>
+                                <th>Strategy</th>
+                                <th>Waiting</th>
+                                <th>Agents</th>
+                                <th>Members</th>
+                                <th>Overflow Mailbox</th>
+                                <th>Enabled</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="queues-table-body">
+                            <tr>
+                                <td colspan="9" class="loading">Loading queues...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Agents -->
+            <div class="config-section">
+                <h3>🧑‍💼 Agent Status</h3>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Extension</th>
+                                <th>Queues</th>
+                                <th>Status</th>
+                                <th>Calls Taken</th>
+                                <th>Missed (consec.)</th>
+                                <th>Last Call</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="queue-agents-table-body">
+                            <tr>
+                                <td colspan="7" class="loading">Loading agents...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
         <div id="paging" class="tab-content">
             <div class="section-header">
                 <h2>📢 Paging System</h2>

@@ -133,6 +133,7 @@ export function showTab(tabName: string): void {
         'auto-attendant':      window.loadAutoAttendantConfig,
         'voicemail':           window.loadVoicemailTab,
         'paging':              window.loadPagingData,
+        'call-queues':         window.loadQueuesData,
         'calls':               window.loadCalls,
         'config':              window.loadConfig,
         'features-status':     window.loadFeaturesStatus,

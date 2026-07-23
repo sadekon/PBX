@@ -403,6 +403,14 @@ voicemail:
 conference:
   max_participants: 50
   record_conferences: false
+# Call queues (ACD). SEED ONLY: this section populates the database the
+# first time the PBX starts with an empty call_queues table; after that the
+# database (admin UI / REST API) is authoritative and edits here are ignored.
+# Per-queue keys: number, name, strategy (round_robin | least_recent |
+# fewest_calls | random), ring_timeout, max_wait_time, max_queue_size,
+# fallback_mailbox (default: the queue number; retrieve via *<queue number>),
+# auto_pause_misses (0 = off), agents (list of member extensions).
+# Agents log in/out by dialing *61 / *62.
 queues:
   - number: '8001'
     name: Sales Queue

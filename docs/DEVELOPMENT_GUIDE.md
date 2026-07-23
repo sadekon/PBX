@@ -105,7 +105,7 @@ flag. Grouped by gating capability.
 
 | Feature | Module | Config gate | Status | Remaining work | Test rig |
 |---------|--------|------------|--------|----------------|----------|
-| Call queues | `call_queue.py` | `features.call_queues` | 🔶 | Queue/agent state logic present, dialplan `8xxx` routes into it. Verify end-to-end: hold music while queued (C2), agent delivery, wrap-up. | A |
+| Call queues | `call_queue.py` + `core/queue_handler.py` | `features.call_queues` | ✅ | Full ACD: DB-persisted queues/membership/agent state (migration 1013, seeded once from `config.yml` `queues:`), REST API (`/api/queues`), admin UI page. Entry via direct dial `8xxx`, DID→`8xxx`, AA menu, or REFER transfer; callers park on MOH, agents rung serially per strategy (`round_robin`/`least_recent`/`fewest_calls`/`random`; `ring_all` deferred) through per-attempt blind TransferSessions with per-queue ring timeout and auto-pause after N misses. Overflow (full/no-agents/max-wait) → queue mailbox (default = queue number, retrievable via `*8xxx`). Agent star codes `*61`/`*62`. Needs field verification on Rig A (manual SIP recipe in plan). | A |
 | Call parking | `call_parking.py` | `features.call_parking` | 🔶 | Slot management wired to `7x` pattern. Verify park/retrieve with real phones (REFER/replaces behavior). | A |
 | Find me / follow me | `find_me_follow_me.py` | `features.find_me_follow_me` | 🔶 | Sequential/simultaneous ring logic; external destinations also need C5. | A, C |
 | Time-based routing | `time_based_routing.py` | config | ✅ | Pure routing logic; unit-testable. | A |

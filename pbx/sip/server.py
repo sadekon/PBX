@@ -1136,6 +1136,21 @@ class SIPServer:
                     self.logger.info("")
                     return
 
+            # A queued call: the queue absorbs the departed transferor's BYE
+            # and handles caller abandon itself. Falls through (False) during
+            # overflow voicemail so the normal end_call path auto-saves the
+            # recording. Checked after the transfer-session branch so an
+            # in-flight agent offer's BYE is resolved by the session first.
+            if (
+                call
+                and getattr(call, "queue_ctx", None)
+                and self.pbx_core.queue_handler.on_bye(call, addr)
+            ):
+                self._send_response(200, "OK", message, addr)
+                self.logger.info(f"  BYE on {call_id} from {addr} handled by queue")
+                self.logger.info("")
+                return
+
             # Bridged call (post-transfer): each leg keeps its own record;
             # tear down both legs with properly rebuilt BYEs, or absorb a
             # stale BYE from the departed transferor.

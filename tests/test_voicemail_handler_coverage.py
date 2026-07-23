@@ -84,6 +84,8 @@ def _make_pbx_core() -> MagicMock:
     pbx._get_dtmf_payload_type.return_value = 101
     pbx._get_ilbc_mode.return_value = 30
     pbx._build_wav_file.return_value = b"RIFF_WAV_DATA"
+    # No call queues configured (queue mailboxes are checked in VM access)
+    pbx.queue_system.get_queue.return_value = None
     return pbx
 
 
