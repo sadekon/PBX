@@ -451,8 +451,11 @@ class QueueCallHandler:
             ok.set_header("Content-type", "application/sdp")
             ok.set_header("Contact", contact_uri)
             # The dialog To header (with our to-tag) makes the standard
-            # voicemail-completion BYE work for queue calls too.
+            # voicemail-completion BYE work for queue calls too, and lets
+            # _send_leg_bye() reach the caller correctly once bridged to an
+            # agent (it reads caller_dialog_to, not voicemail_dialog_to).
             call.voicemail_dialog_to = ok.get_header("To")
+            call.caller_dialog_to = ok.get_header("To")
             pbx.sip_server._send_message(ok.build(), call.caller_addr)
             call.connect()
             pbx.logger.info(f"Answered queue call {call_id} for queue {to_ext}")

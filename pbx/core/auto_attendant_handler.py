@@ -175,8 +175,12 @@ class AutoAttendantHandler:
 
             # Remember the dialog To header (with our to-tag) so downstream
             # features that adopt this call (queue overflow voicemail) can
-            # send a proper in-dialog BYE to the caller.
+            # send a proper in-dialog BYE to the caller, and so a bridge
+            # teardown (_send_leg_bye reads caller_dialog_to, not this) can
+            # reach the caller once this call is transferred/queued and the
+            # far end hangs up first.
             call.voicemail_dialog_to = ok_response.get_header("To")
+            call.caller_dialog_to = ok_response.get_header("To")
 
             # Send to caller
             pbx.sip_server._send_message(ok_response.build(), call.caller_addr)
