@@ -196,6 +196,15 @@ class MusicOnHold:
             # Barge-in: is_set() only peeks, so hold ends within one packet.
             player.play_file(moh_file, interrupt_check=stop_event.is_set)
 
+        # A stop_moh() exit is already logged by the caller; a relay-stop
+        # exit otherwise ends the music with no trace, which makes "hold
+        # music stopped and nothing was logged" undiagnosable in the field.
+        if not stop_event.is_set():
+            self.logger.warning(
+                f"MOH stream for call {relay_handler.call_id} ended because its "
+                f"relay stopped (running={relay_handler.running})"
+            )
+
     def add_moh_class(self, class_name: str, files: list[Path]) -> None:
         """Register a MOH class with an explicit list of files."""
         self.classes[class_name] = files

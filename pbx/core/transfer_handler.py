@@ -307,7 +307,11 @@ class TransferHandler:
         invite_msg = SIPMessageBuilder.build_request(
             method="INVITE",
             uri=f"sip:{destination}@{dest_addr[0]}:{dest_addr[1]}",
-            from_addr=f"<sip:{transferee_ext}@{server_ip}>",
+            # A new-dialog request's From MUST carry a tag (RFC 3261
+            # SS8.1.1.3); every later in-dialog request (ACK/CANCEL/BYE/
+            # re-INVITE) copies From from this message, so minting it here
+            # propagates it across the whole dialog.
+            from_addr=f"<sip:{transferee_ext}@{server_ip}>;tag={uuid.uuid4().hex[:8]}",
             to_addr=f"<sip:{destination}@{server_ip}>",
             call_id=consult_call_id,
             cseq=1,

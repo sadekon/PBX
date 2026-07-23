@@ -142,7 +142,9 @@ class CallOriginator:
             invite_request = SIPMessageBuilder.build_request(
                 method="INVITE",
                 uri=f"sip:{transformed_number}@{trunk.host}:{trunk.port}",
-                from_addr=f"<sip:{from_context}@{server_ip}>",
+                # From tag required on a new dialog (RFC 3261 SS8.1.1.3);
+                # in-dialog follow-ups copy From from this message.
+                from_addr=f"<sip:{from_context}@{server_ip}>;tag={uuid.uuid4().hex[:8]}",
                 to_addr=f"<sip:{transformed_number}@{trunk.host}>",
                 call_id=call_id,
                 cseq=1,
@@ -166,7 +168,9 @@ class CallOriginator:
             invite_request = SIPMessageBuilder.build_request(
                 method="INVITE",
                 uri=f"sip:{destination}@{dest_addr[0]}:{dest_addr[1]}",
-                from_addr=f"<sip:{from_context}@{server_ip}>",
+                # From tag required on a new dialog (RFC 3261 SS8.1.1.3);
+                # in-dialog follow-ups copy From from this message.
+                from_addr=f"<sip:{from_context}@{server_ip}>;tag={uuid.uuid4().hex[:8]}",
                 to_addr=f"<sip:{destination}@{server_ip}>",
                 call_id=call_id,
                 cseq=1,

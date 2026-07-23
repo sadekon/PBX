@@ -18,8 +18,13 @@ from pbx.models import Base
 config = context.config
 
 # Interpret the config file for Python logging.
+# disable_existing_loggers=False is essential: migrations run mid-startup
+# from PBXCore.__init__, AFTER the "PBX" logger is configured. fileConfig's
+# default (True) sets disabled=True on every pre-existing logger, silencing
+# all PBX runtime logging for the life of the process -- the file and
+# journal then show only the few startup lines emitted before this ran.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Set target metadata from our models Base so autogenerate can detect changes
 target_metadata = Base.metadata
