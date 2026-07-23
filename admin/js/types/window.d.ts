@@ -159,9 +159,7 @@ declare global {
         loadPagingZones: () => Promise<void>;
         loadPagingDevices: () => Promise<void>;
         loadActivePages: () => Promise<void>;
-        deletePagingZone: (zoneId: string) => Promise<void>;
-        showAddZoneModal: () => Promise<void>;
-        showAddDeviceModal: () => Promise<void>;
+        deletePagingZone: (extension: string) => Promise<void>;
         deletePagingDevice: (deviceId: string) => Promise<void>;
 
         // pages/license.ts
