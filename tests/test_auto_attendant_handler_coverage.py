@@ -29,6 +29,7 @@ sys.modules.setdefault("pbx.sip.message", _mock_sip_message)
 sys.modules.setdefault("pbx.sip.sdp", _mock_sip_sdp)
 
 from pbx.core.auto_attendant_handler import AutoAttendantHandler
+from pbx.core.transfer_session import TransferMode
 
 
 def _make_pbx_core() -> MagicMock:
@@ -391,7 +392,7 @@ class TestAutoAttendantSession:
             "session": {"state": "TRANSFERRING"},
         }
         pbx.rtp_relay.adopt_existing_port.return_value = True
-        pbx.transfer_handler.start_blind_refer_transfer.return_value = True
+        pbx.transfer_handler.start_transfer.return_value = MagicMock()
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -410,9 +411,14 @@ class TestAutoAttendantSession:
 
         pbx.rtp_relay.adopt_existing_port.assert_called_once_with("call-1", 30000, 30001)
         pbx.rtp_relay.set_endpoints.assert_called_once_with("call-1", ("192.168.1.10", 40000), None)
-        pbx.transfer_handler.start_blind_refer_transfer.assert_called_once_with(
-            call_obj, referrer_is_caller=False, destination="8001", referrer_addr=None
-        )
+        pbx.transfer_handler.start_transfer.assert_called_once()
+        args, kwargs = pbx.transfer_handler.start_transfer.call_args
+        assert args[0] is call_obj
+        assert args[1] == "8001"
+        assert kwargs["mode"] is TransferMode.BLIND
+        assert kwargs["transferor_side"] == "callee"
+        # No transferor phone to recall: the AA handles failure itself.
+        assert callable(kwargs["on_failure"])
         # Handed off: the session must not end the call or return the port
         # (the pool is left untouched -- no extra append of aa_rtp_port).
         pbx.end_call.assert_not_called()
@@ -437,7 +443,7 @@ class TestAutoAttendantSession:
             "session": {"state": "TRANSFERRING"},
         }
         pbx.rtp_relay.adopt_existing_port.return_value = True
-        pbx.transfer_handler.start_blind_refer_transfer.return_value = False  # synchronous failure
+        pbx.transfer_handler.start_transfer.return_value = None  # synchronous failure
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -525,7 +531,7 @@ class TestAutoAttendantSession:
             "destination": "1001",
         }
         pbx.rtp_relay.adopt_existing_port.return_value = True
-        pbx.transfer_handler.start_blind_refer_transfer.return_value = True
+        pbx.transfer_handler.start_transfer.return_value = MagicMock()
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -543,9 +549,12 @@ class TestAutoAttendantSession:
         handler._auto_attendant_session("call-1", call_obj, session)
 
         pbx.auto_attendant.handle_timeout.assert_called()
-        pbx.transfer_handler.start_blind_refer_transfer.assert_called_once_with(
-            call_obj, referrer_is_caller=False, destination="1001", referrer_addr=None
-        )
+        pbx.transfer_handler.start_transfer.assert_called_once()
+        args, kwargs = pbx.transfer_handler.start_transfer.call_args
+        assert args[0] is call_obj
+        assert args[1] == "1001"
+        assert kwargs["mode"] is TransferMode.BLIND
+        assert callable(kwargs["on_failure"])
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
@@ -565,7 +574,7 @@ class TestAutoAttendantSession:
             "destination": "1001",
         }
         pbx.rtp_relay.adopt_existing_port.return_value = True
-        pbx.transfer_handler.start_blind_refer_transfer.return_value = False  # synchronous failure
+        pbx.transfer_handler.start_transfer.return_value = None  # synchronous failure
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -702,7 +711,7 @@ class TestAutoAttendantSession:
             "session": {"state": "TRANSFERRING"},
         }
         pbx.rtp_relay.adopt_existing_port.return_value = True
-        pbx.transfer_handler.start_blind_refer_transfer.return_value = True
+        pbx.transfer_handler.start_transfer.return_value = MagicMock()
         handler = AutoAttendantHandler(pbx)
         call_obj = _make_call()
 
@@ -722,7 +731,7 @@ class TestAutoAttendantSession:
 
         # The transferring prompt file was played, then the transfer started.
         mock_player.play_file.assert_any_call("/audio/transferring.wav")
-        pbx.transfer_handler.start_blind_refer_transfer.assert_called_once()
+        pbx.transfer_handler.start_transfer.assert_called_once()
 
     @patch("pbx.core.auto_attendant_handler.time")
     @patch("pbx.utils.audio.get_prompt_audio")
@@ -790,7 +799,7 @@ class TestAutoAttendantSession:
         with patch.object(handler, "_return_to_menu") as mock_return:
             handler._auto_attendant_session("call-1", call_obj, session)
 
-        pbx.transfer_handler.start_blind_refer_transfer.assert_not_called()
+        pbx.transfer_handler.start_transfer.assert_not_called()
         mock_return.assert_called_once_with("call-1", call_obj)
 
 

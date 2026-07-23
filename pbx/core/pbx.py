@@ -861,8 +861,8 @@ class PBXCore:
 
         Mirrors the hold behavior of a phone-initiated re-INVITE (see
         SIPServer._handle_reinvite) so a hold placed through the API or
-        internally (e.g. consultation_transfer_start) sounds the same to the
-        held party as one signaled by a phone.
+        internally (e.g. parking a call for an attended transfer) sounds the
+        same to the held party as one signaled by a phone.
 
         Args:
             call_id: Call identifier

@@ -1118,31 +1118,29 @@ class SIPServer:
         if self.pbx_core:
             call = self.pbx_core.call_manager.get_call(call_id)
 
+            # A transfer in progress owns its own legs: the session decides
+            # whether this BYE ends the call, is absorbed so a parked party
+            # survives until the bridge completes, or aborts the transfer.
+            # Checked before the bridged branch because a second transfer
+            # chained off an already-bridged call sets both.
+            if call and call.transfer_session_id:
+                from pbx.core.transfer_session import LegEvent, LegEventResult
+
+                result = self.pbx_core.transfer_handler.on_leg_event(call, LegEvent.BYE, addr=addr)
+                if result is not LegEventResult.FORWARD:
+                    self.logger.info(
+                        f"  BYE on {call_id} from {addr} handled by transfer "
+                        f"session ({result.value})"
+                    )
+                    self._send_response(200, "OK", message, addr)
+                    self.logger.info("")
+                    return
+
             # Bridged call (post-transfer): each leg keeps its own record;
             # tear down both legs with properly rebuilt BYEs, or absorb a
             # stale BYE from the departed transferor.
             if call and call.bridged_peer_call_id:
                 self._handle_bye_bridged(message, addr, call)
-                return
-
-            # Pending transfer: after a successful REFER NOTIFY the
-            # transferor's phone drops its own legs. Those BYEs must be
-            # absorbed (200 OK only) so the parked party and the ringing
-            # transfer destination survive until the bridge completes.
-            if (
-                call
-                and (call.pending_transfer_consult_id or call.is_transfer_consult)
-                and call.transfer_referrer_addr == addr
-            ):
-                self.logger.info(
-                    f"  Absorbed BYE from transferor {addr} on {call_id} (transfer pending)"
-                )
-                if call.caller_addr == addr:
-                    call.caller_addr = None
-                elif call.callee_addr == addr:
-                    call.callee_addr = None
-                self._send_response(200, "OK", message, addr)
-                self.logger.info("")
                 return
 
             # Forward BYE to the other party in the call if present
@@ -1180,17 +1178,6 @@ class SIPServer:
                         self.logger.info(f"Forwarded BYE to other party at {other_party_addr}")
                     except Exception as e:
                         self.logger.error(f"Failed to forward BYE to other party: {e}")
-
-            # If the transferee hangs up while a transfer bridge is still
-            # pending, the consultation leg has no one left to bridge to --
-            # cancel it instead of leaving it ringing.
-            if call and call.pending_transfer_consult_id:
-                consult = self.pbx_core.call_manager.get_call(call.pending_transfer_consult_id)
-                call.pending_transfer_consult_id = None
-                if consult:
-                    self.pbx_core.transfer_handler.abort_pending_transfer(
-                        consult, cancel_destination=True
-                    )
 
             # End the call internally
             self.logger.info(f"  Processing BYE - ending call {call_id}")
@@ -1666,17 +1653,18 @@ class SIPServer:
         """
         Handle REFER request for call transfer (RFC 3515).
 
-        Implements the full REFER flow:
-        1. Validates Refer-To header
-        2. Sends 202 Accepted
-        3. Sends NOTIFY with 100 Trying (transfer in progress)
-        4. Initiates new INVITE to the transfer destination
-        5. Sends NOTIFY with final status (200 OK or failure)
+        Validates the request, accepts the implicit subscription, and hands the
+        transfer to TransferHandler. Everything after that -- originating or
+        adopting the target leg, bridging, aborting, and reporting progress on
+        the subscription -- belongs to the TransferSession, so that a transfer
+        signaled over SIP behaves identically to one driven by the REST API or
+        by the auto attendant.
 
         Args:
             message: SIPMessage object.
             addr: Source address tuple.
         """
+        from pbx.core.transfer_session import NOTIFY_TRYING, ReferDialog, TransferMode
 
         self.logger.info(f"REFER request from {addr}")
 
@@ -1696,11 +1684,18 @@ class SIPServer:
         # Accept the REFER request (creates an implicit subscription)
         self._send_response(202, "Accepted", message, addr)
 
-        # Send initial NOTIFY - transfer is in progress (100 Trying)
-        self._send_transfer_notify(message, addr, "SIP/2.0 100 Trying", call_id)
+        # The subscription outlives this request: every NOTIFY for this
+        # transfer is sent on it, with a strictly increasing CSeq.
+        dialog = ReferDialog(
+            call_id=call_id,
+            from_header=message.get_header("To") or "",
+            to_header=message.get_header("From") or "",
+            addr=addr,
+        )
+        self.send_transfer_notify(dialog, NOTIFY_TRYING, terminated=False)
 
         if not self.pbx_core:
-            self._send_transfer_notify(message, addr, "SIP/2.0 503 Service Unavailable", call_id)
+            self.send_transfer_notify(dialog, "SIP/2.0 503 Service Unavailable", terminated=True)
             return
 
         # Parse Refer-To: target user plus any embedded headers (RFC 3515
@@ -1710,44 +1705,23 @@ class SIPServer:
         destination, embedded_headers = self._parse_refer_to(refer_to)
         if not destination:
             self.logger.error(f"Could not parse Refer-To URI: {refer_to}")
-            self._send_transfer_notify(message, addr, "SIP/2.0 400 Bad Request", call_id)
+            self.send_transfer_notify(dialog, "SIP/2.0 400 Bad Request", terminated=True)
             return
 
         # Find the active call for the dialog the REFER arrived on
         call = self.pbx_core.call_manager.get_call(call_id)
         if not call:
             self.logger.warning(f"No active call found for REFER Call-ID: {call_id}")
-            self._send_transfer_notify(
-                message, addr, "SIP/2.0 481 Call/Transaction Does Not Exist", call_id
+            self.send_transfer_notify(
+                dialog, "SIP/2.0 481 Call/Transaction Does Not Exist", terminated=True
             )
             return
+        # Pin the dialog-owning record so every NOTIFY draws CSeq from the
+        # same pbx_leg_cseq counter as any BYE sent on this dialog.
+        dialog.call = call
 
-        # A transfer already pending (waiting on an unanswered consult) on
-        # this same dialog means this REFER is a genuine double-attempt
-        # racing the first one -- silently overwriting
-        # pending_transfer_consult_id would orphan the first consultation
-        # call, left ringing forever with nothing to bridge to. This does
-        # NOT reject a REFER on an *already fully bridged* call (e.g. C
-        # transferring B onward after A's earlier transfer completed) --
-        # that's a distinct, legitimate later transfer with no pending
-        # state to collide with; bridge_attended_transfer's peer-leg
-        # redirect handles it.
-        if call.pending_transfer_consult_id:
-            self.logger.warning(
-                f"REFER for {call_id} arrived while a transfer is already "
-                "pending on this dialog; rejecting"
-            )
-            self._send_transfer_notify(
-                message, addr, "SIP/2.0 480 Temporarily Unavailable", call_id
-            )
-            return
-
-        # Record which side of the call the referrer occupies now, while
-        # its address is still known (it is nulled as legs are dropped).
-        referrer_is_caller = addr == call.caller_addr
-        call.transfer_referrer_addr = addr
-        call.transfer_referrer_is_caller = referrer_is_caller
-
+        consult = None
+        mode = TransferMode.BLIND
         replaces = embedded_headers.get("replaces")
         if replaces:
             # Attended transfer: Replaces names the consultation dialog.
@@ -1758,7 +1732,7 @@ class SIPServer:
 
             if replaces_call_id == call_id:
                 self.logger.error(f"REFER Replaces names its own dialog ({call_id}); rejecting")
-                self._send_transfer_notify(message, addr, "SIP/2.0 400 Bad Request", call_id)
+                self.send_transfer_notify(dialog, "SIP/2.0 400 Bad Request", terminated=True)
                 return
 
             consult = self.pbx_core.call_manager.get_call(replaces_call_id)
@@ -1766,38 +1740,28 @@ class SIPServer:
                 self.logger.error(
                     f"Replaces dialog {replaces_call_id} not found for attended transfer"
                 )
-                self._send_transfer_notify(
-                    message, addr, "SIP/2.0 481 Call/Transaction Does Not Exist", call_id
+                self.send_transfer_notify(
+                    dialog, "SIP/2.0 481 Call/Transaction Does Not Exist", terminated=True
                 )
                 return
-
-            consult.transfer_referrer_addr = addr
-
-            if consult.callee_rtp:
-                # Destination already answered: bridge immediately.
-                if self.pbx_core.transfer_handler.bridge_attended_transfer(call, consult):
-                    self._send_transfer_notify(message, addr, "SIP/2.0 200 OK", call_id)
-                else:
-                    self._send_transfer_notify(
-                        message, addr, "SIP/2.0 500 Server Internal Error", call_id
-                    )
-            else:
-                # Semi-attended: destination still ringing. Defer the
-                # bridge until it answers (handle_callee_answer).
-                call.pending_transfer_consult_id = consult.call_id
-                consult.is_transfer_consult = True
-                self.logger.info(f"Transfer bridge deferred until {replaces_call_id} is answered")
-                self._send_transfer_notify(message, addr, "SIP/2.0 200 OK", call_id)
+            mode = TransferMode.ATTENDED
         else:
-            # Blind transfer: PBX originates the destination leg itself
-            # and bridges when it answers.
             self.logger.info(f"Blind transfer to {destination}")
-            if self.pbx_core.transfer_handler.start_blind_refer_transfer(
-                call, referrer_is_caller, destination, addr, referred_by
-            ):
-                self._send_transfer_notify(message, addr, "SIP/2.0 200 OK", call_id)
-            else:
-                self._send_transfer_notify(message, addr, "SIP/2.0 404 Not Found", call_id)
+
+        # Which side of the call the referrer occupies, captured now while
+        # their address is still known (it is nulled as legs are dropped).
+        transferor_side = "caller" if addr == call.caller_addr else "callee"
+
+        # start_transfer reports its own failures on the subscription.
+        self.pbx_core.transfer_handler.start_transfer(
+            call,
+            destination,
+            mode=mode,
+            transferor_side=transferor_side,
+            refer_dialog=dialog,
+            existing_consult=consult,
+            referred_by=referred_by,
+        )
 
     @staticmethod
     def _parse_refer_to(refer_to: str) -> tuple[str | None, dict[str, str]]:
@@ -1832,44 +1796,69 @@ class SIPServer:
         user_match = re.search(r"sip:([^@;>]+)", uri)
         return (user_match.group(1) if user_match else None, embedded)
 
-    def _send_transfer_notify(
+    def send_transfer_notify(
         self,
-        refer_msg: SIPMessage,
-        addr: AddrTuple,
+        dialog: Any,
         sipfrag_status: str,
-        call_id: str | None,
+        *,
+        terminated: bool,
     ) -> None:
         """
-        Send NOTIFY message for REFER subscription (RFC 3515 Section 2.4).
+        Send a NOTIFY for a REFER subscription (RFC 3515 Section 2.4).
 
-        The NOTIFY body contains a message/sipfrag with the transfer status.
+        The body is a message/sipfrag carrying the transfer's status. This is
+        the only way a transferor's phone learns that a transfer finished, so
+        two details it used to get wrong both left phones stuck displaying
+        "transferring" indefinitely:
+
+        - The request needs Via and Max-Forwards like any other (RFC 3261
+          SS8.1.1.6-7); strict UAs silently drop requests without them, so
+          `_add_pbx_request_headers` is not optional here.
+        - Every NOTIFY in a subscription needs its own CSeq. Reusing one makes
+          the phone treat the final NOTIFY as a retransmission of the initial
+          "100 Trying" and ignore it, so the transfer never appears to end.
+
+        At most one terminating NOTIFY is sent per subscription.
 
         Args:
-            refer_msg: Original REFER message (for dialog headers).
-            addr: Address to send NOTIFY to.
+            dialog: The `ReferDialog` identifying the subscription. Its CSeq
+                counter and final-NOTIFY latch are updated in place.
             sipfrag_status: SIP status line for the sipfrag body.
-            call_id: Call-ID for the dialog.
+            terminated: Whether this is the subscription's final NOTIFY.
         """
-        # Build NOTIFY request within the same dialog
-        from_header = refer_msg.get_header("To") or ""
-        to_header = refer_msg.get_header("From") or ""
+        if dialog.final_sent:
+            return
+        if terminated:
+            dialog.final_sent = True
 
+        # NOTIFYs share a dialog with any BYE the PBX later sends the
+        # transferor on this same leg (same Call-ID, same direction), and
+        # RFC 3261 SS12.2.1.1 requires one strictly increasing CSeq across
+        # both -- not one sequence per method. Draw from the dialog-owning
+        # record's pbx_leg_cseq, the counter _send_leg_bye also uses. The
+        # record is pinned on the dialog so this works even for the final
+        # NOTIFY, sent after end_call has unregistered the record.
+        call = dialog.call
+        if call is None and self.pbx_core:
+            call = self.pbx_core.call_manager.get_call(dialog.call_id)
+        if call is not None:
+            call.pbx_leg_cseq = max(call.pbx_leg_cseq, dialog.notify_cseq) + 1
+            dialog.notify_cseq = call.pbx_leg_cseq
+        else:
+            dialog.notify_cseq += 1
         notify_msg = SIPMessageBuilder.build_request(
             method="NOTIFY",
-            uri=f"sip:{addr[0]}:{addr[1]}",
-            from_addr=from_header,
-            to_addr=to_header,
-            call_id=call_id or "",
-            cseq=1,
+            uri=f"sip:{dialog.addr[0]}:{dialog.addr[1]}",
+            from_addr=dialog.from_header,
+            to_addr=dialog.to_header,
+            call_id=dialog.call_id,
+            cseq=dialog.notify_cseq,
         )
 
-        # Set subscription state
-        is_final = not sipfrag_status.endswith("Trying")
-        if is_final:
-            notify_msg.set_header("Subscription-State", "terminated;reason=noresource")
-        else:
-            notify_msg.set_header("Subscription-State", "active;expires=60")
-
+        notify_msg.set_header(
+            "Subscription-State",
+            "terminated;reason=noresource" if terminated else "active;expires=60",
+        )
         notify_msg.set_header("Event", "refer")
         notify_msg.set_header("Content-type", "message/sipfrag;version=2.0")
 
@@ -1877,8 +1866,12 @@ class SIPServer:
         notify_msg.body = sipfrag_status
         notify_msg.set_header("Content-Length", str(len(sipfrag_status.encode("utf-8"))))
 
-        self._send_message(notify_msg.build(), addr)
-        self.logger.debug(f"Sent transfer NOTIFY: {sipfrag_status}")
+        self._add_pbx_request_headers(notify_msg, dialog.addr)
+        self._send_message(notify_msg.build(), dialog.addr)
+        self.logger.debug(
+            f"Sent transfer NOTIFY: {sipfrag_status} (CSeq {dialog.notify_cseq}, "
+            f"terminated={terminated})"
+        )
 
     def _handle_info(self, message: SIPMessage, addr: AddrTuple) -> None:
         """
@@ -2365,6 +2358,17 @@ class SIPServer:
                             ringing_response = SIPMessageBuilder.build_response(
                                 180, "Ringing", call.original_invite
                             )
+                            # The tag minted here establishes the caller's
+                            # early dialog with the PBX. Keep it stable across
+                            # provisionals and capture it: for a consultation
+                            # leg adopted by a transfer while still ringing,
+                            # no 200 OK is ever sent to the caller, so this is
+                            # the only tag a teardown BYE can be matched by
+                            # (the phone's REFER Replaces references it too).
+                            if call.caller_dialog_to:
+                                ringing_response.set_header("To", call.caller_dialog_to)
+                            else:
+                                call.caller_dialog_to = ringing_response.get_header("To")
                             self._send_message(ringing_response.build(), call.caller_addr)
 
             elif message.status_code == 183:
@@ -2377,6 +2381,11 @@ class SIPServer:
                         progress_response = SIPMessageBuilder.build_response(
                             183, "Session Progress", call.original_invite
                         )
+                        # Same early-dialog tag handling as the 180 above.
+                        if call.caller_dialog_to:
+                            progress_response.set_header("To", call.caller_dialog_to)
+                        else:
+                            call.caller_dialog_to = progress_response.get_header("To")
                         # Include SDP from callee's 183 for early media
                         if message.body:
                             progress_response.body = message.body
@@ -2449,17 +2458,23 @@ class SIPServer:
                     if call:
                         from pbx.core.call import CallState
 
-                        # Transfer destination declined/failed while the
-                        # bridge was pending (transferor already dropped):
-                        # ACK the error and tear down both remaining legs.
-                        if call.is_transfer_consult and call.state != CallState.CONNECTED:
+                        # Transfer destination declined or failed: ACK the
+                        # error and let the transfer session resolve it --
+                        # recalling the transferor or tearing every remaining
+                        # leg down, per the configured failure policy.
+                        if call.transfer_session_id and call.state != CallState.CONNECTED:
+                            from pbx.core.transfer_session import LegEvent, LegEventResult
+
                             cseq_header = message.get_header("CSeq") or ""
                             if "INVITE" in cseq_header:
                                 self._send_ack_to_callee(
                                     message, addr, call_id, use_invite_branch=True
                                 )
-                            self.pbx_core.transfer_handler.abort_pending_transfer(call)
-                            return
+                            result = self.pbx_core.transfer_handler.on_leg_event(
+                                call, LegEvent.REJECTED, side="callee"
+                            )
+                            if result is not LegEventResult.FORWARD:
+                                return
 
                         # If the caller's leg was already answered (e.g. into
                         # voicemail after the no-answer timeout), this response

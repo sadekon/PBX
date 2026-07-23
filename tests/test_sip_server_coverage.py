@@ -615,8 +615,7 @@ class TestHandleAck:
         pbx = MagicMock()
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
-        mock_call.pending_transfer_consult_id = None
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.callee_addr = ("10.0.0.2", 5060)
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -647,8 +646,7 @@ class TestHandleAck:
         pbx = MagicMock()
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
-        mock_call.pending_transfer_consult_id = None
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.callee_addr = None
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -695,8 +693,7 @@ class TestHandleBye:
         pbx = MagicMock()
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
-        mock_call.pending_transfer_consult_id = None
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
         mock_call.state = "CONNECTED"
@@ -720,8 +717,7 @@ class TestHandleBye:
         callee_addr = ("10.0.0.2", 5060)
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
-        mock_call.pending_transfer_consult_id = None
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.caller_addr = ("10.0.0.1", 5060)
         mock_call.callee_addr = callee_addr
         mock_call.state = "CONNECTED"
@@ -757,8 +753,7 @@ class TestHandleBye:
         pbx = MagicMock()
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
-        mock_call.pending_transfer_consult_id = None
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
         mock_call.state = "CONNECTED"
@@ -791,8 +786,7 @@ class TestHandleBye:
         pbx = MagicMock()
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
-        mock_call.pending_transfer_consult_id = None
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.voicemail_access = True
         mock_call.voicemail_extension = "1001"
         mock_call.caller_addr = ADDR
@@ -1442,8 +1436,7 @@ class TestHandleResponse:
         pbx = MagicMock()
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
-        mock_call.pending_transfer_consult_id = None
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.caller_addr = ("10.0.0.1", 5060)
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -1462,8 +1455,7 @@ class TestHandleResponse:
         pbx = MagicMock()
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
-        mock_call.pending_transfer_consult_id = None
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.caller_addr = None
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -1617,7 +1609,7 @@ class TestHandleResponse:
         mock_call.trunk = MagicMock()
         mock_call.invite_auth_retried = True
         mock_call.caller_addr = None
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.routed_to_voicemail = False
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -1637,7 +1629,7 @@ class TestHandleResponse:
         mock_call = MagicMock()
         mock_call.trunk = None
         mock_call.caller_addr = None
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.routed_to_voicemail = False
         pbx.call_manager.get_call.return_value = mock_call
 

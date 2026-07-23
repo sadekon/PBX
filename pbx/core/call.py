@@ -60,28 +60,26 @@ class Call:
         self.transferred: bool = False  # Flag to track if call has been transferred
         self.transfer_destination: str | None = None  # Destination extension for transfer
 
-        # REFER-based transfer state (RFC 3515 / RFC 3891). The consultation
-        # call is the transferor's leg to the transfer destination; on
-        # completion the two surviving legs are bridged, each keeping its own
-        # Call record cross-linked via bridged_peer_call_id.
-        self.is_transfer_consult: bool = False  # True on the consultation call
-        self.pending_transfer_consult_id: str | None = None  # On the original call
-        # while awaiting the consultation call's answer (deferred bridge)
+        # In-flight transfer state lives on the TransferSession that owns the
+        # transfer (pbx/core/transfer_session.py), not here -- a transfer spans
+        # two Call records, so no single record can own it. This is the only
+        # link back: the session id, set while a transfer involving this call is
+        # in progress and cleared when it resolves.
+        self.transfer_session_id: str | None = None
+
+        # Cross-link describing a *completed* transfer bridge. Both surviving
+        # legs keep their own Call record (each with its own SIP dialog), and
+        # media flows through whichever record still owns the RTP relay; the
+        # peer points at it via bridged_peer_call_id plus the relay side its
+        # party occupies. Unlike the fields above this outlives the transfer --
+        # it describes an ordinary bridged call.
         self.bridged_peer_call_id: str | None = None  # Other leg's record after bridge
         self.bridge_peer_side: str | None = None  # Relay side ("a"/"b") this leg's
         # party occupies on the bridged peer's relay
-        self.transfer_referrer_addr: tuple[str, int] | None = None  # REFER sender
-        self.transfer_referrer_is_caller: bool | None = None  # Referrer's side on
-        # the original call, recorded at REFER time (addresses may be nulled later)
-        self.uses_peer_relay: bool = False  # Consult leg was originated by the PBX
-        # advertising the original call's relay port (blind transfer)
-        # Optional hook invoked by abort_pending_transfer() instead of its
-        # default BYE+end_call when a pending transfer's destination never
-        # answers/declines. Lets a transfer initiator with no real transferor
-        # phone to fall back to (e.g. an IVR session) keep its own call alive
-        # and handle the failure itself, without abort_pending_transfer
-        # needing to know who initiated the transfer.
-        self.transfer_failure_callback: Any | None = None
+        self.uses_peer_relay: bool = False  # This leg's SDP advertises another
+        # call's relay port instead of one allocated for it (PBX-originated
+        # blind transfer legs and CallOriginator's bridged legs), so it needs
+        # no re-INVITE to be moved onto that relay
         self.callee_dialog_to: str | None = None  # To header (with tag) from the
         # callee's 200 OK -- dialog identity for PBX-originated in-dialog requests
         # toward the callee leg

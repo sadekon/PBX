@@ -87,6 +87,7 @@ def _make_pbx_core(
     mock_call.original_invite = None
     mock_call.no_answer_timer = None
     mock_call.routed_to_voicemail = False
+    mock_call.transfer_session_id = None
     mock_call.from_extension = "1001"
     mock_call.to_extension = "1002"
     pbx.call_manager = MagicMock()
@@ -1187,9 +1188,7 @@ class TestRouteToTrunkCallerID:
         router = CallRouter(pbx)
         msg = _make_invite_message(to_ext="12125551234", body="")
 
-        with patch(
-            "pbx.sip.message.SIPMessageBuilder.add_caller_id_headers"
-        ) as mock_add_caller_id:
+        with patch("pbx.sip.message.SIPMessageBuilder.add_caller_id_headers") as mock_add_caller_id:
             result = router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
 
         assert result is True
@@ -1202,9 +1201,7 @@ class TestRouteToTrunkCallerID:
         router = CallRouter(pbx)
         msg = _make_invite_message(to_ext="12125551234", body="")
 
-        with patch(
-            "pbx.sip.message.SIPMessageBuilder.add_caller_id_headers"
-        ) as mock_add_caller_id:
+        with patch("pbx.sip.message.SIPMessageBuilder.add_caller_id_headers") as mock_add_caller_id:
             result = router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
 
         assert result is True
@@ -1218,9 +1215,7 @@ class TestRouteToTrunkCallerID:
         router = CallRouter(pbx)
         msg = _make_invite_message(to_ext="12125551234", body="")
 
-        with patch(
-            "pbx.sip.message.SIPMessageBuilder.add_caller_id_headers"
-        ) as mock_add_caller_id:
+        with patch("pbx.sip.message.SIPMessageBuilder.add_caller_id_headers") as mock_add_caller_id:
             result = router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
 
         assert result is True
@@ -1235,7 +1230,9 @@ class TestRouteToTrunkCallerID:
 
         captured: dict[str, Any] = {}
 
-        def _capture(call: Any, call_id: Any, invite_request: Any, *args: Any, **kwargs: Any) -> MagicMock:
+        def _capture(
+            call: Any, call_id: Any, invite_request: Any, *args: Any, **kwargs: Any
+        ) -> MagicMock:
             captured["from_header"] = invite_request.get_header("From")
             return MagicMock()
 
@@ -1367,7 +1364,9 @@ class TestRouteInboundDID:
         assert "sip:1001@" in args[3]  # rewritten to_header
 
     def test_auto_attendant_destination(self) -> None:
-        pbx = _trunk_pbx_with_route({"destination_type": "auto_attendant", "destination_value": "ignored"})
+        pbx = _trunk_pbx_with_route(
+            {"destination_type": "auto_attendant", "destination_value": "ignored"}
+        )
         pbx.auto_attendant.get_extension.return_value = "0"
         router = CallRouter(pbx)
         mock_trunk = MagicMock(trunk_id="t1")
@@ -1390,7 +1389,9 @@ class TestRouteInboundDID:
         )
 
     def test_auto_attendant_destination_when_feature_disabled(self) -> None:
-        pbx = _trunk_pbx_with_route({"destination_type": "auto_attendant", "destination_value": "ignored"})
+        pbx = _trunk_pbx_with_route(
+            {"destination_type": "auto_attendant", "destination_value": "ignored"}
+        )
         pbx.auto_attendant = None
         router = CallRouter(pbx)
         mock_trunk = MagicMock(trunk_id="t1")
@@ -1754,6 +1755,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = mock_call_state.CONNECTED
         mock_call.routed_to_voicemail = False
+        mock_call.transfer_session_id = None
         mock_call.trunk = None
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -1799,6 +1801,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.transfer_session_id = None
         mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
@@ -1860,6 +1863,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.transfer_session_id = None
         mock_call.trunk = MagicMock()
         mock_call.caller_addr = CALLER_ADDR
         mock_call.original_invite = MagicMock()
@@ -1895,6 +1899,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.transfer_session_id = None
         mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         pbx.call_manager.get_call.return_value = mock_call
@@ -1923,6 +1928,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.transfer_session_id = None
         mock_call.trunk = None
         mock_call.caller_rtp = None
         mock_call.caller_addr = CALLER_ADDR
@@ -1953,6 +1959,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.transfer_session_id = None
         mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
@@ -2004,6 +2011,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.transfer_session_id = None
         mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
@@ -2051,6 +2059,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.transfer_session_id = None
         mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
@@ -2109,6 +2118,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.transfer_session_id = None
         mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
@@ -2167,6 +2177,7 @@ class TestHandleNoAnswer:
         mock_call = MagicMock()
         mock_call.state = "RINGING"
         mock_call.routed_to_voicemail = False
+        mock_call.transfer_session_id = None
         mock_call.trunk = None
         mock_call.caller_rtp = {"address": "192.168.1.100", "port": 30000}
         mock_call.rtp_ports = (20000, 20001)
@@ -2381,7 +2392,7 @@ class TestHandleCalleeAnswer:
         mock_call.caller_addr = ("10.0.0.1", 5060)
         mock_call.no_answer_timer = MagicMock()
         mock_call.original_invite = MagicMock()
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.webrtc_session_id = None
         pbx.call_manager.get_call.return_value = mock_call
 
@@ -2437,7 +2448,7 @@ class TestHandleCalleeAnswer:
         mock_call.no_answer_timer = None
         mock_call.original_invite = None
         mock_call.caller_addr = None
-        mock_call.is_transfer_consult = False
+        mock_call.transfer_session_id = None
         mock_call.webrtc_session_id = None
         pbx.call_manager.get_call.return_value = mock_call
 

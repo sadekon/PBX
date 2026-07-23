@@ -425,15 +425,16 @@ class CallRouter:
             call.no_answer_timer.cancel()
             pbx.logger.info(f"Cancelled no-answer timer for call {call_id}")
 
-        # If this is a transfer consultation call whose bridge was deferred
-        # (REFER arrived before the destination answered -- semi-attended,
-        # or a PBX-originated blind transfer leg), complete the bridge now
-        # instead of running the normal answer flow: the transferor is gone.
-        if call.is_transfer_consult:
-            for other_call in pbx.call_manager.get_active_calls():
-                if other_call.pending_transfer_consult_id == call_id:
-                    pbx.transfer_handler.bridge_attended_transfer(other_call, call)
-                    return
+        # If this is a transfer target leg, the transfer session decides what
+        # its answer means -- bridging now if the transferor already committed
+        # (semi-attended, or a PBX-originated blind leg), otherwise letting the
+        # transferor consult. Either way the normal answer flow does not apply.
+        if call.transfer_session_id:
+            from pbx.core.transfer_session import LegEvent, LegEventResult
+
+            result = pbx.transfer_handler.on_leg_event(call, LegEvent.ANSWERED, side="callee")
+            if result is not LegEventResult.FORWARD:
+                return
 
         # Check if this is a WebRTC-originated call
         webrtc_session_id = getattr(call, "webrtc_session_id", None)
@@ -1497,14 +1498,16 @@ class CallRouter:
             pbx.logger.debug(f"Call {call_id} no-answer timeout already handled")
             return
 
-        # A transfer consultation leg whose bridge is pending has no live
-        # caller to route into voicemail (the transferor already dropped);
-        # abort the transfer and tear down both remaining legs instead.
-        if call.is_transfer_consult and any(
-            c.pending_transfer_consult_id == call_id for c in pbx.call_manager.get_active_calls()
-        ):
-            pbx.transfer_handler.abort_pending_transfer(call, cancel_destination=True)
-            return
+        # A transfer target leg that never answered has no live caller to route
+        # into voicemail (the transferor may already have dropped); let the
+        # transfer session resolve it -- recalling the transferor or tearing
+        # every remaining leg down, per the configured failure policy.
+        if call.transfer_session_id:
+            from pbx.core.transfer_session import LegEvent, LegEventResult
+
+            result = pbx.transfer_handler.on_leg_event(call, LegEvent.TIMEOUT, side="callee")
+            if result is not LegEventResult.FORWARD:
+                return
 
         # routed_to_voicemail is reused as a general "no-answer timeout
         # already handled" guard, not only a voicemail flag -- also set on
