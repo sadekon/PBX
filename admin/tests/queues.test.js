@@ -17,20 +17,26 @@ jest.mock('../js/ui/notifications.ts', () => ({
 
 import { describe, it, expect, beforeEach } from '@jest/globals';
 import {
+  loadQueuesData,
   loadQueues,
   loadQueueAgents,
   setQueueAgentState,
-  deleteQueue
+  deleteQueue,
+  removeQueueAgent,
+  toggleQueueCollapse
 } from '../js/pages/queues.ts';
 import { showNotification } from '../js/ui/notifications.ts';
 
 global.fetch = jest.fn();
 global.confirm = jest.fn(() => true);
 
+// The queues page renders one card per queue (not a single table): the
+// queue's own attributes live in the card header, its agents in a sub-table.
 document.body.innerHTML = `
-  <table><tbody id="queues-table-body"></tbody></table>
-  <table><tbody id="queue-agents-table-body"></tbody></table>
+  <div id="queues-cards"></div>
 `;
+
+const container = () => document.getElementById('queues-cards');
 
 const QUEUE = {
   queue_number: '8001',
@@ -60,82 +66,168 @@ const AGENT = {
   queues: ['8001']
 };
 
+// Queue every fetch response the mock should hand out, in call order.
+function mockFetchSequence(...responses) {
+  for (const r of responses) {
+    global.fetch.mockResolvedValueOnce({ ok: true, json: async () => r });
+  }
+}
+
 describe('Call Queues page', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.clearAllMocks();
     global.confirm.mockReturnValue(true);
-    document.getElementById('queues-table-body').innerHTML = '';
-    document.getElementById('queue-agents-table-body').innerHTML = '';
+    // Reset the module-level caches to a known-empty baseline so each test
+    // starts from a clean slate, then clear the DOM.
+    mockFetchSequence({ queues: [] }, { agents: [] });
+    await loadQueuesData();
+    jest.clearAllMocks();
+    container().innerHTML = '';
   });
 
-  describe('loadQueues', () => {
-    it('renders queue rows', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ queues: [QUEUE] })
-      });
+  describe('loadQueuesData (card render)', () => {
+    it('renders a queue card with its agent sub-table', async () => {
+      // loadQueuesData fetches queues first, then agent states.
+      mockFetchSequence({ queues: [QUEUE] }, { agents: [AGENT] });
+
+      await loadQueuesData();
+
+      const html = container().innerHTML;
+      // Queue card header: identity + attributes as labeled stats
+      expect(html).toContain('8001');
+      expect(html).toContain('Sales');
+      expect(html).toContain('Enabled');
+      expect(html).toContain('round_robin');
+      expect(html).toContain('1 / 2'); // Online x / y
+      // Agent sub-table with live state, shown as a status pill
+      expect(html).toContain('1001');
+      expect(html).toContain('status-pill');
+      expect(html).toContain('Available');
+      expect(html).toContain('Log out');
+      // Member without a live state entry still appears (defaults to logged out)
+      expect(html).toContain('1002');
+      // Per-queue removal is available on each agent row
+      expect(html).toContain('Remove');
+      expect(html).toContain("removeQueueAgent('8001', '1001')");
+      // Card title is a collapse toggle
+      expect(html).toContain("toggleQueueCollapse('8001')");
+      // "Add agent" lives beneath the agent table, not the header
+      expect(html).toContain('add-agent-btn');
+      expect(html).toContain("showAddQueueAgentModal('8001')");
+    });
+
+    it('collapses and expands a queue card', async () => {
+      mockFetchSequence({ queues: [QUEUE] }, { agents: [AGENT] });
+      await loadQueuesData();
+
+      const body = () => document.querySelector('[data-queue-body="8001"]');
+      // Expanded by default
+      expect(body().classList.contains('collapsed')).toBe(false);
+
+      toggleQueueCollapse('8001');
+      expect(body().classList.contains('collapsed')).toBe(true);
+      expect(
+        document.querySelector('[data-queue-toggle="8001"]').getAttribute('aria-expanded')
+      ).toBe('false');
+
+      toggleQueueCollapse('8001');
+      expect(body().classList.contains('collapsed')).toBe(false);
+    });
+
+    it('keeps a card collapsed across re-render', async () => {
+      mockFetchSequence({ queues: [QUEUE] }, { agents: [AGENT] });
+      await loadQueuesData();
+      toggleQueueCollapse('8001');
+
+      // A subsequent action triggers a full re-render; collapse state persists.
+      mockFetchSequence({ queues: [QUEUE] }, { agents: [AGENT] });
+      await loadQueuesData();
+
+      expect(
+        document.querySelector('[data-queue-body="8001"]').classList.contains('collapsed')
+      ).toBe(true);
+
+      // Restore expanded state so the shared module-level set stays clean.
+      toggleQueueCollapse('8001');
+    });
+
+    it('renders empty state when there are no queues', async () => {
+      mockFetchSequence({ queues: [] }, { agents: [] });
+
+      await loadQueuesData();
+
+      expect(container().innerHTML).toContain('No call queues configured');
+    });
+
+    it('shows an empty-state hint plus the add affordance for a queue with no members', async () => {
+      mockFetchSequence({ queues: [{ ...QUEUE, members: [] }] }, { agents: [] });
+
+      await loadQueuesData();
+
+      const html = container().innerHTML;
+      expect(html).toContain('No agents assigned');
+      expect(html).toContain('add-agent-btn');
+    });
+
+    it('shows paused status with reason for an agent', async () => {
+      mockFetchSequence(
+        { queues: [QUEUE] },
+        { agents: [{ ...AGENT, paused: true, pause_reason: 'auto_missed' }] }
+      );
+
+      await loadQueuesData();
+
+      expect(container().innerHTML).toContain('Paused (auto_missed)');
+    });
+
+    it('shows the Disabled state for a disabled queue', async () => {
+      mockFetchSequence({ queues: [{ ...QUEUE, enabled: false }] }, { agents: [] });
+
+      await loadQueuesData();
+
+      expect(container().innerHTML).toContain('Disabled');
+    });
+  });
+
+  describe('loadQueues / loadQueueAgents (targeted refresh)', () => {
+    it('loadQueues re-renders the cards from cached queues', async () => {
+      mockFetchSequence({ queues: [QUEUE] });
 
       await loadQueues();
 
-      const html = document.getElementById('queues-table-body').innerHTML;
+      const html = container().innerHTML;
       expect(html).toContain('8001');
       expect(html).toContain('Sales');
-      expect(html).toContain('round_robin');
-      expect(html).toContain('1/2');
       expect(global.fetch).toHaveBeenCalledWith(
         'http://localhost:9000/api/queues',
         expect.objectContaining({ headers: expect.any(Object) })
       );
     });
 
-    it('renders empty state', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ queues: [] })
-      });
-
+    it('loadQueues keeps prior data on HTTP error (renders from cache)', async () => {
+      // Seed a queue, then fail the next refresh.
+      mockFetchSequence({ queues: [QUEUE] });
       await loadQueues();
-
-      expect(document.getElementById('queues-table-body').innerHTML)
-        .toContain('No call queues configured');
-    });
-
-    it('leaves table untouched on HTTP error', async () => {
       global.fetch.mockResolvedValueOnce({ ok: false, status: 500 });
 
       await loadQueues();
 
-      expect(document.getElementById('queues-table-body').innerHTML).toBe('');
+      // Cached queue is still shown rather than being wiped.
+      expect(container().innerHTML).toContain('8001');
     });
-  });
 
-  describe('loadQueueAgents', () => {
-    it('renders agent rows with status', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ agents: [AGENT] })
-      });
+    it('loadQueueAgents refreshes agent status in the card', async () => {
+      mockFetchSequence({ queues: [QUEUE] });
+      await loadQueues();
+      mockFetchSequence({ agents: [AGENT] });
 
       await loadQueueAgents();
 
-      const html = document.getElementById('queue-agents-table-body').innerHTML;
-      expect(html).toContain('1001');
-      expect(html).toContain('Available');
-      expect(html).toContain('Log out');
-    });
-
-    it('shows paused status with reason', async () => {
-      global.fetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          agents: [{ ...AGENT, paused: true, pause_reason: 'auto_missed' }]
-        })
-      });
-
-      await loadQueueAgents();
-
-      expect(document.getElementById('queue-agents-table-body').innerHTML)
-        .toContain('Paused (auto_missed)');
+      expect(container().innerHTML).toContain('Available');
+      expect(global.fetch).toHaveBeenCalledWith(
+        'http://localhost:9000/api/queues/agents/state',
+        expect.objectContaining({ headers: expect.any(Object) })
+      );
     });
   });
 
@@ -206,6 +298,34 @@ describe('Call Queues page', () => {
         'Queue 8001 has waiting callers; cannot delete',
         'error'
       );
+    });
+  });
+
+  describe('removeQueueAgent', () => {
+    it('DELETEs the agent from the queue after confirmation', async () => {
+      global.fetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ success: true, queues: [], agents: [] })
+      });
+
+      await removeQueueAgent('8001', '1001');
+
+      expect(global.fetch).toHaveBeenCalledWith(
+        'http://localhost:9000/api/queues/8001/agents/1001',
+        expect.objectContaining({ method: 'DELETE' })
+      );
+      expect(showNotification).toHaveBeenCalledWith(
+        'Agent 1001 removed from 8001',
+        'success'
+      );
+    });
+
+    it('does nothing when not confirmed', async () => {
+      global.confirm.mockReturnValueOnce(false);
+
+      await removeQueueAgent('8001', '1001');
+
+      expect(global.fetch).not.toHaveBeenCalled();
     });
   });
 });

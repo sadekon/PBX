@@ -160,8 +160,10 @@ declare global {
         loadPagingDevices: () => Promise<void>;
         loadActivePages: () => Promise<void>;
         deletePagingZone: (zoneId: string) => Promise<void>;
-        showAddZoneModal: () => Promise<void>;
-        showAddDeviceModal: () => Promise<void>;
+        showAddZoneModal: () => void;
+        closeZoneModal: () => void;
+        showAddDeviceModal: () => void;
+        closeDeviceModal: () => void;
         deletePagingDevice: (deviceId: string) => Promise<void>;
 
         // pages/queues.ts
@@ -172,10 +174,13 @@ declare global {
             extension: string,
             state: { logged_in?: boolean; paused?: boolean }
         ) => Promise<void>;
-        showAddQueueModal: () => Promise<void>;
-        showEditQueueModal: (queueNumber: string) => Promise<void>;
+        toggleQueueCollapse: (queueNumber: string) => void;
+        showAddQueueModal: () => void;
+        showEditQueueModal: (queueNumber: string) => void;
+        closeQueueModal: () => void;
         deleteQueue: (queueNumber: string) => Promise<void>;
-        showAddQueueAgentModal: (queueNumber: string) => Promise<void>;
+        showAddQueueAgentModal: (queueNumber: string) => void;
+        closeQueueAgentModal: () => void;
         removeQueueAgent: (queueNumber: string, extension: string) => Promise<void>;
 
         // pages/license.ts

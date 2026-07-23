@@ -1406,58 +1406,14 @@
                 <p><strong>Agent dial codes:</strong> *61 to log in, *62 to log out. Dial *<em>queue number</em> (e.g., *8001) to retrieve queue voicemail.</p>
             </div>
 
-            <!-- Queues -->
+            <!-- Queues & Agents: one card per queue, with its agents listed inside -->
             <div class="config-section">
                 <div class="section-header">
-                    <h3>📋 Queues</h3>
+                    <h3>📋 Queues &amp; Agents</h3>
                     <button class="btn btn-success" onclick="showAddQueueModal()">➕ Add Queue</button>
                 </div>
-                <div class="table-container">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th>Number</th>
-                                <th>Name</th>
-                                <th>Strategy</th>
-                                <th>Waiting</th>
-                                <th>Agents</th>
-                                <th>Members</th>
-                                <th>Overflow Mailbox</th>
-                                <th>Enabled</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="queues-table-body">
-                            <tr>
-                                <td colspan="9" class="loading">Loading queues...</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Agents -->
-            <div class="config-section">
-                <h3>🧑‍💼 Agent Status</h3>
-                <div class="table-container">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th>Extension</th>
-                                <th>Queues</th>
-                                <th>Status</th>
-                                <th>Calls Taken</th>
-                                <th>Missed (consec.)</th>
-                                <th>Last Call</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="queue-agents-table-body">
-                            <tr>
-                                <td colspan="7" class="loading">Loading agents...</td>
-                            </tr>
-                        </tbody>
-                    </table>
+                <div id="queues-cards" class="queues-cards">
+                    <div class="loading">Loading queues...</div>
                 </div>
             </div>
         </div>

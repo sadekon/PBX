@@ -5,6 +5,7 @@
 
 import { getAuthHeaders, getApiBaseUrl } from '../api/client.ts';
 import { showNotification } from '../ui/notifications.ts';
+import { icon } from '../ui/icons.ts';
 import { escapeHtml } from '../utils/html.ts';
 
 interface QueueStatus {
@@ -49,11 +50,34 @@ interface ApiResponse {
     error?: string;
 }
 
+const QUEUE_STRATEGIES = ['round_robin', 'least_recent', 'fewest_calls', 'random'];
+
+// Caches of the most recently loaded data, keyed for the combined render.
+let queuesCache: QueueStatus[] = [];
+let agentStatesCache = new Map<string, AgentState>();
+
+// Queue numbers whose agent list is currently collapsed. Persists across
+// re-renders so an action (pause, remove, …) doesn't re-expand a card.
+const collapsedQueues = new Set<string>();
+
 export async function loadQueuesData(): Promise<void> {
-    await Promise.all([loadQueues(), loadQueueAgents()]);
+    await Promise.all([fetchQueues(), fetchAgentStates()]);
+    renderQueueCards();
 }
 
+// Kept for backward compatibility / targeted refresh: each fetches its own
+// slice then re-renders the full set of cards.
 export async function loadQueues(): Promise<void> {
+    await fetchQueues();
+    renderQueueCards();
+}
+
+export async function loadQueueAgents(): Promise<void> {
+    await fetchAgentStates();
+    renderQueueCards();
+}
+
+async function fetchQueues(): Promise<void> {
     try {
         const API_BASE = getApiBaseUrl();
         const response = await fetch(`${API_BASE}/api/queues`, {
@@ -61,39 +85,13 @@ export async function loadQueues(): Promise<void> {
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data: QueuesResponse = await response.json();
-
-        const tbody = document.getElementById('queues-table-body') as HTMLElement | null;
-        if (!tbody) return;
-
-        const queues = data.queues ?? [];
-        if (queues.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="9">No call queues configured</td></tr>';
-            return;
-        }
-
-        tbody.innerHTML = queues.map(q => `
-            <tr>
-                <td>${escapeHtml(q.queue_number)}</td>
-                <td>${escapeHtml(q.name)}</td>
-                <td>${escapeHtml(q.strategy)}</td>
-                <td>${q.calls_waiting}${q.calls_waiting > 0 ? ` (${Math.round(q.longest_wait)}s)` : ''}</td>
-                <td>${q.available_agents}/${q.total_agents}</td>
-                <td>${escapeHtml(q.members.join(', ') || '—')}</td>
-                <td>${escapeHtml(q.fallback_mailbox)}</td>
-                <td>${q.enabled ? '✅' : '⛔'}</td>
-                <td>
-                    <button class="btn btn-secondary btn-sm" onclick="showEditQueueModal('${escapeHtml(q.queue_number)}')">Edit</button>
-                    <button class="btn btn-success btn-sm" onclick="showAddQueueAgentModal('${escapeHtml(q.queue_number)}')">+ Agent</button>
-                    <button class="btn btn-danger btn-sm" onclick="deleteQueue('${escapeHtml(q.queue_number)}')">Delete</button>
-                </td>
-            </tr>
-        `).join('');
+        queuesCache = data.queues ?? [];
     } catch (error: unknown) {
         console.error('Error loading queues:', error);
     }
 }
 
-export async function loadQueueAgents(): Promise<void> {
+async function fetchAgentStates(): Promise<void> {
     try {
         const API_BASE = getApiBaseUrl();
         const response = await fetch(`${API_BASE}/api/queues/agents/state`, {
@@ -101,40 +99,161 @@ export async function loadQueueAgents(): Promise<void> {
         });
         if (!response.ok) return;
         const data: AgentStatesResponse = await response.json();
-
-        const tbody = document.getElementById('queue-agents-table-body') as HTMLElement | null;
-        if (!tbody) return;
-
-        const agents = data.agents ?? [];
-        if (agents.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7">No queue agents (add extensions to a queue first)</td></tr>';
-            return;
-        }
-
-        tbody.innerHTML = agents.map(a => {
-            const status = !a.logged_in
-                ? 'Logged out'
-                : a.paused
-                    ? `Paused (${a.pause_reason ?? 'manual'})`
-                    : 'Available';
-            return `
-            <tr>
-                <td>${escapeHtml(a.extension)}</td>
-                <td>${escapeHtml(a.queues.join(', ') || '—')}</td>
-                <td>${escapeHtml(status)}</td>
-                <td>${a.calls_taken}</td>
-                <td>${a.consecutive_misses}</td>
-                <td>${a.last_call_time ? escapeHtml(new Date(a.last_call_time).toLocaleString()) : '—'}</td>
-                <td>
-                    <button class="btn btn-secondary btn-sm" onclick="setQueueAgentState('${escapeHtml(a.extension)}', {logged_in: ${!a.logged_in}})">${a.logged_in ? 'Log out' : 'Log in'}</button>
-                    <button class="btn btn-secondary btn-sm" onclick="setQueueAgentState('${escapeHtml(a.extension)}', {paused: ${!a.paused}})">${a.paused ? 'Unpause' : 'Pause'}</button>
-                </td>
-            </tr>
-        `;
-        }).join('');
+        agentStatesCache = new Map((data.agents ?? []).map(a => [a.extension, a]));
     } catch (error: unknown) {
         console.error('Error loading queue agents:', error);
     }
+}
+
+function renderStatusPill(state: AgentState | undefined): string {
+    const loggedIn = state?.logged_in ?? false;
+    const paused = state?.paused ?? false;
+    let cls: string;
+    let label: string;
+    let title: string;
+    if (!loggedIn) {
+        cls = 'off';
+        label = 'Logged out';
+        title = 'Logged out';
+    } else if (paused) {
+        cls = 'warn';
+        label = 'Paused';
+        title = state?.pause_reason ? `Paused (${state.pause_reason})` : 'Paused';
+    } else {
+        cls = 'ok';
+        label = 'Available';
+        title = 'Available';
+    }
+    return `<span class="status-pill ${cls}" title="${escapeHtml(title)}"><span class="status-dot"></span>${label}</span>`;
+}
+
+function renderAgentRow(queueNumber: string, extension: string): string {
+    const state = agentStatesCache.get(extension);
+    const loggedIn = state?.logged_in ?? false;
+    const paused = state?.paused ?? false;
+    const callsTaken = state?.calls_taken ?? 0;
+    const misses = state?.consecutive_misses ?? 0;
+    const lastCall = state?.last_call_time
+        ? escapeHtml(new Date(state.last_call_time).toLocaleString())
+        : '—';
+    const ext = escapeHtml(extension);
+    const qn = escapeHtml(queueNumber);
+
+    // Presence toggle: green log-in arrow when logged out, grey log-out when in.
+    const loginTitle = loggedIn ? 'Log out' : 'Log in';
+    const loginClass = loggedIn ? 'icon-btn' : 'icon-btn icon-btn-on';
+    const loginBtn =
+        `<button type="button" class="${loginClass}" title="${loginTitle}" aria-label="${loginTitle}" ` +
+        `onclick="setQueueAgentState('${ext}', {logged_in: ${!loggedIn}})">${icon(loggedIn ? 'log-out' : 'log-in')}</button>`;
+
+    // Pause is only meaningful while logged in; keep the slot but disable it
+    // when logged out so the Remove button stays in a fixed column.
+    const pauseTitle = paused ? 'Resume' : 'Pause';
+    const pauseBtn = loggedIn
+        ? `<button type="button" class="icon-btn" title="${pauseTitle}" aria-label="${pauseTitle}" ` +
+          `onclick="setQueueAgentState('${ext}', {paused: ${!paused}})">${icon(paused ? 'play' : 'pause')}</button>`
+        : `<button type="button" class="icon-btn" title="Log in to pause" aria-label="Pause (log in first)" disabled>${icon('pause')}</button>`;
+
+    const removeBtn =
+        `<button type="button" class="icon-btn icon-btn-danger" title="Remove from queue" aria-label="Remove from queue" ` +
+        `onclick="removeQueueAgent('${qn}', '${ext}')">${icon('trash')}</button>`;
+
+    return `
+        <tr class="queue-agent-row">
+            <td class="queue-agent-ext">${ext}</td>
+            <td>${renderStatusPill(state)}</td>
+            <td>${callsTaken}</td>
+            <td>${misses}</td>
+            <td>${lastCall}</td>
+            <td>
+                <div class="agent-actions">${loginBtn}${pauseBtn}${removeBtn}</div>
+            </td>
+        </tr>
+    `;
+}
+
+function renderQueueCard(q: QueueStatus): string {
+    const qn = escapeHtml(q.queue_number);
+    const collapsed = collapsedQueues.has(q.queue_number);
+    const waiting = `${q.calls_waiting}${q.calls_waiting > 0 ? ` (${Math.round(q.longest_wait)}s)` : ''}`;
+
+    // Single-row header: identity + enabled state + the queue's own
+    // attributes as labeled stats, with queue-level actions on the right.
+    const head = `
+        <div class="queue-card-head">
+            <span class="qch-title" role="button" aria-expanded="${!collapsed}" data-queue-toggle="${qn}" onclick="toggleQueueCollapse('${qn}')">
+                <span class="queue-chevron${collapsed ? '' : ' open'}" aria-hidden="true">▶</span>
+                <strong>${qn}</strong> — ${escapeHtml(q.name)}
+            </span>
+            <span class="en-pill ${q.enabled ? 'on' : 'off'}"><span class="en-dot"></span>${q.enabled ? 'Enabled' : 'Disabled'}</span>
+            <span class="qch-stats">
+                <span class="qch-stat"><span class="k">Strategy</span><span class="v">${escapeHtml(q.strategy)}</span></span>
+                <span class="qch-stat"><span class="k">Waiting</span><span class="v">${waiting}</span></span>
+                <span class="qch-stat"><span class="k">Online</span><span class="v">${q.available_agents} / ${q.total_agents}</span></span>
+                <span class="qch-stat"><span class="k">Overflow</span><span class="v">${escapeHtml(q.fallback_mailbox)}</span></span>
+            </span>
+            <span class="qch-actions">
+                <button type="button" class="qbtn" onclick="showEditQueueModal('${qn}')">${icon('pencil')}Edit</button>
+                <button type="button" class="qbtn qbtn-danger" onclick="deleteQueue('${qn}')">${icon('trash')}Delete</button>
+            </span>
+        </div>
+    `;
+
+    // Agents get their own table with headers that actually describe them,
+    // rather than sharing a header row with the queue's own attributes.
+    const agentTable = q.members.length > 0
+        ? `<table class="agent-subtable">
+               <thead>
+                   <tr>
+                       <th>Extension</th><th>Status</th><th>Calls Taken</th>
+                       <th>Missed (consec.)</th><th>Last Call</th><th>Actions</th>
+                   </tr>
+               </thead>
+               <tbody>${q.members.map(ext => renderAgentRow(q.queue_number, ext)).join('')}</tbody>
+           </table>`
+        : `<div class="queue-empty-hint">No agents assigned yet.</div>`;
+
+    // "Add agent" lives at the end of the queue's agent list, doubling as the
+    // empty-state action, rather than as a button in the card header.
+    const addBtn = `<button type="button" class="add-agent-btn" onclick="showAddQueueAgentModal('${qn}')">${icon('user-plus')}Add agent</button>`;
+
+    return `
+        <div class="queue-card">
+            ${head}
+            <div class="queue-card-body${collapsed ? ' collapsed' : ''}" data-queue-body="${qn}">
+                ${agentTable}
+                ${addBtn}
+            </div>
+        </div>
+    `;
+}
+
+export function toggleQueueCollapse(queueNumber: string): void {
+    if (collapsedQueues.has(queueNumber)) {
+        collapsedQueues.delete(queueNumber);
+    } else {
+        collapsedQueues.add(queueNumber);
+    }
+    const collapsed = collapsedQueues.has(queueNumber);
+    const key = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(queueNumber) : queueNumber;
+    document.querySelector(`[data-queue-body="${key}"]`)?.classList.toggle('collapsed', collapsed);
+    const toggle = document.querySelector(`[data-queue-toggle="${key}"]`);
+    if (toggle) {
+        toggle.setAttribute('aria-expanded', String(!collapsed));
+        toggle.querySelector('.queue-chevron')?.classList.toggle('open', !collapsed);
+    }
+}
+
+function renderQueueCards(): void {
+    const container = document.getElementById('queues-cards') as HTMLElement | null;
+    if (!container) return;
+
+    if (queuesCache.length === 0) {
+        container.innerHTML = `<div class="queues-empty">No call queues configured</div>`;
+        return;
+    }
+
+    container.innerHTML = queuesCache.map(renderQueueCard).join('');
 }
 
 export async function setQueueAgentState(
@@ -161,17 +280,62 @@ export async function setQueueAgentState(
     }
 }
 
-export async function showAddQueueModal(): Promise<void> {
-    const queueNumber = prompt('Queue Number (e.g., 8001):');
-    if (!queueNumber) return;
+function strategyOptions(selected: string): string {
+    return QUEUE_STRATEGIES.map(
+        s => `<option value="${s}"${s === selected ? ' selected' : ''}>${s}</option>`
+    ).join('');
+}
 
-    const name = prompt('Queue Name (e.g., "Sales"):');
-    if (!name) return;
+export function closeQueueModal(): void {
+    document.getElementById('queue-form-modal')?.remove();
+}
 
-    const strategy = prompt(
-        'Strategy (round_robin, least_recent, fewest_calls, random):',
-        'round_robin'
-    ) ?? 'round_robin';
+export function showAddQueueModal(): void {
+    closeQueueModal();
+    const modal = `
+        <div id="queue-form-modal" class="modal" style="display: block;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>➕ Add Call Queue</h3>
+                    <span class="close" onclick="closeQueueModal()">&times;</span>
+                </div>
+                <form id="queue-form">
+                    <div class="form-group">
+                        <label for="queue-number">Queue Number:</label>
+                        <input type="text" id="queue-number" required placeholder="8001">
+                        <small>Extension callers dial to reach this queue</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="queue-name">Queue Name:</label>
+                        <input type="text" id="queue-name" required placeholder="Sales">
+                        <small>Descriptive name for this queue</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="queue-strategy">Ring Strategy:</label>
+                        <select id="queue-strategy">${strategyOptions('round_robin')}</select>
+                        <small>How calls are distributed to agents</small>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary" onclick="closeQueueModal()">Cancel</button>
+                        <button type="submit" class="btn btn-success">Add Queue</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', modal);
+    const form = document.getElementById('queue-form') as HTMLFormElement;
+    form.onsubmit = (e: Event) => {
+        e.preventDefault();
+        void submitAddQueue();
+    };
+}
+
+async function submitAddQueue(): Promise<void> {
+    const queueNumber = (document.getElementById('queue-number') as HTMLInputElement).value.trim();
+    const name = (document.getElementById('queue-name') as HTMLInputElement).value.trim();
+    const strategy = (document.getElementById('queue-strategy') as HTMLSelectElement).value;
+    if (!queueNumber || !name) return;
 
     try {
         const API_BASE = getApiBaseUrl();
@@ -183,6 +347,7 @@ export async function showAddQueueModal(): Promise<void> {
         const data: ApiResponse = await response.json();
         if (data.success) {
             showNotification(`Queue ${queueNumber} created`, 'success');
+            closeQueueModal();
             loadQueuesData();
         } else {
             showNotification(data.error ?? 'Failed to create queue', 'error');
@@ -193,16 +358,60 @@ export async function showAddQueueModal(): Promise<void> {
     }
 }
 
-export async function showEditQueueModal(queueNumber: string): Promise<void> {
-    const name = prompt('Queue Name (leave blank to keep):') ?? '';
-    const strategy = prompt(
-        'Strategy (round_robin, least_recent, fewest_calls, random; blank to keep):'
-    ) ?? '';
-    const ringTimeout = prompt('Ring timeout seconds (blank to keep):') ?? '';
-    const maxWait = prompt('Max wait seconds before voicemail (blank to keep):') ?? '';
-    const fallbackMailbox = prompt(
-        'Fallback mailbox (blank to keep, "-" to reset to queue number):'
-    ) ?? '';
+export function showEditQueueModal(queueNumber: string): void {
+    closeQueueModal();
+    const queue = queuesCache.find(q => q.queue_number === queueNumber);
+    const modal = `
+        <div id="queue-form-modal" class="modal" style="display: block;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>✏️ Edit Queue ${escapeHtml(queueNumber)}</h3>
+                    <span class="close" onclick="closeQueueModal()">&times;</span>
+                </div>
+                <form id="queue-form">
+                    <div class="form-group">
+                        <label for="queue-name">Queue Name:</label>
+                        <input type="text" id="queue-name" value="${escapeHtml(queue?.name ?? '')}">
+                    </div>
+                    <div class="form-group">
+                        <label for="queue-strategy">Ring Strategy:</label>
+                        <select id="queue-strategy">${strategyOptions(queue?.strategy ?? 'round_robin')}</select>
+                    </div>
+                    <div class="form-group">
+                        <label for="queue-ring-timeout">Ring Timeout (seconds):</label>
+                        <input type="number" id="queue-ring-timeout" min="1" value="${queue?.ring_timeout ?? ''}">
+                    </div>
+                    <div class="form-group">
+                        <label for="queue-max-wait">Max Wait Before Voicemail (seconds):</label>
+                        <input type="number" id="queue-max-wait" min="1" value="${queue?.max_wait_time ?? ''}">
+                    </div>
+                    <div class="form-group">
+                        <label for="queue-fallback">Fallback Mailbox:</label>
+                        <input type="text" id="queue-fallback" value="${escapeHtml(queue?.fallback_mailbox ?? '')}" placeholder="Blank to keep, - to reset to queue number">
+                        <small>Where calls go after max wait. Enter "-" to reset to the queue number.</small>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary" onclick="closeQueueModal()">Cancel</button>
+                        <button type="submit" class="btn btn-success">Save Changes</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', modal);
+    const form = document.getElementById('queue-form') as HTMLFormElement;
+    form.onsubmit = (e: Event) => {
+        e.preventDefault();
+        void submitEditQueue(queueNumber);
+    };
+}
+
+async function submitEditQueue(queueNumber: string): Promise<void> {
+    const name = (document.getElementById('queue-name') as HTMLInputElement).value.trim();
+    const strategy = (document.getElementById('queue-strategy') as HTMLSelectElement).value;
+    const ringTimeout = (document.getElementById('queue-ring-timeout') as HTMLInputElement).value.trim();
+    const maxWait = (document.getElementById('queue-max-wait') as HTMLInputElement).value.trim();
+    const fallbackMailbox = (document.getElementById('queue-fallback') as HTMLInputElement).value.trim();
 
     const payload: Record<string, unknown> = {};
     if (name) payload.name = name;
@@ -212,7 +421,10 @@ export async function showEditQueueModal(queueNumber: string): Promise<void> {
     if (fallbackMailbox === '-') payload.fallback_mailbox = null;
     else if (fallbackMailbox) payload.fallback_mailbox = fallbackMailbox;
 
-    if (Object.keys(payload).length === 0) return;
+    if (Object.keys(payload).length === 0) {
+        closeQueueModal();
+        return;
+    }
 
     try {
         const API_BASE = getApiBaseUrl();
@@ -224,6 +436,7 @@ export async function showEditQueueModal(queueNumber: string): Promise<void> {
         const data: ApiResponse = await response.json();
         if (data.success) {
             showNotification(`Queue ${queueNumber} updated`, 'success');
+            closeQueueModal();
             loadQueuesData();
         } else {
             showNotification(data.error ?? 'Failed to update queue', 'error');
@@ -256,8 +469,43 @@ export async function deleteQueue(queueNumber: string): Promise<void> {
     }
 }
 
-export async function showAddQueueAgentModal(queueNumber: string): Promise<void> {
-    const extension = prompt(`Agent extension to add to queue ${queueNumber}:`);
+export function closeQueueAgentModal(): void {
+    document.getElementById('queue-agent-modal')?.remove();
+}
+
+export function showAddQueueAgentModal(queueNumber: string): void {
+    closeQueueAgentModal();
+    const modal = `
+        <div id="queue-agent-modal" class="modal" style="display: block;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>➕ Add Agent to Queue ${escapeHtml(queueNumber)}</h3>
+                    <span class="close" onclick="closeQueueAgentModal()">&times;</span>
+                </div>
+                <form id="queue-agent-form">
+                    <div class="form-group">
+                        <label for="queue-agent-extension">Agent Extension:</label>
+                        <input type="text" id="queue-agent-extension" required placeholder="1001">
+                        <small>Extension of the agent to add to this queue</small>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary" onclick="closeQueueAgentModal()">Cancel</button>
+                        <button type="submit" class="btn btn-success">Add Agent</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', modal);
+    const form = document.getElementById('queue-agent-form') as HTMLFormElement;
+    form.onsubmit = (e: Event) => {
+        e.preventDefault();
+        void submitAddQueueAgent(queueNumber);
+    };
+}
+
+async function submitAddQueueAgent(queueNumber: string): Promise<void> {
+    const extension = (document.getElementById('queue-agent-extension') as HTMLInputElement).value.trim();
     if (!extension) return;
 
     try {
@@ -270,6 +518,7 @@ export async function showAddQueueAgentModal(queueNumber: string): Promise<void>
         const data: ApiResponse = await response.json();
         if (data.success) {
             showNotification(`Agent ${extension} added to ${queueNumber}`, 'success');
+            closeQueueAgentModal();
             loadQueuesData();
         } else {
             showNotification(data.error ?? 'Failed to add agent', 'error');
@@ -307,8 +556,11 @@ window.loadQueuesData = loadQueuesData;
 window.loadQueues = loadQueues;
 window.loadQueueAgents = loadQueueAgents;
 window.setQueueAgentState = setQueueAgentState;
+window.toggleQueueCollapse = toggleQueueCollapse;
 window.showAddQueueModal = showAddQueueModal;
 window.showEditQueueModal = showEditQueueModal;
+window.closeQueueModal = closeQueueModal;
 window.deleteQueue = deleteQueue;
 window.showAddQueueAgentModal = showAddQueueAgentModal;
+window.closeQueueAgentModal = closeQueueAgentModal;
 window.removeQueueAgent = removeQueueAgent;
