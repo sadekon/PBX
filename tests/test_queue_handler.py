@@ -271,6 +271,44 @@ class TestOfferLoop:
         # First agent's miss was recorded
         assert pbx.queue_system.get_agent(first).consecutive_misses == 1
 
+    def test_explicit_reject_pauses_agent(self, pbx, handler):
+        """A DND phone refuses the INVITE: pause it instead of redialing."""
+        ctx = self._ctx(pbx, handler)
+        session = MagicMock()
+        session.abort_reason = "target_rejected"
+
+        with patch.object(handler, "_offer_worker"):
+            handler._on_offer_failure(ctx, "1001", [session])
+            deadline = time.monotonic() + 2
+            while not pbx.queue_system.get_agent("1001").paused:
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.02)
+
+        agent = pbx.queue_system.get_agent("1001")
+        assert agent.paused is True
+        assert agent.pause_reason == "auto_rejected"
+        # Paused, not merely missed: the miss counter is not what removed them.
+        assert "1001" in ctx.tried_agents
+
+    def test_ring_out_counts_miss_not_pause(self, pbx, handler):
+        """No-answer is not a refusal: count a miss, leave the agent active."""
+        ctx = self._ctx(pbx, handler)
+        session = MagicMock()
+        session.abort_reason = "no_answer"
+
+        with patch.object(handler, "_offer_worker"):
+            handler._on_offer_failure(ctx, "1001", [session])
+            deadline = time.monotonic() + 2
+            while pbx.queue_system.get_agent("1001").consecutive_misses == 0:
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.02)
+
+        agent = pbx.queue_system.get_agent("1001")
+        assert agent.consecutive_misses == 1
+        assert agent.paused is False
+
     def test_no_dialable_agents_stays_waiting(self, pbx, handler):
         ctx = self._ctx(pbx, handler)
         pbx.extension_registry.is_registered.return_value = False
@@ -385,6 +423,41 @@ class TestSweep:
         handler._sweep_once()
 
         assert ctx.state == QueueCallState.OVERFLOW_PENDING
+
+    def test_no_agents_mid_wait_overflows_after_grace(self, pbx, handler):
+        """All agents gone mid-wait (e.g. DND auto-pause + logged-out peer):
+        overflow to voicemail instead of holding for the full max_wait."""
+        _seed_queue(pbx, max_wait_time=300)
+        with patch.object(handler, "_answer_caller", return_value=True):
+            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
+        ctx = pbx.call_manager.get_call("c1").queue_ctx
+
+        # Every member becomes unselectable while the caller waits.
+        pbx.queue_system.set_agent_login("1001", False)
+
+        with patch.object(handler, "_overflow_to_voicemail") as overflow:
+            handler._sweep_once()
+            assert not overflow.called  # grace period not yet elapsed
+
+            ctx.no_agents_since -= handler._no_agent_timeout() + 1
+            handler._sweep_once()
+            deadline = time.monotonic() + 2
+            while not overflow.called and time.monotonic() < deadline:
+                time.sleep(0.02)
+            overflow.assert_called_once_with(ctx)
+
+    def test_agent_available_never_overflows_for_no_agents(self, pbx, handler):
+        """A live agent resets the no-agent timer, so waiting continues."""
+        _seed_queue(pbx, max_wait_time=300)
+        with patch.object(handler, "_answer_caller", return_value=True):
+            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
+        ctx = pbx.call_manager.get_call("c1").queue_ctx
+
+        with patch.object(handler, "_overflow_to_voicemail") as overflow:
+            handler._sweep_once()
+            handler._sweep_once()
+            assert ctx.no_agents_since is None
+            assert not overflow.called
 
     def test_dead_call_cleanup(self, pbx, handler):
         _seed_queue(pbx)

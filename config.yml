@@ -411,6 +411,37 @@ conference:
 # fallback_mailbox (default: the queue number; retrieve via *<queue number>),
 # auto_pause_misses (0 = off), agents (list of member extensions).
 # Agents log in/out by dialing *61 / *62.
+# Call queues (ACD).
+#
+# SEED ONLY: this list populates the call_queues table the first time it is
+# empty. After that the DATABASE is authoritative -- edit queues in the admin
+# UI or via /api/queues. Changing entries here has no effect on an already
+# seeded system.
+#
+# Agents: membership is per-queue; login/pause state is global per extension.
+#   *61 = agent login (also clears an auto-pause), *62 = agent logout.
+# Overflow (queue full, no agents, or max wait reached) records a voicemail in
+# fallback_mailbox, defaulting to the queue number itself; retrieve it by
+# dialing *<queue number>, e.g. *8001.
+#
+# Per-queue keys: number, name, strategy, ring_timeout, max_wait_time,
+#   max_queue_size, fallback_mailbox, auto_pause_misses, enabled.
+# Strategies: round_robin | least_recent | fewest_calls | random
+#   ('ring_all' is not yet supported and is rejected/downgraded.)
+#
+# queue_no_agent_timeout: seconds a parked caller may wait with NO selectable
+# agent (all members logged out or paused -- which is where a DND phone ends up
+# once auto-pause trips) before overflowing to voicemail, rather than holding
+# for the full max_wait_time. 0 disables the check. Default 15. Top-level
+# because `queues:` below is a list and cannot carry nested settings.
+queue_no_agent_timeout: 15
+# queue_pause_on_reject: when an agent's phone answers a queue offer with an
+# explicit failure (486/603/480 -- what a phone in DND sends) rather than just
+# ringing out, pause that agent instead of counting a miss. Stops the queue
+# redialing a phone that has said it will not take calls. The pause shows in
+# the admin UI as 'auto_rejected' and is cleared by *61 or an admin unpause.
+# Set false to fall back to plain miss counting (auto_pause_misses).
+queue_pause_on_reject: true
 queues:
   - number: '8001'
     name: Sales Queue

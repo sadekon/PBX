@@ -30,6 +30,24 @@ STAR_CODE_LOGOUT = "*62"
 #: Seconds between sweep ticks (max-wait expiry, retry pacing, stats push).
 SWEEP_INTERVAL_SECONDS = 2.0
 
+#: How long a parked caller may wait with no selectable agent (all members
+#: logged out, or paused -- including auto-paused after missing offers) before
+#: overflowing to voicemail instead of holding for the full max_wait_time.
+#: Entry already overflows immediately in this situation (see _admit); this is
+#: the same rule applied mid-wait, with a short grace so a transient state --
+#: an agent re-registering, or mid *62/*61 -- does not dump a caller. Override
+#: with the top-level `queue_no_agent_timeout` in config.yml (`queues:` itself
+#: is a list, so it cannot carry nested settings); 0 disables the check.
+NO_AGENT_TIMEOUT_SECONDS = 15.0
+
+#: TransferSession.abort_reason when the agent's phone answered the INVITE with
+#: an explicit failure (486 Busy Here / 603 Decline / 480 Unavailable -- what a
+#: phone in DND sends), as opposed to "no_answer"/"target_timeout" for a leg
+#: that simply rang out. The distinction matters: a phone that actively refuses
+#: is telling us it will not take calls, so re-offering to it in a tight loop
+#: is pointless. See _record_reject.
+REJECT_ABORT_REASON = "target_rejected"
+
 
 class QueueEntryShape(Enum):
     """How the caller's leg reached the queue"""
@@ -79,6 +97,9 @@ class QueueCallContext:
     current_agent: str | None = None
     #: Monotonic timestamp before which no new offer should start.
     retry_at: float = 0.0
+    #: Monotonic timestamp when the queue last went empty of selectable
+    #: agents, or None while at least one is available (see _sweep_once).
+    no_agents_since: float | None = None
 
     def wait_seconds(self) -> float:
         """Seconds this caller has been in the queue"""
@@ -385,6 +406,15 @@ class QueueCallHandler:
         self._ensure_sweeper()
         self._kick()
 
+    def _no_agent_timeout(self) -> float:
+        """Grace period before a caller with no selectable agents overflows"""
+        try:
+            return float(
+                self.pbx_core.config.get("queue_no_agent_timeout", NO_AGENT_TIMEOUT_SECONDS)
+            )
+        except (TypeError, ValueError):
+            return NO_AGENT_TIMEOUT_SECONDS
+
     def _any_agent_logged_in(self, queue_number: str) -> bool:
         """Whether any member of the queue is logged in and not paused"""
         queue_system = self.pbx_core.queue_system
@@ -616,6 +646,28 @@ class QueueCallHandler:
             max_wait = queue.max_wait_time if queue else 300
 
             if ctx.state == QueueCallState.WAITING:
+                # Nobody can take this call: every member is logged out or
+                # paused (auto-pause after missed offers lands here too, which
+                # is what a DND phone produces). Holding for the full max_wait
+                # just plays MOH at a caller no one will ever answer.
+                if self._any_agent_logged_in(ctx.queue_number):
+                    ctx.no_agents_since = None
+                else:
+                    if ctx.no_agents_since is None:
+                        ctx.no_agents_since = now
+                    grace = self._no_agent_timeout()
+                    if grace > 0 and now - ctx.no_agents_since >= grace:
+                        with self._lock:
+                            if ctx.state != QueueCallState.WAITING:
+                                continue
+                            ctx.state = QueueCallState.OVERFLOW_PENDING
+                        pbx.logger.info(
+                            f"Queue {ctx.queue_number}: no agents available for "
+                            f"{ctx.call_id}, overflowing to voicemail"
+                        )
+                        self._spawn(self._overflow_to_voicemail, ctx)
+                        continue
+
                 if ctx.wait_seconds() >= max_wait:
                     # Latch under the lock before spawning so consecutive
                     # sweep ticks cannot spawn duplicate overflow workers.
@@ -763,7 +815,10 @@ class QueueCallHandler:
                     self._abandon(ctx, call)
                 return
 
-            self._record_miss(ctx, agent_ext)
+            if reason == REJECT_ABORT_REASON and self._pause_on_reject():
+                self._record_reject(ctx, agent_ext)
+            else:
+                self._record_miss(ctx, agent_ext)
 
             with self._lock:
                 if ctx.state == QueueCallState.OFFERING:
@@ -813,6 +868,36 @@ class QueueCallHandler:
             },
         )
         self._push_stats()
+
+    def _pause_on_reject(self) -> bool:
+        """Whether an explicitly rejected offer pauses the agent"""
+        return bool(self.pbx_core.config.get("queue_pause_on_reject", True))
+
+    def _record_reject(self, ctx: QueueCallContext, agent_ext: str) -> None:
+        """
+        The agent's phone actively refused the offer -- the signature of DND.
+
+        Pause the agent rather than counting a miss, so the rotation stops
+        redialing a phone that has told us it will not take calls. This is
+        deliberately distinct from the no-answer path: a rang-out offer might
+        just be someone away from their desk, but a decline is an answer.
+        The pause is ordinary agent state -- visible in the admin UI, cleared
+        by *61 or an admin unpause -- so nothing is stuck permanently.
+        """
+        from pbx.features.webhooks import WebhookEvent
+
+        pbx = self.pbx_core
+        ctx.tried_agents.add(agent_ext)
+        if not pbx.queue_system.set_agent_pause(agent_ext, True, "auto_rejected"):
+            return
+        pbx.logger.info(
+            f"Queue {ctx.queue_number}: agent {agent_ext} rejected the offer "
+            "(DND/decline); pausing them until *61"
+        )
+        pbx.webhook_system.trigger_event(
+            WebhookEvent.QUEUE_AGENT_PAUSED,
+            {"agent": agent_ext, "reason": "auto_rejected"},
+        )
 
     def _record_miss(self, ctx: QueueCallContext, agent_ext: str) -> None:
         """Count a missed offer; fire the auto-pause webhook when triggered"""
