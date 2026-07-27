@@ -109,7 +109,9 @@ class CallQueue:
         self.enabled = enabled
         # Member extensions; Agent objects are owned globally by QueueSystem.
         self.members: set[str] = set()
-        self.round_robin_index = 0
+        # Extension last offered a call under round-robin; the rotation
+        # continues from the next member after it (see get_next_agent).
+        self.round_robin_last: str | None = None
         self.logger = get_logger()
 
     def overflow_mailbox(self) -> str:
@@ -166,9 +168,18 @@ class CallQueue:
         if self.strategy == QueueStrategy.FEWEST_CALLS:
             return min(candidates, key=lambda a: a.calls_taken)
 
-        # ROUND_ROBIN (and RING_ALL fallback)
-        agent = candidates[self.round_robin_index % len(candidates)]
-        self.round_robin_index += 1
+        # ROUND_ROBIN (and RING_ALL fallback): continue the rotation from the
+        # member after the one last offered. Tracking the extension (not a
+        # positional index into this filtered list) keeps the order stable as
+        # the eligible set changes size between offers -- so a missed offer or
+        # a busy agent no longer skips the next agent or double-serves one.
+        # candidates is sorted by extension, so "next in rotation" is the first
+        # candidate greater than the last, wrapping to the lowest.
+        last = self.round_robin_last
+        agent = next((a for a in candidates if a.extension > last), None) if last else None
+        if agent is None:
+            agent = candidates[0]
+        self.round_robin_last = agent.extension
         return agent
 
 
