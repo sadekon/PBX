@@ -63,6 +63,11 @@ class Agent:
         self.consecutive_misses = 0
         self.calls_taken = 0
         self.last_call_time: datetime | None = None
+        # Least-recent tiebreak only (see CallQueue.get_next_agent): when
+        # last_call_time is None (never yet answered a call), agents would
+        # otherwise all tie and always lose to sorted-extension order.
+        # Not persisted -- ephemeral fairness state, same as round_robin_last.
+        self.last_offered_time: datetime | None = None
 
     def is_selectable(self) -> bool:
         """Engine-level availability: logged in and not paused"""
@@ -178,13 +183,32 @@ class CallQueue:
             return random.choice(candidates)
 
         if self.strategy == QueueStrategy.LEAST_RECENT:
-            return min(
+            # Primary key: recency of last *answered* call. Secondary key:
+            # recency of last *offer*, so agents who have never yet answered
+            # a call (all tied at "never" on the primary key) still rotate
+            # fairly instead of always losing the tie to the lowest sorted
+            # extension -- see Agent.last_offered_time.
+            epoch = datetime.min.replace(tzinfo=UTC)
+            chosen = min(
                 candidates,
-                key=lambda a: a.last_call_time or datetime.min.replace(tzinfo=UTC),
+                key=lambda a: (a.last_call_time or epoch, a.last_offered_time or epoch),
             )
+            chosen.last_offered_time = datetime.now(tz=UTC)
+            return chosen
 
         if self.strategy == QueueStrategy.FEWEST_CALLS:
-            return min(candidates, key=lambda a: a.calls_taken)
+            # Same tiebreak issue as LEAST_RECENT: calls_taken only advances
+            # on answer, so agents tied at 0 (fresh queue, or one who keeps
+            # being offered but never answers) need last_offered_time to
+            # rotate fairly instead of always losing to sorted-extension
+            # order.
+            epoch = datetime.min.replace(tzinfo=UTC)
+            chosen = min(
+                candidates,
+                key=lambda a: (a.calls_taken, a.last_offered_time or epoch),
+            )
+            chosen.last_offered_time = datetime.now(tz=UTC)
+            return chosen
 
         # ROUND_ROBIN (and RING_ALL fallback): continue the rotation from the
         # member after the one last offered. Tracking the extension (not a

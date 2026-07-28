@@ -28,6 +28,7 @@ class TestAgent:
         assert agent.consecutive_misses == 0
         assert agent.calls_taken == 0
         assert agent.last_call_time is None
+        assert agent.last_offered_time is None
 
     def test_is_selectable(self, _mock_logger):
         """Selectable = logged in and not paused."""
@@ -132,6 +133,19 @@ class TestCallQueueSelection:
         queue = self._make_queue(QueueStrategy.LEAST_RECENT, agents)
         assert queue.get_next_agent(agents, set(), _dialable) is agents["1001"]
 
+    def test_least_recent_rotates_among_never_answered(self, _mock_logger):
+        """Regression: before last_offered_time, agents who never answered a
+        call all tied at last_call_time=None, so the lowest extension was
+        always picked -- e.g. offering three separate calls all landed on
+        the same agent even though every agent was logged in and idle."""
+        from pbx.features.call_queue import QueueStrategy
+
+        agents = self._make_agents("1001", "1002", "1003")
+        queue = self._make_queue(QueueStrategy.LEAST_RECENT, agents)
+
+        picks = [queue.get_next_agent(agents, set(), _dialable).extension for _ in range(3)]
+        assert picks == ["1001", "1002", "1003"]
+
     def test_fewest_calls(self, _mock_logger):
         from pbx.features.call_queue import QueueStrategy
 
@@ -141,6 +155,19 @@ class TestCallQueueSelection:
         agents["1003"].calls_taken = 3
         queue = self._make_queue(QueueStrategy.FEWEST_CALLS, agents)
         assert queue.get_next_agent(agents, set(), _dialable) is agents["1002"]
+
+    def test_fewest_calls_rotates_when_tied(self, _mock_logger):
+        """Same regression as least_recent: agents tied at calls_taken=0
+        (fresh queue, or one who keeps being offered but never answers)
+        must rotate by last_offered_time, not always lose to the lowest
+        sorted extension."""
+        from pbx.features.call_queue import QueueStrategy
+
+        agents = self._make_agents("1001", "1002", "1003")
+        queue = self._make_queue(QueueStrategy.FEWEST_CALLS, agents)
+
+        picks = [queue.get_next_agent(agents, set(), _dialable).extension for _ in range(3)]
+        assert picks == ["1001", "1002", "1003"]
 
     def test_random_returns_member(self, _mock_logger):
         from pbx.features.call_queue import QueueStrategy
