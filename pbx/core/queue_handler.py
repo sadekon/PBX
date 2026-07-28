@@ -56,6 +56,11 @@ DEFAULT_ANNOUNCEMENT_TEXT = (
     "answered as soon as possible."
 )
 
+#: Spoken *61/*62 confirmation text (see _star_code_confirm). Falls back to
+#: tone beeps if TTS is unavailable.
+STAR_CODE_LOGIN_TEXT = "You are now signed in."
+STAR_CODE_LOGOUT_TEXT = "You are now signed out."
+
 
 class QueueEntryShape(Enum):
     """How the caller's leg reached the queue"""
@@ -1188,8 +1193,9 @@ class QueueCallHandler:
         Handle an agent dialing *61 (login) or *62 (logout).
 
         State is persisted before the call is answered, so the toggle
-        survives even if the confirmation audio fails. Confirmation is one
-        beep for login, two for logout; non-members get 404.
+        survives even if the confirmation audio fails. Confirmation is a
+        short spoken message (falling back to tone beeps if TTS is
+        unavailable); non-members get 404.
 
         Args:
             from_ext: The agent's extension
@@ -1256,17 +1262,22 @@ class QueueCallHandler:
 
         thread = threading.Thread(
             target=self._star_code_confirm,
-            args=(call, call_id, rtp_port, 1 if login else 2),
+            args=(call, call_id, rtp_port, login),
             daemon=True,
         )
         thread.start()
         return True
 
-    def _star_code_confirm(self, call: Any, call_id: str, rtp_port: int, beeps: int) -> None:
-        """Play N confirmation beeps, BYE the agent, release resources"""
+    def _star_code_confirm(self, call: Any, call_id: str, rtp_port: int, login: bool) -> None:
+        """Play a spoken sign-in/out confirmation, BYE the agent, release resources"""
+        import contextlib
+        import tempfile
+
         from pbx.rtp.handler import RTPPlayer
+        from pbx.utils.audio import generate_tts_audio
 
         pbx = self.pbx_core
+        temp_path: Path | None = None
         try:
             time.sleep(0.3)
             player = RTPPlayer(
@@ -1276,13 +1287,24 @@ class QueueCallHandler:
                 call_id=call_id,
             )
             if player.start():
-                for _ in range(beeps):
-                    player.play_beep(frequency=1000, duration_ms=200)
-                    time.sleep(0.15)
+                text = STAR_CODE_LOGIN_TEXT if login else STAR_CODE_LOGOUT_TEXT
+                audio_bytes = generate_tts_audio(text)
+                if audio_bytes is not None:
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                        temp_file.write(audio_bytes)
+                        temp_path = Path(temp_file.name)
+                    player.play_file(temp_path)
+                else:
+                    for _ in range(1 if login else 2):
+                        player.play_beep(frequency=1000, duration_ms=200)
+                        time.sleep(0.15)
                 player.stop()
         except (KeyError, OSError) as exc:
-            pbx.logger.error(f"Star-code beep failed for {call_id}: {exc}")
+            pbx.logger.error(f"Star-code confirmation failed for {call_id}: {exc}")
         finally:
+            if temp_path is not None:
+                with contextlib.suppress(OSError):
+                    temp_path.unlink()
             pbx.voicemail_handler._send_bye_to_caller(call, call_id)
             self._return_port_to_pool(rtp_port)
             pbx.call_manager.end_call(call_id)

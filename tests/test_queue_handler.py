@@ -8,6 +8,7 @@ the context/state orchestration under test.
 
 import threading
 import time
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -673,6 +674,83 @@ class TestStarCodes:
             builder.build_response.return_value = MagicMock()
             handler.handle_agent_star_code("1001", "*61", "s1", message, CALLER_ADDR)
         assert pbx.queue_system.get_agent("1001").logged_in is True
+
+    def test_star_code_confirm_speaks_tts_message(self, pbx, handler):
+        call = _FakeCall("s1", "1001", "*61")
+        call.caller_rtp = {"address": "10.0.0.5", "port": 4000}
+
+        class FakePlayer:
+            instances: ClassVar[list] = []
+
+            def __init__(self, **_kwargs):
+                self.played_files = []
+                self.beeps = 0
+                self.stopped = False
+                self.__class__.instances.append(self)
+
+            def start(self):
+                return True
+
+            def play_file(self, path):
+                self.played_files.append(path)
+                return True
+
+            def play_beep(self, **_kwargs):
+                self.beeps += 1
+
+            def stop(self):
+                self.stopped = True
+
+        with (
+            patch("pbx.rtp.handler.RTPPlayer", FakePlayer),
+            patch("pbx.utils.audio.generate_tts_audio", return_value=b"WAVDATA"),
+            patch.object(pbx.call_manager, "end_call") as end_call,
+        ):
+            handler._star_code_confirm(call, "s1", 10000, True)
+
+        assert len(FakePlayer.instances) == 1
+        player = FakePlayer.instances[0]
+        assert len(player.played_files) == 1
+        assert player.beeps == 0
+        assert player.stopped is True
+        pbx.voicemail_handler._send_bye_to_caller.assert_called_once()
+        end_call.assert_called_once_with("s1")
+
+    def test_star_code_confirm_falls_back_to_beeps_without_tts(self, pbx, handler):
+        call = _FakeCall("s1", "1001", "*62")
+        call.caller_rtp = {"address": "10.0.0.5", "port": 4000}
+
+        class FakePlayer:
+            instances: ClassVar[list] = []
+
+            def __init__(self, **_kwargs):
+                self.played_files = []
+                self.beeps = 0
+                self.stopped = False
+                self.__class__.instances.append(self)
+
+            def start(self):
+                return True
+
+            def play_file(self, path):
+                self.played_files.append(path)
+                return True
+
+            def play_beep(self, **_kwargs):
+                self.beeps += 1
+
+            def stop(self):
+                self.stopped = True
+
+        with (
+            patch("pbx.rtp.handler.RTPPlayer", FakePlayer),
+            patch("pbx.utils.audio.generate_tts_audio", return_value=None),
+        ):
+            handler._star_code_confirm(call, "s1", 10000, False)
+
+        player = FakePlayer.instances[0]
+        assert player.played_files == []
+        assert player.beeps == 2  # logout = 2 beeps
 
 
 @pytest.mark.unit
