@@ -83,6 +83,11 @@ class CallQueue:
         fallback_mailbox: str | None = None,
         auto_pause_misses: int = 3,
         enabled: bool = True,
+        announcement_enabled: bool = False,
+        announcement_interval: int = 30,
+        announcement_text: str | None = None,
+        announcement_file: str | None = None,
+        announcement_position: bool = False,
     ) -> None:
         """
         Initialize call queue
@@ -97,6 +102,14 @@ class CallQueue:
             fallback_mailbox: Overflow mailbox (None => the queue number)
             auto_pause_misses: Consecutive misses before auto-pause (0 = off)
             enabled: Whether the queue accepts callers
+            announcement_enabled: Whether to periodically interrupt MOH with
+                a hold announcement
+            announcement_interval: Seconds between hold announcements
+            announcement_text: Custom message text (TTS); None => default
+            announcement_file: Pre-recorded WAV filename under
+                ``<moh_directory>/announcements/``; takes priority over TTS
+            announcement_position: Whether to append "you are caller number
+                N" to the TTS announcement (ignored for announcement_file)
         """
         self.queue_number = queue_number
         self.name = name
@@ -107,6 +120,11 @@ class CallQueue:
         self.fallback_mailbox = fallback_mailbox
         self.auto_pause_misses = auto_pause_misses
         self.enabled = enabled
+        self.announcement_enabled = announcement_enabled
+        self.announcement_interval = announcement_interval
+        self.announcement_text = announcement_text
+        self.announcement_file = announcement_file
+        self.announcement_position = announcement_position
         # Member extensions; Agent objects are owned globally by QueueSystem.
         self.members: set[str] = set()
         # Extension last offered a call under round-robin; the rotation
@@ -291,6 +309,11 @@ class QueueSystem:
                 row["auto_pause_misses"] if row.get("auto_pause_misses") is not None else 3
             ),
             enabled=bool(row.get("enabled", True)),
+            announcement_enabled=bool(row.get("announcement_enabled", False)),
+            announcement_interval=row.get("announcement_interval") or 30,
+            announcement_text=row.get("announcement_text"),
+            announcement_file=row.get("announcement_file"),
+            announcement_position=bool(row.get("announcement_position", False)),
         )
 
     def _config_queue_entries(self) -> list[dict]:
@@ -325,6 +348,11 @@ class QueueSystem:
                 max_queue_size=int(entry.get("max_queue_size", 10)),
                 fallback_mailbox=entry.get("fallback_mailbox"),
                 auto_pause_misses=int(entry.get("auto_pause_misses", 3)),
+                announcement_enabled=bool(entry.get("announcement_enabled", False)),
+                announcement_interval=int(entry.get("announcement_interval", 30)),
+                announcement_text=entry.get("announcement_text"),
+                announcement_file=entry.get("announcement_file"),
+                announcement_position=bool(entry.get("announcement_position", False)),
             )
             for ext in entry.get("agents", []) or []:
                 queue.members.add(str(ext))
@@ -599,6 +627,11 @@ class QueueSystem:
                 "max_queue_size": queue.max_queue_size,
                 "fallback_mailbox": queue.overflow_mailbox(),
                 "auto_pause_misses": queue.auto_pause_misses,
+                "announcement_enabled": queue.announcement_enabled,
+                "announcement_interval": queue.announcement_interval,
+                "announcement_text": queue.announcement_text,
+                "announcement_file": queue.announcement_file,
+                "announcement_position": queue.announcement_position,
                 "members": members,
                 "calls_waiting": waiting,
                 "longest_wait": longest_wait,
@@ -624,8 +657,10 @@ class QueueSystem:
                 """
                 INSERT INTO call_queues
                     (queue_number, name, strategy, ring_timeout, max_wait_time,
-                     max_queue_size, fallback_mailbox, auto_pause_misses, enabled, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     max_queue_size, fallback_mailbox, auto_pause_misses, enabled,
+                     announcement_enabled, announcement_interval, announcement_text,
+                     announcement_file, announcement_position, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (queue_number) DO UPDATE SET
                     name = EXCLUDED.name,
                     strategy = EXCLUDED.strategy,
@@ -635,6 +670,11 @@ class QueueSystem:
                     fallback_mailbox = EXCLUDED.fallback_mailbox,
                     auto_pause_misses = EXCLUDED.auto_pause_misses,
                     enabled = EXCLUDED.enabled,
+                    announcement_enabled = EXCLUDED.announcement_enabled,
+                    announcement_interval = EXCLUDED.announcement_interval,
+                    announcement_text = EXCLUDED.announcement_text,
+                    announcement_file = EXCLUDED.announcement_file,
+                    announcement_position = EXCLUDED.announcement_position,
                     updated_at = EXCLUDED.updated_at
                 """,
                 (
@@ -647,6 +687,11 @@ class QueueSystem:
                     queue.fallback_mailbox,
                     queue.auto_pause_misses,
                     queue.enabled,
+                    queue.announcement_enabled,
+                    queue.announcement_interval,
+                    queue.announcement_text,
+                    queue.announcement_file,
+                    queue.announcement_position,
                     datetime.now(tz=UTC),
                 ),
             )

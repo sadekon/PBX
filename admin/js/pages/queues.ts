@@ -18,6 +18,11 @@ interface QueueStatus {
     max_queue_size: number;
     fallback_mailbox: string;
     auto_pause_misses: number;
+    announcement_enabled: boolean;
+    announcement_interval: number;
+    announcement_text: string | null;
+    announcement_file: string | null;
+    announcement_position: boolean;
     members: string[];
     calls_waiting: number;
     longest_wait: number;
@@ -390,6 +395,34 @@ export function showEditQueueModal(queueNumber: string): void {
                         <input type="text" id="queue-fallback" value="${escapeHtml(queue?.fallback_mailbox ?? '')}" placeholder="Blank to keep, - to reset to queue number">
                         <small>Where calls go after max wait. Enter "-" to reset to the queue number.</small>
                     </div>
+                    <div class="form-group">
+                        <label for="queue-announcement-enabled">
+                            <input type="checkbox" id="queue-announcement-enabled" ${queue?.announcement_enabled ? 'checked' : ''}>
+                            Hold Announcements
+                        </label>
+                        <small>Periodically interrupt hold music with a message.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="queue-announcement-interval">Announcement Interval (seconds):</label>
+                        <input type="number" id="queue-announcement-interval" min="10" value="${queue?.announcement_interval ?? ''}">
+                    </div>
+                    <div class="form-group">
+                        <label for="queue-announcement-text">Custom Message:</label>
+                        <input type="text" id="queue-announcement-text" value="${escapeHtml(queue?.announcement_text ?? '')}" placeholder="Blank for the default message">
+                        <small>Spoken via text-to-speech. Ignored if a pre-recorded file is set below.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="queue-announcement-file">Pre-recorded Announcement File:</label>
+                        <input type="text" id="queue-announcement-file" value="${escapeHtml(queue?.announcement_file ?? '')}" placeholder="e.g. sales.wav">
+                        <small>Filename under moh/announcements/. Takes priority over the custom message.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="queue-announcement-position">
+                            <input type="checkbox" id="queue-announcement-position" ${queue?.announcement_position ? 'checked' : ''}>
+                            Announce Caller Position
+                        </label>
+                        <small>Appends "you are caller number N" to the message (ignored for a pre-recorded file).</small>
+                    </div>
                     <div class="modal-actions">
                         <button type="button" class="btn btn-secondary" onclick="closeQueueModal()">Cancel</button>
                         <button type="submit" class="btn btn-success">Save Changes</button>
@@ -412,6 +445,11 @@ async function submitEditQueue(queueNumber: string): Promise<void> {
     const ringTimeout = (document.getElementById('queue-ring-timeout') as HTMLInputElement).value.trim();
     const maxWait = (document.getElementById('queue-max-wait') as HTMLInputElement).value.trim();
     const fallbackMailbox = (document.getElementById('queue-fallback') as HTMLInputElement).value.trim();
+    const announcementEnabled = (document.getElementById('queue-announcement-enabled') as HTMLInputElement).checked;
+    const announcementInterval = (document.getElementById('queue-announcement-interval') as HTMLInputElement).value.trim();
+    const announcementText = (document.getElementById('queue-announcement-text') as HTMLInputElement).value.trim();
+    const announcementFile = (document.getElementById('queue-announcement-file') as HTMLInputElement).value.trim();
+    const announcementPosition = (document.getElementById('queue-announcement-position') as HTMLInputElement).checked;
 
     const payload: Record<string, unknown> = {};
     if (name) payload.name = name;
@@ -420,6 +458,11 @@ async function submitEditQueue(queueNumber: string): Promise<void> {
     if (maxWait) payload.max_wait_time = parseInt(maxWait, 10);
     if (fallbackMailbox === '-') payload.fallback_mailbox = null;
     else if (fallbackMailbox) payload.fallback_mailbox = fallbackMailbox;
+    payload.announcement_enabled = announcementEnabled;
+    payload.announcement_position = announcementPosition;
+    if (announcementInterval) payload.announcement_interval = parseInt(announcementInterval, 10);
+    payload.announcement_text = announcementText || null;
+    payload.announcement_file = announcementFile || null;
 
     if (Object.keys(payload).length === 0) {
         closeQueueModal();

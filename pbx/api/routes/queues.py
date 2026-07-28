@@ -29,6 +29,7 @@ _INT_FIELDS = {
     "max_wait_time": (10, 3600),
     "max_queue_size": (1, 100),
     "auto_pause_misses": (0, 20),
+    "announcement_interval": (10, 600),
 }
 
 _PAUSE_REASONS = ("manual", "auto_missed", "ad_calendar")
@@ -92,6 +93,16 @@ def _apply_queue_fields(queue: Any, data: dict) -> None:
         queue.fallback_mailbox = str(mailbox) if mailbox else None
     if "enabled" in data:
         queue.enabled = bool(data["enabled"])
+    if "announcement_enabled" in data:
+        queue.announcement_enabled = bool(data["announcement_enabled"])
+    if "announcement_position" in data:
+        queue.announcement_position = bool(data["announcement_position"])
+    if "announcement_text" in data:
+        text = data["announcement_text"]
+        queue.announcement_text = str(text) if text else None
+    if "announcement_file" in data:
+        file_name = data["announcement_file"]
+        queue.announcement_file = str(file_name) if file_name else None
 
 
 @queues_bp.route("", methods=["GET"])

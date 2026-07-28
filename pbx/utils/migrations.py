@@ -736,3 +736,19 @@ def register_all_migrations(manager: MigrationManager) -> None:
         );
     """),
     )
+
+    # Migration 1014: Queue Hold Announcements
+    # call_queues already exists on live installs (1013's CREATE TABLE
+    # IF NOT EXISTS is a no-op there), so these columns are added with
+    # ALTER TABLE rather than folded into the 1013 CREATE TABLE.
+    manager.register_migration(
+        1014,
+        "Queue Hold Announcements",
+        manager._build_migration_sql("""
+        ALTER TABLE call_queues ADD COLUMN announcement_enabled BOOLEAN DEFAULT {BOOLEAN_FALSE};
+        ALTER TABLE call_queues ADD COLUMN announcement_interval INTEGER DEFAULT 30;
+        ALTER TABLE call_queues ADD COLUMN announcement_text VARCHAR(500);
+        ALTER TABLE call_queues ADD COLUMN announcement_file VARCHAR(255);
+        ALTER TABLE call_queues ADD COLUMN announcement_position BOOLEAN DEFAULT {BOOLEAN_FALSE};
+    """),
+    )

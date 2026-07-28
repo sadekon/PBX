@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 #: Agent star codes (internal-origin only; see CallRouter.route_call).
@@ -47,6 +48,13 @@ NO_AGENT_TIMEOUT_SECONDS = 15.0
 #: is telling us it will not take calls, so re-offering to it in a tight loop
 #: is pointless. See _record_reject.
 REJECT_ABORT_REASON = "target_rejected"
+
+#: Default hold-announcement text when a queue enables announcements without
+#: a custom message or pre-recorded file (see _resolve_announcement_audio).
+DEFAULT_ANNOUNCEMENT_TEXT = (
+    "Thank you for holding. Your call is important to us and will be "
+    "answered as soon as possible."
+)
 
 
 class QueueEntryShape(Enum):
@@ -100,6 +108,11 @@ class QueueCallContext:
     #: Monotonic timestamp when the queue last went empty of selectable
     #: agents, or None while at least one is available (see _sweep_once).
     no_agents_since: float | None = None
+    #: Which side ("a" or "b") of the relay hears MOH/announcements; the
+    #: inverse of transferee_side, computed once in _admit.
+    held_side: str = ""
+    #: Monotonic timestamp of the last hold announcement (see _announce_worker).
+    last_announcement_at: float = field(default_factory=time.monotonic)
 
     def wait_seconds(self) -> float:
         """Seconds this caller has been in the queue"""
@@ -374,6 +387,7 @@ class QueueCallHandler:
         """
         pbx = self.pbx_core
         queue = pbx.queue_system.get_queue(ctx.queue_number)
+        ctx.held_side = "a" if ctx.transferee_side == "caller" else "b"
 
         with self._lock:
             waiting = self._waiting.setdefault(ctx.queue_number, [])
@@ -399,8 +413,7 @@ class QueueCallHandler:
         if not moh_running:
             relay_handler = pbx.rtp_relay.get_handler(ctx.call_id)
             if relay_handler is not None:
-                held_side = "a" if ctx.transferee_side == "caller" else "b"
-                pbx.moh_system.start_moh(ctx.call_id, relay_handler, held_side)
+                pbx.moh_system.start_moh(ctx.call_id, relay_handler, ctx.held_side)
 
         self._push_stats()
         self._ensure_sweeper()
@@ -679,6 +692,20 @@ class QueueCallHandler:
                     self._spawn(self._overflow_to_voicemail, ctx)
                 elif now >= ctx.retry_at:
                     self._spawn(self._offer_worker, ctx)
+
+                if (
+                    queue is not None
+                    and queue.announcement_enabled
+                    and now - ctx.last_announcement_at >= queue.announcement_interval
+                ):
+                    # Latch before spawning (TTS synthesis can be slow) so a
+                    # worker still in flight isn't double-spawned by the next
+                    # tick, same as the overflow/offer latches above.
+                    with self._lock:
+                        if ctx.state != QueueCallState.WAITING:
+                            continue
+                        ctx.last_announcement_at = now
+                    self._spawn(self._announce_worker, ctx)
             elif ctx.state == QueueCallState.OFFERING and ctx.wait_seconds() >= max_wait:
                 # Never interrupt a ringing agent: latch so the attempt's
                 # failure path goes to voicemail instead of retrying. An
@@ -912,6 +939,86 @@ class QueueCallHandler:
             )
 
     # ------------------------------------------------------------------
+    # Hold announcements: periodic sequential interruption of MOH
+    # ------------------------------------------------------------------
+
+    def _announce_worker(self, ctx: QueueCallContext) -> None:
+        """
+        Interrupt MOH once with a hold announcement, then let it resume.
+
+        Runs on its own daemon thread (TTS/audio playback blocks). Bails
+        cleanly if the caller stopped waiting between the sweep tick that
+        spawned this and now -- MusicOnHold.interject() is itself a safe
+        no-op if the call isn't on MOH anymore.
+        """
+        pbx = self.pbx_core
+
+        with self._lock:
+            if ctx.state != QueueCallState.WAITING:
+                return
+            waiting = self._waiting.get(ctx.queue_number, [])
+            position = waiting.index(ctx.call_id) + 1 if ctx.call_id in waiting else None
+
+        queue = pbx.queue_system.get_queue(ctx.queue_number)
+        if queue is None or position is None:
+            return
+
+        audio_path, is_temp = self._resolve_announcement_audio(queue, position)
+        try:
+            if audio_path is None:
+                return
+            pbx.moh_system.interject(
+                ctx.call_id,
+                ctx.held_side,
+                audio_path,
+                interrupt_check=lambda: ctx.state != QueueCallState.WAITING,
+            )
+        finally:
+            ctx.last_announcement_at = time.monotonic()
+            if is_temp and audio_path is not None:
+                import contextlib
+
+                with contextlib.suppress(OSError):
+                    audio_path.unlink()
+
+    def _resolve_announcement_audio(self, queue: Any, position: int) -> tuple[Path | None, bool]:
+        """
+        Resolve the audio to play for one hold announcement.
+
+        Returns:
+            (path, is_temp) -- path is None if no announcement could be
+            produced (missing file, TTS unavailable); is_temp tells the
+            caller whether to delete the file afterward.
+        """
+        pbx = self.pbx_core
+
+        if queue.announcement_file:
+            moh_dir = pbx.config.get("music_on_hold.directory", "moh")
+            candidate = Path(moh_dir) / "announcements" / queue.announcement_file
+            if candidate.exists():
+                return candidate, False
+            pbx.logger.warning(
+                f"Queue {queue.queue_number}: announcement file {candidate} not found"
+            )
+            return None, False
+
+        from pbx.utils.audio import generate_tts_audio
+
+        text = queue.announcement_text or DEFAULT_ANNOUNCEMENT_TEXT
+        if queue.announcement_position:
+            text = f"{text} You are caller number {position}."
+
+        audio_bytes = generate_tts_audio(text)
+        if audio_bytes is None:
+            return None, False
+
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_file.write(audio_bytes)
+            return Path(temp_file.name), True
+
+    # ------------------------------------------------------------------
     # Overflow: voicemail into the queue's mailbox
     # ------------------------------------------------------------------
 
@@ -1037,7 +1144,6 @@ class QueueCallHandler:
         """Play the mailbox's custom greeting, or the default prompt"""
         import contextlib
         import tempfile
-        from pathlib import Path
 
         from pbx.utils.audio import get_prompt_audio
 

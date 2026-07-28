@@ -471,6 +471,133 @@ class TestSweep:
         with handler._lock:
             assert "c1" not in handler._contexts
 
+    def test_announcement_enabled_spawns_announce_worker(self, pbx, handler):
+        _seed_queue(pbx, announcement_enabled=True, announcement_interval=5)
+        with patch.object(handler, "_answer_caller", return_value=True):
+            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
+        ctx = pbx.call_manager.get_call("c1").queue_ctx
+        ctx.last_announcement_at -= 10  # interval already elapsed
+
+        # Isolate from the real offer loop (also spawned by this sweep tick):
+        # it would race to flip ctx.state to OFFERING before our check runs.
+        with (
+            patch.object(handler, "_offer_worker"),
+            patch.object(handler, "_announce_worker") as announce,
+        ):
+            handler._sweep_once()
+            deadline = time.monotonic() + 2
+            while not announce.called and time.monotonic() < deadline:
+                time.sleep(0.02)
+            announce.assert_called_once_with(ctx)
+
+    def test_announcement_disabled_by_default(self, pbx, handler):
+        _seed_queue(pbx)  # announcement_enabled defaults to False
+        with patch.object(handler, "_answer_caller", return_value=True):
+            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
+        ctx = pbx.call_manager.get_call("c1").queue_ctx
+        ctx.last_announcement_at -= 3600
+
+        with patch.object(handler, "_announce_worker") as announce:
+            handler._sweep_once()
+            time.sleep(0.1)
+            assert not announce.called
+
+
+@pytest.mark.unit
+class TestHoldAnnouncements:
+    def test_resolve_prefers_announcement_file(self, pbx, handler, tmp_path):
+        (tmp_path / "announcements").mkdir()
+        prompt = tmp_path / "announcements" / "sales.wav"
+        prompt.write_bytes(b"RIFF....WAVEfmt ")
+        pbx.config.get.side_effect = (
+            lambda key, default=None: str(tmp_path)
+            if key == "music_on_hold.directory"
+            else default
+        )
+        queue = _seed_queue(pbx, announcement_file="sales.wav")
+
+        path, is_temp = handler._resolve_announcement_audio(queue, position=1)
+
+        assert path == prompt
+        assert is_temp is False
+
+    def test_resolve_missing_file_falls_through(self, pbx, handler, tmp_path):
+        pbx.config.get.side_effect = (
+            lambda key, default=None: str(tmp_path)
+            if key == "music_on_hold.directory"
+            else default
+        )
+        queue = _seed_queue(pbx, announcement_file="missing.wav")
+
+        path, is_temp = handler._resolve_announcement_audio(queue, position=1)
+
+        assert path is None
+        assert is_temp is False
+        assert pbx.logger.warning.called
+
+    def test_resolve_uses_tts_with_position(self, pbx, handler, tmp_path):
+        queue = _seed_queue(
+            pbx, announcement_text="Please hold", announcement_position=True
+        )
+
+        with patch("pbx.utils.audio.generate_tts_audio", return_value=b"WAVDATA") as tts:
+            path, is_temp = handler._resolve_announcement_audio(queue, position=3)
+
+        assert path is not None
+        assert is_temp is True
+        assert path.read_bytes() == b"WAVDATA"
+        spoken_text = tts.call_args[0][0]
+        assert "Please hold" in spoken_text
+        assert "caller number 3" in spoken_text
+        path.unlink()
+
+    def test_resolve_returns_none_when_tts_unavailable(self, pbx, handler):
+        queue = _seed_queue(pbx)
+
+        with patch("pbx.utils.audio.generate_tts_audio", return_value=None):
+            path, is_temp = handler._resolve_announcement_audio(queue, position=1)
+
+        assert path is None
+        assert is_temp is False
+
+    def test_announce_worker_interjects_and_updates_timestamp(self, pbx, handler, tmp_path):
+        (tmp_path / "announcements").mkdir()
+        prompt = tmp_path / "announcements" / "sales.wav"
+        prompt.write_bytes(b"RIFF....WAVEfmt ")
+        pbx.config.get.side_effect = (
+            lambda key, default=None: str(tmp_path)
+            if key == "music_on_hold.directory"
+            else default
+        )
+        _seed_queue(pbx, announcement_enabled=True, announcement_file="sales.wav")
+        with patch.object(handler, "_answer_caller", return_value=True):
+            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
+        ctx = pbx.call_manager.get_call("c1").queue_ctx
+        before = ctx.last_announcement_at
+
+        handler._announce_worker(ctx)
+
+        pbx.moh_system.interject.assert_called_once()
+        args, kwargs = pbx.moh_system.interject.call_args
+        assert args[0] == "c1"
+        assert args[1] == ctx.held_side
+        assert args[2] == prompt
+        assert "interrupt_check" in kwargs
+        assert ctx.last_announcement_at > before
+
+    def test_announce_worker_skips_when_not_waiting(self, pbx, handler):
+        from pbx.core.queue_handler import QueueCallState
+
+        _seed_queue(pbx, announcement_enabled=True, announcement_file="sales.wav")
+        with patch.object(handler, "_answer_caller", return_value=True):
+            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
+        ctx = pbx.call_manager.get_call("c1").queue_ctx
+        ctx.state = QueueCallState.OFFERING
+
+        handler._announce_worker(ctx)
+
+        assert not pbx.moh_system.interject.called
+
 
 @pytest.mark.unit
 class TestAdoption:

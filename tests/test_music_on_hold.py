@@ -221,6 +221,52 @@ class TestMusicOnHold:
 
 
 # ---------------------------------------------------------------------------
+# MusicOnHold.interject (sequential hold-announcement interruption)
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+class TestMusicOnHoldInterject:
+    def test_interject_plays_prompt_then_resumes_moh(self, tmp_path: Path) -> None:
+        _write_wav(tmp_path / "default" / "hold.wav")
+        prompt_path = tmp_path / "prompt.wav"
+        _write_wav(prompt_path, samples=400)
+        moh = MusicOnHold(moh_directory=str(tmp_path))
+
+        relay = RTPRelay(port_range_start=41400, port_range_end=41500)
+        call_id = "interject_test"
+        assert relay.allocate_relay(call_id) is not None
+        handler = relay.get_handler(call_id)
+        assert handler is not None
+
+        held = _recv_socket()
+        try:
+            handler.learned_a = held.getsockname()
+            assert moh.start_moh(call_id, handler, "a") is not None
+            assert held.recvfrom(2048)[0]  # MOH is flowing
+
+            played = moh.interject(call_id, "a", prompt_path)
+
+            assert played is True
+            # MOH resumed afterward: a fresh session exists, relay stays paused.
+            assert call_id in moh.active_sessions
+            assert handler.paused is True
+            assert held.recvfrom(2048)[0]  # MOH resumed after the prompt
+
+            moh.stop_moh(call_id)
+            assert handler.paused is False
+        finally:
+            held.close()
+            relay.release_relay(call_id)
+
+    def test_interject_no_session_is_noop(self, tmp_path: Path) -> None:
+        moh = MusicOnHold(moh_directory=str(tmp_path))
+        prompt_path = tmp_path / "prompt.wav"
+        _write_wav(prompt_path)
+
+        assert moh.interject("never_held", "a", prompt_path) is False
+        assert "never_held" not in moh.active_sessions
+
+
+# ---------------------------------------------------------------------------
 # SDP media-direction parse/build (hold signalling)
 # ---------------------------------------------------------------------------
 @pytest.mark.unit

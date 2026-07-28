@@ -25,6 +25,11 @@ CREATE TABLE IF NOT EXISTS call_queues (
     fallback_mailbox VARCHAR(20),
     auto_pause_misses INTEGER DEFAULT 3,
     enabled BOOLEAN DEFAULT 1,
+    announcement_enabled BOOLEAN DEFAULT 0,
+    announcement_interval INTEGER DEFAULT 30,
+    announcement_text VARCHAR(500),
+    announcement_file VARCHAR(255),
+    announcement_position BOOLEAN DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -163,6 +168,37 @@ class TestSeedAndReload:
         assert reloaded.overflow_mailbox() == "1005"
         assert reloaded.auto_pause_misses == 5
         assert reloaded.enabled is False
+
+    def test_announcement_fields_persist(self, _mock_logger, db_path):
+        system = _system(db_path)
+        queue = system.create_queue("8004", "Support")
+        queue.announcement_enabled = True
+        queue.announcement_interval = 45
+        queue.announcement_text = "Please continue to hold"
+        queue.announcement_file = "support.wav"
+        queue.announcement_position = True
+        system.save_queue(queue)
+
+        reloaded = _system(db_path).get_queue("8004")
+        assert reloaded is not None
+        assert reloaded.announcement_enabled is True
+        assert reloaded.announcement_interval == 45
+        assert reloaded.announcement_text == "Please continue to hold"
+        assert reloaded.announcement_file == "support.wav"
+        assert reloaded.announcement_position is True
+
+    def test_announcement_fields_default_off(self, _mock_logger, db_path):
+        system = _system(db_path)
+        queue = system.create_queue("8005", "Billing")
+        system.save_queue(queue)
+
+        reloaded = _system(db_path).get_queue("8005")
+        assert reloaded is not None
+        assert reloaded.announcement_enabled is False
+        assert reloaded.announcement_interval == 30
+        assert reloaded.announcement_text is None
+        assert reloaded.announcement_file is None
+        assert reloaded.announcement_position is False
 
     def test_delete_queue_removes_rows(self, _mock_logger, db_path):
         system = _system(db_path, SEED_CONFIG)

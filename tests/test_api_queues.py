@@ -120,6 +120,37 @@ class TestQueueCrud:
             response = api_client.put("/api/queues/8009", json={"name": "X"})
         assert response.status_code == 404
 
+    def test_update_announcement_fields(self, api_client: FlaskClient, queue_system) -> None:
+        queue_system.create_queue("8001", "Sales")
+        with patch(AUTH_PATCH, return_value=AUTH_RETURN):
+            response = api_client.put(
+                "/api/queues/8001",
+                json={
+                    "announcement_enabled": True,
+                    "announcement_interval": 45,
+                    "announcement_text": "Please hold",
+                    "announcement_file": "sales.wav",
+                    "announcement_position": True,
+                },
+            )
+        assert response.status_code == 200, _json(response)
+        queue = queue_system.get_queue("8001")
+        assert queue.announcement_enabled is True
+        assert queue.announcement_interval == 45
+        assert queue.announcement_text == "Please hold"
+        assert queue.announcement_file == "sales.wav"
+        assert queue.announcement_position is True
+
+    def test_update_rejects_announcement_interval_out_of_bounds(
+        self, api_client: FlaskClient, queue_system
+    ) -> None:
+        queue_system.create_queue("8001", "Sales")
+        with patch(AUTH_PATCH, return_value=AUTH_RETURN):
+            response = api_client.put(
+                "/api/queues/8001", json={"announcement_interval": 5000}
+            )
+        assert response.status_code == 400
+
     def test_delete(self, api_client: FlaskClient, queue_system) -> None:
         queue_system.create_queue("8001", "Sales")
         with patch(AUTH_PATCH, return_value=AUTH_RETURN):
