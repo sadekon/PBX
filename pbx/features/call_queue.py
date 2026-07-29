@@ -93,6 +93,7 @@ class CallQueue:
         announcement_text: str | None = None,
         announcement_file: str | None = None,
         announcement_position: bool = False,
+        overflow_action: str = "voicemail",
     ) -> None:
         """
         Initialize call queue
@@ -115,6 +116,9 @@ class CallQueue:
                 ``<moh_directory>/announcements/``; takes priority over TTS
             announcement_position: Whether to append "you are caller number
                 N" to the TTS announcement (ignored for announcement_file)
+            overflow_action: What happens to a caller on overflow (queue
+                full, no agents, or max wait reached) -- "voicemail"
+                (default, records into fallback_mailbox) or "drop" (hang up)
         """
         self.queue_number = queue_number
         self.name = name
@@ -130,6 +134,9 @@ class CallQueue:
         self.announcement_text = announcement_text
         self.announcement_file = announcement_file
         self.announcement_position = announcement_position
+        self.overflow_action = (
+            overflow_action if overflow_action in ("voicemail", "drop") else "voicemail"
+        )
         # Member extensions; Agent objects are owned globally by QueueSystem.
         self.members: set[str] = set()
         # Extension last offered a call under round-robin; the rotation
@@ -338,6 +345,7 @@ class QueueSystem:
             announcement_text=row.get("announcement_text"),
             announcement_file=row.get("announcement_file"),
             announcement_position=bool(row.get("announcement_position", False)),
+            overflow_action=row.get("overflow_action") or "voicemail",
         )
 
     def _config_queue_entries(self) -> list[dict]:
@@ -377,6 +385,7 @@ class QueueSystem:
                 announcement_text=entry.get("announcement_text"),
                 announcement_file=entry.get("announcement_file"),
                 announcement_position=bool(entry.get("announcement_position", False)),
+                overflow_action=entry.get("overflow_action") or "voicemail",
             )
             for ext in entry.get("agents", []) or []:
                 queue.members.add(str(ext))
@@ -656,6 +665,7 @@ class QueueSystem:
                 "announcement_text": queue.announcement_text,
                 "announcement_file": queue.announcement_file,
                 "announcement_position": queue.announcement_position,
+                "overflow_action": queue.overflow_action,
                 "members": members,
                 "calls_waiting": waiting,
                 "longest_wait": longest_wait,
@@ -683,8 +693,8 @@ class QueueSystem:
                     (queue_number, name, strategy, ring_timeout, max_wait_time,
                      max_queue_size, fallback_mailbox, auto_pause_misses, enabled,
                      announcement_enabled, announcement_interval, announcement_text,
-                     announcement_file, announcement_position, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     announcement_file, announcement_position, overflow_action, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (queue_number) DO UPDATE SET
                     name = EXCLUDED.name,
                     strategy = EXCLUDED.strategy,
@@ -699,6 +709,7 @@ class QueueSystem:
                     announcement_text = EXCLUDED.announcement_text,
                     announcement_file = EXCLUDED.announcement_file,
                     announcement_position = EXCLUDED.announcement_position,
+                    overflow_action = EXCLUDED.overflow_action,
                     updated_at = EXCLUDED.updated_at
                 """,
                 (
@@ -716,6 +727,7 @@ class QueueSystem:
                     queue.announcement_text,
                     queue.announcement_file,
                     queue.announcement_position,
+                    queue.overflow_action,
                     datetime.now(tz=UTC),
                 ),
             )

@@ -23,6 +23,7 @@ interface QueueStatus {
     announcement_text: string | null;
     announcement_file: string | null;
     announcement_position: boolean;
+    overflow_action: string;
     members: string[];
     calls_waiting: number;
     longest_wait: number;
@@ -396,6 +397,14 @@ export function showEditQueueModal(queueNumber: string): void {
                         <small>Where calls go after max wait. Enter "-" to reset to the queue number.</small>
                     </div>
                     <div class="form-group">
+                        <label for="queue-overflow-action">On Overflow:</label>
+                        <select id="queue-overflow-action">
+                            <option value="voicemail"${queue?.overflow_action !== 'drop' ? ' selected' : ''}>Voicemail</option>
+                            <option value="drop"${queue?.overflow_action === 'drop' ? ' selected' : ''}>Drop (hang up)</option>
+                        </select>
+                        <small>What happens when the queue is full, has no agents, or hits max wait.</small>
+                    </div>
+                    <div class="form-group">
                         <label for="queue-announcement-enabled">
                             <input type="checkbox" id="queue-announcement-enabled" ${queue?.announcement_enabled ? 'checked' : ''}>
                             Hold Announcements
@@ -445,6 +454,7 @@ async function submitEditQueue(queueNumber: string): Promise<void> {
     const ringTimeout = (document.getElementById('queue-ring-timeout') as HTMLInputElement).value.trim();
     const maxWait = (document.getElementById('queue-max-wait') as HTMLInputElement).value.trim();
     const fallbackMailbox = (document.getElementById('queue-fallback') as HTMLInputElement).value.trim();
+    const overflowAction = (document.getElementById('queue-overflow-action') as HTMLSelectElement).value;
     const announcementEnabled = (document.getElementById('queue-announcement-enabled') as HTMLInputElement).checked;
     const announcementInterval = (document.getElementById('queue-announcement-interval') as HTMLInputElement).value.trim();
     const announcementText = (document.getElementById('queue-announcement-text') as HTMLInputElement).value.trim();
@@ -458,6 +468,7 @@ async function submitEditQueue(queueNumber: string): Promise<void> {
     if (maxWait) payload.max_wait_time = parseInt(maxWait, 10);
     if (fallbackMailbox === '-') payload.fallback_mailbox = null;
     else if (fallbackMailbox) payload.fallback_mailbox = fallbackMailbox;
+    if (overflowAction) payload.overflow_action = overflowAction;
     payload.announcement_enabled = announcementEnabled;
     payload.announcement_position = announcementPosition;
     if (announcementInterval) payload.announcement_interval = parseInt(announcementInterval, 10);

@@ -64,6 +64,13 @@ def _validate_strategy(value: str) -> str | None:
     return None
 
 
+def _validate_overflow_action(value: str) -> str | None:
+    """Return an error message if the overflow action is invalid, else None."""
+    if value not in ("voicemail", "drop"):
+        return f"Invalid overflow_action '{value}' (supported: voicemail, drop)"
+    return None
+
+
 def _validate_int_fields(data: dict) -> str | None:
     """Bounds-check integer config fields present in the payload."""
     for field, (lo, hi) in _INT_FIELDS.items():
@@ -103,6 +110,8 @@ def _apply_queue_fields(queue: Any, data: dict) -> None:
     if "announcement_file" in data:
         file_name = data["announcement_file"]
         queue.announcement_file = str(file_name) if file_name else None
+    if data.get("overflow_action"):
+        queue.overflow_action = data["overflow_action"]
 
 
 @queues_bp.route("", methods=["GET"])
@@ -162,6 +171,11 @@ def handle_create_queue() -> Response:
         if strategy_error:
             return send_json({"error": strategy_error}, 400)
 
+        if data.get("overflow_action"):
+            overflow_error = _validate_overflow_action(data["overflow_action"])
+            if overflow_error:
+                return send_json({"error": overflow_error}, 400)
+
         bounds_error = _validate_int_fields(data)
         if bounds_error:
             return send_json({"error": bounds_error}, 400)
@@ -194,6 +208,11 @@ def handle_update_queue(queue_number: str) -> Response:
             strategy_error = _validate_strategy(data["strategy"])
             if strategy_error:
                 return send_json({"error": strategy_error}, 400)
+
+        if data.get("overflow_action"):
+            overflow_error = _validate_overflow_action(data["overflow_action"])
+            if overflow_error:
+                return send_json({"error": overflow_error}, 400)
 
         bounds_error = _validate_int_fields(data)
         if bounds_error:

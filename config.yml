@@ -403,6 +403,19 @@ voicemail:
 conference:
   max_participants: 50
   record_conferences: false
+# Attended/blind transfer failure handling. None of these need to be set --
+# defaults match existing behavior. Siblings read by code but not listed
+# here (all under `transfer:`, unchanged by this key): atxferdropcall
+# (default false) drops the transferee immediately on no-answer instead of
+# recalling the transferor; atxfercallbackretries (default 2),
+# atxfernoanswertimeout (default 15s), atxferloopdelay (default 10s) control
+# the recall attempt count/per-attempt timeout/spacing.
+# atxfer_no_answer_action: what happens to the transferee once nobody can
+# take them back (recall disabled, or its retries exhausted).
+#   drop (default): hang up on them, matching prior behavior.
+#   voicemail: record a message into the transfer destination's mailbox.
+transfer:
+  atxfer_no_answer_action: drop
 # Call queues (ACD). SEED ONLY: this section populates the database the
 # first time the PBX starts with an empty call_queues table; after that the
 # database (admin UI / REST API) is authoritative and edits here are ignored.
@@ -421,11 +434,13 @@ conference:
 # Agents: membership is per-queue; login/pause state is global per extension.
 #   *61 = agent login (also clears an auto-pause), *62 = agent logout.
 # Overflow (queue full, no agents, or max wait reached) records a voicemail in
-# fallback_mailbox, defaulting to the queue number itself; retrieve it by
-# dialing *<queue number>, e.g. *8001.
+# fallback_mailbox by default, defaulting to the queue number itself; retrieve
+# it by dialing *<queue number>, e.g. *8001. Set overflow_action: drop on a
+# queue (admin UI / API) to hang up on overflow instead.
 #
 # Per-queue keys: number, name, strategy, ring_timeout, max_wait_time,
-#   max_queue_size, fallback_mailbox, auto_pause_misses, enabled.
+#   max_queue_size, fallback_mailbox, auto_pause_misses, enabled,
+#   overflow_action (voicemail | drop).
 # Strategies: round_robin | least_recent | fewest_calls | random
 #   ('ring_all' is not yet supported and is rejected/downgraded.)
 #

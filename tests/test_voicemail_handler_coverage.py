@@ -1098,3 +1098,79 @@ class TestCompleteVoicemailRecording:
         pbx._build_wav_file.assert_called_with(b"")
         pbx.voicemail_system.save_message.assert_called_once()
         pbx.end_call.assert_called_with("call-1")
+
+
+@pytest.mark.unit
+class TestRecordIntoMailbox:
+    """
+    Tests for record_into_mailbox: shared by call-queue overflow and
+    transfer no-answer handling to record a message from an
+    already-established call into an arbitrary mailbox extension.
+    """
+
+    def test_records_and_starts_timer_and_monitor(self) -> None:
+        pbx = _make_pbx_core()
+        pbx.config.get.side_effect = lambda key, default=None: {
+            "voicemail.max_message_duration": 180,
+        }.get(key, default)
+        mock_player_cls, mock_recorder_cls, _dtmf_cls, _get_prompt = _setup_rtp_mocks()
+        mock_player_cls.return_value.start.return_value = True
+        mock_recorder_cls.return_value.start.return_value = True
+        pbx.voicemail_system.get_mailbox.return_value.get_greeting_path.return_value = None
+
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+
+        with patch("threading.Timer") as mock_timer, patch("threading.Thread") as mock_thread:
+            result = handler.record_into_mailbox(
+                call_obj,
+                "call1",
+                "8001",
+                {"address": "10.0.0.5", "port": 4000},
+                (20000, 20001),
+                hangup_cause="queue_overflow",
+            )
+
+        assert result is True
+        assert call_obj.to_extension == "8001"
+        assert call_obj.routed_to_voicemail is True
+        pbx.cdr_system.end_record.assert_called_once_with("call1", hangup_cause="queue_overflow")
+        assert call_obj.voicemail_recorder is mock_recorder_cls.return_value
+        mock_timer.return_value.start.assert_called_once()
+        mock_thread.return_value.start.assert_called_once()
+
+    def test_returns_false_without_media(self) -> None:
+        pbx = _make_pbx_core()
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+
+        result = handler.record_into_mailbox(
+            call_obj, "call1", "8001", None, None, hangup_cause="queue_overflow"
+        )
+
+        assert result is False
+        # The call record is still rewritten and CDR closed even without
+        # usable media -- only the caller decides how to clean up further.
+        assert call_obj.to_extension == "8001"
+        pbx.cdr_system.end_record.assert_called_once_with("call1", hangup_cause="queue_overflow")
+
+    def test_returns_false_when_recorder_fails(self) -> None:
+        pbx = _make_pbx_core()
+        mock_player_cls, mock_recorder_cls, _dtmf_cls, _get_prompt = _setup_rtp_mocks()
+        mock_player_cls.return_value.start.return_value = True
+        mock_recorder_cls.return_value.start.return_value = False
+        pbx.voicemail_system.get_mailbox.return_value.get_greeting_path.return_value = None
+
+        handler = VoicemailHandler(pbx)
+        call_obj = _make_call()
+
+        result = handler.record_into_mailbox(
+            call_obj,
+            "call1",
+            "8001",
+            {"address": "10.0.0.5", "port": 4000},
+            (20000, 20001),
+            hangup_cause="queue_overflow",
+        )
+
+        assert result is False

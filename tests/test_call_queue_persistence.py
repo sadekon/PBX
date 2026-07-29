@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS call_queues (
     announcement_text VARCHAR(500),
     announcement_file VARCHAR(255),
     announcement_position BOOLEAN DEFAULT 0,
+    overflow_action VARCHAR(20) DEFAULT 'voicemail',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -199,6 +200,17 @@ class TestSeedAndReload:
         assert reloaded.announcement_text is None
         assert reloaded.announcement_file is None
         assert reloaded.announcement_position is False
+        assert reloaded.overflow_action == "voicemail"
+
+    def test_overflow_action_persists(self, _mock_logger, db_path):
+        system = _system(db_path)
+        queue = system.create_queue("8006", "Overflow Test")
+        queue.overflow_action = "drop"
+        system.save_queue(queue)
+
+        reloaded = _system(db_path).get_queue("8006")
+        assert reloaded is not None
+        assert reloaded.overflow_action == "drop"
 
     def test_delete_queue_removes_rows(self, _mock_logger, db_path):
         system = _system(db_path, SEED_CONFIG)

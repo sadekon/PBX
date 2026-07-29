@@ -475,8 +475,17 @@ class TransferSession:
             # The transferee and target are talking to each other now, and the
             # transferor's legs were already closed above.
             self.state = TransferState.BRIDGED
-            self._notify(NOTIFY_OK)
-            self._close()
+            try:
+                self._notify(NOTIFY_OK)
+                self._close()
+            except Exception as exc:
+                # Must not strand on_complete below: it is a one-shot promise
+                # callers depend on for their own cleanup (e.g. the queue
+                # handler releasing the agent's offering exclusion).
+                self.pbx.logger.error(
+                    f"Transfer {self.session_id}: post-bridge teardown raised: {exc}",
+                    exc_info=True,
+                )
 
             # One-shot success callback, after the session is fully closed so
             # the callback sees a clean call record (transfer_session_id
@@ -533,13 +542,26 @@ class TransferSession:
 
             if self.on_failure is not None:
                 # The initiator owns the transferee's leg and handles failure
-                # itself (e.g. an auto attendant replaying its menu).
+                # itself (e.g. an auto attendant replaying its menu). The
+                # callback must fire even if teardown below raises -- it's a
+                # one-shot promise (already cleared from self) callers rely
+                # on for their own cleanup, e.g. the queue handler releasing
+                # the agent's offering exclusion.
                 callback = self.on_failure
                 self.on_failure = None
-                self._sweep(except_roles={LegRole.TRANSFEREE})
-                self._notify(sipfrag)
-                self._close()
-                callback()
+                try:
+                    self._sweep(except_roles={LegRole.TRANSFEREE})
+                    self._notify(sipfrag)
+                    self._close()
+                except Exception as exc:
+                    self.pbx.logger.error(
+                        f"Transfer {self.session_id}: pre-callback teardown raised: {exc}",
+                        exc_info=True,
+                    )
+                try:
+                    callback()
+                except Exception as exc:
+                    self.pbx.logger.error(f"Transfer {self.session_id}: on_failure raised: {exc}")
                 return
 
             if self._recall_eligible():
@@ -549,7 +571,7 @@ class TransferSession:
                 self._start_recall()
                 return
 
-            self._sweep()
+            self._give_up_on_transferee()
             self._notify(sipfrag)
             self._close()
 
@@ -644,6 +666,53 @@ class TransferSession:
         self.pbx.transfer_handler.retire(self)
 
     # ------------------------------------------------------------------
+    # No-answer resolution (transfer.atxfer_no_answer_action)
+    # ------------------------------------------------------------------
+
+    def _no_answer_action(self) -> str:
+        """What to do with the transferee once nobody can take them back."""
+        action = str(self.pbx.config.get("transfer.atxfer_no_answer_action", "drop")).lower()
+        return action if action in ("drop", "voicemail") else "drop"
+
+    def _give_up_on_transferee(self) -> None:
+        """
+        Final resolution once nobody (transferor or recall) can take the
+        transferee back: drop them (default) or record a message into the
+        transfer destination's mailbox, per ``_no_answer_action()``.
+
+        Leaves ``_notify``/``_close`` to the caller, matching each call
+        site's existing sequencing.
+        """
+        destination = self.destination
+        if self._no_answer_action() == "voicemail" and destination:
+            self._sweep(except_roles={LegRole.TRANSFEREE})
+            if not self._route_transferee_to_voicemail(destination):
+                # Nothing usable to record from (call gone, no media) --
+                # fall back to dropping so the transferee isn't stranded on
+                # a relay nobody is driving.
+                self._sweep()
+            return
+        self._sweep()
+
+    def _route_transferee_to_voicemail(self, destination: str) -> bool:
+        """Record a message from the transferee into the destination's mailbox."""
+        original = self.pbx.call_manager.get_call(self.original_call_id)
+        if original is None:
+            return False
+        transferee_side = "callee" if self.transferor_side == "caller" else "caller"
+        party_rtp = original.caller_rtp if transferee_side == "caller" else original.callee_rtp
+        return bool(
+            self.pbx.voicemail_handler.record_into_mailbox(
+                original,
+                self.original_call_id,
+                destination,
+                party_rtp,
+                original.rtp_ports,
+                hangup_cause="transfer_no_answer",
+            )
+        )
+
+    # ------------------------------------------------------------------
     # Recall (Asterisk atxferdropcall=no)
     # ------------------------------------------------------------------
 
@@ -696,7 +765,7 @@ class TransferSession:
             self.complete()
 
     def _on_recall_failure(self, recall: Call | None, reason: str) -> None:
-        """Recall attempt failed: try again, or give up and drop the transferee."""
+        """Recall attempt failed: try again, or give up on the transferee."""
         with self._lock:
             if self._terminal:
                 return
@@ -713,10 +782,8 @@ class TransferSession:
                 timer.start()
                 return
 
-            self.pbx.logger.warning(
-                f"Transfer {self.session_id}: recall exhausted ({reason}); dropping the transferee"
-            )
-            self._sweep()
+            self.pbx.logger.warning(f"Transfer {self.session_id}: recall exhausted ({reason})")
+            self._give_up_on_transferee()
             self._close()
 
     # ------------------------------------------------------------------

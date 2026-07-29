@@ -412,7 +412,7 @@ class QueueCallHandler:
             pbx.logger.info(
                 f"Queue {ctx.queue_number}: overflow at entry for {ctx.call_id} ({reason})"
             )
-            self._spawn(self._overflow_to_voicemail, ctx)
+            self._spawn(self._handle_overflow, ctx)
             return
 
         if not moh_running:
@@ -653,10 +653,17 @@ class QueueCallHandler:
         for ctx in snapshot:
             call = pbx.call_manager.get_call(ctx.call_id)
             if call is None:
-                # Ended elsewhere (e.g. end_call raced us): drop tracking.
+                # Ended elsewhere (e.g. end_call raced us): drop tracking. If
+                # an agent leg was ringing, release the offering exclusion
+                # too -- normally the TransferSession's own on_failure does
+                # this, but a call bypassed outside the normal BYE/transfer
+                # path (or a raised exception during that teardown) could
+                # otherwise strand the extension out of selection forever.
                 with self._lock:
                     if ctx.state not in TERMINAL_STATES:
                         ctx.state = QueueCallState.DONE
+                    if ctx.current_agent is not None:
+                        self._offering.discard(ctx.current_agent)
                     self._forget_locked(ctx)
                 continue
 
@@ -683,7 +690,7 @@ class QueueCallHandler:
                             f"Queue {ctx.queue_number}: no agents available for "
                             f"{ctx.call_id}, overflowing to voicemail"
                         )
-                        self._spawn(self._overflow_to_voicemail, ctx)
+                        self._spawn(self._handle_overflow, ctx)
                         continue
 
                 if ctx.wait_seconds() >= max_wait:
@@ -694,7 +701,7 @@ class QueueCallHandler:
                             continue
                         ctx.state = QueueCallState.OVERFLOW_PENDING
                     pbx.logger.info(f"Queue {ctx.queue_number}: max wait reached for {ctx.call_id}")
-                    self._spawn(self._overflow_to_voicemail, ctx)
+                    self._spawn(self._handle_overflow, ctx)
                 elif now >= ctx.retry_at:
                     self._spawn(self._offer_worker, ctx)
 
@@ -824,7 +831,7 @@ class QueueCallHandler:
             return
 
         # OVERFLOW_PENDING latched while cycling agents.
-        self._overflow_to_voicemail(ctx)
+        self._handle_overflow(ctx)
 
     def _on_offer_failure(self, ctx: QueueCallContext, agent_ext: str, holder: list[Any]) -> None:
         """
@@ -858,7 +865,7 @@ class QueueCallHandler:
                 overflow_now = ctx.state == QueueCallState.OVERFLOW_PENDING
 
             if overflow_now:
-                self._overflow_to_voicemail(ctx)
+                self._handle_overflow(ctx)
             else:
                 # Caller kept their position (never dequeued); ring the next
                 # agent immediately.
@@ -1024,20 +1031,69 @@ class QueueCallHandler:
             return Path(temp_file.name), True
 
     # ------------------------------------------------------------------
-    # Overflow: voicemail into the queue's mailbox
+    # Overflow: voicemail into the queue's mailbox, or drop
     # ------------------------------------------------------------------
+
+    def _handle_overflow(self, ctx: QueueCallContext) -> None:
+        """Dispatch an overflowing caller per the queue's overflow_action."""
+        queue = self.pbx_core.queue_system.get_queue(ctx.queue_number)
+        if queue is not None and queue.overflow_action == "drop":
+            self._overflow_drop(ctx)
+        else:
+            self._overflow_to_voicemail(ctx)
+
+    def _overflow_drop(self, ctx: QueueCallContext) -> None:
+        """
+        Overflow-drop: end the call instead of recording a message, when
+        queue.overflow_action is 'drop'.
+
+        Runs on a worker thread (matches _overflow_to_voicemail).
+        """
+        from pbx.features.webhooks import WebhookEvent
+
+        pbx = self.pbx_core
+
+        with self._lock:
+            if ctx.state in TERMINAL_STATES:
+                return
+            ctx.state = QueueCallState.DONE
+            waiting = self._waiting.get(ctx.queue_number)
+            if waiting and ctx.call_id in waiting:
+                waiting.remove(ctx.call_id)
+
+        pbx.logger.info(f"Queue {ctx.queue_number}: dropping {ctx.call_id} on overflow")
+        pbx.webhook_system.trigger_event(
+            WebhookEvent.QUEUE_CALL_OVERFLOW,
+            {
+                "call_id": ctx.call_id,
+                "queue": ctx.queue_number,
+                "caller": ctx.caller_ext,
+                "mailbox": None,
+            },
+        )
+
+        pbx.moh_system.stop_moh(ctx.call_id)
+        pbx.cdr_system.end_record(ctx.call_id, hangup_cause="queue_overflow_drop")
+
+        call = pbx.call_manager.get_call(ctx.call_id)
+        if call is not None:
+            pbx.voicemail_handler._send_bye_to_caller(call, ctx.call_id)
+            call.queue_ctx = None
+
+        with self._lock:
+            self._forget_locked(ctx)
+        pbx.end_call(ctx.call_id)
+        self._push_stats()
 
     def _overflow_to_voicemail(self, ctx: QueueCallContext) -> None:
         """
-        Divert a queued caller to the queue's voicemail box: stop MOH, take
-        the relay's port back for a player/recorder, play greeting + beep,
-        and record until max duration, '#', or hangup.
+        Divert a queued caller to the queue's voicemail box: stop MOH and
+        record via the shared VoicemailHandler.record_into_mailbox (greeting
+        + beep, record until max duration, '#', or hangup).
 
         Runs on a worker thread (audio playback blocks).
         """
         from pbx.features.webhooks import WebhookEvent
-        from pbx.rtp.dtmf_monitor import build_ivr_dtmf_channel
-        from pbx.rtp.handler import RTPPlayer
 
         pbx = self.pbx_core
 
@@ -1073,109 +1129,27 @@ class QueueCallHandler:
 
         pbx.moh_system.stop_moh(ctx.call_id)
 
-        # Stop the relay handler in place (record kept so the final
-        # end_call -> release_relay port bookkeeping stays consistent) and
-        # reuse its port for the greeting player and recorder.
-        relay_info = pbx.rtp_relay.active_relays.get(ctx.call_id)
-        if relay_info:
-            relay_info["handler"].stop()
-
-        # Rewrite the record so every downstream voicemail path (completion,
-        # hangup auto-save) keys off the queue mailbox.
-        call.to_extension = mailbox_key
-        call.routed_to_voicemail = True
-        # First end_record wins: record the overflow cause now.
-        pbx.cdr_system.end_record(ctx.call_id, hangup_cause="queue_overflow")
-
         transferee_rtp = call.caller_rtp if ctx.transferee_side == "caller" else call.callee_rtp
-        if not transferee_rtp or not call.rtp_ports:
-            pbx.logger.error(f"Queue overflow: no media info for {ctx.call_id}, ending call")
+        started = pbx.voicemail_handler.record_into_mailbox(
+            call,
+            ctx.call_id,
+            mailbox_key,
+            transferee_rtp,
+            call.rtp_ports,
+            hangup_cause="queue_overflow",
+        )
+        if not started:
+            pbx.logger.error(f"Queue overflow: could not record {ctx.call_id}, ending call")
             with self._lock:
                 ctx.state = QueueCallState.DONE
                 self._forget_locked(ctx)
             call.queue_ctx = None
             pbx.end_call(ctx.call_id)
             return
-
-        # Greeting + beep (queue mailbox greeting, else the default prompt).
-        try:
-            player = RTPPlayer(
-                local_port=call.rtp_ports[0],
-                remote_host=transferee_rtp["address"],
-                remote_port=transferee_rtp["port"],
-                call_id=ctx.call_id,
-            )
-            if player.start():
-                self._play_greeting(player, mailbox_key)
-                player.play_beep(frequency=1000, duration_ms=500)
-                player.stop()
-        except OSError as exc:
-            pbx.logger.error(f"Queue overflow greeting failed for {ctx.call_id}: {exc}")
-
-        recorder, _monitor = build_ivr_dtmf_channel(pbx, call, ctx.call_id, call.rtp_ports[0])
-        if not recorder.start():
-            pbx.logger.error(f"Queue overflow recorder failed for {ctx.call_id}")
-            with self._lock:
-                ctx.state = QueueCallState.DONE
-                self._forget_locked(ctx)
-            call.queue_ctx = None
-            pbx.end_call(ctx.call_id)
-            return
-
-        call.voicemail_recorder = recorder
-        max_duration: int = pbx.config.get("voicemail.max_message_duration", 180)
-        timer = threading.Timer(
-            max_duration,
-            pbx.voicemail_handler.complete_voicemail_recording,
-            args=(ctx.call_id,),
-        )
-        timer.daemon = True
-        timer.start()
-        call.voicemail_timer = timer
-
-        # '#' finishes the recording via the standard monitor.
-        monitor_thread = threading.Thread(
-            target=pbx.voicemail_handler.monitor_voicemail_dtmf,
-            args=(ctx.call_id, call, recorder),
-            daemon=True,
-        )
-        monitor_thread.start()
 
         with self._lock:
             self._forget_locked(ctx, keep_context=True)
         self._push_stats()
-
-    def _play_greeting(self, player: Any, mailbox_key: str) -> None:
-        """Play the mailbox's custom greeting, or the default prompt"""
-        import contextlib
-        import tempfile
-
-        from pbx.utils.audio import get_prompt_audio
-
-        pbx = self.pbx_core
-
-        greeting_path: str | None = None
-        with contextlib.suppress(Exception):
-            mailbox = pbx.voicemail_system.get_mailbox(mailbox_key)
-            candidate = mailbox.get_greeting_path()
-            if candidate and Path(candidate).exists():
-                greeting_path = candidate
-
-        if greeting_path:
-            player.play_file(greeting_path)
-            time.sleep(0.3)
-            return
-
-        prompt = get_prompt_audio("leave_message")
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-            temp_file.write(prompt)
-            temp_path = temp_file.name
-        try:
-            player.play_file(temp_path)
-            time.sleep(0.3)
-        finally:
-            with contextlib.suppress(OSError):
-                Path(temp_path).unlink()
 
     # ------------------------------------------------------------------
     # Star codes: *61 login / *62 logout

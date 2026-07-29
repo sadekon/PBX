@@ -45,8 +45,11 @@ from pbx.core.transfer_handler import TransferHandler
 from pbx.core.transfer_session import (
     LegEvent,
     LegEventResult,
+    LegRef,
     LegRole,
     LegStatus,
+    TransferMode,
+    TransferSession,
     TransferState,
 )
 from pbx.rtp.handler import RTPRelay
@@ -823,6 +826,173 @@ class TestTeardownGuarantees:
         assert cm.get_call("call1").transfer_session_id is None
         assert cm.get_call(target_id).transfer_session_id is None
         assert not pbx.transfer_handler.sessions
+
+    def test_abort_on_failure_callback_fires_even_if_teardown_raises(
+        self, cm: CallManager, relay: RTPRelay
+    ) -> None:
+        """Regression: a call queue's on_failure releases its agent-offering
+        exclusion. If _sweep/_notify/_close raises during an on_failure abort
+        (e.g. a bug tearing down the agent's leg), the callback must still
+        fire -- otherwise that agent is silently excluded from selection
+        forever, since nothing else ever revisits it."""
+        pbx = _wire_pbx(cm, relay)
+        callback = MagicMock()
+        session = TransferSession(
+            pbx=pbx,
+            mode=TransferMode.BLIND,
+            original_call_id="c1",
+            transferor_side="caller",
+            transferor_extension="2000",
+            transferee_extension="1001",
+            on_failure=callback,
+        )
+        session._sweep = MagicMock(side_effect=RuntimeError("boom"))
+
+        session.abort("no_answer")
+
+        callback.assert_called_once()
+        assert session.on_failure is None  # one-shot: cleared even though sweep raised
+        pbx.logger.error.assert_called()
+
+    def test_complete_on_complete_callback_fires_even_if_teardown_raises(
+        self, cm: CallManager, relay: RTPRelay
+    ) -> None:
+        """Same guarantee on the success path: a call queue's on_complete
+        records the answer and releases the agent-offering exclusion."""
+        pbx = _wire_pbx(cm, relay)
+        pbx.transfer_handler.bridge = MagicMock(return_value=True)
+        cm.create_call("c1", "2000", "1001")
+        cm.create_call("target1", "1001", "1002")
+        callback = MagicMock()
+        session = TransferSession(
+            pbx=pbx,
+            mode=TransferMode.BLIND,
+            original_call_id="c1",
+            transferor_side="caller",
+            transferor_extension="2000",
+            transferee_extension="1001",
+            target_call_id="target1",
+            on_complete=callback,
+        )
+        session.legs = {
+            LegRole.TRANSFEROR: [],
+            LegRole.TRANSFEREE: [],
+            LegRole.TARGET: [LegRef("target1", "callee", LegStatus.ANSWERED)],
+        }
+        session._notify = MagicMock(side_effect=RuntimeError("boom"))
+        session._close = MagicMock()
+
+        result = session.complete()
+
+        assert result is True
+        callback.assert_called_once()
+        assert session.on_complete is None
+        pbx.logger.error.assert_called()
+
+
+@pytest.mark.unit
+class TestNoAnswerAction:
+    """transfer.atxfer_no_answer_action: what happens to the transferee once
+    nobody can take them back (recall disabled, or its retries exhausted)."""
+
+    def test_default_drops_transferee(self, cm: CallManager, relay: RTPRelay) -> None:
+        pbx = _wire_pbx(cm, relay)
+        session = TransferSession(
+            pbx=pbx,
+            mode=TransferMode.BLIND,
+            original_call_id="c1",
+            transferor_side="caller",
+            transferor_extension="2000",
+            transferee_extension="1001",
+            destination="1001",
+        )
+        session._sweep = MagicMock()
+
+        session._give_up_on_transferee()
+
+        session._sweep.assert_called_once_with()
+        assert not pbx.voicemail_handler.record_into_mailbox.called
+
+    def test_voicemail_records_into_destination_mailbox(
+        self, cm: CallManager, relay: RTPRelay
+    ) -> None:
+        pbx = _wire_pbx(cm, relay)
+        pbx.config.get.side_effect = lambda key, default=None: (
+            "voicemail" if key == "transfer.atxfer_no_answer_action" else default
+        )
+        cm.create_call("c1", "2000", "1001")
+        original = cm.get_call("c1")
+        original.caller_rtp = B_RTP
+        original.rtp_ports = (40000, 40001)
+        pbx.voicemail_handler.record_into_mailbox.return_value = True
+
+        session = TransferSession(
+            pbx=pbx,
+            mode=TransferMode.BLIND,
+            original_call_id="c1",
+            transferor_side="callee",
+            transferor_extension="2000",
+            transferee_extension="1001",
+            destination="1001",
+        )
+        session._sweep = MagicMock()
+
+        session._give_up_on_transferee()
+
+        session._sweep.assert_called_once_with(except_roles={LegRole.TRANSFEREE})
+        pbx.voicemail_handler.record_into_mailbox.assert_called_once_with(
+            original, "c1", "1001", B_RTP, (40000, 40001), hangup_cause="transfer_no_answer"
+        )
+
+    def test_voicemail_falls_back_to_drop_when_nothing_to_record(
+        self, cm: CallManager, relay: RTPRelay
+    ) -> None:
+        """destination set but the original call is already gone -- fall
+        back to a full sweep instead of leaving the transferee stranded."""
+        pbx = _wire_pbx(cm, relay)
+        pbx.config.get.side_effect = lambda key, default=None: (
+            "voicemail" if key == "transfer.atxfer_no_answer_action" else default
+        )
+        session = TransferSession(
+            pbx=pbx,
+            mode=TransferMode.BLIND,
+            original_call_id="gone",
+            transferor_side="caller",
+            transferor_extension="2000",
+            transferee_extension="1001",
+            destination="1001",
+        )
+        session._sweep = MagicMock()
+
+        session._give_up_on_transferee()
+
+        assert session._sweep.call_count == 2
+        session._sweep.assert_any_call(except_roles={LegRole.TRANSFEREE})
+        session._sweep.assert_any_call()
+
+    def test_no_destination_stays_drop(self, cm: CallManager, relay: RTPRelay) -> None:
+        """voicemail action but no destination on record (e.g. attended
+        transfer with no explicit target extension) -- nothing to key a
+        mailbox by, so just drop."""
+        pbx = _wire_pbx(cm, relay)
+        pbx.config.get.side_effect = lambda key, default=None: (
+            "voicemail" if key == "transfer.atxfer_no_answer_action" else default
+        )
+        session = TransferSession(
+            pbx=pbx,
+            mode=TransferMode.BLIND,
+            original_call_id="c1",
+            transferor_side="caller",
+            transferor_extension="2000",
+            transferee_extension="1001",
+            destination=None,
+        )
+        session._sweep = MagicMock()
+
+        session._give_up_on_transferee()
+
+        session._sweep.assert_called_once_with()
+        assert not pbx.voicemail_handler.record_into_mailbox.called
 
 
 # ===========================================================================

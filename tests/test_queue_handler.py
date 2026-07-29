@@ -505,6 +505,60 @@ class TestSweep:
 
 
 @pytest.mark.unit
+class TestOverflowAction:
+    def test_handle_overflow_defaults_to_voicemail(self, pbx, handler):
+        _seed_queue(pbx)  # overflow_action defaults to "voicemail"
+        with patch.object(handler, "_answer_caller", return_value=True):
+            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
+        ctx = pbx.call_manager.get_call("c1").queue_ctx
+
+        with (
+            patch.object(handler, "_overflow_to_voicemail") as voicemail,
+            patch.object(handler, "_overflow_drop") as drop,
+        ):
+            handler._handle_overflow(ctx)
+
+        voicemail.assert_called_once_with(ctx)
+        assert not drop.called
+
+    def test_handle_overflow_dispatches_to_drop(self, pbx, handler):
+        _seed_queue(pbx, overflow_action="drop")
+        with patch.object(handler, "_answer_caller", return_value=True):
+            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
+        ctx = pbx.call_manager.get_call("c1").queue_ctx
+
+        with (
+            patch.object(handler, "_overflow_to_voicemail") as voicemail,
+            patch.object(handler, "_overflow_drop") as drop,
+        ):
+            handler._handle_overflow(ctx)
+
+        drop.assert_called_once_with(ctx)
+        assert not voicemail.called
+
+    def test_overflow_drop_ends_call_without_recording(self, pbx, handler):
+        from pbx.core.queue_handler import QueueCallState
+
+        _seed_queue(pbx, overflow_action="drop")
+        with patch.object(handler, "_answer_caller", return_value=True):
+            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
+        ctx = pbx.call_manager.get_call("c1").queue_ctx
+        call = pbx.call_manager.get_call("c1")
+
+        handler._overflow_drop(ctx)
+
+        assert ctx.state == QueueCallState.DONE
+        pbx.moh_system.stop_moh.assert_called_once_with("c1")
+        pbx.cdr_system.end_record.assert_called_once_with("c1", hangup_cause="queue_overflow_drop")
+        pbx.voicemail_handler._send_bye_to_caller.assert_called_once_with(call, "c1")
+        assert not pbx.voicemail_handler.record_into_mailbox.called
+        assert call.queue_ctx is None
+        with handler._lock:
+            assert "c1" not in handler._contexts
+        assert pbx.queue_system.get_queue_status("8001")["calls_waiting"] == 0
+
+
+@pytest.mark.unit
 class TestHoldAnnouncements:
     def test_resolve_prefers_announcement_file(self, pbx, handler, tmp_path):
         (tmp_path / "announcements").mkdir()

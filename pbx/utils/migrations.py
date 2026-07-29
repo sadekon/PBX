@@ -752,3 +752,12 @@ def register_all_migrations(manager: MigrationManager) -> None:
         ALTER TABLE call_queues ADD COLUMN announcement_position BOOLEAN DEFAULT {BOOLEAN_FALSE};
     """),
     )
+
+    # Migration 1015: Queue Overflow Action
+    manager.register_migration(
+        1015,
+        "Queue Overflow Action",
+        manager._build_migration_sql("""
+        ALTER TABLE call_queues ADD COLUMN overflow_action VARCHAR(20) DEFAULT 'voicemail';
+    """),
+    )

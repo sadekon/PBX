@@ -151,6 +151,21 @@ class TestQueueCrud:
             )
         assert response.status_code == 400
 
+    def test_update_overflow_action(self, api_client: FlaskClient, queue_system) -> None:
+        queue_system.create_queue("8001", "Sales")
+        with patch(AUTH_PATCH, return_value=AUTH_RETURN):
+            response = api_client.put("/api/queues/8001", json={"overflow_action": "drop"})
+        assert response.status_code == 200, _json(response)
+        assert queue_system.get_queue("8001").overflow_action == "drop"
+
+    def test_update_rejects_bad_overflow_action(
+        self, api_client: FlaskClient, queue_system
+    ) -> None:
+        queue_system.create_queue("8001", "Sales")
+        with patch(AUTH_PATCH, return_value=AUTH_RETURN):
+            response = api_client.put("/api/queues/8001", json={"overflow_action": "bogus"})
+        assert response.status_code == 400
+
     def test_delete(self, api_client: FlaskClient, queue_system) -> None:
         queue_system.create_queue("8001", "Sales")
         with patch(AUTH_PATCH, return_value=AUTH_RETURN):
