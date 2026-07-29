@@ -94,6 +94,7 @@ class CallQueue:
         announcement_file: str | None = None,
         announcement_position: bool = False,
         overflow_action: str = "voicemail",
+        max_redials: int = 0,
     ) -> None:
         """
         Initialize call queue
@@ -119,6 +120,10 @@ class CallQueue:
             overflow_action: What happens to a caller on overflow (queue
                 full, no agents, or max wait reached) -- "voicemail"
                 (default, records into fallback_mailbox) or "drop" (hang up)
+            max_redials: Extra times one caller may be offered to the same
+                agent after the first attempt (0 = offer each agent once).
+                Once every selectable agent is spent the caller overflows
+                rather than holding for max_wait_time.
         """
         self.queue_number = queue_number
         self.name = name
@@ -137,6 +142,7 @@ class CallQueue:
         self.overflow_action = (
             overflow_action if overflow_action in ("voicemail", "drop") else "voicemail"
         )
+        self.max_redials = max(0, max_redials)
         # Member extensions; Agent objects are owned globally by QueueSystem.
         self.members: set[str] = set()
         # Extension last offered a call under round-robin; the rotation
@@ -346,6 +352,7 @@ class QueueSystem:
             announcement_file=row.get("announcement_file"),
             announcement_position=bool(row.get("announcement_position", False)),
             overflow_action=row.get("overflow_action") or "voicemail",
+            max_redials=row.get("max_redials") or 0,
         )
 
     def _config_queue_entries(self) -> list[dict]:
@@ -386,6 +393,7 @@ class QueueSystem:
                 announcement_file=entry.get("announcement_file"),
                 announcement_position=bool(entry.get("announcement_position", False)),
                 overflow_action=entry.get("overflow_action") or "voicemail",
+                max_redials=int(entry.get("max_redials", 0)),
             )
             for ext in entry.get("agents", []) or []:
                 queue.members.add(str(ext))
@@ -666,6 +674,7 @@ class QueueSystem:
                 "announcement_file": queue.announcement_file,
                 "announcement_position": queue.announcement_position,
                 "overflow_action": queue.overflow_action,
+                "max_redials": queue.max_redials,
                 "members": members,
                 "calls_waiting": waiting,
                 "longest_wait": longest_wait,
@@ -693,8 +702,9 @@ class QueueSystem:
                     (queue_number, name, strategy, ring_timeout, max_wait_time,
                      max_queue_size, fallback_mailbox, auto_pause_misses, enabled,
                      announcement_enabled, announcement_interval, announcement_text,
-                     announcement_file, announcement_position, overflow_action, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     announcement_file, announcement_position, overflow_action,
+                     max_redials, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (queue_number) DO UPDATE SET
                     name = EXCLUDED.name,
                     strategy = EXCLUDED.strategy,
@@ -710,6 +720,7 @@ class QueueSystem:
                     announcement_file = EXCLUDED.announcement_file,
                     announcement_position = EXCLUDED.announcement_position,
                     overflow_action = EXCLUDED.overflow_action,
+                    max_redials = EXCLUDED.max_redials,
                     updated_at = EXCLUDED.updated_at
                 """,
                 (
@@ -728,6 +739,7 @@ class QueueSystem:
                     queue.announcement_file,
                     queue.announcement_position,
                     queue.overflow_action,
+                    queue.max_redials,
                     datetime.now(tz=UTC),
                 ),
             )

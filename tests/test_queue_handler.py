@@ -8,6 +8,7 @@ the context/state orchestration under test.
 
 import threading
 import time
+from collections import Counter
 from contextlib import nullcontext
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
@@ -283,13 +284,15 @@ class TestPickAgent:
     def test_claims_agent_and_marks_offering(self, pbx, handler):
         ctx = _two_agent_ctx(pbx, handler)
         queue = pbx.queue_system.get_queue("8001")
+        offers = Counter()
 
-        agent_ext = handler._pick_agent(ctx, queue, set())
+        agent_ext = handler._pick_agent(ctx, queue, offers)
 
         assert agent_ext in ("1001", "1002")
         assert ctx.state.value == "offering"
         assert ctx.current_agent == agent_ext
         assert ctx.attempts == 1
+        assert offers[agent_ext] == 1
         # Claimed, so a second caller cannot be offered the same agent.
         with handler._lock:
             assert agent_ext in handler._offering
@@ -298,14 +301,20 @@ class TestPickAgent:
         ctx = _two_agent_ctx(pbx, handler)
         pbx.extension_registry.is_registered.return_value = False
 
-        assert handler._pick_agent(ctx, pbx.queue_system.get_queue("8001"), set()) is None
+        assert handler._pick_agent(ctx, pbx.queue_system.get_queue("8001"), Counter()) is None
         assert ctx.state.value == "waiting"
 
-    def test_skips_already_tried(self, pbx, handler):
-        ctx = _two_agent_ctx(pbx, handler)
+    def test_skips_agent_that_spent_its_budget(self, pbx, handler):
+        ctx = _two_agent_ctx(pbx, handler)  # max_redials defaults to 0 -> budget 1
         queue = pbx.queue_system.get_queue("8001")
 
-        assert handler._pick_agent(ctx, queue, {"1001"}) == "1002"
+        assert handler._pick_agent(ctx, queue, Counter({"1001": 1})) == "1002"
+
+    def test_redials_same_agent_while_budget_remains(self, pbx, handler):
+        ctx = _two_agent_ctx(pbx, handler, max_redials=1)  # budget 2
+        queue = pbx.queue_system.get_queue("8001")
+
+        assert handler._pick_agent(ctx, queue, Counter({"1001": 1})) == "1001"
 
     def test_none_when_caller_no_longer_waiting(self, pbx, handler):
         from pbx.core.queue_handler import QueueCallState
@@ -313,7 +322,90 @@ class TestPickAgent:
         ctx = _two_agent_ctx(pbx, handler)
         ctx.state = QueueCallState.ABANDONED
 
-        assert handler._pick_agent(ctx, pbx.queue_system.get_queue("8001"), set()) is None
+        assert handler._pick_agent(ctx, pbx.queue_system.get_queue("8001"), Counter()) is None
+
+    def test_expired_offering_claim_is_released(self, pbx, handler):
+        """
+        Regression: _offering was a plain set only ever cleared by the path
+        that added it, so one missed release excluded that extension from
+        every queue until the process restarted -- the reported symptom of
+        only one of two active agents ever getting calls.
+        """
+        ctx = _two_agent_ctx(pbx, handler)
+        queue = pbx.queue_system.get_queue("8001")
+        with handler._lock:
+            handler._offering["1001"] = time.monotonic() - 1  # already expired
+            handler._offering["1002"] = time.monotonic() + 300  # still ringing
+
+        assert handler._pick_agent(ctx, queue, Counter()) == "1001"
+        with handler._lock:
+            assert "1002" in handler._offering  # live claim untouched
+
+
+@pytest.mark.unit
+class TestRetryBudget:
+    def test_not_exhausted_while_budget_remains(self, pbx, handler):
+        _two_agent_ctx(pbx, handler)
+        queue = pbx.queue_system.get_queue("8001")
+
+        assert handler._retries_exhausted(queue, Counter({"1001": 1})) is False
+
+    def test_exhausted_once_every_selectable_agent_is_spent(self, pbx, handler):
+        _two_agent_ctx(pbx, handler)
+        queue = pbx.queue_system.get_queue("8001")
+
+        assert handler._retries_exhausted(queue, Counter({"1001": 1, "1002": 1})) is True
+
+    def test_logged_out_agents_do_not_count(self, pbx, handler):
+        """All agents gone is the no-agent grace path's job, not this one."""
+        _two_agent_ctx(pbx, handler)
+        queue = pbx.queue_system.get_queue("8001")
+        pbx.queue_system.set_agent_login("1001", False)
+        pbx.queue_system.set_agent_login("1002", False)
+
+        assert handler._retries_exhausted(queue, Counter()) is False
+
+    def test_budget_follows_max_redials(self, pbx, handler):
+        _two_agent_ctx(pbx, handler, max_redials=2)
+        queue = pbx.queue_system.get_queue("8001")
+
+        assert handler._offer_budget(queue) == 3
+        assert handler._retries_exhausted(queue, Counter({"1001": 3, "1002": 2})) is False
+        assert handler._retries_exhausted(queue, Counter({"1001": 3, "1002": 3})) is True
+
+
+@pytest.mark.unit
+class TestSelectionReport:
+    def _report(self, pbx, handler, offers=None):
+        return handler._selection_report(
+            pbx.queue_system.get_queue("8001"), offers if offers is not None else Counter()
+        )
+
+    def test_names_spent_budget(self, pbx, handler):
+        _two_agent_ctx(pbx, handler)
+        assert "1001: offered 1/1" in self._report(pbx, handler, Counter({"1001": 1}))
+
+    def test_names_logged_out_and_paused(self, pbx, handler):
+        _two_agent_ctx(pbx, handler)
+        pbx.queue_system.set_agent_login("1001", False)
+        pbx.queue_system.set_agent_pause("1002", True, "auto_missed")
+
+        report = self._report(pbx, handler)
+        assert "1001: logged out" in report
+        assert "1002: paused (auto_missed)" in report
+
+    def test_names_unregistered(self, pbx, handler):
+        _two_agent_ctx(pbx, handler)
+        pbx.extension_registry.is_registered.return_value = False
+
+        assert "1001: not registered" in self._report(pbx, handler)
+
+    def test_names_busy_call(self, pbx, handler):
+        """The gate the queue layer cannot fix: a leaked call record."""
+        _two_agent_ctx(pbx, handler)
+        pbx.call_manager.create_call("stuck", "2000", "1001")
+
+        assert "1001: busy on stuck" in self._report(pbx, handler)
 
 
 @pytest.mark.unit
@@ -355,13 +447,12 @@ class TestOfferAgent:
 
 @pytest.mark.unit
 class TestResolveOffer:
-    def _resolve(self, pbx, handler, ctx, agent_ext="1001", tried=None):
+    def _resolve(self, pbx, handler, ctx, agent_ext="1001"):
         return handler._resolve_offer(
             ctx,
             pbx.queue_system.get_queue("8001"),
             pbx.call_manager.get_call("c1"),
             agent_ext,
-            tried if tried is not None else set(),
         )
 
     def test_answered_records_and_stops(self, pbx, handler):
@@ -380,28 +471,24 @@ class TestResolveOffer:
         """A DND phone refuses the INVITE: pause it instead of redialing."""
         ctx = _two_agent_ctx(pbx, handler)
         _resolve_transfer_with(pbx, "on_failure", "target_rejected")
-        tried: set[str] = set()
 
-        assert self._resolve(pbx, handler, ctx, "1001", tried) is False
+        assert self._resolve(pbx, handler, ctx, "1001") is False
 
         agent = pbx.queue_system.get_agent("1001")
         assert agent.paused is True
         assert agent.pause_reason == "auto_rejected"
-        assert "1001" in tried
 
     def test_ring_out_counts_miss_not_pause(self, pbx, handler):
         """No-answer is not a refusal: count a miss, leave the agent active."""
         ctx = _two_agent_ctx(pbx, handler)
         _resolve_transfer_with(pbx, "on_failure", "no_answer")
-        tried: set[str] = set()
 
-        assert self._resolve(pbx, handler, ctx, "1001", tried) is False
+        assert self._resolve(pbx, handler, ctx, "1001") is False
 
         agent = pbx.queue_system.get_agent("1001")
         assert agent.consecutive_misses == 1
         assert agent.paused is False
         assert ctx.state.value == "waiting"
-        assert "1001" in tried
 
     def test_caller_hangup_abandons(self, pbx, handler):
         ctx = _two_agent_ctx(pbx, handler)
@@ -418,7 +505,7 @@ class TestResolveOffer:
         ctx = _two_agent_ctx(pbx, handler)
         queue = pbx.queue_system.get_queue("8001")
         _resolve_transfer_with(pbx, "on_failure", "no_answer")
-        agent_ext = handler._pick_agent(ctx, queue, set())
+        agent_ext = handler._pick_agent(ctx, queue, Counter())
 
         self._resolve(pbx, handler, ctx, agent_ext)
 
@@ -514,6 +601,48 @@ class TestCallerLoop:
 
         queue = pbx.queue_system.get_queue("8001")
         assert handler._overflow_reason(ctx, queue, None) is None
+
+    def test_overflows_once_every_agent_has_had_its_attempts(self, pbx, handler):
+        """
+        Each agent is offered 1 + max_redials times for one caller, then the
+        caller overflows immediately rather than holding to max_wait_time.
+        """
+        _seed_queue(pbx, agents=("1001", "1002"), max_wait_time=300, max_redials=1)
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
+        offered = []
+
+        def _offer(_ctx, _queue, _call, agent_ext):
+            offered.append(agent_ext)
+            return "no_answer"
+
+        with (
+            patch.object(handler, "_offer_agent", side_effect=_offer),
+            patch.object(handler, "_handle_overflow") as overflow,
+        ):
+            handler._caller_loop(ctx)
+
+        # budget = 1 + max_redials = 2 attempts each, across two agents
+        assert sorted(offered) == ["1001", "1001", "1002", "1002"]
+        overflow.assert_called_once_with(ctx)
+
+    def test_each_agent_offered_once_by_default(self, pbx, handler):
+        _seed_queue(pbx, agents=("1001", "1002"), max_wait_time=300)
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
+        offered = []
+
+        def _offer(_ctx, _queue, _call, agent_ext):
+            offered.append(agent_ext)
+            return "no_answer"
+
+        with (
+            patch.object(handler, "_offer_agent", side_effect=_offer),
+            patch.object(handler, "_handle_overflow"),
+        ):
+            handler._caller_loop(ctx)
+
+        assert sorted(offered) == ["1001", "1002"]
 
     def test_dead_call_is_released(self, pbx, handler):
         _seed_queue(pbx)

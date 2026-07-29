@@ -34,6 +34,7 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -163,9 +164,13 @@ class QueueCallHandler:
         self._contexts: dict[str, QueueCallContext] = {}
         # FIFO of call_ids per queue (position = index while non-terminal).
         self._waiting: dict[str, list[str]] = {}
-        # Agents with an offer leg currently ringing. Genuinely cross-caller:
-        # it stops two callers offering the same agent at once.
-        self._offering: set[str] = set()
+        # Agents with an offer leg currently ringing, mapped to the monotonic
+        # time their claim expires. Genuinely cross-caller: it stops two
+        # callers offering the same agent at once. Expiring rather than
+        # relying solely on an explicit release matters -- a claim that never
+        # got released used to exclude that extension from every queue until
+        # the process restarted, with nothing to show why.
+        self._offering: dict[str, float] = {}
         # call_id -> the one thread that owns that caller's decisions.
         self._owners: dict[str, threading.Thread] = {}
         self._stats_thread: threading.Thread | None = None
@@ -715,9 +720,10 @@ class QueueCallHandler:
         pbx = self.pbx_core
         # Loop-local: only this thread reads them, so they are not shared
         # state and need no locking.
-        tried: set[str] = set()
+        offers: Counter[str] = Counter()
         no_agents_since: float | None = None
         last_announcement = time.monotonic()
+        logged_idle = False
 
         try:
             while not self._stop.is_set():
@@ -760,16 +766,32 @@ class QueueCallHandler:
                     last_announcement = time.monotonic()
                     continue
 
-                agent_ext = self._pick_agent(ctx, queue, tried)
+                agent_ext = self._pick_agent(ctx, queue, offers)
                 if agent_ext is None:
-                    # Nobody offerable right now: clear the exclusion cycle
-                    # once everyone has been tried, then pace the next pass.
-                    tried.clear()
+                    # Everyone who could take this call has had their allowed
+                    # attempts: stop waiting rather than holding to max_wait.
+                    if self._retries_exhausted(queue, offers):
+                        pbx.logger.info(
+                            f"Queue {ctx.queue_number}: every agent has had "
+                            f"{self._offer_budget(queue)} attempt(s) for "
+                            f"{ctx.call_id}; overflowing"
+                        )
+                        self._handle_overflow(ctx)
+                        return
+                    # Otherwise agents still have attempts left but none are
+                    # reachable this instant. Say why once, then pace.
+                    if not logged_idle:
+                        pbx.logger.info(
+                            f"Queue {ctx.queue_number}: nobody offerable for "
+                            f"{ctx.call_id} -- {self._selection_report(queue, offers)}"
+                        )
+                        logged_idle = True
                     ctx.wake.wait(SWEEP_INTERVAL_SECONDS)
                     ctx.wake.clear()
                     continue
 
-                if self._resolve_offer(ctx, queue, call, agent_ext, tried):
+                logged_idle = False
+                if self._resolve_offer(ctx, queue, call, agent_ext):
                     return
         except Exception as exc:
             pbx.logger.error(
@@ -810,7 +832,6 @@ class QueueCallHandler:
         queue: Any,
         call: Any,
         agent_ext: str,
-        tried: set[str],
     ) -> bool:
         """
         Offer the caller to one agent and act on the result.
@@ -822,7 +843,7 @@ class QueueCallHandler:
         outcome = self._offer_agent(ctx, queue, call, agent_ext)
 
         with self._lock:
-            self._offering.discard(agent_ext)
+            self._offering.pop(agent_ext, None)
             ctx.current_agent = None
 
         if outcome == OFFER_ANSWERED:
@@ -837,12 +858,11 @@ class QueueCallHandler:
                 self._abandon(ctx, live)
             return True
 
-        # The attempt failed: back to waiting, and do not re-offer this agent
-        # until the whole eligible set has had a turn.
+        # The attempt failed: back to waiting. The offer already counted
+        # against this agent's budget when it was claimed in _pick_agent.
         with self._lock:
             if ctx.state == QueueCallState.OFFERING:
                 ctx.state = QueueCallState.WAITING
-        tried.add(agent_ext)
 
         if outcome == REJECT_ABORT_REASON and self._pause_on_reject():
             self._record_reject(ctx, agent_ext)
@@ -863,7 +883,7 @@ class QueueCallHandler:
             if ctx.state not in TERMINAL_STATES:
                 ctx.state = QueueCallState.DONE
             if ctx.current_agent is not None:
-                self._offering.discard(ctx.current_agent)
+                self._offering.pop(ctx.current_agent, None)
                 ctx.current_agent = None
             self._forget_locked(ctx)
         self._push_stats()
@@ -879,28 +899,109 @@ class QueueCallHandler:
             return False
         return not pbx.call_manager.get_extension_calls(ext)
 
-    def _pick_agent(self, ctx: QueueCallContext, queue: Any, tried: set[str]) -> str | None:
+    def _offer_budget(self, queue: Any) -> int:
+        """How many times one caller may be offered to the same agent"""
+        return 1 + max(0, int(getattr(queue, "max_redials", 0) or 0))
+
+    def _claim_seconds(self, queue: Any) -> float:
+        """How long an offer claim stays valid before it is assumed stale"""
+        return float(queue.ring_timeout) + OFFER_RESOLVE_GRACE_SECONDS
+
+    def _offering_now(self) -> set[str]:
+        """
+        Extensions with a live offer claim, dropping any that have expired.
+
+        Caller must hold the lock. An expired claim means some path failed to
+        release it; recovering here keeps that from silently excluding the
+        agent from every queue for the life of the process.
+        """
+        now = time.monotonic()
+        stale = [ext for ext, until in self._offering.items() if until <= now]
+        for ext in stale:
+            del self._offering[ext]
+            self.pbx_core.logger.warning(
+                f"Queue: stale offer claim on agent {ext} released; they were "
+                "excluded from selection without an in-flight offer"
+            )
+        return set(self._offering)
+
+    def _pick_agent(self, ctx: QueueCallContext, queue: Any, offers: Counter[str]) -> str | None:
         """
         Claim the next agent to offer to, or None if nobody is offerable.
 
-        Claiming (state, current_agent, the _offering exclusion) happens under
-        the lock so two callers cannot claim the same agent.
+        Claiming (state, current_agent, the offer count, the cross-caller
+        _offering entry) happens under the lock so two callers cannot claim
+        the same agent.
         """
+        budget = self._offer_budget(queue)
         with self._lock:
             if ctx.state != QueueCallState.WAITING:
                 return None
+            spent = {ext for ext, count in offers.items() if count >= budget}
             agent = queue.get_next_agent(
                 self.pbx_core.queue_system.agents,
-                exclude=tried | self._offering,
+                exclude=spent | self._offering_now(),
                 is_dialable=self._agent_dialable,
             )
             if agent is None:
                 return None
+            agent_ext = str(agent.extension)
             ctx.state = QueueCallState.OFFERING
-            ctx.current_agent = agent.extension
+            ctx.current_agent = agent_ext
             ctx.attempts += 1
-            self._offering.add(agent.extension)
-            return str(agent.extension)
+            offers[agent_ext] += 1
+            self._offering[agent_ext] = time.monotonic() + self._claim_seconds(queue)
+            return agent_ext
+
+    def _retries_exhausted(self, queue: Any, offers: Counter[str]) -> bool:
+        """
+        Whether every selectable member has used up its offer budget.
+
+        Scoped to selectable members so a queue whose agents have all logged
+        out or paused stays owned by the no-agent grace check rather than
+        being reported as exhausted retries.
+        """
+        agents = self.pbx_core.queue_system.agents
+        selectable = [ext for ext in queue.members if ext in agents and agents[ext].is_selectable()]
+        if not selectable:
+            return False
+        budget = self._offer_budget(queue)
+        return all(offers[ext] >= budget for ext in selectable)
+
+    def _selection_report(self, queue: Any, offers: Counter[str]) -> str:
+        """
+        One `ext: reason` per member explaining why nobody could be offered.
+
+        Mirrors the gates in CallQueue.get_next_agent and _agent_dialable, so
+        a queue that stops distributing calls can be diagnosed from the log
+        instead of by inspection.
+        """
+        pbx = self.pbx_core
+        agents = pbx.queue_system.agents
+        budget = self._offer_budget(queue)
+        with self._lock:
+            claimed = self._offering_now()
+
+        parts = []
+        for ext in sorted(queue.members):
+            agent = agents.get(ext)
+            if agent is None:
+                reason = "no agent record"
+            elif not agent.logged_in:
+                reason = "logged out"
+            elif agent.paused:
+                reason = f"paused ({agent.pause_reason or 'manual'})"
+            elif offers[ext] >= budget:
+                reason = f"offered {offers[ext]}/{budget}"
+            elif ext in claimed:
+                reason = "ringing for another caller"
+            elif not pbx.extension_registry.is_registered(ext):
+                reason = "not registered"
+            else:
+                busy = pbx.call_manager.get_extension_calls(ext)
+                reason = f"busy on {busy[0].call_id}" if busy else "available"
+            parts.append(f"{ext}: {reason}")
+        return "; ".join(parts) if parts else "queue has no members"
 
     def _offer_agent(self, ctx: QueueCallContext, queue: Any, call: Any, agent_ext: str) -> str:
         """
@@ -970,7 +1071,7 @@ class QueueCallHandler:
         with self._lock:
             ctx.state = QueueCallState.BRIDGED
             ctx.current_agent = agent_ext
-            self._offering.discard(agent_ext)
+            self._offering.pop(agent_ext, None)
             self._forget_locked(ctx)
 
         call = pbx.call_manager.get_call(ctx.call_id)

@@ -24,6 +24,7 @@ interface QueueStatus {
     announcement_file: string | null;
     announcement_position: boolean;
     overflow_action: string;
+    max_redials: number;
     members: string[];
     calls_waiting: number;
     longest_wait: number;
@@ -397,6 +398,11 @@ export function showEditQueueModal(queueNumber: string): void {
                         <small>Where calls go after max wait. Enter "-" to reset to the queue number.</small>
                     </div>
                     <div class="form-group">
+                        <label for="queue-max-redials">Max Redials Per Agent:</label>
+                        <input type="number" id="queue-max-redials" min="0" max="20" value="${queue?.max_redials ?? 0}">
+                        <small>Extra attempts on the same agent for one caller. 0 rings each agent once, then overflows.</small>
+                    </div>
+                    <div class="form-group">
                         <label for="queue-overflow-action">On Overflow:</label>
                         <select id="queue-overflow-action">
                             <option value="voicemail"${queue?.overflow_action !== 'drop' ? ' selected' : ''}>Voicemail</option>
@@ -454,6 +460,7 @@ async function submitEditQueue(queueNumber: string): Promise<void> {
     const ringTimeout = (document.getElementById('queue-ring-timeout') as HTMLInputElement).value.trim();
     const maxWait = (document.getElementById('queue-max-wait') as HTMLInputElement).value.trim();
     const fallbackMailbox = (document.getElementById('queue-fallback') as HTMLInputElement).value.trim();
+    const maxRedials = (document.getElementById('queue-max-redials') as HTMLInputElement).value.trim();
     const overflowAction = (document.getElementById('queue-overflow-action') as HTMLSelectElement).value;
     const announcementEnabled = (document.getElementById('queue-announcement-enabled') as HTMLInputElement).checked;
     const announcementInterval = (document.getElementById('queue-announcement-interval') as HTMLInputElement).value.trim();
@@ -468,6 +475,7 @@ async function submitEditQueue(queueNumber: string): Promise<void> {
     if (maxWait) payload.max_wait_time = parseInt(maxWait, 10);
     if (fallbackMailbox === '-') payload.fallback_mailbox = null;
     else if (fallbackMailbox) payload.fallback_mailbox = fallbackMailbox;
+    if (maxRedials !== '') payload.max_redials = parseInt(maxRedials, 10);
     if (overflowAction) payload.overflow_action = overflowAction;
     payload.announcement_enabled = announcementEnabled;
     payload.announcement_position = announcementPosition;

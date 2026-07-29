@@ -761,3 +761,12 @@ def register_all_migrations(manager: MigrationManager) -> None:
         ALTER TABLE call_queues ADD COLUMN overflow_action VARCHAR(20) DEFAULT 'voicemail';
     """),
     )
+
+    # Migration 1016: Per-queue redial cap
+    manager.register_migration(
+        1016,
+        "Queue Redial Cap",
+        manager._build_migration_sql("""
+        ALTER TABLE call_queues ADD COLUMN max_redials INTEGER DEFAULT 0;
+    """),
+    )

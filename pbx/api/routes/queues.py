@@ -30,6 +30,7 @@ _INT_FIELDS = {
     "max_queue_size": (1, 100),
     "auto_pause_misses": (0, 20),
     "announcement_interval": (10, 600),
+    "max_redials": (0, 20),
 }
 
 _PAUSE_REASONS = ("manual", "auto_missed", "ad_calendar")

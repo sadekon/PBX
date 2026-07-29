@@ -438,9 +438,14 @@ transfer:
 # it by dialing *<queue number>, e.g. *8001. Set overflow_action: drop on a
 # queue (admin UI / API) to hang up on overflow instead.
 #
+# max_redials: extra times ONE caller may be offered to the SAME agent after
+# the first attempt (0 = each agent is offered once). When every logged-in,
+# unpaused agent has used up its attempts the caller overflows immediately
+# instead of holding for max_wait_time.
+#
 # Per-queue keys: number, name, strategy, ring_timeout, max_wait_time,
 #   max_queue_size, fallback_mailbox, auto_pause_misses, enabled,
-#   overflow_action (voicemail | drop).
+#   overflow_action (voicemail | drop), max_redials.
 # Strategies: round_robin | least_recent | fewest_calls | random
 #   ('ring_all' is not yet supported and is rejected/downgraded.)
 #

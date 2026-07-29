@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS call_queues (
     announcement_file VARCHAR(255),
     announcement_position BOOLEAN DEFAULT 0,
     overflow_action VARCHAR(20) DEFAULT 'voicemail',
+    max_redials INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -201,6 +202,22 @@ class TestSeedAndReload:
         assert reloaded.announcement_file is None
         assert reloaded.announcement_position is False
         assert reloaded.overflow_action == "voicemail"
+
+    def test_max_redials_persists(self, _mock_logger, db_path):
+        system = _system(db_path)
+        queue = system.create_queue("8007", "Redial Test")
+        queue.max_redials = 3
+        system.save_queue(queue)
+
+        reloaded = _system(db_path).get_queue("8007")
+        assert reloaded is not None
+        assert reloaded.max_redials == 3
+
+    def test_max_redials_defaults_to_zero(self, _mock_logger, db_path):
+        system = _system(db_path)
+        system.save_queue(system.create_queue("8008", "Default Redials"))
+
+        assert _system(db_path).get_queue("8008").max_redials == 0
 
     def test_overflow_action_persists(self, _mock_logger, db_path):
         system = _system(db_path)
