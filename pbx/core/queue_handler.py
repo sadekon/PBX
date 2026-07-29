@@ -955,18 +955,29 @@ class QueueCallHandler:
 
     def _retries_exhausted(self, queue: Any, offers: Counter[str]) -> bool:
         """
-        Whether every selectable member has used up its offer budget.
+        Whether no agent can still be offered this caller.
 
-        Scoped to selectable members so a queue whose agents have all logged
-        out or paused stays owned by the no-agent grace check rather than
-        being reported as exhausted retries.
+        Keyed on whether anything has been attempted yet, not on whether
+        anyone is currently selectable. An agent going unselectable *because*
+        of the attempt -- ringing out into an auto-pause, or logging out
+        mid-offer -- still counts as an attempt spent, so the caller must
+        move on to the queue's end behaviour rather than fall through to the
+        no-agent grace (which would add its whole timeout, or hold to
+        max_wait_time when that grace is disabled).
+
+        Before any offer has been made the grace period does own the
+        decision: a caller admitted just as the last agent logs out should
+        get that window to see if somebody comes back.
         """
-        agents = self.pbx_core.queue_system.agents
-        selectable = [ext for ext in queue.members if ext in agents and agents[ext].is_selectable()]
-        if not selectable:
+        if not offers:
             return False
+        agents = self.pbx_core.queue_system.agents
         budget = self._offer_budget(queue)
-        return all(offers[ext] >= budget for ext in selectable)
+        return not any(
+            offers[ext] < budget
+            for ext in queue.members
+            if ext in agents and agents[ext].is_selectable()
+        )
 
     def _selection_report(self, queue: Any, offers: Counter[str]) -> str:
         """

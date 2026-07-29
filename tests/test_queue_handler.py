@@ -356,14 +356,37 @@ class TestRetryBudget:
 
         assert handler._retries_exhausted(queue, Counter({"1001": 1, "1002": 1})) is True
 
-    def test_logged_out_agents_do_not_count(self, pbx, handler):
-        """All agents gone is the no-agent grace path's job, not this one."""
+    def test_all_logged_out_before_any_attempt_defers_to_grace(self, pbx, handler):
+        """A caller admitted as the last agent leaves gets the grace window."""
         _two_agent_ctx(pbx, handler)
         queue = pbx.queue_system.get_queue("8001")
         pbx.queue_system.set_agent_login("1001", False)
         pbx.queue_system.set_agent_login("1002", False)
 
         assert handler._retries_exhausted(queue, Counter()) is False
+
+    def test_agent_going_unselectable_mid_loop_still_counts_as_spent(self, pbx, handler):
+        """
+        Regression: an agent auto-paused by the very attempt that rang out
+        (or logging out mid-loop) left no selectable members, which used to
+        report 'not exhausted' and fall through to the no-agent grace --
+        adding its whole timeout, or holding to max_wait_time when that
+        grace is disabled.
+        """
+        _two_agent_ctx(pbx, handler)
+        queue = pbx.queue_system.get_queue("8001")
+        offers = Counter({"1001": 1, "1002": 1})
+        pbx.queue_system.set_agent_pause("1001", True, "auto_missed")
+        pbx.queue_system.set_agent_login("1002", False)
+
+        assert handler._retries_exhausted(queue, offers) is True
+
+    def test_agent_returning_with_budget_left_is_not_exhausted(self, pbx, handler):
+        """One agent spent, the other logs back in unspent: keep trying."""
+        _two_agent_ctx(pbx, handler)
+        queue = pbx.queue_system.get_queue("8001")
+
+        assert handler._retries_exhausted(queue, Counter({"1001": 1})) is False
 
     def test_budget_follows_max_redials(self, pbx, handler):
         _two_agent_ctx(pbx, handler, max_redials=2)
@@ -624,6 +647,36 @@ class TestCallerLoop:
 
         # budget = 1 + max_redials = 2 attempts each, across two agents
         assert sorted(offered) == ["1001", "1001", "1002", "1002"]
+        overflow.assert_called_once_with(ctx)
+
+    def test_overflows_when_final_attempt_auto_pauses_the_last_agent(self, pbx, handler):
+        """
+        Regression: the last redial rings out, _record_miss trips auto-pause,
+        and the queue is left with nobody selectable. The loop must still see
+        the attempts as spent and overflow, rather than fall through to the
+        no-agent grace -- which is disabled here, so the old behaviour held
+        the caller until max_wait_time.
+        """
+        _seed_queue(pbx, agents=("1001",), max_wait_time=300, max_redials=1, auto_pause_misses=2)
+        pbx.config.get.side_effect = lambda key, default=None: (
+            0 if key == "queue_no_agent_timeout" else default
+        )
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
+        offered = []
+
+        def _offer(_ctx, _queue, _call, agent_ext):
+            offered.append(agent_ext)
+            return "no_answer"
+
+        with (
+            patch.object(handler, "_offer_agent", side_effect=_offer),
+            patch.object(handler, "_handle_overflow") as overflow,
+        ):
+            handler._caller_loop(ctx)
+
+        assert offered == ["1001", "1001"]  # budget spent
+        assert pbx.queue_system.get_agent("1001").paused is True  # auto-paused by the 2nd miss
         overflow.assert_called_once_with(ctx)
 
     def test_each_agent_offered_once_by_default(self, pbx, handler):
