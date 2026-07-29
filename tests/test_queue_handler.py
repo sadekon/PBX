@@ -8,6 +8,7 @@ the context/state orchestration under test.
 
 import threading
 import time
+from contextlib import nullcontext
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
@@ -121,6 +122,49 @@ def _seed_queue(pbx, number="8001", agents=("1001",), login=True, **attrs):
     return queue
 
 
+def _enter(pbx, handler, call_id="c1", from_ext="2000", *, owned=False):
+    """
+    Answer a caller into the queue.
+
+    The caller's owner thread is stubbed out by default so a test can drive
+    one step at a time; pass owned=True to let the real loop run.
+    """
+    owner = nullcontext() if owned else patch.object(handler, "_start_owner")
+    with patch.object(handler, "_answer_caller", return_value=True), owner:
+        return handler.handle_queue_entry(from_ext, "8001", call_id, _FakeMessage(), CALLER_ADDR)
+
+
+def _ctx(pbx, call_id="c1"):
+    """The queue context attached to an admitted caller."""
+    return pbx.call_manager.get_call(call_id).queue_ctx
+
+
+def _use_moh_dir(pbx, tmp_path):
+    """Point music_on_hold.directory at tmp_path, leaving other config defaults."""
+    pbx.config.get.side_effect = lambda key, default=None: (
+        str(tmp_path) if key == "music_on_hold.directory" else default
+    )
+
+
+def _resolve_transfer_with(pbx, callback: str, abort_reason=None):
+    """
+    Make start_transfer hand back a session that immediately resolves.
+
+    The callback fires from arm_watchdog so the session is already in
+    _offer_agent's holder, matching the real watchdog/SIP-thread ordering
+    where the abort reason is readable.
+    """
+    session = MagicMock()
+    session.abort_reason = abort_reason
+
+    def _start(_call, _agent_ext, **kwargs):
+        session.arm_watchdog.side_effect = lambda _timeout: kwargs[callback]()
+        return session
+
+    pbx.transfer_handler.start_transfer.side_effect = _start
+    return session
+
+
 @pytest.mark.unit
 class TestQueueDestination:
     def test_enabled_queue(self, pbx, handler):
@@ -137,15 +181,9 @@ class TestQueueDestination:
 
 @pytest.mark.unit
 class TestQueueEntry:
-    def _enter(self, pbx, handler, call_id="c1", from_ext="2000"):
-        with patch.object(handler, "_answer_caller", return_value=True):
-            return handler.handle_queue_entry(
-                from_ext, "8001", call_id, _FakeMessage(), CALLER_ADDR
-            )
-
     def test_answers_parks_and_registers(self, pbx, handler):
         _seed_queue(pbx)
-        assert self._enter(pbx, handler) is True
+        assert _enter(pbx, handler) is True
 
         call = pbx.call_manager.get_call("c1")
         assert call.queue_ctx is not None
@@ -159,7 +197,7 @@ class TestQueueEntry:
 
     def test_disabled_queue_falls_through(self, pbx, handler):
         _seed_queue(pbx, enabled=False)
-        assert self._enter(pbx, handler) is False
+        assert _enter(pbx, handler) is False
         assert pbx.call_manager.get_call("c1") is None
 
     def test_no_sdp_falls_through(self, pbx, handler):
@@ -171,7 +209,7 @@ class TestQueueEntry:
     def test_zero_agents_overflows(self, pbx, handler):
         _seed_queue(pbx, login=False)
         with patch.object(handler, "_overflow_to_voicemail") as overflow:
-            assert self._enter(pbx, handler) is True
+            assert _enter(pbx, handler) is True
             deadline = time.monotonic() + 2
             while not overflow.called and time.monotonic() < deadline:
                 time.sleep(0.02)
@@ -181,9 +219,9 @@ class TestQueueEntry:
 
     def test_full_queue_overflows(self, pbx, handler):
         _seed_queue(pbx, max_queue_size=1)
-        assert self._enter(pbx, handler, call_id="c1") is True
+        assert _enter(pbx, handler, call_id="c1") is True
         with patch.object(handler, "_overflow_to_voicemail") as overflow:
-            assert self._enter(pbx, handler, call_id="c2", from_ext="2001") is True
+            assert _enter(pbx, handler, call_id="c2", from_ext="2001") is True
             deadline = time.monotonic() + 2
             while not overflow.called and time.monotonic() < deadline:
                 time.sleep(0.02)
@@ -194,8 +232,7 @@ class TestQueueEntry:
 class TestOnBye:
     def _waiting_ctx(self, pbx, handler, call_id="c1"):
         _seed_queue(pbx)
-        with patch.object(handler, "_answer_caller", return_value=True):
-            handler.handle_queue_entry("2000", "8001", call_id, _FakeMessage(), CALLER_ADDR)
+        _enter(pbx, handler, call_id=call_id)
         return pbx.call_manager.get_call(call_id)
 
     def test_abandon_while_waiting(self, pbx, handler):
@@ -234,156 +271,165 @@ class TestOnBye:
         assert handler.on_bye(call, ("172.16.0.1", 5062)) is False
 
 
-@pytest.mark.unit
-class TestOfferLoop:
-    def _ctx(self, pbx, handler, **queue_attrs):
-        _seed_queue(pbx, agents=("1001", "1002"), **queue_attrs)
-        with patch.object(handler, "_answer_caller", return_value=True):
-            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
-        return pbx.call_manager.get_call("c1").queue_ctx
+def _two_agent_ctx(pbx, handler, **queue_attrs):
+    """A caller waiting in a two-agent queue, with no owner loop running."""
+    _seed_queue(pbx, agents=("1001", "1002"), **queue_attrs)
+    _enter(pbx, handler)
+    return _ctx(pbx)
 
-    def test_offer_starts_blind_transfer_with_ring_timeout(self, pbx, handler):
+
+@pytest.mark.unit
+class TestPickAgent:
+    def test_claims_agent_and_marks_offering(self, pbx, handler):
+        ctx = _two_agent_ctx(pbx, handler)
+        queue = pbx.queue_system.get_queue("8001")
+
+        agent_ext = handler._pick_agent(ctx, queue, set())
+
+        assert agent_ext in ("1001", "1002")
+        assert ctx.state.value == "offering"
+        assert ctx.current_agent == agent_ext
+        assert ctx.attempts == 1
+        # Claimed, so a second caller cannot be offered the same agent.
+        with handler._lock:
+            assert agent_ext in handler._offering
+
+    def test_none_when_nothing_dialable(self, pbx, handler):
+        ctx = _two_agent_ctx(pbx, handler)
+        pbx.extension_registry.is_registered.return_value = False
+
+        assert handler._pick_agent(ctx, pbx.queue_system.get_queue("8001"), set()) is None
+        assert ctx.state.value == "waiting"
+
+    def test_skips_already_tried(self, pbx, handler):
+        ctx = _two_agent_ctx(pbx, handler)
+        queue = pbx.queue_system.get_queue("8001")
+
+        assert handler._pick_agent(ctx, queue, {"1001"}) == "1002"
+
+    def test_none_when_caller_no_longer_waiting(self, pbx, handler):
+        from pbx.core.queue_handler import QueueCallState
+
+        ctx = _two_agent_ctx(pbx, handler)
+        ctx.state = QueueCallState.ABANDONED
+
+        assert handler._pick_agent(ctx, pbx.queue_system.get_queue("8001"), set()) is None
+
+
+@pytest.mark.unit
+class TestOfferAgent:
+    def _offer(self, pbx, handler, ctx, agent_ext="1001"):
+        return handler._offer_agent(
+            ctx, pbx.queue_system.get_queue("8001"), pbx.call_manager.get_call("c1"), agent_ext
+        )
+
+    def test_blind_transfer_with_per_queue_ring_timeout(self, pbx, handler):
         from pbx.core.transfer_session import TransferMode
 
-        ctx = self._ctx(pbx, handler, ring_timeout=7)
-        session = MagicMock()
-        pbx.transfer_handler.start_transfer.return_value = session
+        ctx = _two_agent_ctx(pbx, handler, ring_timeout=7)
+        session = _resolve_transfer_with(pbx, "on_failure", "no_answer")
 
-        handler._offer_worker(ctx)
+        assert self._offer(pbx, handler, ctx) == "no_answer"
 
-        assert ctx.state.value == "offering"
-        args, kwargs = pbx.transfer_handler.start_transfer.call_args
-        assert args[1] in ("1001", "1002")
+        _args, kwargs = pbx.transfer_handler.start_transfer.call_args
         assert kwargs["mode"] == TransferMode.BLIND
         assert kwargs["transferor_side"] == "callee"
         session.arm_watchdog.assert_called_once_with(7.0)
 
-    def test_synchronous_failure_tries_next_agent(self, pbx, handler):
-        ctx = self._ctx(pbx, handler)
-        session = MagicMock()
-        pbx.transfer_handler.start_transfer.side_effect = [None, session]
+    def test_answered_outcome(self, pbx, handler):
+        from pbx.core.queue_handler import OFFER_ANSWERED
 
-        handler._offer_worker(ctx)
+        ctx = _two_agent_ctx(pbx, handler)
+        _resolve_transfer_with(pbx, "on_complete")
 
-        assert pbx.transfer_handler.start_transfer.call_count == 2
-        first = pbx.transfer_handler.start_transfer.call_args_list[0][0][1]
-        second = pbx.transfer_handler.start_transfer.call_args_list[1][0][1]
-        assert first != second
-        # First agent's miss was recorded
-        assert pbx.queue_system.get_agent(first).consecutive_misses == 1
+        assert self._offer(pbx, handler, ctx) == OFFER_ANSWERED
+
+    def test_unreachable_when_no_session(self, pbx, handler):
+        """Agent unregistered between the dialability check and the INVITE."""
+        ctx = _two_agent_ctx(pbx, handler)
+        pbx.transfer_handler.start_transfer.side_effect = None
+        pbx.transfer_handler.start_transfer.return_value = None
+
+        assert self._offer(pbx, handler, ctx) == "unreachable"
+
+
+@pytest.mark.unit
+class TestResolveOffer:
+    def _resolve(self, pbx, handler, ctx, agent_ext="1001", tried=None):
+        return handler._resolve_offer(
+            ctx,
+            pbx.queue_system.get_queue("8001"),
+            pbx.call_manager.get_call("c1"),
+            agent_ext,
+            tried if tried is not None else set(),
+        )
+
+    def test_answered_records_and_stops(self, pbx, handler):
+        ctx = _two_agent_ctx(pbx, handler)
+        call = pbx.call_manager.get_call("c1")
+        _resolve_transfer_with(pbx, "on_complete")
+
+        assert self._resolve(pbx, handler, ctx, "1002") is True
+
+        assert ctx.state.value == "bridged"
+        assert call.queue_ctx is None
+        assert pbx.queue_system.get_agent("1002").calls_taken == 1
+        assert pbx.queue_system.get_queue_status("8001")["calls_waiting"] == 0
 
     def test_explicit_reject_pauses_agent(self, pbx, handler):
         """A DND phone refuses the INVITE: pause it instead of redialing."""
-        ctx = self._ctx(pbx, handler)
-        session = MagicMock()
-        session.abort_reason = "target_rejected"
+        ctx = _two_agent_ctx(pbx, handler)
+        _resolve_transfer_with(pbx, "on_failure", "target_rejected")
+        tried: set[str] = set()
 
-        with patch.object(handler, "_offer_worker"):
-            handler._on_offer_failure(ctx, "1001", [session])
-            deadline = time.monotonic() + 2
-            while not pbx.queue_system.get_agent("1001").paused:
-                if time.monotonic() > deadline:
-                    break
-                time.sleep(0.02)
+        assert self._resolve(pbx, handler, ctx, "1001", tried) is False
 
         agent = pbx.queue_system.get_agent("1001")
         assert agent.paused is True
         assert agent.pause_reason == "auto_rejected"
-        # Paused, not merely missed: the miss counter is not what removed them.
-        assert "1001" in ctx.tried_agents
+        assert "1001" in tried
 
     def test_ring_out_counts_miss_not_pause(self, pbx, handler):
         """No-answer is not a refusal: count a miss, leave the agent active."""
-        ctx = self._ctx(pbx, handler)
-        session = MagicMock()
-        session.abort_reason = "no_answer"
+        ctx = _two_agent_ctx(pbx, handler)
+        _resolve_transfer_with(pbx, "on_failure", "no_answer")
+        tried: set[str] = set()
 
-        with patch.object(handler, "_offer_worker"):
-            handler._on_offer_failure(ctx, "1001", [session])
-            deadline = time.monotonic() + 2
-            while pbx.queue_system.get_agent("1001").consecutive_misses == 0:
-                if time.monotonic() > deadline:
-                    break
-                time.sleep(0.02)
+        assert self._resolve(pbx, handler, ctx, "1001", tried) is False
 
         agent = pbx.queue_system.get_agent("1001")
         assert agent.consecutive_misses == 1
         assert agent.paused is False
-
-    def test_no_dialable_agents_stays_waiting(self, pbx, handler):
-        ctx = self._ctx(pbx, handler)
-        pbx.extension_registry.is_registered.return_value = False
-
-        handler._offer_worker(ctx)
-
         assert ctx.state.value == "waiting"
-        pbx.transfer_handler.start_transfer.assert_not_called()
-        assert ctx.retry_at > 0
+        assert "1001" in tried
 
-    def test_offer_failure_miss_then_retry(self, pbx, handler):
-        ctx = self._ctx(pbx, handler)
-        session = MagicMock()
-        session.abort_reason = "target_timeout"
+    def test_caller_hangup_abandons(self, pbx, handler):
+        ctx = _two_agent_ctx(pbx, handler)
+        _resolve_transfer_with(pbx, "on_failure", "transferee_hangup")
 
-        with patch.object(handler, "_offer_worker") as next_offer:
-            from pbx.core.queue_handler import QueueCallState
-
-            ctx.state = QueueCallState.OFFERING
-            handler._on_offer_failure(ctx, "1001", [session])
-            deadline = time.monotonic() + 2
-            while not next_offer.called and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert next_offer.called
-
-        assert ctx.state.value == "waiting"
-        assert "1001" in ctx.tried_agents
-        assert pbx.queue_system.get_agent("1001").consecutive_misses == 1
-
-    def test_offer_failure_caller_hangup_abandons(self, pbx, handler):
-        ctx = self._ctx(pbx, handler)
-        session = MagicMock()
-        session.abort_reason = "transferee_hangup"
-
-        handler._on_offer_failure(ctx, "1001", [session])
-        deadline = time.monotonic() + 2
-        while not pbx.end_call.called and time.monotonic() < deadline:
-            time.sleep(0.02)
+        assert self._resolve(pbx, handler, ctx, "1001") is True
 
         pbx.end_call.assert_called_once_with("c1")
         pbx.cdr_system.end_record.assert_called_with("c1", hangup_cause="queue_abandoned")
         assert ctx.state.value == "abandoned"
 
-    def test_offer_failure_overflow_pending_goes_to_vm(self, pbx, handler):
-        from pbx.core.queue_handler import QueueCallState
+    def test_offering_exclusion_released(self, pbx, handler):
+        """However an attempt ends, the agent must not stay blacklisted."""
+        ctx = _two_agent_ctx(pbx, handler)
+        queue = pbx.queue_system.get_queue("8001")
+        _resolve_transfer_with(pbx, "on_failure", "no_answer")
+        agent_ext = handler._pick_agent(ctx, queue, set())
 
-        ctx = self._ctx(pbx, handler)
-        ctx.state = QueueCallState.OVERFLOW_PENDING
-        session = MagicMock()
-        session.abort_reason = "no_answer"
+        self._resolve(pbx, handler, ctx, agent_ext)
 
-        with patch.object(handler, "_overflow_to_voicemail") as overflow:
-            handler._on_offer_failure(ctx, "1001", [session])
-            deadline = time.monotonic() + 2
-            while not overflow.called and time.monotonic() < deadline:
-                time.sleep(0.02)
-            overflow.assert_called_once_with(ctx)
-
-    def test_offer_complete_records_answer(self, pbx, handler):
-        ctx = self._ctx(pbx, handler)
-        call = pbx.call_manager.get_call("c1")
-
-        handler._on_offer_complete(ctx, "1002")
-
-        assert ctx.state.value == "bridged"
-        assert call.queue_ctx is None
-        agent = pbx.queue_system.get_agent("1002")
-        assert agent.calls_taken == 1
-        assert pbx.queue_system.get_queue_status("8001")["calls_waiting"] == 0
+        with handler._lock:
+            assert agent_ext not in handler._offering
+        assert ctx.current_agent is None
 
     def test_auto_pause_webhook_on_missed_threshold(self, pbx, handler):
         from pbx.features.webhooks import WebhookEvent
 
-        ctx = self._ctx(pbx, handler, auto_pause_misses=1)
+        ctx = _two_agent_ctx(pbx, handler, auto_pause_misses=1)
         handler._record_miss(ctx, "1001")
 
         assert pbx.queue_system.get_agent("1001").paused is True
@@ -391,117 +437,166 @@ class TestOfferLoop:
         assert WebhookEvent.QUEUE_AGENT_PAUSED in events
 
 
+def _age(ctx, seconds):
+    """Backdate a caller's enqueue time so it looks like it has waited."""
+    from datetime import UTC, datetime, timedelta
+
+    ctx.enqueue_time = datetime.now(tz=UTC) - timedelta(seconds=seconds)
+
+
 @pytest.mark.unit
-class TestSweep:
-    def test_max_wait_triggers_overflow(self, pbx, handler):
-        from datetime import UTC, datetime, timedelta
+class TestCallerLoop:
+    """
+    The owner loop is the only driver now, so these run it directly and let
+    it return -- no sweep ticks, no spawned workers, no polling.
+    """
 
+    def test_max_wait_overflows(self, pbx, handler):
         _seed_queue(pbx, max_wait_time=10)
-        with patch.object(handler, "_answer_caller", return_value=True):
-            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
-        ctx = pbx.call_manager.get_call("c1").queue_ctx
-        ctx.enqueue_time = datetime.now(tz=UTC) - timedelta(seconds=60)
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
+        _age(ctx, 60)
 
-        with patch.object(handler, "_overflow_to_voicemail") as overflow:
-            handler._sweep_once()
-            deadline = time.monotonic() + 2
-            while not overflow.called and time.monotonic() < deadline:
-                time.sleep(0.02)
-            overflow.assert_called_once_with(ctx)
+        with patch.object(handler, "_handle_overflow") as overflow:
+            handler._caller_loop(ctx)
 
-    def test_max_wait_mid_offer_latches_pending(self, pbx, handler):
-        from datetime import UTC, datetime, timedelta
+        overflow.assert_called_once_with(ctx)
 
-        from pbx.core.queue_handler import QueueCallState
-
+    def test_max_wait_never_interrupts_a_ringing_agent(self, pbx, handler):
+        """
+        Max wait passing mid-offer must not cut the agent off: the loop is
+        blocked in the offer and only overflows once it resolves. (Replaces
+        the old OVERFLOW_PENDING latch, which existed to get this ordering
+        when several threads could act on the caller at once.)
+        """
         _seed_queue(pbx, max_wait_time=10)
-        with patch.object(handler, "_answer_caller", return_value=True):
-            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
-        ctx = pbx.call_manager.get_call("c1").queue_ctx
-        ctx.state = QueueCallState.OFFERING
-        ctx.enqueue_time = datetime.now(tz=UTC) - timedelta(seconds=60)
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
+        order = []
 
-        handler._sweep_once()
+        def _offer(*_args, **_kwargs):
+            _age(ctx, 60)  # max wait passes while the agent is ringing
+            order.append("offer-resolved")
+            return "no_answer"
 
-        assert ctx.state == QueueCallState.OVERFLOW_PENDING
+        with (
+            patch.object(handler, "_offer_agent", side_effect=_offer),
+            patch.object(
+                handler, "_handle_overflow", side_effect=lambda _c: order.append("overflow")
+            ),
+        ):
+            handler._caller_loop(ctx)
 
-    def test_no_agents_mid_wait_overflows_after_grace(self, pbx, handler):
+        assert order == ["offer-resolved", "overflow"]
+
+    def test_no_agents_overflows_after_grace(self, pbx, handler):
         """All agents gone mid-wait (e.g. DND auto-pause + logged-out peer):
         overflow to voicemail instead of holding for the full max_wait."""
         _seed_queue(pbx, max_wait_time=300)
-        with patch.object(handler, "_answer_caller", return_value=True):
-            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
-        ctx = pbx.call_manager.get_call("c1").queue_ctx
-
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
         # Every member becomes unselectable while the caller waits.
         pbx.queue_system.set_agent_login("1001", False)
+        pbx.config.get.side_effect = lambda key, default=None: (
+            0.01 if key == "queue_no_agent_timeout" else default
+        )
 
-        with patch.object(handler, "_overflow_to_voicemail") as overflow:
-            handler._sweep_once()
-            assert not overflow.called  # grace period not yet elapsed
+        with patch.object(handler, "_handle_overflow") as overflow:
+            handler._caller_loop(ctx)
 
-            ctx.no_agents_since -= handler._no_agent_timeout() + 1
-            handler._sweep_once()
-            deadline = time.monotonic() + 2
-            while not overflow.called and time.monotonic() < deadline:
-                time.sleep(0.02)
-            overflow.assert_called_once_with(ctx)
+        overflow.assert_called_once_with(ctx)
 
     def test_agent_available_never_overflows_for_no_agents(self, pbx, handler):
-        """A live agent resets the no-agent timer, so waiting continues."""
+        """A live agent keeps the no-agent grace from ever starting."""
         _seed_queue(pbx, max_wait_time=300)
-        with patch.object(handler, "_answer_caller", return_value=True):
-            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
-        ctx = pbx.call_manager.get_call("c1").queue_ctx
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
 
-        with patch.object(handler, "_overflow_to_voicemail") as overflow:
-            handler._sweep_once()
-            handler._sweep_once()
-            assert ctx.no_agents_since is None
-            assert not overflow.called
+        queue = pbx.queue_system.get_queue("8001")
+        assert handler._overflow_reason(ctx, queue, None) is None
 
-    def test_dead_call_cleanup(self, pbx, handler):
+    def test_dead_call_is_released(self, pbx, handler):
         _seed_queue(pbx)
-        with patch.object(handler, "_answer_caller", return_value=True):
-            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
         pbx.call_manager.end_call("c1")
 
-        handler._sweep_once()
+        handler._caller_loop(ctx)
 
         assert pbx.queue_system.get_queue_status("8001")["calls_waiting"] == 0
         with handler._lock:
             assert "c1" not in handler._contexts
 
-    def test_announcement_enabled_spawns_announce_worker(self, pbx, handler):
-        _seed_queue(pbx, announcement_enabled=True, announcement_interval=5)
-        with patch.object(handler, "_answer_caller", return_value=True):
-            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
-        ctx = pbx.call_manager.get_call("c1").queue_ctx
-        ctx.last_announcement_at -= 10  # interval already elapsed
+    def test_stops_once_caller_is_terminal(self, pbx, handler):
+        from pbx.core.queue_handler import QueueCallState
 
-        # Isolate from the real offer loop (also spawned by this sweep tick):
-        # it would race to flip ctx.state to OFFERING before our check runs.
+        _seed_queue(pbx)
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
+        ctx.state = QueueCallState.ABANDONED
+
+        with patch.object(handler, "_offer_agent") as offer:
+            handler._caller_loop(ctx)
+
+        assert not offer.called
+
+    def test_announcement_completes_before_any_offer(self, pbx, handler):
+        """
+        Regression: announcements used to run on their own thread, spawned
+        from the same sweep tick as an offer. The offer flipped state to
+        OFFERING mid-TTS and the prompt's barge-out check clipped it after
+        about one packet. One owner thread makes the ordering structural.
+        """
+        from pbx.core.queue_handler import OFFER_ANSWERED
+
+        _seed_queue(pbx, announcement_enabled=True, announcement_interval=0)
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
+        order = []
+
+        def _announce(_ctx, queue):
+            order.append("announce-start")
+            time.sleep(0.05)
+            order.append("announce-end")
+            queue.announcement_enabled = False  # exactly one, then move on
+
+        def _offer(*_args, **_kwargs):
+            order.append("offer")
+            return OFFER_ANSWERED  # terminal, so the loop stops here
+
         with (
-            patch.object(handler, "_offer_worker"),
-            patch.object(handler, "_announce_worker") as announce,
+            patch.object(handler, "_play_announcement", side_effect=_announce),
+            patch.object(handler, "_offer_agent", side_effect=_offer),
         ):
-            handler._sweep_once()
-            deadline = time.monotonic() + 2
-            while not announce.called and time.monotonic() < deadline:
-                time.sleep(0.02)
-            announce.assert_called_once_with(ctx)
+            handler._caller_loop(ctx)
 
-    def test_announcement_disabled_by_default(self, pbx, handler):
+        assert order == ["announce-start", "announce-end", "offer"]
+
+    def test_announcement_skipped_when_disabled(self, pbx, handler):
+        from pbx.core.queue_handler import OFFER_ANSWERED
+
         _seed_queue(pbx)  # announcement_enabled defaults to False
-        with patch.object(handler, "_answer_caller", return_value=True):
-            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
-        ctx = pbx.call_manager.get_call("c1").queue_ctx
-        ctx.last_announcement_at -= 3600
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
 
-        with patch.object(handler, "_announce_worker") as announce:
-            handler._sweep_once()
-            time.sleep(0.1)
-            assert not announce.called
+        with (
+            patch.object(handler, "_play_announcement") as announce,
+            patch.object(handler, "_offer_agent", return_value=OFFER_ANSWERED),
+        ):
+            handler._caller_loop(ctx)
+
+        assert not announce.called
+
+    def test_owner_thread_registered_per_caller(self, pbx, handler):
+        _seed_queue(pbx)
+        release = threading.Event()
+
+        # _owners is populated before the thread starts, so this is not racy.
+        with patch.object(handler, "_caller_loop", side_effect=lambda _ctx: release.wait(2)):
+            _enter(pbx, handler, owned=True)
+            with handler._lock:
+                assert list(handler._owners) == ["c1"]
+            release.set()
 
 
 @pytest.mark.unit
@@ -564,11 +659,7 @@ class TestHoldAnnouncements:
         (tmp_path / "announcements").mkdir()
         prompt = tmp_path / "announcements" / "sales.wav"
         prompt.write_bytes(b"RIFF....WAVEfmt ")
-        pbx.config.get.side_effect = (
-            lambda key, default=None: str(tmp_path)
-            if key == "music_on_hold.directory"
-            else default
-        )
+        _use_moh_dir(pbx, tmp_path)
         queue = _seed_queue(pbx, announcement_file="sales.wav")
 
         path, is_temp = handler._resolve_announcement_audio(queue, position=1)
@@ -577,11 +668,7 @@ class TestHoldAnnouncements:
         assert is_temp is False
 
     def test_resolve_missing_file_falls_through(self, pbx, handler, tmp_path):
-        pbx.config.get.side_effect = (
-            lambda key, default=None: str(tmp_path)
-            if key == "music_on_hold.directory"
-            else default
-        )
+        _use_moh_dir(pbx, tmp_path)
         queue = _seed_queue(pbx, announcement_file="missing.wav")
 
         path, is_temp = handler._resolve_announcement_audio(queue, position=1)
@@ -591,9 +678,7 @@ class TestHoldAnnouncements:
         assert pbx.logger.warning.called
 
     def test_resolve_uses_tts_with_position(self, pbx, handler, tmp_path):
-        queue = _seed_queue(
-            pbx, announcement_text="Please hold", announcement_position=True
-        )
+        queue = _seed_queue(pbx, announcement_text="Please hold", announcement_position=True)
 
         with patch("pbx.utils.audio.generate_tts_audio", return_value=b"WAVDATA") as tts:
             path, is_temp = handler._resolve_announcement_audio(queue, position=3)
@@ -615,22 +700,16 @@ class TestHoldAnnouncements:
         assert path is None
         assert is_temp is False
 
-    def test_announce_worker_interjects_and_updates_timestamp(self, pbx, handler, tmp_path):
+    def test_play_announcement_interjects_with_prompt(self, pbx, handler, tmp_path):
         (tmp_path / "announcements").mkdir()
         prompt = tmp_path / "announcements" / "sales.wav"
         prompt.write_bytes(b"RIFF....WAVEfmt ")
-        pbx.config.get.side_effect = (
-            lambda key, default=None: str(tmp_path)
-            if key == "music_on_hold.directory"
-            else default
-        )
-        _seed_queue(pbx, announcement_enabled=True, announcement_file="sales.wav")
-        with patch.object(handler, "_answer_caller", return_value=True):
-            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
-        ctx = pbx.call_manager.get_call("c1").queue_ctx
-        before = ctx.last_announcement_at
+        _use_moh_dir(pbx, tmp_path)
+        queue = _seed_queue(pbx, announcement_enabled=True, announcement_file="sales.wav")
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
 
-        handler._announce_worker(ctx)
+        handler._play_announcement(ctx, queue)
 
         pbx.moh_system.interject.assert_called_once()
         args, kwargs = pbx.moh_system.interject.call_args
@@ -638,18 +717,16 @@ class TestHoldAnnouncements:
         assert args[1] == ctx.held_side
         assert args[2] == prompt
         assert "interrupt_check" in kwargs
-        assert ctx.last_announcement_at > before
 
-    def test_announce_worker_skips_when_not_waiting(self, pbx, handler):
+    def test_play_announcement_skips_when_not_waiting(self, pbx, handler):
         from pbx.core.queue_handler import QueueCallState
 
-        _seed_queue(pbx, announcement_enabled=True, announcement_file="sales.wav")
-        with patch.object(handler, "_answer_caller", return_value=True):
-            handler.handle_queue_entry("2000", "8001", "c1", _FakeMessage(), CALLER_ADDR)
-        ctx = pbx.call_manager.get_call("c1").queue_ctx
+        queue = _seed_queue(pbx, announcement_enabled=True, announcement_file="sales.wav")
+        _enter(pbx, handler)
+        ctx = _ctx(pbx)
         ctx.state = QueueCallState.OFFERING
 
-        handler._announce_worker(ctx)
+        handler._play_announcement(ctx, queue)
 
         assert not pbx.moh_system.interject.called
 

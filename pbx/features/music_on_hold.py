@@ -241,10 +241,29 @@ class MusicOnHold:
                 return False
             relay_handler = session["relay_handler"]
             moh_class = session["class"]
-            self.active_sessions.pop(call_id, None)
             self._stop_session(session, resume_relay=False)
 
+            # Stand-in session for the duration of the prompt. The relay stays
+            # paused while it plays, so a concurrent stop_moh() -- the call
+            # being bridged, hung up, or diverted to voicemail -- must still
+            # find *something* here to cancel and to resume the relay against.
+            # Leaving the slot empty makes that stop_moh() a silent no-op, and
+            # the start_moh() at the tail of this method would then re-pause a
+            # call that is no longer on hold, deafening both parties.
+            cancelled = threading.Event()
+            announcing: dict[str, Any] = {
+                "class": moh_class,
+                "relay_handler": relay_handler,
+                "stop_event": cancelled,
+                "thread": None,
+                "file": prompt_path,
+            }
+            self.active_sessions[call_id] = announcing
+
         from pbx.rtp.handler import RTPPlayer
+
+        def _interrupted() -> bool:
+            return cancelled.is_set() or bool(interrupt_check and interrupt_check())
 
         played = False
         target = relay_handler.get_endpoint(held_side)
@@ -257,11 +276,18 @@ class MusicOnHold:
                 external_socket=relay_handler.socket,
             )
             if player.start():
-                player.play_file(prompt_path, interrupt_check=interrupt_check)
+                player.play_file(prompt_path, interrupt_check=_interrupted)
                 player.stop()
                 played = True
 
-        if relay_handler.running:
+        with self._session_lock:
+            # Someone ended hold while the prompt was playing: they already
+            # resumed the relay, so resuming music now would re-pause it.
+            if self.active_sessions.get(call_id) is not announcing:
+                return played
+            self.active_sessions.pop(call_id, None)
+
+        if relay_handler.running and not cancelled.is_set():
             self.start_moh(call_id, relay_handler, held_side, moh_class)
         return played
 

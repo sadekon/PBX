@@ -12,10 +12,26 @@ RTP for queued calls. The media model is the auto attendant's proven
 park-and-bridge loop (see AutoAttendantHandler._begin_transfer): the caller
 sits as one side of an adopted RTP relay with MOH, and each agent attempt is
 a blind TransferSession whose bridge swaps the far side of that relay.
+
+Concurrency model: **one owner thread per queued caller** (_caller_loop),
+started at admission. That loop is the only thing that decides anything about
+its caller -- announcements, agent selection, offers, overflow -- and it does
+so strictly sequentially, so an announcement can never overlap an agent offer.
+Offers block on the TransferSession's own callbacks (_offer_agent), which are
+reduced to pure signals rather than driving recovery themselves. The only
+other thread is a stats ticker, which is purely observational.
+
+That single-owner rule is what keeps the caller's media coherent: MOH pause /
+prompt / resume and the bridge's MOH stop are all sequenced by one thread
+instead of racing. A previous design drove offers from a sweep tick, from the
+offer worker's own retry loop, and recursively from the failure callback --
+with announcements racing all three -- which produced clipped announcements
+and, when a bridge landed mid-announcement, a re-paused relay and dead air.
 """
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from dataclasses import dataclass, field
@@ -28,8 +44,18 @@ from typing import Any
 STAR_CODE_LOGIN = "*61"
 STAR_CODE_LOGOUT = "*62"
 
-#: Seconds between sweep ticks (max-wait expiry, retry pacing, stats push).
+#: Pacing for a caller loop that has nobody to offer to right now, and the
+#: period of the stats ticker.
 SWEEP_INTERVAL_SECONDS = 2.0
+
+#: Slack added to a queue's ring_timeout when waiting for an offer to resolve.
+#: The TransferSession watchdog always fires a callback, so this bound is only
+#: a backstop against a wedged session -- never the normal path.
+OFFER_RESOLVE_GRACE_SECONDS = 10.0
+
+#: _offer_agent outcome for an agent who answered (any other value is a
+#: TransferSession abort reason, e.g. "no_answer" / "target_rejected").
+OFFER_ANSWERED = "answered"
 
 #: How long a parked caller may wait with no selectable agent (all members
 #: logged out, or paused -- including auto-paused after missing offers) before
@@ -81,7 +107,6 @@ class QueueCallState(Enum):
 
     WAITING = "waiting"  # Parked on MOH, no agent leg in flight
     OFFERING = "offering"  # An agent leg is ringing
-    OVERFLOW_PENDING = "overflow_pending"  # Max-wait hit mid-offer; VM on failure
     OVERFLOW_VM = "overflow_vm"  # Recording into the queue mailbox
     BRIDGED = "bridged"  # Terminal: talking to an agent
     ABANDONED = "abandoned"  # Terminal: caller hung up while waiting
@@ -106,18 +131,14 @@ class QueueCallContext:
     state: QueueCallState = QueueCallState.WAITING
     enqueue_time: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     attempts: int = 0
-    tried_agents: set[str] = field(default_factory=set)
     current_agent: str | None = None
-    #: Monotonic timestamp before which no new offer should start.
-    retry_at: float = 0.0
-    #: Monotonic timestamp when the queue last went empty of selectable
-    #: agents, or None while at least one is available (see _sweep_once).
-    no_agents_since: float | None = None
     #: Which side ("a" or "b") of the relay hears MOH/announcements; the
     #: inverse of transferee_side, computed once in _admit.
     held_side: str = ""
-    #: Monotonic timestamp of the last hold announcement (see _announce_worker).
-    last_announcement_at: float = field(default_factory=time.monotonic)
+    #: Wakes this caller's owner loop out of an idle pause -- an agent logging
+    #: in, the caller hanging up, or shutdown. Never a decision in itself; the
+    #: loop always re-reads real state after waking.
+    wake: threading.Event = field(default_factory=threading.Event)
 
     def wait_seconds(self) -> float:
         """Seconds this caller has been in the queue"""
@@ -135,17 +156,20 @@ class QueueCallHandler:
             pbx_core: The PBXCore instance
         """
         self.pbx_core: Any = pbx_core
-        # One lock for contexts, waiting lists, and the offering set. Never
-        # held across SIP sends, start_transfer, DB writes, or audio playback.
+        # One lock for contexts, waiting lists, the offering set, and the owner
+        # registry. Never held across SIP sends, start_transfer, DB writes, or
+        # audio playback.
         self._lock = threading.RLock()
         self._contexts: dict[str, QueueCallContext] = {}
         # FIFO of call_ids per queue (position = index while non-terminal).
         self._waiting: dict[str, list[str]] = {}
-        # Agents with an offer leg currently ringing (never double-ring).
+        # Agents with an offer leg currently ringing. Genuinely cross-caller:
+        # it stops two callers offering the same agent at once.
         self._offering: set[str] = set()
-        self._sweep_thread: threading.Thread | None = None
+        # call_id -> the one thread that owns that caller's decisions.
+        self._owners: dict[str, threading.Thread] = {}
+        self._stats_thread: threading.Thread | None = None
         self._stop = threading.Event()
-        self._kick_event = threading.Event()
 
     # ------------------------------------------------------------------
     # Public queries
@@ -388,7 +412,7 @@ class QueueCallHandler:
         """
         Register an answered caller with the queue: overflow immediately if
         the queue is full or has no logged-in agents, otherwise park on MOH
-        and kick the pump.
+        and start the caller's owner thread.
         """
         pbx = self.pbx_core
         queue = pbx.queue_system.get_queue(ctx.queue_number)
@@ -421,8 +445,8 @@ class QueueCallHandler:
                 pbx.moh_system.start_moh(ctx.call_id, relay_handler, ctx.held_side)
 
         self._push_stats()
-        self._ensure_sweeper()
-        self._kick()
+        self._ensure_stats_thread()
+        self._start_owner(ctx)
 
     def _no_agent_timeout(self) -> float:
         """Grace period before a caller with no selectable agents overflows"""
@@ -568,6 +592,8 @@ class QueueCallHandler:
                 return
             ctx.state = QueueCallState.ABANDONED
             self._forget_locked(ctx)
+        # Let the owner loop notice immediately rather than after its pause.
+        ctx.wake.set()
 
         pbx.logger.info(
             f"Queue {ctx.queue_number}: caller {ctx.caller_ext} abandoned after "
@@ -590,148 +616,257 @@ class QueueCallHandler:
         self._push_stats()
 
     # ------------------------------------------------------------------
-    # The pump: sweep thread + kicks
+    # Owner threads + the stats ticker
     # ------------------------------------------------------------------
 
     def kick(self) -> None:
-        """Public nudge (agent login/unpause) to re-evaluate waiting callers"""
-        self._ensure_sweeper()
-        self._kick()
-
-    def _kick(self) -> None:
-        self._kick_event.set()
-
-    def _ensure_sweeper(self) -> None:
-        """Start the sweep thread if it is not already running"""
+        """
+        Public nudge (agent login/unpause): wake every waiting caller so it
+        re-evaluates now instead of after its idle pause. Never a decision --
+        each loop re-reads real state after waking.
+        """
         with self._lock:
-            if self._sweep_thread is not None and self._sweep_thread.is_alive():
+            contexts = list(self._contexts.values())
+        for ctx in contexts:
+            ctx.wake.set()
+
+    def _start_owner(self, ctx: QueueCallContext) -> None:
+        """Start the single thread that owns every decision for this caller"""
+        thread = threading.Thread(
+            target=self._caller_loop,
+            args=(ctx,),
+            daemon=True,
+            name=f"queue-{ctx.queue_number}-{ctx.call_id}",
+        )
+        with self._lock:
+            self._owners[ctx.call_id] = thread
+        thread.start()
+
+    def _ensure_stats_thread(self) -> None:
+        """Start the stats ticker if it is not already running"""
+        with self._lock:
+            if self._stats_thread is not None and self._stats_thread.is_alive():
                 return
             self._stop.clear()
-            thread = threading.Thread(target=self._sweep_loop, daemon=True)
-            self._sweep_thread = thread
+            thread = threading.Thread(target=self._stats_loop, daemon=True)
+            self._stats_thread = thread
             thread.start()
 
     def shutdown(self) -> None:
-        """Stop the sweep thread (from PBXCore.stop())"""
+        """Stop the stats ticker and wake every caller loop (from PBXCore.stop())"""
         self._stop.set()
-        self._kick_event.set()
-        thread = self._sweep_thread
+        with self._lock:
+            contexts = list(self._contexts.values())
+            owners = list(self._owners.values())
+        for ctx in contexts:
+            ctx.wake.set()
+
+        thread = self._stats_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=5)
+        # Best-effort: owners are daemons, and one parked in an offer can
+        # outlive this by up to its ring timeout.
+        for owner in owners:
+            if owner.is_alive():
+                owner.join(timeout=1)
 
-    def _sweep_loop(self) -> None:
+    def _stats_loop(self) -> None:
         """
-        Periodic driver: dead-call cleanup, max-wait expiry, retry pacing,
-        offering waiting callers, stats push. Exits when idle (reaper
-        pattern); restarted lazily by the next admission or kick.
+        Publish live waiting counts on a fixed tick.
+
+        Purely observational -- it makes no decisions about any caller, so it
+        cannot race an owner loop. Exits when idle (reaper pattern); the next
+        admission restarts it.
         """
         pbx = self.pbx_core
         while not self._stop.is_set():
-            self._kick_event.wait(SWEEP_INTERVAL_SECONDS)
-            self._kick_event.clear()
+            self._stop.wait(SWEEP_INTERVAL_SECONDS)
             if self._stop.is_set():
                 return
 
             try:
-                self._sweep_once()
+                self._push_stats()
             except Exception as exc:
-                pbx.logger.error(f"Queue sweep error: {exc}", exc_info=True)
+                pbx.logger.error(f"Queue stats error: {exc}", exc_info=True)
 
             with self._lock:
                 if not self._contexts:
-                    self._sweep_thread = None
+                    self._stats_thread = None
                     return
-
-    def _sweep_once(self) -> None:
-        """One sweep tick over every tracked context"""
-        pbx = self.pbx_core
-        now = time.monotonic()
-
-        with self._lock:
-            snapshot = list(self._contexts.values())
-
-        for ctx in snapshot:
-            call = pbx.call_manager.get_call(ctx.call_id)
-            if call is None:
-                # Ended elsewhere (e.g. end_call raced us): drop tracking. If
-                # an agent leg was ringing, release the offering exclusion
-                # too -- normally the TransferSession's own on_failure does
-                # this, but a call bypassed outside the normal BYE/transfer
-                # path (or a raised exception during that teardown) could
-                # otherwise strand the extension out of selection forever.
-                with self._lock:
-                    if ctx.state not in TERMINAL_STATES:
-                        ctx.state = QueueCallState.DONE
-                    if ctx.current_agent is not None:
-                        self._offering.discard(ctx.current_agent)
-                    self._forget_locked(ctx)
-                continue
-
-            queue = pbx.queue_system.get_queue(ctx.queue_number)
-            max_wait = queue.max_wait_time if queue else 300
-
-            if ctx.state == QueueCallState.WAITING:
-                # Nobody can take this call: every member is logged out or
-                # paused (auto-pause after missed offers lands here too, which
-                # is what a DND phone produces). Holding for the full max_wait
-                # just plays MOH at a caller no one will ever answer.
-                if self._any_agent_logged_in(ctx.queue_number):
-                    ctx.no_agents_since = None
-                else:
-                    if ctx.no_agents_since is None:
-                        ctx.no_agents_since = now
-                    grace = self._no_agent_timeout()
-                    if grace > 0 and now - ctx.no_agents_since >= grace:
-                        with self._lock:
-                            if ctx.state != QueueCallState.WAITING:
-                                continue
-                            ctx.state = QueueCallState.OVERFLOW_PENDING
-                        pbx.logger.info(
-                            f"Queue {ctx.queue_number}: no agents available for "
-                            f"{ctx.call_id}, overflowing to voicemail"
-                        )
-                        self._spawn(self._handle_overflow, ctx)
-                        continue
-
-                if ctx.wait_seconds() >= max_wait:
-                    # Latch under the lock before spawning so consecutive
-                    # sweep ticks cannot spawn duplicate overflow workers.
-                    with self._lock:
-                        if ctx.state != QueueCallState.WAITING:
-                            continue
-                        ctx.state = QueueCallState.OVERFLOW_PENDING
-                    pbx.logger.info(f"Queue {ctx.queue_number}: max wait reached for {ctx.call_id}")
-                    self._spawn(self._handle_overflow, ctx)
-                elif now >= ctx.retry_at:
-                    self._spawn(self._offer_worker, ctx)
-
-                if (
-                    queue is not None
-                    and queue.announcement_enabled
-                    and now - ctx.last_announcement_at >= queue.announcement_interval
-                ):
-                    # Latch before spawning (TTS synthesis can be slow) so a
-                    # worker still in flight isn't double-spawned by the next
-                    # tick, same as the overflow/offer latches above.
-                    with self._lock:
-                        if ctx.state != QueueCallState.WAITING:
-                            continue
-                        ctx.last_announcement_at = now
-                    self._spawn(self._announce_worker, ctx)
-            elif ctx.state == QueueCallState.OFFERING and ctx.wait_seconds() >= max_wait:
-                # Never interrupt a ringing agent: latch so the attempt's
-                # failure path goes to voicemail instead of retrying. An
-                # answer still wins.
-                with self._lock:
-                    if ctx.state == QueueCallState.OFFERING:
-                        ctx.state = QueueCallState.OVERFLOW_PENDING
-
-        self._push_stats()
 
     def _spawn(self, target: Any, ctx: QueueCallContext) -> None:
         """Run queue work on a fresh daemon thread (never on SIP/timer threads)"""
         thread = threading.Thread(target=target, args=(ctx,), daemon=True)
         thread.start()
+
+    # ------------------------------------------------------------------
+    # The caller loop: the one place a queued caller's fate is decided
+    # ------------------------------------------------------------------
+
+    def _caller_loop(self, ctx: QueueCallContext) -> None:
+        """
+        Own one queued caller from admission to a terminal outcome.
+
+        Everything happens in this one thread, in order: overflow checks,
+        then a hold announcement if one is due, then a single agent offer
+        that blocks until it resolves. Nothing here can overlap anything
+        else for this caller, which is what keeps its MOH/relay coherent.
+        """
+        pbx = self.pbx_core
+        # Loop-local: only this thread reads them, so they are not shared
+        # state and need no locking.
+        tried: set[str] = set()
+        no_agents_since: float | None = None
+        last_announcement = time.monotonic()
+
+        try:
+            while not self._stop.is_set():
+                call = pbx.call_manager.get_call(ctx.call_id)
+                if call is None:
+                    # Ended elsewhere (e.g. end_call raced us).
+                    self._release(ctx)
+                    return
+
+                with self._lock:
+                    if ctx.state != QueueCallState.WAITING:
+                        # Terminal, or handed to the overflow recorder.
+                        return
+
+                queue = pbx.queue_system.get_queue(ctx.queue_number)
+                if queue is None:
+                    self._release(ctx)
+                    return
+
+                if self._any_agent_logged_in(ctx.queue_number):
+                    no_agents_since = None
+                elif no_agents_since is None:
+                    no_agents_since = time.monotonic()
+
+                reason = self._overflow_reason(ctx, queue, no_agents_since)
+                if reason is not None:
+                    pbx.logger.info(
+                        f"Queue {ctx.queue_number}: {reason} for {ctx.call_id}; overflowing"
+                    )
+                    self._handle_overflow(ctx)
+                    return
+
+                # An announcement runs to completion before any offer starts,
+                # so it can never be clipped by one.
+                if (
+                    queue.announcement_enabled
+                    and time.monotonic() - last_announcement >= queue.announcement_interval
+                ):
+                    self._play_announcement(ctx, queue)
+                    last_announcement = time.monotonic()
+                    continue
+
+                agent_ext = self._pick_agent(ctx, queue, tried)
+                if agent_ext is None:
+                    # Nobody offerable right now: clear the exclusion cycle
+                    # once everyone has been tried, then pace the next pass.
+                    tried.clear()
+                    ctx.wake.wait(SWEEP_INTERVAL_SECONDS)
+                    ctx.wake.clear()
+                    continue
+
+                if self._resolve_offer(ctx, queue, call, agent_ext, tried):
+                    return
+        except Exception as exc:
+            pbx.logger.error(
+                f"Queue {ctx.queue_number}: caller loop failed for {ctx.call_id}: {exc}",
+                exc_info=True,
+            )
+            self._release(ctx)
+        finally:
+            with self._lock:
+                self._owners.pop(ctx.call_id, None)
+
+    def _overflow_reason(
+        self, ctx: QueueCallContext, queue: Any, no_agents_since: float | None
+    ) -> str | None:
+        """
+        Why this caller should stop waiting now, or None to keep waiting.
+
+        The no-agent rule mirrors the one applied at admission: when every
+        member is logged out or paused -- where a DND phone ends up once
+        auto-pause trips -- holding for the full max_wait just plays MOH at
+        a caller nobody will ever answer. The grace period rides out a
+        transient gap, e.g. an agent re-registering or mid *62/*61.
+        """
+        if ctx.wait_seconds() >= queue.max_wait_time:
+            return "max wait reached"
+        grace = self._no_agent_timeout()
+        if (
+            no_agents_since is not None
+            and grace > 0
+            and (time.monotonic() - no_agents_since >= grace)
+        ):
+            return "no agents available"
+        return None
+
+    def _resolve_offer(
+        self,
+        ctx: QueueCallContext,
+        queue: Any,
+        call: Any,
+        agent_ext: str,
+        tried: set[str],
+    ) -> bool:
+        """
+        Offer the caller to one agent and act on the result.
+
+        Returns:
+            True if the caller reached a terminal outcome (answered or
+            abandoned) and the loop should stop.
+        """
+        outcome = self._offer_agent(ctx, queue, call, agent_ext)
+
+        with self._lock:
+            self._offering.discard(agent_ext)
+            ctx.current_agent = None
+
+        if outcome == OFFER_ANSWERED:
+            self._on_answered(ctx, agent_ext)
+            return True
+
+        if outcome == "transferee_hangup":
+            # The caller hung up while the agent was ringing: the session
+            # swept the agent leg and left the caller's record for us.
+            live = self.pbx_core.call_manager.get_call(ctx.call_id)
+            if live is not None:
+                self._abandon(ctx, live)
+            return True
+
+        # The attempt failed: back to waiting, and do not re-offer this agent
+        # until the whole eligible set has had a turn.
+        with self._lock:
+            if ctx.state == QueueCallState.OFFERING:
+                ctx.state = QueueCallState.WAITING
+        tried.add(agent_ext)
+
+        if outcome == REJECT_ABORT_REASON and self._pause_on_reject():
+            self._record_reject(ctx, agent_ext)
+        else:
+            self._record_miss(ctx, agent_ext)
+        return False
+
+    def _release(self, ctx: QueueCallContext) -> None:
+        """
+        Drop tracking for a caller the loop is giving up on.
+
+        Releases any offering exclusion the caller still holds: normally the
+        offer's own resolution does that, but a call torn down outside the
+        usual BYE/transfer path could otherwise strand an extension out of
+        selection for every queue until restart.
+        """
+        with self._lock:
+            if ctx.state not in TERMINAL_STATES:
+                ctx.state = QueueCallState.DONE
+            if ctx.current_agent is not None:
+                self._offering.discard(ctx.current_agent)
+                ctx.current_agent = None
+            self._forget_locked(ctx)
+        self._push_stats()
 
     # ------------------------------------------------------------------
     # Dial-out: one blind TransferSession per agent attempt
@@ -744,138 +879,89 @@ class QueueCallHandler:
             return False
         return not pbx.call_manager.get_extension_calls(ext)
 
-    def _offer_worker(self, ctx: QueueCallContext) -> None:
+    def _pick_agent(self, ctx: QueueCallContext, queue: Any, tried: set[str]) -> str | None:
         """
-        Pick an agent and originate the offer leg; on synchronous failure
-        (agent unregistered race) count the miss and try the next agent in
-        the same thread.
+        Claim the next agent to offer to, or None if nobody is offerable.
+
+        Claiming (state, current_agent, the _offering exclusion) happens under
+        the lock so two callers cannot claim the same agent.
+        """
+        with self._lock:
+            if ctx.state != QueueCallState.WAITING:
+                return None
+            agent = queue.get_next_agent(
+                self.pbx_core.queue_system.agents,
+                exclude=tried | self._offering,
+                is_dialable=self._agent_dialable,
+            )
+            if agent is None:
+                return None
+            ctx.state = QueueCallState.OFFERING
+            ctx.current_agent = agent.extension
+            ctx.attempts += 1
+            self._offering.add(agent.extension)
+            return str(agent.extension)
+
+    def _offer_agent(self, ctx: QueueCallContext, queue: Any, call: Any, agent_ext: str) -> str:
+        """
+        Ring one agent and block until the attempt resolves.
+
+        The TransferSession callbacks are pure signals here -- they record the
+        outcome and wake this thread, which then owns every recovery decision.
+
+        Returns:
+            OFFER_ANSWERED, or the session's abort reason.
         """
         from pbx.core.transfer_session import TransferMode
 
         pbx = self.pbx_core
+        pbx.logger.info(
+            f"Queue {ctx.queue_number}: offering {ctx.call_id} to agent {agent_ext} "
+            f"(attempt {ctx.attempts})"
+        )
 
-        while True:
-            with self._lock:
-                if ctx.state != QueueCallState.WAITING:
-                    return
-                queue = pbx.queue_system.get_queue(ctx.queue_number)
-                if queue is None:
-                    return
-                agent = queue.get_next_agent(
-                    pbx.queue_system.agents,
-                    exclude=ctx.tried_agents | self._offering,
-                    is_dialable=self._agent_dialable,
-                )
-                if agent is None:
-                    # Nobody offerable right now: clear the exclusion cycle
-                    # once everyone has been tried, and let the sweep pace
-                    # the next attempt.
-                    if ctx.tried_agents:
-                        ctx.tried_agents.clear()
-                    ctx.retry_at = time.monotonic() + SWEEP_INTERVAL_SECONDS
-                    return
-                agent_ext = agent.extension
-                ctx.state = QueueCallState.OFFERING
-                ctx.current_agent = agent_ext
-                ctx.attempts += 1
-                self._offering.add(agent_ext)
+        done = threading.Event()
+        outcome: list[str] = []
+        # The session is only available after start_transfer returns, but a
+        # callback can fire before then; an empty holder just means the abort
+        # reason is unknown.
+        holder: list[Any] = []
 
-            call = pbx.call_manager.get_call(ctx.call_id)
-            if call is None:
-                with self._lock:
-                    self._offering.discard(agent_ext)
-                    if ctx.state not in TERMINAL_STATES:
-                        ctx.state = QueueCallState.DONE
-                    self._forget_locked(ctx)
-                return
+        def _failed() -> None:
+            outcome.append((holder[0].abort_reason if holder else None) or "failed")
+            done.set()
 
-            pbx.logger.info(
-                f"Queue {ctx.queue_number}: offering {ctx.call_id} to agent {agent_ext} "
-                f"(attempt {ctx.attempts})"
-            )
+        def _answered() -> None:
+            outcome.append(OFFER_ANSWERED)
+            done.set()
 
-            transferor_side = "callee" if ctx.transferee_side == "caller" else "caller"
-            # The session outlives this scope; the failure closure reads the
-            # holder to learn the abort reason. Loop variables are bound as
-            # defaults so each iteration's callbacks see their own agent.
-            holder: list[Any] = []
-            session = pbx.transfer_handler.start_transfer(
-                call,
-                agent_ext,
-                mode=TransferMode.BLIND,
-                transferor_side=transferor_side,
-                on_failure=lambda a=agent_ext, h=holder: self._on_offer_failure(ctx, a, h),
-                on_complete=lambda a=agent_ext: self._on_offer_complete(ctx, a),
-            )
+        session = pbx.transfer_handler.start_transfer(
+            call,
+            agent_ext,
+            mode=TransferMode.BLIND,
+            transferor_side="callee" if ctx.transferee_side == "caller" else "caller",
+            on_failure=_failed,
+            on_complete=_answered,
+        )
+        if session is None:
+            # Agent unregistered between the dialability check and the INVITE.
+            pbx.logger.info(f"Queue {ctx.queue_number}: agent {agent_ext} unreachable")
+            return "unreachable"
 
-            if session is None:
-                # Synchronous failure (agent unregistered between the
-                # dialability check and the INVITE): a miss, try the next.
-                pbx.logger.info(
-                    f"Queue {ctx.queue_number}: agent {agent_ext} unreachable, trying next"
-                )
-                self._record_miss(ctx, agent_ext)
-                with self._lock:
-                    self._offering.discard(agent_ext)
-                    ctx.current_agent = None
-                    if ctx.state == QueueCallState.OFFERING:
-                        ctx.state = QueueCallState.WAITING
-                    if ctx.state == QueueCallState.OVERFLOW_PENDING:
-                        break
-                continue
-
-            holder.append(session)
+        holder.append(session)
+        if not done.is_set():
             # Per-queue ring timeout overrides the default armed in
             # _originate_target (safe: arm_watchdog cancels the prior timer).
             session.arm_watchdog(float(queue.ring_timeout))
-            return
+            timeout = float(queue.ring_timeout) + OFFER_RESOLVE_GRACE_SECONDS
+            if not done.wait(timeout):
+                # The watchdog should always have resolved by now.
+                pbx.logger.error(f"Queue {ctx.queue_number}: offer to {agent_ext} never resolved")
+                return "unresolved"
+        return outcome[0] if outcome else "failed"
 
-        # OVERFLOW_PENDING latched while cycling agents.
-        self._handle_overflow(ctx)
-
-    def _on_offer_failure(self, ctx: QueueCallContext, agent_ext: str, holder: list[Any]) -> None:
-        """
-        TransferSession failure hook. Fires on SIP-response/watchdog threads:
-        hop to a fresh daemon thread before doing recovery work.
-        """
-        reason = holder[0].abort_reason if holder else None
-
-        def _recover() -> None:
-            pbx = self.pbx_core
-            with self._lock:
-                self._offering.discard(agent_ext)
-                ctx.current_agent = None
-
-            if reason == "transferee_hangup":
-                # The caller hung up while the agent was ringing: the session
-                # swept the agent leg and left the caller's record for us.
-                call = pbx.call_manager.get_call(ctx.call_id)
-                if call is not None:
-                    self._abandon(ctx, call)
-                return
-
-            if reason == REJECT_ABORT_REASON and self._pause_on_reject():
-                self._record_reject(ctx, agent_ext)
-            else:
-                self._record_miss(ctx, agent_ext)
-
-            with self._lock:
-                if ctx.state == QueueCallState.OFFERING:
-                    ctx.state = QueueCallState.WAITING
-                overflow_now = ctx.state == QueueCallState.OVERFLOW_PENDING
-
-            if overflow_now:
-                self._handle_overflow(ctx)
-            else:
-                # Caller kept their position (never dequeued); ring the next
-                # agent immediately.
-                self._offer_worker(ctx)
-
-        thread = threading.Thread(target=_recover, daemon=True)
-        thread.start()
-
-    def _on_offer_complete(self, ctx: QueueCallContext, agent_ext: str) -> None:
-        """TransferSession success hook: the agent answered and is bridged"""
+    def _on_answered(self, ctx: QueueCallContext, agent_ext: str) -> None:
+        """The agent answered and is bridged to the caller"""
         from pbx.features.webhooks import WebhookEvent
 
         pbx = self.pbx_core
@@ -926,7 +1012,6 @@ class QueueCallHandler:
         from pbx.features.webhooks import WebhookEvent
 
         pbx = self.pbx_core
-        ctx.tried_agents.add(agent_ext)
         if not pbx.queue_system.set_agent_pause(agent_ext, True, "auto_rejected"):
             return
         pbx.logger.info(
@@ -943,7 +1028,6 @@ class QueueCallHandler:
         from pbx.features.webhooks import WebhookEvent
 
         pbx = self.pbx_core
-        ctx.tried_agents.add(agent_ext)
         if pbx.queue_system.record_miss(agent_ext):
             pbx.webhook_system.trigger_event(
                 WebhookEvent.QUEUE_AGENT_PAUSED,
@@ -951,34 +1035,29 @@ class QueueCallHandler:
             )
 
     # ------------------------------------------------------------------
-    # Hold announcements: periodic sequential interruption of MOH
+    # Hold announcements: sequential interruption of MOH
     # ------------------------------------------------------------------
 
-    def _announce_worker(self, ctx: QueueCallContext) -> None:
+    def _play_announcement(self, ctx: QueueCallContext, queue: Any) -> None:
         """
-        Interrupt MOH once with a hold announcement, then let it resume.
+        Interrupt MOH with one hold announcement and let it resume.
 
-        Runs on its own daemon thread (TTS/audio playback blocks). Bails
-        cleanly if the caller stopped waiting between the sweep tick that
-        spawned this and now -- MusicOnHold.interject() is itself a safe
-        no-op if the call isn't on MOH anymore.
+        Called only from the caller's own loop, so no agent offer can be in
+        flight and the prompt always plays in full. It still barges out if
+        the caller hangs up mid-prompt.
         """
         pbx = self.pbx_core
 
         with self._lock:
-            if ctx.state != QueueCallState.WAITING:
-                return
             waiting = self._waiting.get(ctx.queue_number, [])
-            position = waiting.index(ctx.call_id) + 1 if ctx.call_id in waiting else None
-
-        queue = pbx.queue_system.get_queue(ctx.queue_number)
-        if queue is None or position is None:
-            return
+            if ctx.state != QueueCallState.WAITING or ctx.call_id not in waiting:
+                return
+            position = waiting.index(ctx.call_id) + 1
 
         audio_path, is_temp = self._resolve_announcement_audio(queue, position)
+        if audio_path is None:
+            return
         try:
-            if audio_path is None:
-                return
             pbx.moh_system.interject(
                 ctx.call_id,
                 ctx.held_side,
@@ -986,10 +1065,7 @@ class QueueCallHandler:
                 interrupt_check=lambda: ctx.state != QueueCallState.WAITING,
             )
         finally:
-            ctx.last_announcement_at = time.monotonic()
-            if is_temp and audio_path is not None:
-                import contextlib
-
+            if is_temp:
                 with contextlib.suppress(OSError):
                     audio_path.unlink()
 
@@ -1244,7 +1320,6 @@ class QueueCallHandler:
 
     def _star_code_confirm(self, call: Any, call_id: str, rtp_port: int, login: bool) -> None:
         """Play a spoken sign-in/out confirmation, BYE the agent, release resources"""
-        import contextlib
         import tempfile
 
         from pbx.rtp.handler import RTPPlayer

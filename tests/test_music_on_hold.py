@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import socket
 import struct
+import threading
 import time
 from typing import TYPE_CHECKING, ClassVar
+from unittest.mock import patch
 
 import pytest
 
@@ -264,6 +266,56 @@ class TestMusicOnHoldInterject:
 
         assert moh.interject("never_held", "a", prompt_path) is False
         assert "never_held" not in moh.active_sessions
+
+    def test_stop_moh_during_interject_leaves_relay_resumed(self, tmp_path: Path) -> None:
+        """Regression: hold ending mid-announcement (a bridge, BYE, or
+        voicemail divert) used to find no MOH session -- interject had
+        popped it for the duration of the prompt -- so stop_moh silently
+        skipped the resume, and interject's tail then restarted MOH. That
+        left a *bridged* relay paused, i.e. dead air in both directions.
+        """
+        _write_wav(tmp_path / "default" / "hold.wav")
+        prompt_path = tmp_path / "prompt.wav"
+        _write_wav(prompt_path)
+        moh = MusicOnHold(moh_directory=str(tmp_path))
+
+        relay = RTPRelay(port_range_start=41500, port_range_end=41600)
+        call_id = "interject_cancelled"
+        assert relay.allocate_relay(call_id) is not None
+        handler = relay.get_handler(call_id)
+        assert handler is not None
+
+        playing = threading.Event()
+        release = threading.Event()
+
+        def _blocking_play(_self, _file_path, interrupt_check=None):
+            playing.set()
+            release.wait(2)
+            return True
+
+        held = _recv_socket()
+        try:
+            handler.learned_a = held.getsockname()
+            assert moh.start_moh(call_id, handler, "a") is not None
+            assert handler.paused is True
+
+            with patch.object(RTPPlayer, "play_file", _blocking_play):
+                worker = threading.Thread(target=moh.interject, args=(call_id, "a", prompt_path))
+                worker.start()
+                assert playing.wait(2), "interject never started playing the prompt"
+
+                # Hold ends while the prompt is still playing.
+                moh.stop_moh(call_id)
+                release.set()
+                worker.join(timeout=3)
+                assert not worker.is_alive()
+
+            assert handler.paused is False
+            assert call_id not in moh.active_sessions
+        finally:
+            release.set()
+            held.close()
+            relay.release_relay(call_id)
 
 
 # ---------------------------------------------------------------------------
