@@ -162,6 +162,10 @@
                         <span class="tab-icon">📢</span>
                         <span class="tab-text">Paging System</span>
                     </button>
+                    <button class="tab-button" data-tab="call-queues">
+                        <span class="tab-icon">👥</span>
+                        <span class="tab-text">Call Queues</span>
+                    </button>
                     <button class="tab-button" data-tab="codecs">
                         <span class="tab-icon">🎵</span>
                         <span class="tab-text">Codecs</span>
@@ -1390,6 +1394,30 @@
         </div>
 
         <!-- Paging System Tab -->
+        <div id="call-queues" class="tab-content">
+            <div class="section-header">
+                <h2>👥 Call Queues (ACD)</h2>
+                <button class="btn btn-primary" onclick="loadQueuesData()">🔄 Refresh</button>
+            </div>
+
+            <div class="info-box">
+                <h3>ℹ️ About Call Queues</h3>
+                <p>Callers dialing a queue number (e.g., 8001) or transferred into it wait on hold music while calls are distributed to logged-in agents. Overflow (queue full, wait too long, or no agents) goes to the queue's voicemail box.</p>
+                <p><strong>Agent dial codes:</strong> *61 to log in, *62 to log out. Dial *<em>queue number</em> (e.g., *8001) to retrieve queue voicemail.</p>
+            </div>
+
+            <!-- Queues & Agents: one card per queue, with its agents listed inside -->
+            <div class="config-section">
+                <div class="section-header">
+                    <h3>📋 Queues &amp; Agents</h3>
+                    <button class="btn btn-success" onclick="showAddQueueModal()">➕ Add Queue</button>
+                </div>
+                <div id="queues-cards" class="queues-cards">
+                    <div class="loading">Loading queues...</div>
+                </div>
+            </div>
+        </div>
+
         <div id="paging" class="tab-content">
             <div class="section-header">
                 <h2>📢 Paging System</h2>

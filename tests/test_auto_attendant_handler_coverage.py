@@ -45,6 +45,9 @@ def _make_pbx_core() -> MagicMock:
     pbx._get_ilbc_mode.return_value = 30
     pbx.rtp_relay.port_pool = [30000, 30002, 30004]
     pbx.auto_attendant.timeout = 30
+    # No queues configured: AA transfers go through start_transfer, not
+    # queue adoption
+    pbx.queue_handler.is_queue_destination.return_value = False
     return pbx
 
 

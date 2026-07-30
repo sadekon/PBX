@@ -2462,38 +2462,77 @@ POST /api/framework/geo-redundancy/region/{region_id}/failover</pre>
     `;
 }
 
-const showCreateRegionDialog = async () => {
-    const regionId = prompt('Enter Region ID (e.g., us-east-1):');
-    if (!regionId) return;
+function hideCreateRegionDialog() {
+    const modal = document.getElementById('create-region-dialog');
+    if (modal) modal.remove();
+}
 
-    const name = prompt('Enter Region Name (e.g., US East):');
-    if (!name) return;
+function showCreateRegionDialog() {
+    hideCreateRegionDialog();
+    const modal = `
+        <div id="create-region-dialog" class="modal" style="display: flex; align-items: center;
+             justify-content: center;">
+            <div class="modal-content" style="max-width: 600px;">
+                <div class="modal-header">
+                    <h3>➕ Add Region</h3>
+                    <span class="close" onclick="hideCreateRegionDialog()">&times;</span>
+                </div>
+                <form id="create-region-form">
+                    <div class="form-group">
+                        <label>Region ID:</label>
+                        <input type="text" name="region_id" required class="form-control"
+                            placeholder="us-east-1">
+                    </div>
+                    <div class="form-group">
+                        <label>Region Name:</label>
+                        <input type="text" name="name" required class="form-control"
+                            placeholder="US East">
+                    </div>
+                    <div class="form-group">
+                        <label>Location:</label>
+                        <input type="text" name="location" required class="form-control"
+                            placeholder="Virginia, USA">
+                    </div>
+                    <div class="modal-actions">
+                        <button type="submit" class="btn-primary">Create Region</button>
+                        <button type="button" class="btn-secondary"
+                            onclick="hideCreateRegionDialog()">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', modal);
 
-    const location = prompt('Enter Region Location (e.g., Virginia, USA):');
-    if (!location) return;
+    document.getElementById('create-region-form').onsubmit = async function(e) {
+        e.preventDefault();
+        const formData = new FormData(e.target);
+        const data = {
+            region_id: formData.get('region_id'),
+            name: formData.get('name'),
+            location: formData.get('location')
+        };
 
-    try {
-        const r = await fetch('/api/framework/geo-redundancy/region', {
-            method: 'POST',
-            headers: pbxAuthHeaders(),
-            body: JSON.stringify({
-                region_id: regionId,
-                name: name,
-                location: location
-            })
-        });
-        const result = await r.json();
-        if (result.success) {
-            alert(`✅ Region created successfully!`);
-            // Reload the tab
-            switchTab('geo-redundancy');
-        } else {
-            alert(`❌ Failed to create region: ${result.error}`);
+        try {
+            const r = await fetch('/api/framework/geo-redundancy/region', {
+                method: 'POST',
+                headers: pbxAuthHeaders(),
+                body: JSON.stringify(data)
+            });
+            const result = await r.json();
+            if (result.success) {
+                alert(`✅ Region created successfully!`);
+                hideCreateRegionDialog();
+                // Reload the tab
+                switchTab('geo-redundancy');
+            } else {
+                alert(`❌ Failed to create region: ${result.error}`);
+            }
+        } catch (err) {
+            alert(`❌ Error: ${err.message}`);
         }
-    } catch (err) {
-        alert(`❌ Error: ${err.message}`);
-    }
-};
+    };
+}
 
 const triggerFailover = async (regionId) => {
     if (!confirm(`Are you sure you want to failover to region ${regionId}?`)) return;
@@ -2740,6 +2779,8 @@ window.frameworkFeatures = {
     hideEnrollUserDialog,
     deleteVoiceProfile,
     hideCreateCampaignDialog,
+    showCreateRegionDialog,
+    hideCreateRegionDialog,
     hideCreateTagDialog,
     hideCreateRuleDialog,
     submitConversationalAIConfig,

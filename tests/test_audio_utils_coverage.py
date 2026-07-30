@@ -699,3 +699,78 @@ class TestGetPromptAudio:
         result = get_prompt_audio("goodbye", str(tmp_path / "nonexistent"), sample_rate=16000)
         sr = struct.unpack("<I", result[24:28])[0]
         assert sr == 16000
+
+
+@pytest.mark.unit
+class TestVectorisedG711:
+    """
+    The lookup-table G.711 path used by the audio mixer.
+
+    These exist because the mixer decodes and re-encodes every leg every
+    20 ms, which the scalar per-sample helpers cannot sustain. The tables
+    must stay bit-identical to those scalar helpers.
+    """
+
+    def test_ulaw_encode_matches_scalar_over_full_int16_range(self) -> None:
+        import numpy as np
+
+        from pbx.utils.audio import pcm16_to_ulaw, samples_to_ulaw
+
+        every_sample = np.arange(-32768, 32768, dtype=np.int16)
+        assert samples_to_ulaw(every_sample) == pcm16_to_ulaw(every_sample.tobytes())
+
+    def test_decode_tables_match_scalar_decoders(self) -> None:
+        from pbx.utils.audio import (
+            _alaw_byte_to_linear,
+            _ulaw_byte_to_linear,
+            alaw_to_pcm16,
+            ulaw_to_pcm16,
+        )
+
+        codes = bytes(range(256))
+        assert list(ulaw_to_pcm16(codes)) == [_ulaw_byte_to_linear(b) for b in range(256)]
+        assert list(alaw_to_pcm16(codes)) == [_alaw_byte_to_linear(b) for b in range(256)]
+
+    def test_alaw_round_trips_every_code(self) -> None:
+        from pbx.utils.audio import alaw_to_pcm16, samples_to_alaw
+
+        codes = bytes(range(256))
+        assert samples_to_alaw(alaw_to_pcm16(codes)) == codes
+
+    def test_ulaw_round_trips_every_code_except_negative_zero(self) -> None:
+        """0x7F and 0xFF both decode to 0; encoding 0 yields 0xFF."""
+        from pbx.utils.audio import samples_to_ulaw, ulaw_to_pcm16
+
+        codes = bytes(range(256))
+        result = samples_to_ulaw(ulaw_to_pcm16(codes))
+        differing = [i for i, (a, b) in enumerate(zip(codes, result, strict=True)) if a != b]
+        assert differing == [0x7F]
+        assert result[0x7F] == 0xFF
+
+    @pytest.mark.parametrize("law", ["ulaw", "alaw"])
+    def test_quantisation_snr_is_within_g711_expectations(self, law: str) -> None:
+        import numpy as np
+
+        from pbx.utils import audio
+
+        encode = audio.samples_to_ulaw if law == "ulaw" else audio.samples_to_alaw
+        decode = audio.ulaw_to_pcm16 if law == "ulaw" else audio.alaw_to_pcm16
+
+        signal = (np.sin(np.linspace(0, 40 * np.pi, 8000)) * 12000).astype(np.int16)
+        recovered = decode(encode(signal)).astype(np.int32)
+        noise = np.sum((signal.astype(np.int32) - recovered) ** 2)
+        snr_db = 10 * np.log10(np.sum(signal.astype(np.int32) ** 2) / max(noise, 1))
+        assert snr_db > 30
+
+    def test_pcm16_to_alaw_matches_array_encoder(self) -> None:
+        import numpy as np
+
+        from pbx.utils.audio import pcm16_to_alaw, samples_to_alaw
+
+        samples = np.array([0, 1, -1, 4096, -4096, 32767, -32768], dtype=np.int16)
+        assert pcm16_to_alaw(samples.tobytes()) == samples_to_alaw(samples)
+
+    def test_pcm16_to_alaw_ignores_trailing_odd_byte(self) -> None:
+        from pbx.utils.audio import pcm16_to_alaw
+
+        assert len(pcm16_to_alaw(b"\x00\x01\x02")) == 1

@@ -567,20 +567,16 @@ class OperatorConsole:
         Returns:
             dict: Queue statistics
         """
-        if not hasattr(self.pbx_core, "call_queue_system"):
+        queue_system = getattr(self.pbx_core, "queue_system", None)
+        if queue_system is None:
             return {}
 
-        queue_system = self.pbx_core.call_queue_system
-        status = {}
-
-        for queue in queue_system.queues.values():
-            status[queue.number] = {
-                "name": queue.name,
-                "calls_waiting": queue.get_queue_depth(),
-                "available_agents": len(
-                    [a for a in queue.agents.values() if a.status == "available"]
-                ),
-                "longest_wait": queue.get_longest_wait_time(),
+        return {
+            entry["queue_number"]: {
+                "name": entry["name"],
+                "calls_waiting": entry["calls_waiting"],
+                "available_agents": entry["available_agents"],
+                "longest_wait": entry["longest_wait"],
             }
-
-        return status
+            for entry in queue_system.get_all_status()
+        }

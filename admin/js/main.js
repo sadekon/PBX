@@ -56,6 +56,7 @@ import './pages/security.ts';
 import './pages/emergency.ts';
 import './pages/phone_book.ts';
 import './pages/paging.ts';
+import './pages/queues.ts';
 import './pages/license.ts';
 import './pages/analytics.ts';
 import './pages/sip-trunks.ts';

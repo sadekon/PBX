@@ -403,6 +403,76 @@ voicemail:
 conference:
   max_participants: 50
   record_conferences: false
+# Audio mixer (N-way media). Backs conference, three-way calling and the
+# supervisor modes (silent monitor, whisper, barge). Ordinary two-party calls
+# never touch it -- they stay on the cheaper codec-opaque RTP relay, and a
+# call is only promoted onto a bridge when a third party is involved.
+#
+# max_ports_per_bridge is a measured limit, not an arbitrary one. Per 20 ms
+# frame the mix loop costs roughly 1% of its budget at 8 G.711 legs, but
+# ~49% at 8 G.722 legs, because the G.722 codec is pure-Python ADPCM. Raising
+# this much above 8 risks late frames on wideband bridges.
+mixer:
+  max_ports_per_bridge: 8
+# Attended/blind transfer failure handling. None of these need to be set --
+# defaults match existing behavior. Siblings read by code but not listed
+# here (all under `transfer:`, unchanged by this key): atxferdropcall
+# (default false) drops the transferee immediately on no-answer instead of
+# recalling the transferor; atxfercallbackretries (default 2),
+# atxfernoanswertimeout (default 15s), atxferloopdelay (default 10s) control
+# the recall attempt count/per-attempt timeout/spacing.
+# atxfer_no_answer_action: what happens to the transferee once nobody can
+# take them back (recall disabled, or its retries exhausted).
+#   drop (default): hang up on them, matching prior behavior.
+#   voicemail: record a message into the transfer destination's mailbox.
+transfer:
+  atxfer_no_answer_action: drop
+# Call queues (ACD). SEED ONLY: this section populates the database the
+# first time the PBX starts with an empty call_queues table; after that the
+# database (admin UI / REST API) is authoritative and edits here are ignored.
+# Per-queue keys: number, name, strategy (round_robin | least_recent |
+# fewest_calls | random), ring_timeout, max_wait_time, max_queue_size,
+# fallback_mailbox (default: the queue number; retrieve via *<queue number>),
+# auto_pause_misses (0 = off), agents (list of member extensions).
+# Agents log in/out by dialing *61 / *62.
+# Call queues (ACD).
+#
+# SEED ONLY: this list populates the call_queues table the first time it is
+# empty. After that the DATABASE is authoritative -- edit queues in the admin
+# UI or via /api/queues. Changing entries here has no effect on an already
+# seeded system.
+#
+# Agents: membership is per-queue; login/pause state is global per extension.
+#   *61 = agent login (also clears an auto-pause), *62 = agent logout.
+# Overflow (queue full, no agents, or max wait reached) records a voicemail in
+# fallback_mailbox by default, defaulting to the queue number itself; retrieve
+# it by dialing *<queue number>, e.g. *8001. Set overflow_action: drop on a
+# queue (admin UI / API) to hang up on overflow instead.
+#
+# max_redials: extra times ONE caller may be offered to the SAME agent after
+# the first attempt (0 = each agent is offered once). When every logged-in,
+# unpaused agent has used up its attempts the caller overflows immediately
+# instead of holding for max_wait_time.
+#
+# Per-queue keys: number, name, strategy, ring_timeout, max_wait_time,
+#   max_queue_size, fallback_mailbox, auto_pause_misses, enabled,
+#   overflow_action (voicemail | drop), max_redials.
+# Strategies: round_robin | least_recent | fewest_calls | random
+#   ('ring_all' is not yet supported and is rejected/downgraded.)
+#
+# queue_no_agent_timeout: seconds a parked caller may wait with NO selectable
+# agent (all members logged out or paused -- which is where a DND phone ends up
+# once auto-pause trips) before overflowing to voicemail, rather than holding
+# for the full max_wait_time. 0 disables the check. Default 15. Top-level
+# because `queues:` below is a list and cannot carry nested settings.
+queue_no_agent_timeout: 15
+# queue_pause_on_reject: when an agent's phone answers a queue offer with an
+# explicit failure (486/603/480 -- what a phone in DND sends) rather than just
+# ringing out, pause that agent instead of counting a miss. Stops the queue
+# redialing a phone that has said it will not take calls. The pause shows in
+# the admin UI as 'auto_rejected' and is cleared by *61 or an admin unpause.
+# Set false to fall back to plain miss counting (auto_pause_misses).
+queue_pause_on_reject: true
 queues:
   - number: '8001'
     name: Sales Queue

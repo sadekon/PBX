@@ -14,9 +14,22 @@ import socket
 import struct
 import sys
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_retransmit_timers():
+    """Keep INVITE retransmission timer chains from leaking past each test.
+
+    Routing tests start real InviteClientTransactions whose timer-A chain
+    keeps re-scheduling after the test ends; if it fires while another test
+    has threading.Thread/Timer patched globally, the leaked thread raises
+    and pytest fails that unrelated test.
+    """
+    with patch("pbx.sip.transaction.InviteClientTransaction._schedule_timer_a"):
+        yield
 
 # Other test modules may inject MagicMock objects into sys.modules for
 # ``pbx.rtp.handler`` (and related SIP/SDP modules) to avoid importing heavy

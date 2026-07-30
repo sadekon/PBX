@@ -1,150 +1,398 @@
 """Unit tests for pbx.features.call_queue — Agent, CallQueue, QueueSystem."""
 
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 
+def _dialable(_ext: str) -> bool:
+    return True
+
+
 @pytest.mark.unit
 @patch("pbx.features.call_queue.get_logger", return_value=MagicMock())
-class TestCallQueue:
-    """Tests for call queue classes."""
+class TestAgent:
+    """Tests for the global Agent state object."""
 
-    def test_agent_status_transitions(self, _mock_logger):
-        """Agent status transitions through all states."""
-        from pbx.features.call_queue import Agent, AgentStatus
-
-        agent = Agent("1001", "Alice")
-        assert agent.status == AgentStatus.OFFLINE
-
-        agent.set_available()
-        assert agent.status == AgentStatus.AVAILABLE
-
-        agent.set_busy("call1")
-        assert agent.status == AgentStatus.BUSY
-
-        agent.set_break()
-        assert agent.status == AgentStatus.ON_BREAK
-
-        agent.set_offline()
-        assert agent.status == AgentStatus.OFFLINE
-
-    def test_agent_complete_call(self, _mock_logger):
-        """complete_call increments calls_taken and resets status."""
-        from pbx.features.call_queue import Agent, AgentStatus
+    def test_defaults(self, _mock_logger):
+        """New agents start logged out with clean counters."""
+        from pbx.features.call_queue import Agent
 
         agent = Agent("1001", "Alice")
-        agent.set_busy("call1")
-        assert agent.current_call_id == "call1"
+        assert agent.extension == "1001"
+        assert agent.name == "Alice"
+        assert agent.logged_in is False
+        assert agent.paused is False
+        assert agent.pause_reason is None
+        assert agent.consecutive_misses == 0
+        assert agent.calls_taken == 0
+        assert agent.last_call_time is None
+        assert agent.last_offered_time is None
 
-        agent.complete_call()
+    def test_is_selectable(self, _mock_logger):
+        """Selectable = logged in and not paused."""
+        from pbx.features.call_queue import Agent
 
-        assert agent.calls_taken == 1
-        assert agent.status == AgentStatus.AVAILABLE
-        assert agent.current_call_id is None
-        assert agent.last_call_time is not None
+        agent = Agent("1001")
+        assert agent.is_selectable() is False
 
-    def test_queue_enqueue_dequeue(self, _mock_logger):
-        """Enqueue assigns positions; dequeue reindexes remaining."""
-        from pbx.features.call_queue import CallQueue, QueueStrategy
+        agent.logged_in = True
+        assert agent.is_selectable() is True
 
-        q = CallQueue("100", "Support", strategy=QueueStrategy.ROUND_ROBIN)
-        c1 = q.enqueue("call1", "2001")
-        c2 = q.enqueue("call2", "2002")
-        c3 = q.enqueue("call3", "2003")
+        agent.paused = True
+        assert agent.is_selectable() is False
 
-        assert c1.position == 1
-        assert c2.position == 2
-        assert c3.position == 3
-        assert len(q.queue) == 3
 
-        first = q.dequeue()
-        assert first.call_id == "call1"
-        assert len(q.queue) == 2
-        assert q.queue[0].position == 1
-        assert q.queue[1].position == 2
+@pytest.mark.unit
+@patch("pbx.features.call_queue.get_logger", return_value=MagicMock())
+class TestCallQueueSelection:
+    """Tests for CallQueue.get_next_agent strategies."""
 
-    def test_queue_full(self, _mock_logger):
-        """Enqueue returns None when queue is full."""
-        from pbx.features.call_queue import CallQueue, QueueStrategy
+    def _make_agents(self, *extensions):
+        from pbx.features.call_queue import Agent
 
-        q = CallQueue("100", "Support", strategy=QueueStrategy.ROUND_ROBIN, max_queue_size=2)
-        assert q.enqueue("call1", "2001") is not None
-        assert q.enqueue("call2", "2002") is not None
-        assert q.enqueue("call3", "2003") is None
+        agents = {}
+        for ext in extensions:
+            agent = Agent(ext)
+            agent.logged_in = True
+            agents[ext] = agent
+        return agents
 
-    def test_next_agent_round_robin(self, _mock_logger):
-        """ROUND_ROBIN cycles through available agents."""
-        from pbx.features.call_queue import Agent, CallQueue, QueueStrategy
+    def _make_queue(self, strategy, members):
+        from pbx.features.call_queue import CallQueue
 
-        q = CallQueue("100", "Support", strategy=QueueStrategy.ROUND_ROBIN)
-        agents = [Agent(f"100{i}", f"Agent{i}") for i in range(3)]
-        for a in agents:
-            a.set_available()
-            q.add_agent(a)
+        queue = CallQueue("8001", "Sales", strategy=strategy)
+        queue.members.update(members)
+        return queue
 
-        first = q.get_next_agent()
-        second = q.get_next_agent()
-        third = q.get_next_agent()
+    def test_no_members(self, _mock_logger):
+        from pbx.features.call_queue import QueueStrategy
 
-        # Should cycle through all three
-        selected = {first.extension, second.extension, third.extension}
-        assert len(selected) == 3
+        queue = self._make_queue(QueueStrategy.ROUND_ROBIN, [])
+        assert queue.get_next_agent({}, set(), _dialable) is None
 
-    def test_next_agent_fewest_calls(self, _mock_logger):
-        """FEWEST_CALLS returns the agent with the lowest calls_taken."""
-        from pbx.features.call_queue import Agent, CallQueue, QueueStrategy
+    def test_nobody_logged_in(self, _mock_logger):
+        from pbx.features.call_queue import QueueStrategy
 
-        q = CallQueue("100", "Support", strategy=QueueStrategy.FEWEST_CALLS)
+        agents = self._make_agents("1001", "1002")
+        for agent in agents.values():
+            agent.logged_in = False
+        queue = self._make_queue(QueueStrategy.ROUND_ROBIN, agents)
+        assert queue.get_next_agent(agents, set(), _dialable) is None
 
-        a1 = Agent("1001", "Alice")
-        a1.calls_taken = 5
-        a1.set_available()
+    def test_paused_agent_skipped(self, _mock_logger):
+        from pbx.features.call_queue import QueueStrategy
 
-        a2 = Agent("1002", "Bob")
-        a2.calls_taken = 1
-        a2.set_available()
+        agents = self._make_agents("1001", "1002")
+        agents["1001"].paused = True
+        queue = self._make_queue(QueueStrategy.ROUND_ROBIN, agents)
+        selected = queue.get_next_agent(agents, set(), _dialable)
+        assert selected is agents["1002"]
 
-        a3 = Agent("1003", "Charlie")
-        a3.calls_taken = 3
-        a3.set_available()
+    def test_excluded_agent_skipped(self, _mock_logger):
+        from pbx.features.call_queue import QueueStrategy
 
-        q.add_agent(a1)
-        q.add_agent(a2)
-        q.add_agent(a3)
+        agents = self._make_agents("1001", "1002")
+        queue = self._make_queue(QueueStrategy.ROUND_ROBIN, agents)
+        selected = queue.get_next_agent(agents, {"1001"}, _dialable)
+        assert selected is agents["1002"]
 
-        agent = q.get_next_agent()
-        assert agent.extension == "1002"
+    def test_dialable_predicate_applied(self, _mock_logger):
+        from pbx.features.call_queue import QueueStrategy
 
-    def test_process_queue(self, _mock_logger):
-        """process_queue matches queued calls to available agents."""
-        from pbx.features.call_queue import Agent, AgentStatus, CallQueue, QueueStrategy
+        agents = self._make_agents("1001", "1002")
+        queue = self._make_queue(QueueStrategy.ROUND_ROBIN, agents)
+        selected = queue.get_next_agent(agents, set(), lambda ext: ext != "1001")
+        assert selected is agents["1002"]
 
-        q = CallQueue("100", "Support", strategy=QueueStrategy.ROUND_ROBIN)
+    def test_round_robin_cycles(self, _mock_logger):
+        from pbx.features.call_queue import QueueStrategy
 
-        a1 = Agent("1001", "Alice")
-        a1.set_available()
-        a2 = Agent("1002", "Bob")
-        a2.set_available()
-        q.add_agent(a1)
-        q.add_agent(a2)
+        agents = self._make_agents("1001", "1002", "1003")
+        queue = self._make_queue(QueueStrategy.ROUND_ROBIN, agents)
 
-        q.enqueue("call1", "2001")
-        q.enqueue("call2", "2002")
+        picks = {queue.get_next_agent(agents, set(), _dialable).extension for _ in range(3)}
+        assert picks == {"1001", "1002", "1003"}
 
-        assignments = q.process_queue()
+    def test_least_recent(self, _mock_logger):
+        from pbx.features.call_queue import QueueStrategy
 
-        assert len(assignments) == 2
-        for _call, agent in assignments:
-            assert agent.status == AgentStatus.BUSY
-        assert len(q.queue) == 0
+        agents = self._make_agents("1001", "1002")
+        agents["1001"].last_call_time = datetime.now(UTC) - timedelta(hours=2)
+        agents["1002"].last_call_time = datetime.now(UTC) - timedelta(minutes=5)
+        queue = self._make_queue(QueueStrategy.LEAST_RECENT, agents)
+        assert queue.get_next_agent(agents, set(), _dialable) is agents["1001"]
 
-    def test_queue_system_create_enqueue(self, _mock_logger):
-        """QueueSystem.create_queue and enqueue_call basics."""
+    def test_least_recent_never_called_wins(self, _mock_logger):
+        from pbx.features.call_queue import QueueStrategy
+
+        agents = self._make_agents("1001", "1002")
+        agents["1001"].last_call_time = None
+        agents["1002"].last_call_time = datetime.now(UTC)
+        queue = self._make_queue(QueueStrategy.LEAST_RECENT, agents)
+        assert queue.get_next_agent(agents, set(), _dialable) is agents["1001"]
+
+    def test_least_recent_rotates_among_never_answered(self, _mock_logger):
+        """Regression: before last_offered_time, agents who never answered a
+        call all tied at last_call_time=None, so the lowest extension was
+        always picked -- e.g. offering three separate calls all landed on
+        the same agent even though every agent was logged in and idle."""
+        from pbx.features.call_queue import QueueStrategy
+
+        agents = self._make_agents("1001", "1002", "1003")
+        queue = self._make_queue(QueueStrategy.LEAST_RECENT, agents)
+
+        picks = [queue.get_next_agent(agents, set(), _dialable).extension for _ in range(3)]
+        assert picks == ["1001", "1002", "1003"]
+
+    def test_fewest_calls(self, _mock_logger):
+        from pbx.features.call_queue import QueueStrategy
+
+        agents = self._make_agents("1001", "1002", "1003")
+        agents["1001"].calls_taken = 5
+        agents["1002"].calls_taken = 1
+        agents["1003"].calls_taken = 3
+        queue = self._make_queue(QueueStrategy.FEWEST_CALLS, agents)
+        assert queue.get_next_agent(agents, set(), _dialable) is agents["1002"]
+
+    def test_fewest_calls_rotates_when_tied(self, _mock_logger):
+        """Same regression as least_recent: agents tied at calls_taken=0
+        (fresh queue, or one who keeps being offered but never answers)
+        must rotate by last_offered_time, not always lose to the lowest
+        sorted extension."""
+        from pbx.features.call_queue import QueueStrategy
+
+        agents = self._make_agents("1001", "1002", "1003")
+        queue = self._make_queue(QueueStrategy.FEWEST_CALLS, agents)
+
+        picks = [queue.get_next_agent(agents, set(), _dialable).extension for _ in range(3)]
+        assert picks == ["1001", "1002", "1003"]
+
+    def test_random_returns_member(self, _mock_logger):
+        from pbx.features.call_queue import QueueStrategy
+
+        agents = self._make_agents("1001", "1002")
+        queue = self._make_queue(QueueStrategy.RANDOM, agents)
+        selected = queue.get_next_agent(agents, set(), _dialable)
+        assert selected.extension in {"1001", "1002"}
+
+    def test_ring_all_falls_back_to_round_robin(self, _mock_logger):
+        """RING_ALL is unsupported: guard falls back to single-agent pick."""
+        from pbx.features.call_queue import QueueStrategy
+
+        agents = self._make_agents("1001", "1002")
+        queue = self._make_queue(QueueStrategy.RING_ALL, agents)
+        selected = queue.get_next_agent(agents, set(), _dialable)
+        assert selected is not None
+        assert not isinstance(selected, list)
+
+    def test_overflow_mailbox_default_and_override(self, _mock_logger):
+        from pbx.features.call_queue import CallQueue
+
+        queue = CallQueue("8001", "Sales")
+        assert queue.overflow_mailbox() == "8001"
+
+        queue.fallback_mailbox = "1005"
+        assert queue.overflow_mailbox() == "1005"
+
+
+@pytest.mark.unit
+@patch("pbx.features.call_queue.get_logger", return_value=MagicMock())
+class TestQueueSystem:
+    """Tests for QueueSystem (in-memory, no database)."""
+
+    def _system(self):
         from pbx.features.call_queue import QueueSystem
 
-        system = QueueSystem()
-        system.create_queue("100", "Support")
+        return QueueSystem()
 
-        assert system.enqueue_call("100", "call1", "2001") is True
-        assert system.enqueue_call("999", "call2", "2002") is False
+    def test_create_and_get_queue(self, _mock_logger):
+        system = self._system()
+        queue = system.create_queue("8001", "Sales")
+        assert system.get_queue("8001") is queue
+        assert system.get_queue("9999") is None
+
+    def test_delete_queue(self, _mock_logger):
+        system = self._system()
+        system.create_queue("8001", "Sales")
+        assert system.delete_queue("8001") is True
+        assert system.get_queue("8001") is None
+        assert system.delete_queue("8001") is False
+
+    def test_membership(self, _mock_logger):
+        system = self._system()
+        system.create_queue("8001", "Sales")
+        system.create_queue("8002", "Support")
+
+        assert system.add_member("8001", "1001") is True
+        assert system.add_member("8002", "1001") is True
+        assert system.add_member("9999", "1001") is False
+
+        assert sorted(system.agent_queues("1001")) == ["8001", "8002"]
+        assert system.get_agent("1001") is not None
+
+        assert system.remove_member("8001", "1001") is True
+        assert system.agent_queues("1001") == ["8002"]
+        assert system.remove_member("8001", "1001") is False
+
+    def test_login_returns_queues_and_clears_pause(self, _mock_logger):
+        system = self._system()
+        system.create_queue("8001", "Sales")
+        system.add_member("8001", "1001")
+
+        agent = system.get_agent("1001")
+        agent.paused = True
+        agent.pause_reason = "auto_missed"
+        agent.consecutive_misses = 3
+
+        queues = system.set_agent_login("1001", True)
+        assert queues == ["8001"]
+        assert agent.logged_in is True
+        assert agent.paused is False
+        assert agent.pause_reason is None
+        assert agent.consecutive_misses == 0
+
+    def test_login_non_member_returns_empty(self, _mock_logger):
+        system = self._system()
+        system.create_queue("8001", "Sales")
+        assert system.set_agent_login("1099", True) == []
+        # No phantom agent state should have been created
+        assert system.get_agent("1099") is None
+
+    def test_pause_unpause(self, _mock_logger):
+        system = self._system()
+        system.create_queue("8001", "Sales")
+        system.add_member("8001", "1001")
+        system.set_agent_login("1001", True)
+
+        assert system.set_agent_pause("1001", True, "manual") is True
+        agent = system.get_agent("1001")
+        assert agent.paused is True
+        assert agent.pause_reason == "manual"
+
+        agent.consecutive_misses = 2
+        assert system.set_agent_pause("1001", False) is True
+        assert agent.paused is False
+        assert agent.pause_reason is None
+        assert agent.consecutive_misses == 0
+
+        assert system.set_agent_pause("2000", True) is False
+
+    def test_record_miss_auto_pause(self, _mock_logger):
+        system = self._system()
+        queue = system.create_queue("8001", "Sales")
+        queue.auto_pause_misses = 2
+        system.add_member("8001", "1001")
+        system.set_agent_login("1001", True)
+
+        assert system.record_miss("1001") is False
+        triggered = system.record_miss("1001")
+        assert triggered is True
+
+        agent = system.get_agent("1001")
+        assert agent.paused is True
+        assert agent.pause_reason == "auto_missed"
+
+    def test_record_miss_threshold_is_max_across_queues(self, _mock_logger):
+        system = self._system()
+        q1 = system.create_queue("8001", "Sales")
+        q2 = system.create_queue("8002", "Support")
+        q1.auto_pause_misses = 2
+        q2.auto_pause_misses = 4
+        system.add_member("8001", "1001")
+        system.add_member("8002", "1001")
+        system.set_agent_login("1001", True)
+
+        assert system.record_miss("1001") is False
+        assert system.record_miss("1001") is False  # 2 misses < max(2, 4)
+        assert system.record_miss("1001") is False
+        assert system.record_miss("1001") is True  # 4 misses reaches max
+
+    def test_record_miss_disabled(self, _mock_logger):
+        system = self._system()
+        queue = system.create_queue("8001", "Sales")
+        queue.auto_pause_misses = 0
+        system.add_member("8001", "1001")
+        system.set_agent_login("1001", True)
+
+        for _ in range(10):
+            assert system.record_miss("1001") is False
+        assert system.get_agent("1001").paused is False
+
+    def test_record_answered(self, _mock_logger):
+        system = self._system()
+        system.create_queue("8001", "Sales")
+        system.add_member("8001", "1001")
+        system.set_agent_login("1001", True)
+        system.record_miss("1001")
+
+        system.record_answered("1001")
+        agent = system.get_agent("1001")
+        assert agent.consecutive_misses == 0
+        assert agent.calls_taken == 1
+        assert agent.last_call_time is not None
+        assert agent.last_call_time.tzinfo is not None
+
+    def test_runtime_stats(self, _mock_logger):
+        system = self._system()
+        system.create_queue("8001", "Sales")
+        system.create_queue("8002", "Support")
+        system.set_runtime_stats("8001", 3, 42.0)
+        system.set_runtime_stats("8002", 1, 5.0)
+
+        assert system.total_waiting() == 4
+        status = system.get_queue_status("8001")
+        assert status["calls_waiting"] == 3
+        assert status["longest_wait"] == 42.0
+
+    def test_get_queue_status(self, _mock_logger):
+        system = self._system()
+        system.create_queue("8001", "Sales")
+        system.add_member("8001", "1001")
+        system.add_member("8001", "1002")
+        system.set_agent_login("1001", True)
+
+        status = system.get_queue_status("8001")
+        assert status["queue_number"] == "8001"
+        assert status["name"] == "Sales"
+        assert status["strategy"] == "round_robin"
+        assert status["fallback_mailbox"] == "8001"
+        assert status["members"] == ["1001", "1002"]
+        assert status["total_agents"] == 2
+        assert status["available_agents"] == 1
+
+        assert system.get_queue_status("9999") is None
+
+    def test_get_all_status_sorted(self, _mock_logger):
+        system = self._system()
+        system.create_queue("8002", "Support")
+        system.create_queue("8001", "Sales")
+
+        result = system.get_all_status()
+        assert [s["queue_number"] for s in result] == ["8001", "8002"]
+
+    def test_get_all_status_empty(self, _mock_logger):
+        assert self._system().get_all_status() == []
+
+
+@pytest.mark.unit
+@patch("pbx.features.call_queue.get_logger", return_value=MagicMock())
+class TestQueueStrategyEnum:
+    """Strategy enum values and the supported-strategies constant."""
+
+    def test_strategy_values(self, _mock_logger):
+        from pbx.features.call_queue import SUPPORTED_STRATEGIES, QueueStrategy
+
+        assert QueueStrategy.RING_ALL.value == "ring_all"
+        assert QueueStrategy.ROUND_ROBIN.value == "round_robin"
+        assert QueueStrategy.LEAST_RECENT.value == "least_recent"
+        assert QueueStrategy.FEWEST_CALLS.value == "fewest_calls"
+        assert QueueStrategy.RANDOM.value == "random"
+        assert "ring_all" not in SUPPORTED_STRATEGIES
+        assert set(SUPPORTED_STRATEGIES) == {
+            "round_robin",
+            "least_recent",
+            "fewest_calls",
+            "random",
+        }

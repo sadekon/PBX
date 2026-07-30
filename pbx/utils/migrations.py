@@ -685,3 +685,88 @@ def register_all_migrations(manager: MigrationManager) -> None:
         );
     """),
     )
+
+    # Migration 1013: Call Queues (ACD)
+    manager.register_migration(
+        1013,
+        "Call Queues",
+        manager._build_migration_sql("""
+        -- Queue definitions (config.yml queues: section seeds this once;
+        -- the database is authoritative thereafter)
+        CREATE TABLE IF NOT EXISTS call_queues (
+            id {SERIAL},
+            queue_number VARCHAR(20) UNIQUE NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            strategy VARCHAR(20) NOT NULL DEFAULT 'round_robin',
+            ring_timeout INTEGER DEFAULT 15,
+            max_wait_time INTEGER DEFAULT 300,
+            max_queue_size INTEGER DEFAULT 10,
+            fallback_mailbox VARCHAR(20),
+            auto_pause_misses INTEGER DEFAULT 3,
+            enabled BOOLEAN DEFAULT {BOOLEAN_TRUE},
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Queue membership (which extensions serve which queue); kept
+        -- separate from runtime state so external sync (e.g. AD calendar)
+        -- can manage membership without touching login state
+        CREATE TABLE IF NOT EXISTS queue_agents (
+            id {SERIAL},
+            queue_number VARCHAR(20) NOT NULL,
+            extension VARCHAR(20) NOT NULL,
+            penalty INTEGER DEFAULT 0,
+            source VARCHAR(20) DEFAULT 'manual',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (queue_number, extension)
+        );
+
+        -- Global per-agent runtime state (login/pause survive restarts);
+        -- one row per extension, shared across all queues
+        CREATE TABLE IF NOT EXISTS queue_agent_state (
+            id {SERIAL},
+            extension VARCHAR(20) UNIQUE NOT NULL,
+            logged_in BOOLEAN DEFAULT {BOOLEAN_FALSE},
+            paused BOOLEAN DEFAULT {BOOLEAN_FALSE},
+            pause_reason VARCHAR(30),
+            consecutive_misses INTEGER DEFAULT 0,
+            calls_taken INTEGER DEFAULT 0,
+            last_call_time TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """),
+    )
+
+    # Migration 1014: Queue Hold Announcements
+    # call_queues already exists on live installs (1013's CREATE TABLE
+    # IF NOT EXISTS is a no-op there), so these columns are added with
+    # ALTER TABLE rather than folded into the 1013 CREATE TABLE.
+    manager.register_migration(
+        1014,
+        "Queue Hold Announcements",
+        manager._build_migration_sql("""
+        ALTER TABLE call_queues ADD COLUMN announcement_enabled BOOLEAN DEFAULT {BOOLEAN_FALSE};
+        ALTER TABLE call_queues ADD COLUMN announcement_interval INTEGER DEFAULT 30;
+        ALTER TABLE call_queues ADD COLUMN announcement_text VARCHAR(500);
+        ALTER TABLE call_queues ADD COLUMN announcement_file VARCHAR(255);
+        ALTER TABLE call_queues ADD COLUMN announcement_position BOOLEAN DEFAULT {BOOLEAN_FALSE};
+    """),
+    )
+
+    # Migration 1015: Queue Overflow Action
+    manager.register_migration(
+        1015,
+        "Queue Overflow Action",
+        manager._build_migration_sql("""
+        ALTER TABLE call_queues ADD COLUMN overflow_action VARCHAR(20) DEFAULT 'voicemail';
+    """),
+    )
+
+    # Migration 1016: Per-queue redial cap
+    manager.register_migration(
+        1016,
+        "Queue Redial Cap",
+        manager._build_migration_sql("""
+        ALTER TABLE call_queues ADD COLUMN max_redials INTEGER DEFAULT 0;
+    """),
+    )

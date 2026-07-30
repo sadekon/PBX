@@ -78,6 +78,11 @@ class VoicemailHandler:
         elif pbx.config.get_extension(target_ext):
             extension_exists = True
             pbx.logger.info(f"[VM Access] ✓ Extension {target_ext} found in config file")
+        # Call queue overflow mailboxes are keyed by the queue number, which
+        # is never a provisioned extension -- allow retrieval (e.g. *8001).
+        elif pbx.queue_system.get_queue(target_ext) is not None:
+            extension_exists = True
+            pbx.logger.info(f"[VM Access] ✓ {target_ext} is a call queue mailbox")
 
         if not extension_exists:
             pbx.logger.warning(
@@ -1033,6 +1038,140 @@ class VoicemailHandler:
         except (KeyError, TypeError, ValueError, struct.error) as e:
             pbx.logger.error(f"Error in voicemail DTMF monitoring: {e}")
             pbx.logger.error(traceback.format_exc())
+
+    # ------------------------------------------------------------------
+    # Recording into a mailbox from an already-established call
+    # ------------------------------------------------------------------
+
+    def record_into_mailbox(
+        self,
+        call: Any,
+        call_id: str,
+        mailbox_key: str,
+        party_rtp: dict[str, Any] | None,
+        rtp_ports: tuple[int, int] | None,
+        hangup_cause: str,
+    ) -> bool:
+        """
+        Take over an already-established, MOH-parked call's relay port and
+        record a voicemail into ``mailbox_key`` from the party at
+        ``party_rtp``.
+
+        Shared by call-queue overflow and transfer no-answer handling: both
+        need to record a message from a party already connected on a relay,
+        keyed by a mailbox extension that need not be ``call.to_extension``
+        (the queue's fallback mailbox, or a transfer's destination
+        extension).
+
+        The caller is responsible for stopping MOH first, and for its own
+        cleanup (ending the call, its own state bookkeeping) if this
+        returns False -- this method does not tear the call down itself.
+
+        Args:
+            call: The Call record whose relay is being taken over.
+            call_id: Call identifier.
+            mailbox_key: Extension whose mailbox receives the recording.
+            party_rtp: The recording party's RTP endpoint info.
+            rtp_ports: The relay's local (rtp, rtcp) port pair to reuse.
+            hangup_cause: CDR hangup cause to record.
+
+        Returns:
+            True if recording started; False if there was no usable media
+            or the recorder failed to start.
+        """
+        from pbx.rtp.dtmf_monitor import build_ivr_dtmf_channel
+        from pbx.rtp.handler import RTPPlayer
+
+        pbx = self.pbx_core
+
+        # Stop the relay handler in place (record kept so the final
+        # end_call -> release_relay port bookkeeping stays consistent) and
+        # reuse its port for the greeting player and recorder.
+        relay_info = pbx.rtp_relay.active_relays.get(call_id)
+        if relay_info:
+            relay_info["handler"].stop()
+
+        # Rewrite the record so every downstream voicemail path (completion,
+        # hangup auto-save) keys off the target mailbox.
+        call.to_extension = mailbox_key
+        call.routed_to_voicemail = True
+        # First end_record wins: record this cause now.
+        pbx.cdr_system.end_record(call_id, hangup_cause=hangup_cause)
+
+        if not party_rtp or not rtp_ports:
+            pbx.logger.error(f"record_into_mailbox: no media info for {call_id}")
+            return False
+
+        # Greeting + beep (mailbox's custom greeting, else the default prompt).
+        try:
+            player = RTPPlayer(
+                local_port=rtp_ports[0],
+                remote_host=party_rtp["address"],
+                remote_port=party_rtp["port"],
+                call_id=call_id,
+            )
+            if player.start():
+                self._play_greeting_and_beep(player, mailbox_key)
+                player.play_beep(frequency=1000, duration_ms=500)
+                player.stop()
+        except OSError as exc:
+            pbx.logger.error(f"record_into_mailbox: greeting failed for {call_id}: {exc}")
+
+        recorder, _monitor = build_ivr_dtmf_channel(pbx, call, call_id, rtp_ports[0])
+        if not recorder.start():
+            pbx.logger.error(f"record_into_mailbox: recorder failed for {call_id}")
+            return False
+
+        call.voicemail_recorder = recorder
+        max_duration: int = pbx.config.get("voicemail.max_message_duration", 180)
+        timer = threading.Timer(
+            max_duration,
+            self.complete_voicemail_recording,
+            args=(call_id,),
+        )
+        timer.daemon = True
+        timer.start()
+        call.voicemail_timer = timer
+
+        # '#' finishes the recording via the standard monitor.
+        monitor_thread = threading.Thread(
+            target=self.monitor_voicemail_dtmf,
+            args=(call_id, call, recorder),
+            daemon=True,
+        )
+        monitor_thread.start()
+        return True
+
+    def _play_greeting_and_beep(self, player: Any, mailbox_key: str) -> None:
+        """Play the mailbox's custom greeting, or the default prompt"""
+        import tempfile
+
+        from pbx.utils.audio import get_prompt_audio
+
+        pbx = self.pbx_core
+
+        greeting_path: str | None = None
+        with contextlib.suppress(Exception):
+            mailbox = pbx.voicemail_system.get_mailbox(mailbox_key)
+            candidate = mailbox.get_greeting_path()
+            if candidate and Path(candidate).exists():
+                greeting_path = candidate
+
+        if greeting_path:
+            player.play_file(greeting_path)
+            time.sleep(0.3)
+            return
+
+        prompt = get_prompt_audio("leave_message")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_file.write(prompt)
+            temp_path = temp_file.name
+        try:
+            player.play_file(temp_path)
+            time.sleep(0.3)
+        finally:
+            with contextlib.suppress(OSError):
+                Path(temp_path).unlink()
 
     def _send_bye_to_caller(self, call: Any, call_id: str) -> None:
         """

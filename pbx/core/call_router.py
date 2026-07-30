@@ -120,6 +120,17 @@ class CallRouter:
                 )
             )
 
+        # Agent queue login/logout star codes (*61/*62). Internal-origin
+        # only: trunk calls already diverted to DID routing above.
+        from pbx.core.queue_handler import STAR_CODE_LOGIN, STAR_CODE_LOGOUT
+
+        if to_ext in (STAR_CODE_LOGIN, STAR_CODE_LOGOUT):
+            return bool(
+                pbx.queue_handler.handle_agent_star_code(
+                    from_ext, to_ext, call_id, message, from_addr
+                )
+            )
+
         # Check if this is a paging call (7xx pattern or all-call)
         if pbx.paging_system and pbx.paging_system.is_paging_extension(to_ext):
             return bool(
@@ -157,6 +168,16 @@ class CallRouter:
         from pbx.sip.sdp import SDPSession
 
         pbx = self.pbx_core
+
+        # Call queue destination? Checked here (not in route_call) so DID
+        # routing -- which calls this method directly -- reaches the queue
+        # with zero DID-specific code.
+        if pbx.queue_handler.is_queue_destination(to_ext):
+            return bool(
+                pbx.queue_handler.handle_queue_entry(
+                    from_ext, to_ext, call_id, message, from_addr
+                )
+            )
 
         # Check if destination extension is registered and not expired,
         # recovering its registration from the database if necessary.

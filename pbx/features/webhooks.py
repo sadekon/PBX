@@ -43,6 +43,8 @@ class WebhookEvent:
     QUEUE_CALL_ADDED = "queue.call_added"
     QUEUE_CALL_ANSWERED = "queue.call_answered"
     QUEUE_CALL_ABANDONED = "queue.call_abandoned"
+    QUEUE_CALL_OVERFLOW = "queue.call_overflow"
+    QUEUE_AGENT_PAUSED = "queue.agent_paused"
 
     PAGING_STARTED = "paging.started"
     PAGING_ENDED = "paging.ended"

@@ -141,15 +141,60 @@ export async function deletePagingZone(zoneId: string): Promise<void> {
     }
 }
 
-export async function showAddZoneModal(): Promise<void> {
-    const extension = prompt('Zone Extension (e.g., 701):');
-    if (!extension) return;
+export function closeZoneModal(): void {
+    document.getElementById('paging-zone-modal')?.remove();
+}
 
-    const name = prompt('Zone Name (e.g., "Warehouse"):');
-    if (!name) return;
+export function showAddZoneModal(): void {
+    closeZoneModal();
+    const modal = `
+        <div id="paging-zone-modal" class="modal" style="display: block;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>➕ Add Paging Zone</h3>
+                    <span class="close" onclick="closeZoneModal()">&times;</span>
+                </div>
+                <form id="paging-zone-form">
+                    <div class="form-group">
+                        <label for="zone-extension">Zone Extension:</label>
+                        <input type="text" id="zone-extension" required placeholder="701">
+                        <small>Extension callers dial to page this zone</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="zone-name">Zone Name:</label>
+                        <input type="text" id="zone-name" required placeholder="Warehouse">
+                    </div>
+                    <div class="form-group">
+                        <label for="zone-description">Description:</label>
+                        <input type="text" id="zone-description" placeholder="Optional">
+                    </div>
+                    <div class="form-group">
+                        <label for="zone-device-id">Device ID:</label>
+                        <input type="text" id="zone-device-id" placeholder="Optional">
+                        <small>Associate a paging device with this zone</small>
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary" onclick="closeZoneModal()">Cancel</button>
+                        <button type="submit" class="btn btn-success">Add Zone</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', modal);
+    const form = document.getElementById('paging-zone-form') as HTMLFormElement;
+    form.onsubmit = (e: Event) => {
+        e.preventDefault();
+        void submitAddZone();
+    };
+}
 
-    const description = prompt('Description (optional):') ?? '';
-    const deviceId = prompt('Device ID (optional):') ?? '';
+async function submitAddZone(): Promise<void> {
+    const extension = (document.getElementById('zone-extension') as HTMLInputElement).value.trim();
+    const name = (document.getElementById('zone-name') as HTMLInputElement).value.trim();
+    const description = (document.getElementById('zone-description') as HTMLInputElement).value.trim();
+    const deviceId = (document.getElementById('zone-device-id') as HTMLInputElement).value.trim();
+    if (!extension || !name) return;
 
     const zoneData = {
         extension: extension,
@@ -168,6 +213,7 @@ export async function showAddZoneModal(): Promise<void> {
         const data: ApiResponse = await response.json();
         if (data.success) {
             showNotification(`Zone ${name} added successfully`, 'success');
+            closeZoneModal();
             loadPagingZones();
         } else {
             showNotification(data.message ?? 'Failed to add zone', 'error');
@@ -178,15 +224,59 @@ export async function showAddZoneModal(): Promise<void> {
     }
 }
 
-export async function showAddDeviceModal(): Promise<void> {
-    const deviceId = prompt('Device ID (e.g., "dac-1"):');
-    if (!deviceId) return;
+export function closeDeviceModal(): void {
+    document.getElementById('paging-device-modal')?.remove();
+}
 
-    const name = prompt('Device Name (e.g., "Main PA System"):');
-    if (!name) return;
+export function showAddDeviceModal(): void {
+    closeDeviceModal();
+    const modal = `
+        <div id="paging-device-modal" class="modal" style="display: block;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>➕ Add Paging Device</h3>
+                    <span class="close" onclick="closeDeviceModal()">&times;</span>
+                </div>
+                <form id="paging-device-form">
+                    <div class="form-group">
+                        <label for="device-id">Device ID:</label>
+                        <input type="text" id="device-id" required placeholder="dac-1">
+                        <small>Unique identifier for this device</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="device-name">Device Name:</label>
+                        <input type="text" id="device-name" required placeholder="Main PA System">
+                    </div>
+                    <div class="form-group">
+                        <label for="device-type">Device Type:</label>
+                        <input type="text" id="device-type" value="sip_gateway" placeholder="sip_gateway">
+                    </div>
+                    <div class="form-group">
+                        <label for="device-sip-address">SIP Address:</label>
+                        <input type="text" id="device-sip-address" placeholder="paging@192.168.1.10:5060">
+                    </div>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-secondary" onclick="closeDeviceModal()">Cancel</button>
+                        <button type="submit" class="btn btn-success">Add Device</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', modal);
+    const form = document.getElementById('paging-device-form') as HTMLFormElement;
+    form.onsubmit = (e: Event) => {
+        e.preventDefault();
+        void submitAddDevice();
+    };
+}
 
-    const type = prompt('Device Type (e.g., "sip_gateway"):') ?? 'sip_gateway';
-    const sipAddress = prompt('SIP Address (e.g., "paging@192.168.1.10:5060"):') ?? '';
+async function submitAddDevice(): Promise<void> {
+    const deviceId = (document.getElementById('device-id') as HTMLInputElement).value.trim();
+    const name = (document.getElementById('device-name') as HTMLInputElement).value.trim();
+    const type = (document.getElementById('device-type') as HTMLInputElement).value.trim() || 'sip_gateway';
+    const sipAddress = (document.getElementById('device-sip-address') as HTMLInputElement).value.trim();
+    if (!deviceId || !name) return;
 
     const deviceData = {
         device_id: deviceId,
@@ -205,6 +295,7 @@ export async function showAddDeviceModal(): Promise<void> {
         const data: ApiResponse = await response.json();
         if (data.success) {
             showNotification(`Device ${name} added successfully`, 'success');
+            closeDeviceModal();
             loadPagingDevices();
         } else {
             showNotification(data.message ?? 'Failed to add device', 'error');
@@ -244,5 +335,7 @@ window.loadPagingDevices = loadPagingDevices;
 window.loadActivePages = loadActivePages;
 window.deletePagingZone = deletePagingZone;
 window.showAddZoneModal = showAddZoneModal;
+window.closeZoneModal = closeZoneModal;
 window.showAddDeviceModal = showAddDeviceModal;
+window.closeDeviceModal = closeDeviceModal;
 window.deletePagingDevice = deletePagingDevice;

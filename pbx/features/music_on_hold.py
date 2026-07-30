@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 from pbx.utils.logger import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pbx.rtp.handler import RTPRelayHandler
 
 
@@ -204,6 +206,90 @@ class MusicOnHold:
                 f"MOH stream for call {relay_handler.call_id} ended because its "
                 f"relay stopped (running={relay_handler.running})"
             )
+
+    def interject(
+        self,
+        call_id: str,
+        held_side: str,
+        prompt_path: Path,
+        interrupt_check: Callable[[], bool] | None = None,
+    ) -> bool:
+        """
+        Briefly interrupt an active MOH session to play ``prompt_path``, then
+        resume MOH (a freshly chosen file from the same class).
+
+        Stops the current stream thread without resuming the relay (so the
+        held party never hears silence-then-crosstalk), plays the prompt on
+        the relay's own socket, then calls ``start_moh`` again -- the same
+        "replace an existing session" path already exercised whenever a phone
+        repeats its hold re-INVITE.
+
+        Args:
+            call_id: Call identifier.
+            held_side: Which side ("a" or "b") should hear the prompt.
+            prompt_path: WAV file to play.
+            interrupt_check: Optional barge-in predicate forwarded to
+                ``play_file`` so playback can be cut short (e.g. the call was
+                just bridged).
+
+        Returns:
+            True if the prompt played; False if the call was not on MOH.
+        """
+        with self._session_lock:
+            session = self.active_sessions.get(call_id)
+            if session is None:
+                return False
+            relay_handler = session["relay_handler"]
+            moh_class = session["class"]
+            self._stop_session(session, resume_relay=False)
+
+            # Stand-in session for the duration of the prompt. The relay stays
+            # paused while it plays, so a concurrent stop_moh() -- the call
+            # being bridged, hung up, or diverted to voicemail -- must still
+            # find *something* here to cancel and to resume the relay against.
+            # Leaving the slot empty makes that stop_moh() a silent no-op, and
+            # the start_moh() at the tail of this method would then re-pause a
+            # call that is no longer on hold, deafening both parties.
+            cancelled = threading.Event()
+            announcing: dict[str, Any] = {
+                "class": moh_class,
+                "relay_handler": relay_handler,
+                "stop_event": cancelled,
+                "thread": None,
+                "file": prompt_path,
+            }
+            self.active_sessions[call_id] = announcing
+
+        from pbx.rtp.handler import RTPPlayer
+
+        def _interrupted() -> bool:
+            return cancelled.is_set() or bool(interrupt_check and interrupt_check())
+
+        played = False
+        target = relay_handler.get_endpoint(held_side)
+        if target is not None and relay_handler.running and relay_handler.socket is not None:
+            player = RTPPlayer(
+                local_port=relay_handler.local_port,
+                remote_host=target[0],
+                remote_port=target[1],
+                call_id=call_id,
+                external_socket=relay_handler.socket,
+            )
+            if player.start():
+                player.play_file(prompt_path, interrupt_check=_interrupted)
+                player.stop()
+                played = True
+
+        with self._session_lock:
+            # Someone ended hold while the prompt was playing: they already
+            # resumed the relay, so resuming music now would re-pause it.
+            if self.active_sessions.get(call_id) is not announcing:
+                return played
+            self.active_sessions.pop(call_id, None)
+
+        if relay_handler.running and not cancelled.is_set():
+            self.start_moh(call_id, relay_handler, held_side, moh_class)
+        return played
 
     def add_moh_class(self, class_name: str, files: list[Path]) -> None:
         """Register a MOH class with an explicit list of files."""
