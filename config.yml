@@ -403,6 +403,17 @@ voicemail:
 conference:
   max_participants: 50
   record_conferences: false
+# Audio mixer (N-way media). Backs conference, three-way calling and the
+# supervisor modes (silent monitor, whisper, barge). Ordinary two-party calls
+# never touch it -- they stay on the cheaper codec-opaque RTP relay, and a
+# call is only promoted onto a bridge when a third party is involved.
+#
+# max_ports_per_bridge is a measured limit, not an arbitrary one. Per 20 ms
+# frame the mix loop costs roughly 1% of its budget at 8 G.711 legs, but
+# ~49% at 8 G.722 legs, because the G.722 codec is pure-Python ADPCM. Raising
+# this much above 8 risks late frames on wideband bridges.
+mixer:
+  max_ports_per_bridge: 8
 # Attended/blind transfer failure handling. None of these need to be set --
 # defaults match existing behavior. Siblings read by code but not listed
 # here (all under `transfer:`, unchanged by this key): atxferdropcall

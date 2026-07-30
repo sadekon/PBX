@@ -8,6 +8,8 @@ import struct
 import warnings
 from pathlib import Path
 
+import numpy as np
+
 # Audio generation constants
 MAX_16BIT_SIGNED = 32767  # Maximum value for 16-bit signed integer
 DEFAULT_AMPLITUDE = 0.5  # Default amplitude (50% of maximum)
@@ -152,6 +154,103 @@ def g711_to_float_samples(payload: bytes, payload_type: int = 0) -> list[float]:
     """
     decode = _alaw_byte_to_linear if payload_type == 8 else _ulaw_byte_to_linear
     return [decode(b) / 32768.0 for b in payload]
+
+
+# ---------------------------------------------------------------------------
+# Vectorised G.711 (for the audio mixer's 20 ms budget)
+#
+# The scalar helpers above walk one sample at a time, which is fine for a
+# 0.8 s DTMF window but far too slow to decode and re-encode N legs every
+# 20 ms. These lookup-table versions do the same arithmetic as a single
+# numpy fancy-index. Decode tables are generated *from* the scalar decoders,
+# so the two paths cannot drift apart.
+# ---------------------------------------------------------------------------
+
+_ULAW_DECODE_TABLE = np.array([_ulaw_byte_to_linear(b) for b in range(256)], dtype=np.int16)
+_ALAW_DECODE_TABLE = np.array([_alaw_byte_to_linear(b) for b in range(256)], dtype=np.int16)
+
+
+def _build_ulaw_encode_table() -> "np.ndarray":
+    """μ-law code for every int16, mirroring pcm16_to_ulaw exactly."""
+    x = np.arange(-32768, 32768, dtype=np.int32)
+    sign = np.where(x < 0, 0x80, 0x00).astype(np.int32)
+    magnitude = np.minimum(np.abs(x), _ULAW_CLIP).astype(np.int32) + _ULAW_BIAS
+
+    # Highest set bit among bits 8..14, taking the first (highest) match --
+    # the vectorised form of the scalar loop's `break`.
+    exponent = np.zeros_like(magnitude)
+    assigned = np.zeros(magnitude.shape, dtype=bool)
+    for exp in range(7, -1, -1):
+        hit = ~assigned & ((magnitude & (1 << (exp + 7))) != 0)
+        exponent[hit] = exp
+        assigned |= hit
+
+    mantissa = (magnitude >> (exponent + 3)) & 0x0F
+    return (~(sign | (exponent << 4) | mantissa) & 0xFF).astype(np.uint8)
+
+
+def _build_alaw_encode_table() -> "np.ndarray":
+    """
+    A-law code for every int16, by nearest-level inversion of the decoder.
+
+    There is no scalar A-law encoder to mirror, so the table is derived from
+    _alaw_byte_to_linear: each input maps to whichever code decodes closest
+    to it. That makes encode/decode a true round trip by construction.
+    """
+    order = np.argsort(_ALAW_DECODE_TABLE)
+    levels = _ALAW_DECODE_TABLE[order].astype(np.int32)
+
+    x = np.arange(-32768, 32768, dtype=np.int32)
+    upper = np.clip(np.searchsorted(levels, x), 1, len(levels) - 1)
+    below, above = levels[upper - 1], levels[upper]
+    nearest = np.where(np.abs(x - below) <= np.abs(above - x), upper - 1, upper)
+    return order[nearest].astype(np.uint8)
+
+
+_ULAW_ENCODE_TABLE = _build_ulaw_encode_table()
+_ALAW_ENCODE_TABLE = _build_alaw_encode_table()
+
+
+def ulaw_to_pcm16(payload: bytes) -> "np.ndarray":
+    """Decode G.711 μ-law bytes to an int16 sample array."""
+    return _ULAW_DECODE_TABLE[np.frombuffer(payload, dtype=np.uint8)]
+
+
+def alaw_to_pcm16(payload: bytes) -> "np.ndarray":
+    """Decode G.711 A-law bytes to an int16 sample array."""
+    return _ALAW_DECODE_TABLE[np.frombuffer(payload, dtype=np.uint8)]
+
+
+def _encode_index(samples: "np.ndarray") -> "np.ndarray":
+    """Shift int16 samples into the 0..65535 range the encode tables use."""
+    return np.asarray(samples, dtype=np.int16).astype(np.int32) + 32768
+
+
+def samples_to_ulaw(samples: "np.ndarray") -> bytes:
+    """Encode an int16 sample array to G.711 μ-law bytes."""
+    return _ULAW_ENCODE_TABLE[_encode_index(samples)].tobytes()
+
+
+def samples_to_alaw(samples: "np.ndarray") -> bytes:
+    """Encode an int16 sample array to G.711 A-law bytes."""
+    return _ALAW_ENCODE_TABLE[_encode_index(samples)].tobytes()
+
+
+def pcm16_to_alaw(pcm_data: bytes) -> bytes:
+    """
+    Convert 16-bit PCM audio data to G.711 A-law format.
+
+    The A-law counterpart of :func:`pcm16_to_ulaw`, which had no equivalent
+    until the mixer needed to send to A-law endpoints.
+
+    Args:
+        pcm_data: Raw 16-bit PCM audio data (little-endian signed).
+
+    Returns:
+        G.711 A-law encoded audio data (8-bit per sample).
+    """
+    usable = len(pcm_data) - (len(pcm_data) % 2)
+    return samples_to_alaw(np.frombuffer(pcm_data[:usable], dtype="<i2"))
 
 
 def pcm16_to_g722(pcm_data: bytes, sample_rate: int = 8000) -> bytes:

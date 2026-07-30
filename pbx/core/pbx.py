@@ -24,6 +24,7 @@ from pbx.core.transfer_handler import TransferHandler
 from pbx.core.voicemail_handler import VoicemailHandler
 from pbx.features.extensions import ExtensionRegistry
 from pbx.rtp.handler import RTPRelay
+from pbx.rtp.mixer import RTPMixer
 from pbx.sip.server import SIPServer
 from pbx.utils.config import Config
 from pbx.utils.database import DatabaseBackend, RegisteredPhonesDB
@@ -203,6 +204,13 @@ class PBXCore:
             self.config.get("server.rtp_port_range_start", 10000),
             self.config.get("server.rtp_port_range_end", 20000),
             qos_monitor=self.qos_monitor,
+        )
+
+        # N-way mixing (conference, three-way, supervisor modes). The relay
+        # stays the cheap path for ordinary two-party calls; a call is only
+        # promoted onto a bridge when a third party is involved.
+        self.rtp_mixer = RTPMixer(
+            max_ports_per_bridge=self.config.get("mixer.max_ports_per_bridge", 8),
         )
 
         # Initialize SIP server
@@ -546,6 +554,9 @@ class PBXCore:
 
         # Stop the queue sweep thread
         self.queue_handler.shutdown()
+
+        # Tear down any active mix bridges (each owns threads and sockets)
+        self.rtp_mixer.shutdown()
 
         # Stop Prometheus metrics collector
         self._stop_metrics_collector()

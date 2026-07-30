@@ -46,7 +46,7 @@ with a second gate says so in its row.
 |----|-----------|--------|----------|----------------------|
 | **C1** | SIP signaling core — registration, dialogs, routing, transfer/hold | ✅ working (UDP-only) | `pbx/sip/`, `core/call_router.py` | Call-handling features work today; TLS/TCP transport is Phase-7 hardening. REFER transfer rewritten on `auto-attendant` (attended via Replaces per RFC 3891, blind via PBX-originated leg); pending field verification with Zultys ZIP phones |
 | **C2** | RTP media relay & IVR plumbing — relay, DTMF (RFC 2833 + SIP INFO + in-band), prompt playback, recording tap | ✅ voicemail-fix merged to DEV; DTMF sources unified into one `DTMFMonitor` on `auto-attendant` | `pbx/rtp/`, `core/voicemail_handler.py`, `rtp/handler.py`, `rtp/dtmf_monitor.py` | Voicemail, AA, MoH, recording, paging; codec expansion slots in here |
-| **C3** | **Audio mixer (N-way media) — does not exist** | ❌ missing | (to build: sum/mix G.711 streams per participant, or bridge via Jitsi) | Conference audio, 3-way calling, barge/whisper/screening |
+| **C3** | Audio mixer (N-way media) | ✅ **built** — `MixBridge` primitive, tested; **no feature is wired onto it yet** | `pbx/rtp/mixer.py`, `pbx/rtp/codecs.py`, numpy G.711 LUTs in `pbx/utils/audio.py` | Conference audio, 3-way calling, barge/whisper/monitor, call screening — all now unblocked but still unwired (see C3 section below) |
 | **C4** | Call-originate primitive ("PBX creates a leg to X, then bridges") | ✅ built on `sip-trunk` | `core/call_originator.py`, `core/call_router.py` (`_build_and_send_leg_invite`) | `CallOriginator.originate_call()`/`originate_and_bridge()`; click-to-dial wired onto it. Callback completion, predictive dialing, emergency-notification calls, operator console remain to be wired. Field-unverified against real phones. |
 | **C5** | Trunk / PSTN connectivity | 🔶 outbound + inbound DID routing built on `sip-trunk`; **field-unverified** (no carrier account) | `features/sip_trunk.py`, `features/inbound_routing.py`, `sip/server.py`, `core/call_router.py` | E911 stack, LCR, STIR/SHAKEN, DNS SRV failover, fraud detection on real traffic, SBC validation |
 | **C6** | Analytics tap — live audio/transcript/QoS feed into analysis engines | 🔶 recordings + RTCP QoS data exist; no live feed wiring | `features/call_recording.py`, `rtp/rtcp_monitor.py` | Speech analytics, voice biometrics, call tagging, quality prediction, recording analytics, conversational AI |
@@ -75,7 +75,7 @@ forwarding methods, so call sites use e.g. `pbx.transfer_handler.start_blind_ref
 |-----------|-------|--------|------------------------|
 | SIP server (C1) | `pbx/sip/server.py` (~2 257 ln) | ✅ | **UDP only** — a single `SOCK_DGRAM` socket. No TCP or TLS transport, so no SIPS and no encrypted signaling to carriers/phones. Biggest core limitation. REFER/Replaces transfer parsing and SIP 3xx redirect (call-forwarding) handling landed on `auto-attendant`. |
 | SIP message/SDP/transaction (C1) | `pbx/sip/message.py`, `sdp.py`, `transaction.py` | ✅ | Parser, SDP builder/negotiation, transaction state machine. |
-| RTP relay + media (C2) | `pbx/rtp/handler.py` (~1 645 ln), `jitter_buffer.py`, `dtmf_monitor.py`, `rtcp_monitor.py` | ✅ | In-process relay, ports 10000–20000, RTCP QoS feed. G.711 µ/A end-to-end; G.722 partially via `utils/audio`. DTMF (RFC 2833 + SIP INFO + in-band) unified into one `DTMFMonitor` shared by AA and voicemail IVR (`auto-attendant`). No mixer (C3) — now the one remaining missing core build (C4 originate landed on `sip-trunk`). |
+| RTP relay + media (C2) | `pbx/rtp/handler.py` (~1 645 ln), `jitter_buffer.py`, `dtmf_monitor.py`, `rtcp_monitor.py` | ✅ | In-process relay, ports 10000–20000, RTCP QoS feed. G.711 µ/A end-to-end; **G.722 is present but broken** (see the C3 G.722 warning). DTMF (RFC 2833 + SIP INFO + in-band) unified into one `DTMFMonitor` shared by AA and voicemail IVR (`auto-attendant`). Mixer (C3) now built — `pbx/rtp/mixer.py`, G.711 only. |
 | Call transfer (C1) | `pbx/core/transfer_handler.py` (~862 ln) | ✅ | Blind + attended transfer via REFER/Replaces (RFC 3891); invite-based transfer detection; mandatory Via/Max-Forwards on teardown; auto-attendant calls transfer via the RTP relay instead of REFER (PBX stays in the media path) and are held with MOH during the transfer. Pending field verification with Zultys ZIP phones. |
 | Codec negotiation (C2) | `pbx/core/codec_negotiator.py` (~339 ln) | ✅ | Phone-model detection and codec compatibility, extracted out of `PBXCore`. |
 | Registration handling (C1) | `pbx/core/registration_handler.py` (~314 ln) | ✅ | SIP REGISTER handling, extracted out of `PBXCore`. |
@@ -126,11 +126,79 @@ flag. Grouped by gating capability.
 | Paging | `paging.py` + `core/paging_handler.py` | `features.paging` | 🔶 | Handler contains production-gap language; multicast paging needs real phones on a LAN segment that permits multicast. | B |
 | CDR + statistics (C7) | `cdr.py`, `statistics.py` | always | ✅ | Feeds analytics pages and the Tier-2 BI framework. | A + F |
 
-### C3 — Mixer-gated (mixer ❌ — blocked until built)
+### C3 — Mixer built ✅, no consumer wired yet
+
+The mixer exists and is tested. What is missing is the call-control wiring
+between each feature and a bridge — deliberately left for a later pass so the
+media layer could be validated on its own.
+
+**The primitive.** `pbx/rtp/mixer.py` gives you `RTPMixer` (attached to
+PBXCore as `rtp_mixer`) → `MixBridge` → N `MixPort`s. Each port declares the
+set of ports it *hears*; that routing matrix is the entire abstraction, and it
+is intentionally not hard-coded to "everyone minus self" because the
+supervisor modes are asymmetric. `BridgeMode` builders supply the matrices:
+
+| Mode | Routing |
+|---|---|
+| `ConferenceMode` / `BargeMode` | every port hears every other port |
+| `MonitorMode(supervisor)` | supervisor hears the parties; parties unchanged |
+| `WhisperMode(supervisor, target)` | only `target` also hears the supervisor |
+
+Typical use: `bridge = pbx.rtp_mixer.create_bridge(id)`, then `add_port()` per
+leg, then `apply_mode(...)`. Features never touch sockets.
+
+**Constraints worth knowing before wiring anything:**
+
+- Audio is normalised to **mono int16 / 8 kHz / 160-sample frames**. Only
+  G.711 µ-law and A-law are registered, so **every** other codec —
+  including G.722 — is renegotiated to G.711 on joining a bridge (see the
+  G.722 defect below).
+- `add_port` returns `None` for a payload type with no transcoder (G.729,
+  Opus, iLBC, Speex). That is the signal to **re-INVITE that leg to G.711**,
+  not an error — see `_send_bridge_reinvite` in `transfer_handler.py` for the
+  existing re-negotiation precedent.
+- `mixer.max_ports_per_bridge` defaults to **8**, and that is a measured
+  number: per 20 ms frame the mix loop costs ~1% of budget at 8 G.711 legs
+  (numpy lookup tables). Re-benchmark before raising, especially if a
+  non-table codec is ever registered — the same test at 8 G.722 legs cost
+  ~49% of budget.
+- Two-party calls must stay on the **RTP relay**, which is codec-opaque and
+  far cheaper. Promote to a bridge only when a third party appears, via
+  `release_relay_keep_port()`; collapse back when it drops to two.
+- DTMF (RFC 2833) is **forwarded, never mixed**, and re-stamped onto each
+  listener's own SSRC so endpoints see a single stream.
+
+> **⚠ G.722 is broken in this repo — measured, not suspected.**
+> Both `pbx/features/g722_codec.py` and `g722_codec_itu.py` are
+> non-functional. Feed either one a 1 kHz tone at its native 16 kHz and the
+> round trip comes back with its energy at **250 Hz**, 26× stronger than the
+> correct frequency. Two independent causes: the sub-band ADPCM predictor
+> diverges (decoded output is literally powers of two, doubling every
+> sample), and `_qmf_tx_filter` is a stub whose own comment admits "in full
+> ITU-T implementation, this uses interpolation filters" — there is no
+> synthesis filter, just `(rlow ± rhigh) << 1`.
+>
+> This was never noticed because nothing had listened critically to G.722
+> output: the codec is only reachable through `utils/audio.pcm16_to_g722`
+> for offline WAV conversion, and AA/voicemail prompts are PCMU-only by
+> design. **Anything that does generate G.722 audio today is producing
+> garbage.**
+>
+> Fixing it is a rewrite, not a patch — polyphase QMF analysis *and*
+> synthesis, plus both ADPCM sub-bands with logarithmic scale-factor
+> adaptation and 2-pole/6-zero predictors, in exact integer arithmetic
+> validated against ITU vectors. A native binding (spandsp or similar) would
+> fix correctness and the CPU cost together. The mixer is deliberately
+> decoupled from this: `pbx/rtp/mixer.py` needs no change, and re-enabling
+> is one line — `register_codec(PT_G722, G722Codec)` in `pbx/rtp/codecs.py`,
+> where the wrapper is already written and waiting.
 
 | Feature | Module | Config gate | Status | Remaining work | Test rig |
 |---------|--------|------------|--------|----------------|----------|
-| Conference | `conference.py` | `features.conference` | 🔶 | **State machine only** — rooms, participants, mute all tracked, dialplan `2xxx` routes in. **No RTP audio mixer exists anywhere in `pbx/rtp/`**, so N-way audio does not actually mix. Build the mixer (sum G.711 per participant, minus own audio) or bridge via Jitsi. | A (3 phones) |
+| Conference | `conference.py` | `features.conference` | 🔶 | State machine only (rooms, participants, mute). Two gaps: it stores a `call_id` per participant but never uses it — that is the handle to pass to `add_port` — and **`2xxx` is only *permitted* by `_check_dialplan`, never routed**: `route_call()` has no conference branch, so dialing `2001` falls through to `_dial_to_internal_extension` and dies. Wire routing + `ConferenceMode`. | A (3 phones) |
+| Supervisor monitor / whisper / barge | `advanced_call_features.py` | (no config block yet) | 🔶 | Permissions + a dict; **never instantiated anywhere in `pbx/`**. Needs: a PBXCore attribute, a `config.yml` block, conversion from nested-dict reads to dotted `Config.get`, a supervisor leg via `CallOriginator.originate_call()`, and an invocation path (star code, following `*61`/`*62` in `call_router.py:127`). **Security, unresolved:** `supervisor_id` is a trusted parameter rather than the authenticated registration; `can_monitor()` authorises against an *extension*, not a specific call; and any star code must sit **below** the trunk-origin guard at `call_router.py:85` or an external caller could dial it. Silent monitoring also carries jurisdiction-specific consent/notification obligations. | A (3 phones) |
+| Three-way calling | — | — | ❌ | No implementation at all; no in-call feature-code dispatcher exists (`DTMFMonitor` is consumed only by the voicemail and AA IVRs). Needs a hold-then-join flow; `BargeMode` is the routing. | A (3 phones) |
+| Call screening | `operator_console.py` | `features.operator_console` | 🔶 | Never instantiated. `screen_call()` rewrites `call.to_extension` without re-routing; `announce_and_transfer()` is an explicit stub. Needs a temporary bridge where one leg is muted rather than the all-or-nothing `Call.hold()`. | A |
 
 ### C4 — Originate-gated (primitive ✅ built on `sip-trunk`; consumers still to wire)
 
@@ -235,11 +303,11 @@ covers several). Each needs an explicit wire-or-cut decision before "finished" m
 | `stir_shaken.py` | C5 | Caller-ID attestation/verification | **Wire** — `add_stir_shaken_to_invite()` into `_route_to_trunk()` (alongside the caller-ID headers), `verify_stir_shaken_invite()` into the inbound path. Complete but still called from nowhere; needs signing certs from carrier/STI-PA. Rig C. |
 | `least_cost_routing.py` | C5 | Multi-trunk cost-based route selection | **Wire** — natural extension of `SIPTrunkSystem.route_outbound()` once >1 trunk exists. Rig C. |
 | `operator_console.py` | C4 | Attendant console backend | Wire to admin UI + presence (originate now exists via `CallOriginator`); or defer. |
-| `advanced_call_features.py` | C3 | Call screening/whisper/barge | Same mixer investment as conference — schedule together. |
+| `advanced_call_features.py` | C3 | Supervisor whisper/barge/monitor | **Wire** — the mixer it was waiting on is built (`MonitorMode`/`WhisperMode`/`BargeMode`). Remaining work and the open authorisation questions are in the C3 section. Note the actual call *screening* implementation is in `operator_console.py`, not here. |
 | `ai_call_routing.py` | C7 | ML route selection | Defer until call-volume data exists. |
 | `audio_processing.py` | C2 | Audio effects/normalization | Fold into recording pipeline or cut. |
-| `opus_codec.py`, `g729_codec.py`, `g726_codec.py`, `ilbc_codec.py`, `speex_codec.py` | C2 | Codec implementations | Wire into SDP negotiation + transcoding in `utils/audio.py` (only G.711/G.722 live). Opus first — WebRTC config already advertises it (PT 111). |
-| `g722_codec_itu.py` | C2 | Alternate G.722 | Duplicate of wired `g722_codec.py` — consolidate or delete. |
+| `opus_codec.py`, `g729_codec.py`, `g726_codec.py`, `ilbc_codec.py`, `speex_codec.py` | C2 | Codec implementations | Wire into SDP negotiation + transcoding. **Only G.711 µ/A is actually verified end-to-end** — G.722 is present but broken (see the C3 warning), and these five are unimported and unproven, so treat all of them as unvalidated until a round-trip test says otherwise. For mixing, register each with `pbx/rtp/codecs.py::register_codec`; until then a bridge re-INVITEs those legs to G.711. G.729 needs a licensed native library and Opus needs `opuslib`, neither currently installed. |
+| `g722_codec_itu.py` | C2 | Alternate G.722 | Duplicate of wired `g722_codec.py` — and **equally broken** (same 1 kHz → 250 Hz round-trip failure). Delete rather than consolidate; see the G.722 warning in the C3 section. |
 | `sso_auth.py` | Rig E | SSO for admin UI | Wire into `api/routes/auth.py`; SAML/OIDC needs an IdP to test. |
 | `mobile_apps.py` | Rig E | Mobile device registry | Wire alongside mobile_push when mobile clients are real. |
 
@@ -356,8 +424,11 @@ These constrain *every* feature's deployed testing and should be scheduled as pl
 1. **SIP is UDP-only** (C1). No TCP (large-message fragmentation risk), no TLS (no SIPS),
    no SRTP → no encrypted calling. Carrier trunks increasingly require TLS.
    `utils/tls_support.py` exists for the API layer only.
-2. **No conference/N-way audio mixer** (C3) — blocks real conferencing, barge/whisper,
-   and 3-way calling.
+2. ~~**No conference/N-way audio mixer** (C3)~~ — **built** and tested
+   (`pbx/rtp/mixer.py`). No feature is wired onto it yet: conferencing,
+   barge/whisper/monitor, 3-way calling and call screening each still need
+   their call-control path (see the C3 section). The supervisor modes also
+   have unresolved authorisation questions noted there.
 3. ~~**No call-originate primitive** (C4)~~ — **built** on `sip-trunk`
    (`core/call_originator.py`); click-to-dial is wired onto it. Predictive dialing,
    callback completion, emergency-notification calls and operator console still need
