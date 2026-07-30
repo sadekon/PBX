@@ -7,9 +7,9 @@ import json
 import threading
 import time
 from datetime import UTC, datetime
-from email.utils import formatdate
 from typing import Any
 
+from pbx.utils.audit_logger import get_audit_logger
 from pbx.utils.logger import get_logger
 
 
@@ -504,20 +504,8 @@ class EmergencyNotificationSystem:
             self.logger.warning(f"Cannot email {contact.name}: no email configured")
             return
 
-        try:
-            # Check if email notification system is available
-            if hasattr(self.pbx_core, "email_notifier") and self.pbx_core.email_notifier:
-                email_notifier = self.pbx_core.email_notifier
-
-                if not email_notifier.enabled:
-                    self.logger.warning("Email notification system is disabled")
-                    return
-
-                # Build emergency email
-                subject = f"🚨 EMERGENCY ALERT: {trigger_type}"
-
-                # Build email body
-                body = f"""EMERGENCY NOTIFICATION
+        subject = f"🚨 EMERGENCY ALERT: {trigger_type}"
+        body = f"""EMERGENCY NOTIFICATION
 
 type: {trigger_type}
 Time: {details.get("timestamp", datetime.now(UTC))}
@@ -534,22 +522,44 @@ Please respond immediately.
 PBX Emergency Notification System
 """
 
-                # Send email using the existing email notifier
-                self.logger.info(f"Sending emergency email to {contact.name} at {contact.email}")
+        self.logger.info(f"Sending emergency email to {contact.name} at {contact.email}")
 
-                # Use send method if available, otherwise use SMTP directly
-                if hasattr(email_notifier, "_send_email"):
-                    email_notifier._send_email(to_address=contact.email, subject=subject, body=body)
-                else:
-                    # Fallback to direct SMTP
-                    self._send_email_direct(contact.email, subject, body, email_notifier)
+        # Synchronous on purpose. This runs from on_911_call, not from call teardown, and the
+        # outcome is worth waiting for -- an emergency notification that quietly failed is the
+        # whole reason this path is being rewritten.
+        result = self.pbx_core.mailer.send(
+            contact.email,
+            subject,
+            body,
+            importance="high",
+        )
 
-                self.logger.warning(f"📧 Emergency email sent: {contact.name} ({contact.email})")
-            else:
-                self.logger.info(f"Would email {contact.name} at {contact.email}")
-                self.logger.info("Email notification system not available - logging only")
-        except (KeyError, TypeError, ValueError) as e:
-            self.logger.error(f"Error sending emergency email: {e}")
+        if result.ok:
+            self.logger.warning(f"📧 Emergency email sent: {contact.name} ({contact.email})")
+        else:
+            self.logger.error(
+                f"Emergency email FAILED for {contact.name} ({contact.email}): {result.error}"
+            )
+
+        # Kari's Law wants an auditable record of the notification attempt, not just a log
+        # line. Audited here rather than in pbx/mail, which must not know what Kari's Law is.
+        try:
+            get_audit_logger().log_action(
+                action="emergency_notification_email",
+                user="system",
+                resource="emergency_contact",
+                resource_id=contact.name,
+                success=result.ok,
+                details={
+                    "trigger_type": trigger_type,
+                    "recipient": contact.email,
+                    "priority": contact.priority,
+                    "message_id": result.message_id,
+                    "error": str(result.error) if result.error else None,
+                },
+            )
+        except Exception as e:
+            self.logger.error(f"Could not audit-log emergency email: {e}")
 
     def _format_email_details(self, details: dict) -> str:
         """Format emergency details for email"""
@@ -558,35 +568,6 @@ PBX Emergency Notification System
             if key != "timestamp":
                 lines.append(f"  {key}: {value}")
         return "\n".join(lines)
-
-    def _send_email_direct(
-        self, to_address: str, subject: str, body: str, email_notifier: Any | None
-    ) -> None:
-        """Send email directly using SMTP"""
-        import smtplib
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text import MIMEText
-
-        msg = MIMEMultipart()
-        msg["From"] = email_notifier.from_address
-        msg["To"] = to_address
-        msg["Subject"] = subject
-        msg["Date"] = formatdate(localtime=True)
-
-        msg.attach(MIMEText(body, "plain"))
-
-        # Connect and send
-        server = smtplib.SMTP(email_notifier.smtp_host, email_notifier.smtp_port)
-        try:
-            if email_notifier.use_tls:
-                server.starttls()
-
-            if email_notifier.username and email_notifier.password:
-                server.login(email_notifier.username, email_notifier.password)
-
-            server.send_message(msg)
-        finally:
-            server.quit()
 
     def _send_sms_notification(
         self, contact: EmergencyContact, trigger_type: str, details: dict

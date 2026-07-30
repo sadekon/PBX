@@ -12,7 +12,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pbx.core.pbx import PBXCore
-from pbx.features.email_notification import EmailNotifier
 from pbx.features.voicemail import VoicemailBox, VoicemailSystem
 from pbx.utils.config import Config
 

@@ -6,14 +6,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pbx.mail import Attachment, EmailError
 from pbx.utils.logger import get_logger, get_vm_ivr_logger
-
-try:
-    from pbx.features.email_notification import EmailNotifier
-
-    EMAIL_NOTIFIER_AVAILABLE = True
-except ImportError:
-    EMAIL_NOTIFIER_AVAILABLE = False
 
 try:
     from pbx.features.voicemail_transcription import VoicemailTranscriptionService  # noqa: F401
@@ -56,7 +50,7 @@ class VoicemailBox:
         extension_number: str,
         storage_path: str = "voicemail",
         config: Any | None = None,
-        email_notifier: Any | None = None,
+        mailer: Any | None = None,
         database: Any | None = None,
         transcription_service: Any | None = None,
     ) -> None:
@@ -67,7 +61,7 @@ class VoicemailBox:
             extension_number: Extension number
             storage_path: Path to store voicemail files
             config: Config object
-            email_notifier: EmailNotifier object
+            mailer: pbx.mail.Mailer used to send notifications (optional)
             database: DatabaseBackend object (optional)
             transcription_service: VoicemailTranscriptionService object (optional)
         """
@@ -76,7 +70,7 @@ class VoicemailBox:
         self.messages = []
         self.logger = get_logger()
         self.config = config
-        self.email_notifier = email_notifier
+        self.mailer = mailer
         self.database = database
         self.transcription_service = transcription_service
         self.pin = None  # Voicemail PIN (plaintext, for config file PINs)
@@ -256,13 +250,10 @@ class VoicemailBox:
                     f"✗ Voicemail transcription failed: {transcription_result['error']}"
                 )
 
-        # Send email notification if enabled
-        transcription_text = (
-            transcription_result["text"]
-            if transcription_result and transcription_result["success"]
-            else None
-        )
-        if self.email_notifier and self.config:
+        # Send email notification if enabled. The transcription is stored on the message but
+        # is not yet included in the email body -- the old code probed for a `transcription`
+        # parameter that never existed on the notifier, so this never worked.
+        if self.mailer and self.config:
             # Get extension configuration - check database first, then config
             # file
             extension_config = None
@@ -294,34 +285,108 @@ class VoicemailBox:
                     )
 
             if extension_config and email_address:
-                # Check if email notifier supports transcription parameter
-                import inspect
-
-                sig = inspect.signature(self.email_notifier.send_voicemail_notification)
-
-                if "transcription" in sig.parameters:
-                    # Email notifier supports transcription
-                    self.email_notifier.send_voicemail_notification(
-                        to_email=email_address,
-                        extension_number=self.extension_number,
-                        caller_id=caller_id,
-                        timestamp=timestamp,
-                        audio_file_path=file_path,
-                        duration=duration,
-                        transcription=transcription_text,
-                    )
-                else:
-                    # Older email notifier without transcription support
-                    self.email_notifier.send_voicemail_notification(
-                        to_email=email_address,
-                        extension_number=self.extension_number,
-                        caller_id=caller_id,
-                        timestamp=timestamp,
-                        audio_file_path=file_path,
-                        duration=duration,
-                    )
+                self._send_notification_email(
+                    to_email=email_address,
+                    caller_id=caller_id,
+                    timestamp=timestamp,
+                    audio_file_path=file_path,
+                    duration=duration,
+                )
 
         return message_id
+
+    def _notification_subject(self, caller_id: str, timestamp: Any) -> str:
+        """
+        Render the subject line from the configured template.
+
+        Content, so it lives with the feature rather than the transport. A template that
+        references an unknown field is a config error, not a reason to lose the notification.
+        """
+        template = "New Voicemail from {caller_id}"
+        if self.config:
+            template = self.config.get(
+                "voicemail.email.subject_template", "New Voicemail from {caller_id}"
+            )
+
+        formatted_time = (
+            timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            if isinstance(timestamp, datetime)
+            else str(timestamp)
+        )
+        try:
+            return template.format(
+                caller_id=caller_id,
+                timestamp=formatted_time,
+                extension=self.extension_number,
+            )
+        except (IndexError, KeyError) as e:
+            self.logger.warning(f"Invalid voicemail.email.subject_template ({e}); using default")
+            return f"New Voicemail from {caller_id}"
+
+    def _notification_body(
+        self, caller_id: str, timestamp: Any, duration: float | None = None
+    ) -> str:
+        """Build the plain-text body of a new-voicemail notification."""
+        body = "Hello,\n\n"
+        body += "You have received a new voicemail message.\n\n"
+        body += "Message Details:\n"
+        body += f"  Extension: {self.extension_number}\n"
+        body += f"  From: {caller_id}\n"
+
+        if isinstance(timestamp, datetime):
+            body += f"  Received: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        else:
+            body += f"  Received: {timestamp}\n"
+
+        if duration:
+            mins = int(duration // 60)
+            secs = int(duration % 60)
+            body += f"  Duration: {mins}:{secs:02d}\n"
+
+        body += f"\nTo listen to this message, please dial *{self.extension_number}\n"
+        body += "\nBest regards,\n"
+        body += "Warden VoIP\n"
+
+        return body
+
+    def _send_notification_email(
+        self,
+        to_email: str,
+        caller_id: str,
+        timestamp: Any,
+        audio_file_path: str | None = None,
+        duration: float | None = None,
+    ) -> None:
+        """
+        Queue the new-voicemail notification.
+
+        Asynchronous on purpose: this runs while the call is being torn down, and SMTP to an
+        unreachable server blocks for the full connect timeout. The old code sent inline and
+        held up teardown on a pooled thread for every message.
+        """
+        if not self.mailer:
+            return
+
+        attachments = []
+        include_attachment = True
+        if self.config:
+            include_attachment = self.config.get("voicemail.email.include_attachment", True)
+
+        if include_attachment and audio_file_path:
+            audio_path = Path(audio_file_path)
+            if audio_path.exists():
+                try:
+                    attachments.append(Attachment.from_path(audio_path, mime_type="audio/wav"))
+                except EmailError as e:
+                    # A missing or unreadable recording must not cost us the notification.
+                    self.logger.error(f"Could not attach voicemail recording: {e}")
+
+        self.mailer.send_async(
+            to_email,
+            self._notification_subject(caller_id, timestamp),
+            self._notification_body(caller_id, timestamp, duration),
+            attachments=attachments,
+        )
 
     def get_messages(self, unread_only: bool = False) -> list:
         """
@@ -688,6 +753,7 @@ class VoicemailSystem:
         storage_path: str = "voicemail",
         config: Any | None = None,
         database: Any | None = None,
+        mailer: Any | None = None,
     ) -> None:
         """
         Initialize voicemail system
@@ -696,20 +762,16 @@ class VoicemailSystem:
             storage_path: Path to store voicemail files
             config: Config object
             database: DatabaseBackend object (optional)
+            mailer: pbx.mail.Mailer owned by PBXCore (optional)
         """
         self.storage_path = storage_path
         self.mailboxes = {}
         self.logger = get_logger()
         self.config = config
         self.database = database
-
-        # Initialize email notifier if config provided
-        self.email_notifier = None
-        if config and EMAIL_NOTIFIER_AVAILABLE:
-            try:
-                self.email_notifier = EmailNotifier(config)
-            except Exception as e:
-                self.logger.error(f"Failed to initialize email notifier: {e}")
+        # The mailer is a PBX-wide subsystem, not something voicemail constructs. Sharing one
+        # transport is what lets emergency notification use it too.
+        self.mailer = mailer
 
         Path(storage_path).mkdir(parents=True, exist_ok=True)
 
@@ -728,7 +790,7 @@ class VoicemailSystem:
                 extension_number,
                 self.storage_path,
                 config=self.config,
-                email_notifier=self.email_notifier,
+                mailer=self.mailer,
                 database=self.database,
             )
         return self.mailboxes[extension_number]
@@ -759,25 +821,66 @@ class VoicemailSystem:
         """
         Send daily reminders for unread voicemails
 
+        Note: nothing calls this yet. The reminder scheduler is separate work; the send path
+        below is current and works against the shared Mailer.
+
         Returns:
             Number of reminders sent
         """
-        if not self.email_notifier or not self.config:
+        if not self.mailer or not self.config:
+            return 0
+        if not self.config.get("voicemail.reminders.enabled", False):
             return 0
 
         count = 0
         for extension_number, mailbox in self.mailboxes.items():
             unread_messages = mailbox.get_messages(unread_only=True)
-            if unread_messages:
-                extension_config = self.config.get_extension(extension_number)
-                if extension_config:
-                    email_address = extension_config.get("email")
-                    if email_address and self.email_notifier.send_reminder(
-                        email_address, extension_number, len(unread_messages), unread_messages
-                    ):
-                        count += 1
+            if not unread_messages:
+                continue
+
+            extension_config = self.config.get_extension(extension_number)
+            if not extension_config:
+                continue
+
+            email_address = extension_config.get("email")
+            if not email_address:
+                continue
+
+            self.mailer.send_async(
+                email_address,
+                self._reminder_subject(len(unread_messages)),
+                self._reminder_body(extension_number, unread_messages),
+            )
+            count += 1
 
         return count
+
+    @staticmethod
+    def _reminder_subject(unread_count: int) -> str:
+        """Subject for the unread-voicemail reminder."""
+        plural = "s" if unread_count > 1 else ""
+        return f"Voicemail Reminder: {unread_count} Unread Message{plural}"
+
+    @staticmethod
+    def _reminder_body(extension_number: str, messages: list) -> str:
+        """Body listing each unread message. Content, so it lives with the feature."""
+        unread_count = len(messages)
+        plural = "s" if unread_count > 1 else ""
+
+        body = "Hello,\n\n"
+        body += f"You have {unread_count} unread voicemail message{plural} "
+        body += f"in your mailbox (Extension {extension_number}):\n\n"
+
+        for index, msg_info in enumerate(messages, 1):
+            caller = msg_info.get("caller_id", "Unknown")
+            ts = msg_info.get("timestamp")
+            ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts)
+            body += f"{index}. From: {caller}, Received: {ts_str}\n"
+
+        body += f"\nPlease check your voicemail by dialing *{extension_number}\n\n"
+        body += "Best regards,\nWarden VoIP"
+
+        return body
 
     def get_message_count(self, extension_number: str, unread_only: bool = True) -> int:
         """

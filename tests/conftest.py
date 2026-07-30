@@ -1,11 +1,15 @@
 """Shared pytest fixtures for PBX test suite."""
 
+import smtplib
 from collections.abc import Callable, Generator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from flask.testing import FlaskClient
+
+if TYPE_CHECKING:
+    from pbx.mail import SmtpSettings
 
 
 @pytest.fixture
@@ -117,3 +121,90 @@ def sip_message_factory() -> Callable[..., str]:
         )
 
     return make_sip_message
+
+
+class FakeSmtp:
+    """
+    Scriptable stand-in for :class:`smtplib.SMTP`, satisfying ``pbx.mail.SmtpTransport``.
+
+    Records the conversation so tests can assert on protocol *order* (EHLO before STARTTLS
+    before AUTH), and can be scripted to fail a set number of times or to refuse specific
+    recipients. Using a real object rather than ``mock.patch("smtplib.SMTP")`` means the
+    client is exercised through the same seam production uses.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_times: int = 0,
+        failure: Exception | None = None,
+        refuse: dict[str, tuple[int, bytes]] | None = None,
+        quit_raises: bool = False,
+    ) -> None:
+        self.conversation: list[str] = []
+        self.sent: list[Any] = []
+        self.fail_times = fail_times
+        self.failure = failure or smtplib.SMTPServerDisconnected("connection lost")
+        self.refuse = refuse or {}
+        self.quit_raises = quit_raises
+        self.closed = False
+        self.tls_context = None
+
+    def ehlo_or_helo_if_needed(self) -> None:
+        self.conversation.append("ehlo")
+
+    def has_extn(self, name: str) -> bool:
+        self.conversation.append(f"has_extn:{name}")
+        return True
+
+    def starttls(self, *, context: Any = None) -> tuple[int, bytes]:
+        self.conversation.append("starttls")
+        self.tls_context = context
+        return (220, b"ready to start TLS")
+
+    def login(self, user: str, password: str) -> tuple[int, bytes]:
+        self.conversation.append(f"login:{user}")
+        return (235, b"authenticated")
+
+    def send_message(
+        self, msg: Any, from_addr: str | None = None, to_addrs: Any = None
+    ) -> dict[str, tuple[int, bytes]]:
+        self.conversation.append(f"send_message:from={from_addr}")
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise self.failure
+        self.sent.append(msg)
+        return dict(self.refuse)
+
+    def quit(self) -> tuple[int, bytes]:
+        self.conversation.append("quit")
+        if self.quit_raises:
+            raise smtplib.SMTPServerDisconnected("already gone")
+        return (221, b"bye")
+
+    def close(self) -> None:
+        self.conversation.append("close")
+        self.closed = True
+
+
+@pytest.fixture
+def fake_smtp() -> FakeSmtp:
+    """A FakeSmtp that accepts everything."""
+    return FakeSmtp()
+
+
+@pytest.fixture
+def smtp_settings() -> "SmtpSettings":
+    """Minimal working SMTP settings with retry delays short enough for tests."""
+    from pbx.mail import SmtpSettings
+
+    return SmtpSettings(
+        host="mail.corp.local",
+        port=587,
+        security="starttls",
+        auth="none",
+        from_address="pbx@corp.local",
+        from_name="Warden VoIP",
+        max_retries=2,
+        retry_backoff=0.01,
+    )

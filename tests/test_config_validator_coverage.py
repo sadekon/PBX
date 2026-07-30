@@ -653,25 +653,22 @@ class TestValidateProductionReadiness:
         assert len(example_warnings) == 0
 
     def test_voicemail_email_no_smtp_host(self) -> None:
-        config = {"voicemail": {"email_notifications": True, "smtp": {}}}
+        config = {"voicemail": {"email_notifications": True}, "smtp": {}}
         validator = ConfigValidator(config)
         validator._validate_production_readiness()
-        assert any("SMTP host" in w for w in validator.warnings)
+        assert any("smtp.host" in w for w in validator.warnings)
 
     def test_voicemail_email_with_smtp_host(self) -> None:
-        config = {"voicemail": {"email_notifications": True, "smtp": {"host": "smtp.acme.com"}}}
+        config = {"voicemail": {"email_notifications": True}, "smtp": {"host": "smtp.acme.com"}}
         validator = ConfigValidator(config)
         validator._validate_production_readiness()
-        smtp_warnings = [w for w in validator.warnings if "SMTP host" in w]
+        smtp_warnings = [w for w in validator.warnings if "smtp.host" in w]
         assert len(smtp_warnings) == 0
 
     def test_voicemail_example_from_address(self) -> None:
         config = {
-            "voicemail": {
-                "email_notifications": True,
-                "smtp": {"host": "smtp.acme.com"},
-                "email": {"from_address": "pbx@example.com"},
-            }
+            "voicemail": {"email_notifications": True},
+            "smtp": {"host": "smtp.acme.com", "from_address": "pbx@example.com"},
         }
         validator = ConfigValidator(config)
         validator._validate_production_readiness()
@@ -679,11 +676,8 @@ class TestValidateProductionReadiness:
 
     def test_voicemail_valid_from_address(self) -> None:
         config = {
-            "voicemail": {
-                "email_notifications": True,
-                "smtp": {"host": "smtp.acme.com"},
-                "email": {"from_address": "pbx@acme.com"},
-            }
+            "voicemail": {"email_notifications": True},
+            "smtp": {"host": "smtp.acme.com", "from_address": "pbx@acme.com"},
         }
         validator = ConfigValidator(config)
         validator._validate_production_readiness()

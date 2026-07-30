@@ -27,6 +27,9 @@ class EnvironmentLoader:
         # DB_PASSWORD has no default - must be explicitly set for PostgreSQL
         "SMTP_HOST": "",  # Empty default - set in .env if using email notifications
         "SMTP_PORT": "587",
+        "SMTP_SECURITY": "starttls",  # starttls | smtps (TLS is mandatory)
+        "SMTP_AUTH": "none",  # none | login ('none' == anonymous IP-restricted relay)
+        "SMTP_CA_FILE": "",  # PEM bundle for an internal CA; empty = system trust store
         "SMTP_USERNAME": "",  # Empty default - set in .env if using email notifications
         # SMTP_PASSWORD has no default - must be explicitly set if using email
         # Empty default - set in .env if using voicemail transcription

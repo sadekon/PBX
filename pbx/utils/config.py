@@ -5,11 +5,14 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, overload
+from typing import TYPE_CHECKING, Any, overload
 
 import yaml
 
-from pbx.utils.env_loader import get_env_loader, load_env_file
+from pbx.utils.env_loader import EnvironmentLoader, get_env_loader, load_env_file
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,12 @@ class Config:
         self.config = {}
         self.env_loader = None
         self.env_enabled = load_env
+
+        # Dotted path -> the raw "${VAR}" text as it appears in the YAML file, and the value
+        # that resolving that text produced. save() consults both so resolved secrets are
+        # never written back to disk. See _restore_placeholders().
+        self._placeholders: dict[str, str] = {}
+        self._resolved_placeholders: dict[str, Any] = {}
 
         # Load .env file if it exists
         if load_env:
@@ -58,15 +67,74 @@ class Config:
 
     def load(self) -> None:
         """Load configuration from YAML file and resolve environment variables"""
-        if Path(self.config_file).exists():
-            with Path(self.config_file).open() as f:
-                self.config = yaml.safe_load(f) or {}
-
-            # Resolve environment variables in configuration
-            if self.env_enabled and self.env_loader:
-                self.config = self.env_loader.resolve_config(self.config)
-        else:
+        if not Path(self.config_file).exists():
             raise FileNotFoundError(f"Configuration file not found: {self.config_file}")
+
+        with Path(self.config_file).open() as f:
+            raw_config = yaml.safe_load(f) or {}
+
+        self._placeholders = {}
+        self._resolved_placeholders = {}
+
+        # Resolve environment variables in configuration
+        if self.env_enabled and self.env_loader:
+            self._placeholders = {
+                path: value
+                for path, value in self._walk_leaves(raw_config)
+                if isinstance(value, str) and EnvironmentLoader.ENV_VAR_PATTERN.search(value)
+            }
+            self.config = self.env_loader.resolve_config(raw_config)
+            self._resolved_placeholders = {
+                path: value
+                for path, value in self._walk_leaves(self.config)
+                if path in self._placeholders
+            }
+        else:
+            self.config = raw_config
+
+    @staticmethod
+    def _walk_leaves(node: Any, path: str = "") -> Iterator[tuple[str, Any]]:
+        """
+        Yield (dotted_path, value) for every scalar leaf in a nested config structure.
+
+        List elements are addressed as ``key[0]`` so a placeholder inside a list of
+        dicts (e.g. sip_trunks) keeps a stable identity across load and save.
+        """
+        if isinstance(node, dict):
+            for key, value in node.items():
+                yield from Config._walk_leaves(value, f"{path}.{key}" if path else str(key))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                yield from Config._walk_leaves(value, f"{path}[{index}]")
+        else:
+            yield path, node
+
+    def _restore_placeholders(self, node: Any, path: str = "") -> Any:
+        """
+        Rebuild the config tree with resolved environment values swapped back to ``${VAR}``.
+
+        A leaf reverts to its placeholder only if it still holds exactly what resolution
+        produced. If it differs, someone changed it deliberately (an admin editing the SMTP
+        host) and the new literal is kept. Comparing types as well as values keeps Python's
+        ``True == 1`` equivalence from mistaking a changed value for an untouched one.
+        """
+        if isinstance(node, dict):
+            return {
+                key: self._restore_placeholders(value, f"{path}.{key}" if path else str(key))
+                for key, value in node.items()
+            }
+        if isinstance(node, list):
+            return [
+                self._restore_placeholders(value, f"{path}[{index}]")
+                for index, value in enumerate(node)
+            ]
+
+        if path in self._placeholders and path in self._resolved_placeholders:
+            resolved = self._resolved_placeholders[path]
+            if type(node) is type(resolved) and node == resolved:
+                return self._placeholders[path]
+
+        return node
 
     @overload
     def get(self, key: str) -> Any: ...
@@ -139,8 +207,9 @@ class Config:
     def save(self) -> bool:
         """Save current configuration to YAML file"""
         try:
+            to_write = self._restore_placeholders(self.config)
             with Path(self.config_file).open("w") as f:
-                yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
+                yaml.dump(to_write, f, default_flow_style=False, sort_keys=False)
             return True
         except PermissionError as e:
             logger.error("Error saving config: Permission denied - %s", e)
@@ -460,8 +529,9 @@ class Config:
                     self.config["voicemail"]["smtp"]["port"] = smtp["port"]
                 if "username" in smtp:
                     self.config["voicemail"]["smtp"]["username"] = smtp["username"]
-                if "password" in smtp:
-                    self.config["voicemail"]["smtp"]["password"] = smtp["password"]
+                # The password is deliberately not accepted here: writing a submitted
+                # plaintext secret into the config dict would land it in config.yml on the
+                # next save(). SMTP credentials come from SMTP_PASSWORD in the environment.
 
             # Update email settings
             if "email" in config_data:

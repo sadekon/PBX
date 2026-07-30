@@ -69,10 +69,12 @@ if TYPE_CHECKING:
     from pbx.integrations.jitsi import JitsiIntegration
     from pbx.integrations.matrix import MatrixIntegration
     from pbx.integrations.zoom import ZoomIntegration
+    from pbx.mail import Mailer
     from pbx.utils.database import ExtensionDB
     from pbx.utils.prometheus_exporter import PBXMetricsExporter
     from pbx.utils.security import ThreatDetector
     from pbx.utils.security_monitor import SecurityMonitor
+
 
 class PBXCore:
     """Main PBX system coordinator"""
@@ -119,6 +121,8 @@ class PBXCore:
     matrix_integration: MatrixIntegration | None
     espocrm_integration: EspoCRMIntegration | None
     zoom_integration: ZoomIntegration | None
+    # Always present, even when SMTP is unconfigured -- see FeatureInitializer.initialize()
+    mailer: Mailer
 
     # Database attributes (set conditionally in __init__)
     extension_db: ExtensionDB | None
@@ -560,6 +564,10 @@ class PBXCore:
 
         # Stop Prometheus metrics collector
         self._stop_metrics_collector()
+
+        # Drain queued mail before the process goes away
+        if hasattr(self, "mailer"):
+            self.mailer.stop()
 
         # Stop security monitor
         if hasattr(self, "security_monitor"):
