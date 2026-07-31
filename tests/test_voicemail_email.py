@@ -256,6 +256,25 @@ class TestDailyReminders:
         assert "5552222222" in body
         assert "2 unread voicemail messages" in body
 
+    def test_body_reports_the_total_when_some_are_already_read(self):
+        """Matches what the desk phone shows -- MWI advertises new and old counts."""
+        messages = [{"caller_id": "555", "timestamp": datetime(2026, 7, 30, 9, 0, tzinfo=UTC)}]
+
+        body = VoicemailSystem._reminder_body("1001", messages, total_count=3)
+
+        assert "1 unread voicemail message" in body
+        assert "3 in total" in body
+
+    def test_body_omits_the_total_when_it_repeats_the_unread_count(self):
+        messages = [{"caller_id": "555", "timestamp": datetime(2026, 7, 30, 9, 0, tzinfo=UTC)}]
+
+        assert "in total" not in VoicemailSystem._reminder_body("1001", messages, total_count=1)
+
+    def test_body_without_a_total_is_unchanged(self):
+        messages = [{"caller_id": "555", "timestamp": datetime(2026, 7, 30, 9, 0, tzinfo=UTC)}]
+
+        assert "in total" not in VoicemailSystem._reminder_body("1001", messages)
+
     def test_reminder_subject_is_singular_for_one_message(self):
         assert VoicemailSystem._reminder_subject(1).endswith("1 Unread Message")
 

@@ -99,8 +99,12 @@ def main(argv: list[str] | None = None) -> int:
 
     mailbox = system.get_mailbox(args.extension)
     messages = mailbox.get_messages(unread_only=not args.include_read)
+    total_count = len(mailbox.get_messages(unread_only=False))
     scope = "message(s)" if args.include_read else "unread message(s)"
-    print(f"Mailbox {args.extension}: {len(messages)} {scope} in {storage_path}")
+    print(
+        f"Mailbox {args.extension}: {len(messages)} {scope} "
+        f"of {total_count} total, in {storage_path}"
+    )
 
     if not messages:
         print()
@@ -109,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     subject = VoicemailSystem._reminder_subject(len(messages))
-    body = VoicemailSystem._reminder_body(args.extension, messages)
+    body = VoicemailSystem._reminder_body(args.extension, messages, total_count=total_count)
 
     print()
     print("=" * 70)

@@ -929,7 +929,11 @@ class VoicemailSystem:
             self.mailer.send_async(
                 email_address,
                 self._reminder_subject(len(unread_messages)),
-                self._reminder_body(extension_number, unread_messages),
+                self._reminder_body(
+                    extension_number,
+                    unread_messages,
+                    total_count=len(mailbox.get_messages(unread_only=False)),
+                ),
             )
             count += 1
 
@@ -942,14 +946,30 @@ class VoicemailSystem:
         return f"Voicemail Reminder: {unread_count} Unread Message{plural}"
 
     @staticmethod
-    def _reminder_body(extension_number: str, messages: list) -> str:
-        """Body listing each unread message. Content, so it lives with the feature."""
+    def _reminder_body(
+        extension_number: str, messages: list, total_count: int | None = None
+    ) -> str:
+        """
+        Body listing each unread message. Content, so it lives with the feature.
+
+        Args:
+            extension_number: Mailbox the summary is for.
+            messages: The unread messages, which are the ones listed.
+            total_count: Messages in the mailbox including those already heard. Reported
+                alongside the unread count so the figure matches what the desk phone shows
+                -- MWI advertises new *and* old counts, and a summary quoting only the
+                unread number reads as though messages have gone missing. Omitted when it
+                would merely repeat the unread count.
+        """
         unread_count = len(messages)
         plural = "s" if unread_count > 1 else ""
 
         body = "Hello,\n\n"
         body += f"You have {unread_count} unread voicemail message{plural} "
-        body += f"in your mailbox (Extension {extension_number}):\n\n"
+        body += f"in your mailbox (Extension {extension_number})"
+        if total_count is not None and total_count > unread_count:
+            body += f", {total_count} in total"
+        body += ":\n\n"
 
         for index, msg_info in enumerate(messages, 1):
             caller = msg_info.get("caller_id", "Unknown")
