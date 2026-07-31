@@ -84,6 +84,8 @@ declare global {
 
         // pages/config.ts
         loadConfig: () => Promise<void>;
+        loadEmailConfig: () => Promise<void>;
+        saveEmailConfig: () => Promise<void>;
         loadFeaturesStatus: () => Promise<void>;
         saveConfigSection: (section: string) => Promise<void>;
         loadSSLStatus: () => Promise<void>;

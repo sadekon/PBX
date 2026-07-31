@@ -17,7 +17,10 @@ database:
 smtp:
   host: ${SMTP_HOST}
   port: ${SMTP_PORT}
+  security: starttls
+  auth: none
   from_address: pbx@corp.local
+  from_name: Warden VoIP
 integrations:
   matrix:
     bot_password: ${MATRIX_BOT_PASSWORD}
@@ -130,3 +133,71 @@ class TestUpdateEmailConfig:
         text = config_file.read_text()
         assert "relay.corp.local" in text
         assert "leaked" not in text
+
+
+@pytest.mark.unit
+class TestUpdateEmailConfigPersistence:
+    """The admin Email/SMTP form round-trips through the top-level smtp: section."""
+
+    def test_settings_persist_and_reload(self, config_file):
+        config = Config(str(config_file))
+
+        assert config.update_email_config(
+            {
+                "smtp": {
+                    "host": "exchange.corp.local",
+                    "port": "465",
+                    "security": "smtps",
+                    "auth": "login",
+                    "username": "pbx",
+                    "from_address": "vm@corp.local",
+                    "verify_cert": False,
+                }
+            }
+        )
+
+        reloaded = Config(str(config_file)).config["smtp"]
+        assert reloaded["host"] == "exchange.corp.local"
+        assert reloaded["port"] == 465
+        assert reloaded["security"] == "smtps"
+        assert reloaded["auth"] == "login"
+        assert reloaded["verify_cert"] is False
+
+    def test_password_is_never_written(self, config_file):
+        config = Config(str(config_file))
+
+        config.update_email_config({"smtp": {"host": "h", "password": "plaintext-secret"}})
+
+        assert "plaintext-secret" not in config_file.read_text()
+
+    def test_unrelated_placeholders_survive(self, config_file):
+        config = Config(str(config_file))
+
+        config.update_email_config({"smtp": {"host": "exchange.corp.local"}})
+
+        text = config_file.read_text()
+        assert "${DB_PASSWORD}" in text
+        assert "db-s3cret" not in text
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"security": "plaintext"},
+            {"security": "none"},
+            {"auth": "kerberos"},
+            {"port": "not-a-number"},
+        ],
+    )
+    def test_invalid_values_are_rejected(self, config_file, payload):
+        assert Config(str(config_file)).update_email_config({"smtp": payload}) is False
+
+    def test_absent_keys_are_left_alone(self, config_file):
+        config = Config(str(config_file))
+        config.update_email_config({"smtp": {"host": "first.corp.local", "from_name": "Keep Me"}})
+
+        config = Config(str(config_file))
+        config.update_email_config({"smtp": {"host": "second.corp.local"}})
+
+        smtp = Config(str(config_file)).config["smtp"]
+        assert smtp["host"] == "second.corp.local"
+        assert smtp["from_name"] == "Keep Me"

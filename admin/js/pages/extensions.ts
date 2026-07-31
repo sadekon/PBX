@@ -201,6 +201,7 @@ export function initExtensionForms(): void {
                 did_number: val('new-ext-did-number'),
                 allow_external: chk('new-ext-allow-external'),
                 is_admin: chk('new-ext-is-admin'),
+                voicemail_email_enabled: chk('new-ext-voicemail-email-enabled'),
             };
 
             try {
