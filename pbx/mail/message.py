@@ -136,6 +136,12 @@ def build_message(
         from_name: Overrides ``settings.from_name``.
         importance: ``"high"`` adds the X-Priority/Importance pair Outlook reacts to.
 
+    When ``settings.redirect_to`` is set, every recipient is replaced by that address, the
+    subject gains a ``[REDIRECTED]`` prefix and the real recipients are recorded in an
+    ``X-Original-To`` header. This is a testing aid for running against live extensions, and
+    it lives here rather than in any one feature so that emergency notification is diverted
+    too.
+
     Returns:
         A fully populated message, including a ``Message-ID`` and a timezone-aware ``Date``.
 
@@ -157,6 +163,16 @@ def build_message(
     _validate_addresses(to_addresses, "To")
     _validate_addresses(cc_addresses, "Cc")
     _validate_addresses(bcc_addresses, "Bcc")
+
+    # Redirection happens after the real addresses are validated, so a malformed recipient
+    # still fails loudly during testing rather than being silently swallowed by the diversion.
+    original_recipients = to_addresses + cc_addresses + bcc_addresses
+    redirected = bool(settings.redirect_to)
+    if redirected:
+        _validate_addresses([settings.redirect_to], "redirect_to")
+        to_addresses = [settings.redirect_to]
+        cc_addresses = []
+        bcc_addresses = []
 
     attachment_list = list(attachments)
     total_bytes = sum(len(item.data) for item in attachment_list)
@@ -183,7 +199,13 @@ def build_message(
         _validate_addresses([reply_address], "Reply-To")
         message["Reply-To"] = reply_address
 
-    message["Subject"] = sanitize_header(subject)
+    if redirected:
+        # Both markers are deliberate: the prefix makes a diverted message obvious in an
+        # inbox, and X-Original-To records who would actually have received it.
+        message["Subject"] = sanitize_header(f"[REDIRECTED] {subject}")
+        message["X-Original-To"] = sanitize_header(", ".join(original_recipients))
+    else:
+        message["Subject"] = sanitize_header(subject)
     message["Date"] = format_datetime(datetime.now(tz=UTC))
 
     # A Message-ID in the sender's own domain costs nothing and is the handle you search on in

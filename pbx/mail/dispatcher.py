@@ -99,6 +99,14 @@ class Mailer:
             problems = settings.validate()
             for problem in problems:
                 self.logger.warning("SMTP configuration: %s", problem)
+            if settings.redirect_to:
+                # Loud on purpose: left on in production this silently stops every
+                # notification reaching the person it was meant for.
+                self.logger.warning(
+                    "ALL MAIL IS BEING REDIRECTED TO %s -- no real recipient will receive "
+                    "anything. This is a testing aid; unset smtp.redirect_to for production.",
+                    settings.redirect_to,
+                )
             self.logger.info(
                 "Mailer ready: %s:%d security=%s auth=%s from=%s",
                 settings.host,
