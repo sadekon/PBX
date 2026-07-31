@@ -14,6 +14,11 @@ def make_mailer(settings, transport, **kwargs):
     return Mailer(settings, transport_factory=lambda _s: transport, **kwargs)
 
 
+def _delivery_threads() -> set:
+    """Identity of every live Mailer worker, so a test can measure just its own."""
+    return {id(t) for t in threading.enumerate() if t.name == "mailer-delivery" and t.is_alive()}
+
+
 def wait_until(predicate, timeout=5.0):
     """Poll until predicate holds. Keeps thread tests from being timing-fragile."""
     deadline = time.monotonic() + timeout
@@ -172,13 +177,17 @@ class TestRetryPolicy:
 @pytest.mark.unit
 class TestShutdown:
     def test_stop_joins_the_worker(self, smtp_settings):
+        # Count only workers this test creates. Asserting on the global thread list makes
+        # the test depend on every other test in the run having cleaned up after itself.
+        before = _delivery_threads()
         mailer = make_mailer(smtp_settings, FakeSmtp())
         mailer.start()
+        assert _delivery_threads() - before, "worker did not start"
 
         mailer.stop(timeout=5)
 
         assert mailer.get_statistics()["running"] is False
-        assert not any(t.name == "mailer-delivery" for t in threading.enumerate())
+        assert _delivery_threads() - before == set(), "worker outlived stop()"
 
     def test_stop_drains_queued_mail(self, smtp_settings):
         """A SIGTERM with mail pending must not silently discard it."""
@@ -196,12 +205,12 @@ class TestShutdown:
         make_mailer(smtp_settings, FakeSmtp()).stop(timeout=1)
 
     def test_start_is_idempotent(self, smtp_settings):
+        before = _delivery_threads()
         mailer = make_mailer(smtp_settings, FakeSmtp())
         mailer.start()
         mailer.start()
         try:
-            workers = [t for t in threading.enumerate() if t.name == "mailer-delivery"]
-            assert len(workers) == 1
+            assert len(_delivery_threads() - before) == 1
         finally:
             mailer.stop(timeout=5)
 

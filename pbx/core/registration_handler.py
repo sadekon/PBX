@@ -191,7 +191,7 @@ class RegistrationHandler:
                 # Store phone registration in database (skip for unregistration)
             # Store phone registration in database (skip for unregistration)
             if pbx.registered_phones_db and expires > 0:
-                ip_address = registered_addr[0]
+                ip_address, sip_port = registered_addr
                 mac_address = self._extract_mac_address(contact, user_agent)
 
                 try:
@@ -201,6 +201,7 @@ class RegistrationHandler:
                         mac_address=mac_address,
                         user_agent=user_agent,
                         contact_uri=contact,
+                        sip_port=sip_port,
                     )
 
                     if stored_mac:

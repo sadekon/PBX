@@ -22,6 +22,10 @@ class Extension(TimestampMixin, Base):
     sip_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     voicemail_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    # Whether new voicemail is emailed to `email`. Distinct from voicemail_enabled, which is
+    # about having a mailbox at all. Defaults on so existing extensions keep the notifications
+    # they were already receiving before this column existed.
+    voicemail_email_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
     voicemail_pin_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     caller_id: Mapped[str | None] = mapped_column(String(50), nullable=True)

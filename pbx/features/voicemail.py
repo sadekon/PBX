@@ -42,6 +42,28 @@ import os
 _DEBUG_PIN_LOGGING_ENABLED = os.environ.get("DEBUG_VM_PIN", "false").lower() in ("true", "1", "yes")
 
 
+def is_subscribed_to_voicemail_email(extension_config: dict | None) -> bool:
+    """
+    Whether an extension wants new voicemail emailed to it.
+
+    Defaults to True when the key is absent. Extensions predating the
+    `voicemail_email_enabled` column, and those defined in config.yml rather than the
+    database, have no value for it — and before the column existed every extension with an
+    email address was notified unconditionally. Defaulting to False here would silently
+    unsubscribe everyone the moment the migration ran.
+
+    Args:
+        extension_config: Extension row or config dict. None counts as unsubscribed, since
+            there is no extension to notify.
+
+    Returns:
+        True if a notification should be sent.
+    """
+    if not extension_config:
+        return False
+    return bool(extension_config.get("voicemail_email_enabled", True))
+
+
 class VoicemailBox:
     """Represents a voicemail box for an extension"""
 
@@ -285,15 +307,77 @@ class VoicemailBox:
                     )
 
             if extension_config and email_address:
-                self._send_notification_email(
-                    to_email=email_address,
-                    caller_id=caller_id,
-                    timestamp=timestamp,
-                    audio_file_path=file_path,
-                    duration=duration,
-                )
+                if is_subscribed_to_voicemail_email(extension_config):
+                    self._send_notification_email(
+                        to_email=email_address,
+                        caller_id=caller_id,
+                        timestamp=timestamp,
+                        audio_file_path=file_path,
+                        duration=duration,
+                    )
+                else:
+                    self.logger.debug(
+                        f"Extension {self.extension_number} is unsubscribed from voicemail "
+                        "email; skipping notification"
+                    )
 
         return message_id
+
+    @staticmethod
+    def _format_timestamp(timestamp: Any) -> str:
+        """
+        Render a timestamp as ``09:15 AM, July 30, 2026``.
+
+        Shared by the subject and the body so the two can never disagree. Anything that is
+        not a datetime is passed through unchanged rather than guessed at.
+        """
+        if isinstance(timestamp, datetime):
+            return timestamp.strftime("%I:%M %p, %B %d, %Y")
+        return str(timestamp)
+
+    def _caller_display(self, caller_id: str) -> str:
+        """
+        Resolve a caller ID to the name on that extension, when it is one of ours.
+
+        An internal caller arrives as a bare extension number, which tells the recipient
+        nothing. The name is looked up the same way the recipient's address is -- database
+        first, then config.yml -- and the number is kept alongside it so nothing is lost.
+        External callers have no extension to match and are returned unchanged.
+
+        Args:
+            caller_id: Caller ID as it arrived from the SIP wire.
+
+        Returns:
+            ``"Jane Smith (1001)"`` when the extension is known, otherwise the caller ID.
+        """
+        if not caller_id:
+            return caller_id
+
+        name = None
+        # Every lookup below is best-effort: a failure must cost the name, never the
+        # notification, so both paths are guarded and fall through to the raw caller ID.
+        if self.database and getattr(self.database, "enabled", False):
+            try:
+                from pbx.utils.database import ExtensionDB
+
+                db_extension = ExtensionDB(self.database).get(caller_id)
+                if db_extension:
+                    name = db_extension.get("name")
+            except Exception as e:
+                self.logger.debug(f"Could not resolve caller name for {caller_id}: {e}")
+
+        if not name and self.config:
+            try:
+                extension_config = self.config.get_extension(caller_id)
+                if extension_config:
+                    name = extension_config.get("name")
+            except Exception as e:
+                self.logger.debug(f"Could not resolve caller name for {caller_id}: {e}")
+
+        # Only a real string is usable here; anything else is treated as no name at all.
+        if isinstance(name, str) and name.strip():
+            return f"{name.strip()} ({caller_id})"
+        return caller_id
 
     def _notification_subject(self, caller_id: str, timestamp: Any) -> str:
         """
@@ -308,20 +392,17 @@ class VoicemailBox:
                 "voicemail.email.subject_template", "New Voicemail from {caller_id}"
             )
 
-        formatted_time = (
-            timestamp.strftime("%Y-%m-%d %H:%M:%S")
-            if isinstance(timestamp, datetime)
-            else str(timestamp)
-        )
+        caller_display = self._caller_display(caller_id)
+        formatted_time = self._format_timestamp(timestamp)
         try:
             return template.format(
-                caller_id=caller_id,
+                caller_id=caller_display,
                 timestamp=formatted_time,
                 extension=self.extension_number,
             )
         except (IndexError, KeyError) as e:
             self.logger.warning(f"Invalid voicemail.email.subject_template ({e}); using default")
-            return f"New Voicemail from {caller_id}"
+            return f"New Voicemail from {caller_display}"
 
     def _notification_body(
         self, caller_id: str, timestamp: Any, duration: float | None = None
@@ -331,12 +412,8 @@ class VoicemailBox:
         body += "You have received a new voicemail message.\n\n"
         body += "Message Details:\n"
         body += f"  Extension: {self.extension_number}\n"
-        body += f"  From: {caller_id}\n"
-
-        if isinstance(timestamp, datetime):
-            body += f"  Received: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        else:
-            body += f"  Received: {timestamp}\n"
+        body += f"  From: {self._caller_display(caller_id)}\n"
+        body += f"  Received: {self._format_timestamp(timestamp)}\n"
 
         if duration:
             mins = int(duration // 60)
@@ -354,7 +431,7 @@ class VoicemailBox:
         to_email: str,
         caller_id: str,
         timestamp: Any,
-        audio_file_path: str | None = None,
+        audio_file_path: str | Path | None = None,
         duration: float | None = None,
     ) -> None:
         """
@@ -846,6 +923,9 @@ class VoicemailSystem:
             if not email_address:
                 continue
 
+            if not is_subscribed_to_voicemail_email(extension_config):
+                continue
+
             self.mailer.send_async(
                 email_address,
                 self._reminder_subject(len(unread_messages)),
@@ -874,7 +954,7 @@ class VoicemailSystem:
         for index, msg_info in enumerate(messages, 1):
             caller = msg_info.get("caller_id", "Unknown")
             ts = msg_info.get("timestamp")
-            ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts)
+            ts_str = VoicemailBox._format_timestamp(ts)
             body += f"{index}. From: {caller}, Received: {ts_str}\n"
 
         body += f"\nPlease check your voicemail by dialing *{extension_number}\n\n"

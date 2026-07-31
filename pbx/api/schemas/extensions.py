@@ -11,6 +11,7 @@ class ExtensionCreate(BaseModel):
     password: str = Field(min_length=4, description="SIP password")
     email: str | None = Field(default=None, max_length=255)
     voicemail_enabled: bool = True
+    voicemail_email_enabled: bool = True
     voicemail_pin: str | None = Field(default=None, min_length=4, max_length=10)
     is_admin: bool = False
     did_number: str | None = Field(default=None, max_length=20)
@@ -37,6 +38,7 @@ class ExtensionUpdate(BaseModel):
     password: str | None = Field(default=None, min_length=4)
     email: str | None = Field(default=None, max_length=255)
     voicemail_enabled: bool | None = None
+    voicemail_email_enabled: bool | None = None
     voicemail_pin: str | None = Field(default=None, min_length=4, max_length=10)
     is_admin: bool | None = None
     caller_id: str | None = Field(default=None, max_length=100)
@@ -54,6 +56,7 @@ class ExtensionResponse(BaseModel):
     email: str | None = None
     registered: bool = False
     voicemail_enabled: bool = True
+    voicemail_email_enabled: bool = True
     is_admin: bool = False
     caller_id: str | None = None
     dnd_enabled: bool = False

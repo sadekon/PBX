@@ -55,6 +55,23 @@ class Extension:
         self.registration_time = None
         self.expires_at = None
 
+    def adopt_registration(self, other: "Extension") -> None:
+        """
+        Take over the live registration held by a previous object for this extension.
+
+        Registration state exists only in memory, and a phone is never told when the server
+        forgets it -- there is no SIP message for "you are no longer registered". A phone
+        whose registration is dropped server-side therefore stays silent until its own
+        expiry, which can be an hour. Rebuilding extensions must not cost a registration.
+
+        Args:
+            other: The Extension object being replaced.
+        """
+        self.registered = other.registered
+        self.address = other.address
+        self.registration_time = other.registration_time
+        self.expires_at = other.expires_at
+
     def __str__(self) -> str:
         status = "registered" if self.registered else "unregistered"
         return f"Extension {self.number} ({self.name}) - {status}"
@@ -106,6 +123,8 @@ class ExtensionRegistry:
             "password_hash": db_extension.get("password_hash", ""),
             "allow_external": bool(db_extension.get("allow_external", True)),
             "voicemail_pin_hash": db_extension.get("voicemail_pin_hash", ""),
+            # Defaults to True so a row predating the column keeps its notifications
+            "voicemail_email_enabled": bool(db_extension.get("voicemail_email_enabled", True)),
             "ad_synced": bool(db_extension.get("ad_synced", False)),
             "is_admin": bool(db_extension.get("is_admin", False)),
             "did_number": db_extension.get("did_number"),
@@ -161,12 +180,27 @@ class ExtensionRegistry:
             self.logger.error(traceback.format_exc())
 
     def reload(self) -> None:
-        """Reload extensions from database or configuration"""
+        """
+        Reload extension configuration, preserving live registrations.
+
+        Called after every admin add/update/delete. Rebuilding the Extension objects
+        refreshes their config from the database, but must not drop the registrations held
+        on them: doing so silently unreachable-s every phone until it happens to re-register.
+        See Extension.adopt_registration().
+        """
         if not self.database or not self.database.enabled:
             # Only reload config if not using database
             self.config.load()
-        self.extensions.clear()
+
+        # Load into a fresh dict so the previous objects stay readable while rebuilding.
+        previous = self.extensions
+        self.extensions = {}
         self._load_extensions()
+
+        for number, extension in self.extensions.items():
+            prior = previous.get(number)
+            if prior is not None:
+                extension.adopt_registration(prior)
 
     def reload_extensions(self) -> None:
         """Alias for reload() - reload extensions from database or configuration"""
