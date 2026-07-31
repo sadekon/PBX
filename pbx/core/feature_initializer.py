@@ -23,6 +23,7 @@ from pbx.features.recording_retention import RecordingRetentionManager
 from pbx.features.sip_trunk import SIPTrunkSystem
 from pbx.features.time_based_routing import TimeBasedRouting
 from pbx.features.voicemail import VoicemailSystem
+from pbx.mail import Mailer, SmtpSettings
 
 
 class FeatureInitializer:
@@ -44,12 +45,23 @@ class FeatureInitializer:
         logger = pbx_core.logger
         database = pbx_core.database
 
+        # Mail transport comes first: voicemail and emergency notification both need it.
+        # Set unconditionally, even when SMTP is unconfigured -- an unconfigured Mailer is a
+        # real object that reports EmailConfigError, so no caller needs a hasattr() guard.
+        # Guarding is exactly what emergency notification used to do, and getting it wrong is
+        # why Kari's Law email silently logged instead of sending.
+        smtp_config: dict[str, Any] = config.get("smtp", {}) or {}
+        pbx_core.mailer = Mailer(SmtpSettings.from_dict(smtp_config))
+        pbx_core.mailer.start()
+        logger.info("Mail subsystem initialized (enabled=%s)", pbx_core.mailer.enabled)
+
         # Initialize advanced features
         voicemail_path: str = config.get("voicemail.storage_path", "voicemail")
         pbx_core.voicemail_system = VoicemailSystem(
             storage_path=voicemail_path,
             config=config,
             database=database if hasattr(pbx_core, "database") and database.enabled else None,
+            mailer=pbx_core.mailer,
         )
         pbx_core.conference_system = ConferenceSystem()
         pbx_core.recording_system = CallRecordingSystem(

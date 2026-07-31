@@ -21,7 +21,13 @@ def mock_pbx_core():
     pbx = MagicMock()
     pbx.config = MagicMock()
     pbx.config.get.return_value = None
-    pbx.email_notifier = None
+    # PBXCore always has a mailer now, configured or not -- so no caller needs a hasattr
+    # guard. The old fixture set pbx.email_notifier, an attribute production never set.
+    pbx.mailer = MagicMock()
+    pbx.mailer.enabled = True
+    pbx.mailer.send.return_value = MagicMock(
+        ok=True, message_id="<test@corp.local>", error=None, duration_ms=1.0
+    )
     pbx.paging_system = MagicMock()
     pbx.paging_system.enabled = False
     return pbx
@@ -518,124 +524,106 @@ class TestNotifyContact:
         # page not added when page not in notify_methods
         assert "page" not in record["methods_used"]
 
-    def test_send_email_notification_with_notifier(self, ens, mock_pbx_core) -> None:
+    def test_send_email_notification_sends(self, ens, mock_pbx_core) -> None:
+        """This is the first time emergency email actually sends."""
         from pbx.features.emergency_notification import EmergencyContact
-
-        email_notifier = MagicMock()
-        email_notifier.enabled = True
-        email_notifier._send_email = MagicMock()
-        mock_pbx_core.email_notifier = email_notifier
 
         contact = EmergencyContact(
             name="Test", email="test@example.com", notification_methods=["email"]
         )
         record = {"contacts_notified": [], "methods_used": []}
         ens._notify_contact(contact, "911_call", {}, record)
-        assert "email" in record["methods_used"]
-        email_notifier._send_email.assert_called_once()
 
-    def test_send_email_notification_no_email(self, ens) -> None:
+        assert "email" in record["methods_used"]
+        mock_pbx_core.mailer.send.assert_called_once()
+
+    def test_send_email_notification_is_synchronous(self, ens, mock_pbx_core) -> None:
+        """Runs from on_911_call, not call teardown, so the result is worth waiting for."""
+        from pbx.features.emergency_notification import EmergencyContact
+
+        contact = EmergencyContact(name="Test", email="test@example.com")
+        ens._send_email_notification(contact, "911_call", {})
+
+        mock_pbx_core.mailer.send.assert_called_once()
+        mock_pbx_core.mailer.send_async.assert_not_called()
+
+    def test_send_email_notification_marks_high_importance(self, ens, mock_pbx_core) -> None:
+        from pbx.features.emergency_notification import EmergencyContact
+
+        contact = EmergencyContact(name="Test", email="test@example.com")
+        ens._send_email_notification(contact, "911_call", {})
+
+        assert mock_pbx_core.mailer.send.call_args.kwargs["importance"] == "high"
+
+    def test_send_email_notification_subject_and_body(self, ens, mock_pbx_core) -> None:
+        from pbx.features.emergency_notification import EmergencyContact
+
+        contact = EmergencyContact(name="Reception", email="test@example.com", priority=2)
+        ens._send_email_notification(contact, "911_call", {"caller": "1001"})
+
+        args = mock_pbx_core.mailer.send.call_args[0]
+        assert args[0] == "test@example.com"
+        assert "911_call" in args[1]
+        assert "Reception" in args[2]
+        assert "1001" in args[2]
+
+    def test_send_email_notification_no_email(self, ens, mock_pbx_core) -> None:
         from pbx.features.emergency_notification import EmergencyContact
 
         contact = EmergencyContact(name="NoEmail", notification_methods=["email"])
         record = {"contacts_notified": [], "methods_used": []}
         ens._notify_contact(contact, "911_call", {}, record)
+
         assert "email" not in record["methods_used"]
+        mock_pbx_core.mailer.send.assert_not_called()
 
-    def test_send_email_notification_notifier_disabled(self, ens, mock_pbx_core) -> None:
+    def test_send_email_notification_is_audit_logged(self, ens, mock_pbx_core) -> None:
+        """Kari's Law wants an auditable record, not just a log line."""
         from pbx.features.emergency_notification import EmergencyContact
 
-        email_notifier = MagicMock()
-        email_notifier.enabled = False
-        mock_pbx_core.email_notifier = email_notifier
-
-        contact = EmergencyContact(
-            name="Test", email="test@example.com", notification_methods=["email"]
-        )
-        ens._send_email_notification(contact, "911_call", {})
-        # Should not send since disabled
-
-    def test_send_email_notification_no_notifier(self, ens, mock_pbx_core) -> None:
-        from pbx.features.emergency_notification import EmergencyContact
-
-        mock_pbx_core.email_notifier = None
-        contact = EmergencyContact(
-            name="Test", email="test@example.com", notification_methods=["email"]
-        )
-        # Should not raise
-        ens._send_email_notification(contact, "911_call", {})
-
-    def test_send_email_notification_direct_fallback(self, ens, mock_pbx_core) -> None:
-        from pbx.features.emergency_notification import EmergencyContact
-
-        email_notifier = MagicMock()
-        email_notifier.enabled = True
-        # Remove _send_email to trigger direct fallback
-        del email_notifier._send_email
-        email_notifier.from_address = "pbx@example.com"
-        email_notifier.use_tls = False
-        email_notifier.smtp_host = "localhost"
-        email_notifier.smtp_port = 25
-        email_notifier.username = None
-        email_notifier.password = None
-        mock_pbx_core.email_notifier = email_notifier
-
-        contact = EmergencyContact(
-            name="Test", email="test@example.com", notification_methods=["email"]
-        )
-        with patch("smtplib.SMTP") as mock_smtp_cls:
-            mock_server = MagicMock()
-            mock_smtp_cls.return_value = mock_server
+        contact = EmergencyContact(name="Test", email="test@example.com")
+        with patch("pbx.features.emergency_notification.get_audit_logger") as mock_audit:
             ens._send_email_notification(contact, "911_call", {})
-            mock_server.send_message.assert_called_once()
-            mock_server.quit.assert_called_once()
 
-    def test_send_email_direct_with_tls(self, ens) -> None:
-        email_notifier = MagicMock()
-        email_notifier.from_address = "pbx@example.com"
-        email_notifier.use_tls = True
-        email_notifier.smtp_host = "smtp.example.com"
-        email_notifier.smtp_port = 587
-        email_notifier.username = "user"
-        email_notifier.password = "pass"
+            mock_audit.return_value.log_action.assert_called_once()
+            kwargs = mock_audit.return_value.log_action.call_args.kwargs
+            assert kwargs["action"] == "emergency_notification_email"
+            assert kwargs["success"] is True
 
-        with patch("smtplib.SMTP") as mock_smtp_cls:
-            mock_server = MagicMock()
-            mock_smtp_cls.return_value = mock_server
-            ens._send_email_direct("test@example.com", "Subject", "Body", email_notifier)
-            mock_server.starttls.assert_called_once()
-            mock_server.login.assert_called_once_with("user", "pass")
-            mock_server.send_message.assert_called_once()
-
-    def test_send_email_direct_no_tls(self, ens) -> None:
-        email_notifier = MagicMock()
-        email_notifier.from_address = "pbx@example.com"
-        email_notifier.use_tls = False
-        email_notifier.smtp_host = "localhost"
-        email_notifier.smtp_port = 25
-        email_notifier.username = None
-        email_notifier.password = None
-
-        with patch("smtplib.SMTP") as mock_smtp_cls:
-            mock_server = MagicMock()
-            mock_smtp_cls.return_value = mock_server
-            ens._send_email_direct("test@example.com", "Subject", "Body", email_notifier)
-            mock_server.starttls.assert_not_called()
-            mock_server.login.assert_not_called()
-
-    def test_send_email_notification_error(self, ens, mock_pbx_core) -> None:
+    def test_failed_send_is_audited_as_a_failure(self, ens, mock_pbx_core) -> None:
         from pbx.features.emergency_notification import EmergencyContact
 
-        email_notifier = MagicMock()
-        email_notifier.enabled = True
-        email_notifier._send_email = MagicMock(side_effect=TypeError("email error"))
-        mock_pbx_core.email_notifier = email_notifier
-
-        contact = EmergencyContact(
-            name="Test", email="test@example.com", notification_methods=["email"]
+        mock_pbx_core.mailer.send.return_value = MagicMock(
+            ok=False, message_id=None, error=Exception("refused"), duration_ms=1.0
         )
-        # Should not raise
+        contact = EmergencyContact(name="Test", email="test@example.com")
+
+        with patch("pbx.features.emergency_notification.get_audit_logger") as mock_audit:
+            ens._send_email_notification(contact, "911_call", {})
+
+            assert mock_audit.return_value.log_action.call_args.kwargs["success"] is False
+
+    def test_send_failure_does_not_raise(self, ens, mock_pbx_core) -> None:
+        from pbx.features.emergency_notification import EmergencyContact
+
+        mock_pbx_core.mailer.send.return_value = MagicMock(
+            ok=False, message_id=None, error=Exception("smtp down"), duration_ms=1.0
+        )
+        contact = EmergencyContact(name="Test", email="test@example.com")
+
         ens._send_email_notification(contact, "911_call", {})
+
+    def test_audit_failure_does_not_break_notification(self, ens, mock_pbx_core) -> None:
+        from pbx.features.emergency_notification import EmergencyContact
+
+        contact = EmergencyContact(name="Test", email="test@example.com")
+        with patch(
+            "pbx.features.emergency_notification.get_audit_logger",
+            side_effect=OSError("audit log unwritable"),
+        ):
+            ens._send_email_notification(contact, "911_call", {})
+
+        mock_pbx_core.mailer.send.assert_called_once()
 
     def test_send_sms_notification_no_phone(self, ens) -> None:
         from pbx.features.emergency_notification import EmergencyContact

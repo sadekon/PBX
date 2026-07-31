@@ -225,22 +225,21 @@ class ConfigValidator:
         if "example" in server_name.lower():
             self.warnings.append("Server name contains 'example'. Update for production.")
 
-        # Check voicemail configuration
+        # Check voicemail configuration. SMTP transport now lives in the top-level smtp:
+        # section, shared with emergency notification, so both checks read from there.
         voicemail_config = self.config.get("voicemail", {})
         if voicemail_config.get("email_notifications", False):
-            smtp_config = voicemail_config.get("smtp", {})
+            smtp_config = self.config.get("smtp", {})
 
             if not smtp_config.get("host"):
                 self.warnings.append(
-                    "Voicemail email notifications enabled but SMTP host not configured"
+                    "Voicemail email notifications enabled but smtp.host not configured"
                 )
 
             # Check for default/example email addresses
-            from_address = voicemail_config.get("email", {}).get("from_address", "")
-            if from_address.endswith("@example.com") or "@example.com" in from_address:
-                self.warnings.append(
-                    "Voicemail from_address uses example.com. Update for production."
-                )
+            from_address = smtp_config.get("from_address", "")
+            if "@example.com" in from_address:
+                self.warnings.append("smtp.from_address uses example.com. Update for production.")
 
         # Check logging configuration
         logging_config = self.config.get("logging", {})

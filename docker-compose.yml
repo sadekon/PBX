@@ -108,6 +108,8 @@ services:
       # Email/SMTP configuration (optional)
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURITY: ${SMTP_SECURITY:-starttls}  # starttls | smtps
+      SMTP_AUTH: ${SMTP_AUTH:-none}  # none | login
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
 

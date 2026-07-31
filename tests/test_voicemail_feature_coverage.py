@@ -48,7 +48,7 @@ def mock_database():
 
 
 @pytest.fixture
-def mock_email_notifier():
+def mock_mailer():
     """Provide a mock email notifier."""
     notifier = MagicMock()
     return notifier
@@ -69,13 +69,12 @@ def voicemail_box(tmp_storage, mock_config):
 @pytest.fixture
 def voicemail_system(tmp_storage, mock_config):
     """Provide a VoicemailSystem instance."""
-    with patch("pbx.features.voicemail.EMAIL_NOTIFIER_AVAILABLE", False):
-        from pbx.features.voicemail import VoicemailSystem
+    from pbx.features.voicemail import VoicemailSystem
 
-        return VoicemailSystem(
-            storage_path=tmp_storage,
-            config=mock_config,
-        )
+    return VoicemailSystem(
+        storage_path=tmp_storage,
+        config=mock_config,
+    )
 
 
 # =============================================================================
@@ -442,56 +441,35 @@ class TestVoicemailBoxSaveMessage:
         assert "transcription" not in voicemail_box.messages[0]
 
     def test_save_message_with_email_notification(
-        self, voicemail_box, mock_config, mock_email_notifier
+        self, voicemail_box, mock_config, mock_mailer
+    ) -> None:
+        """Notification is queued, not sent inline, so call teardown never waits on SMTP."""
+        voicemail_box.config = mock_config
+        voicemail_box.mailer = mock_mailer
+
+        voicemail_box.save_message("5551234", b"audio data", duration=10.0)
+
+        mock_mailer.send_async.assert_called_once()
+        mock_mailer.send.assert_not_called()
+
+    def test_save_message_notification_carries_subject_and_body(
+        self, voicemail_box, mock_config, mock_mailer
     ) -> None:
         voicemail_box.config = mock_config
-        voicemail_box.email_notifier = mock_email_notifier
+        voicemail_box.mailer = mock_mailer
 
-        # Use a real function so inspect.signature works in Python 3.13
-        def send_with_transcription(
-            to_email,
-            extension_number,
-            caller_id,
-            timestamp,
-            audio_file_path,
-            duration,
-            transcription=None,
-        ):
-            pass
+        voicemail_box.save_message("5551234", b"audio data", duration=10.0)
 
-        mock_email_notifier.send_voicemail_notification = send_with_transcription
-
-        with patch.object(
-            mock_email_notifier, "send_voicemail_notification", wraps=send_with_transcription
-        ) as wrapped:
-            voicemail_box.save_message("5551234", b"audio data", duration=10.0)
-            wrapped.assert_called_once()
-
-    def test_save_message_email_notification_no_transcription_param(
-        self, voicemail_box, mock_config, mock_email_notifier
-    ) -> None:
-        voicemail_box.config = mock_config
-        voicemail_box.email_notifier = mock_email_notifier
-
-        # Use a real function WITHOUT the transcription parameter
-        def send_without_transcription(
-            to_email, extension_number, caller_id, timestamp, audio_file_path, duration
-        ):
-            pass
-
-        mock_email_notifier.send_voicemail_notification = send_without_transcription
-
-        with patch.object(
-            mock_email_notifier, "send_voicemail_notification", wraps=send_without_transcription
-        ) as wrapped:
-            voicemail_box.save_message("5551234", b"audio data", duration=10.0)
-            wrapped.assert_called_once()
+        args, kwargs = mock_mailer.send_async.call_args
+        assert "5551234" in args[2]  # body names the caller
+        assert "1001" in args[2]  # ...and the extension
+        assert "attachments" in kwargs
 
     def test_save_message_email_from_database(
-        self, voicemail_box, mock_config, mock_database, mock_email_notifier
+        self, voicemail_box, mock_config, mock_database, mock_mailer
     ) -> None:
         voicemail_box.config = mock_config
-        voicemail_box.email_notifier = mock_email_notifier
+        voicemail_box.mailer = mock_mailer
         voicemail_box.database = mock_database
 
         with patch("pbx.utils.database.ExtensionDB") as mock_ext_db_cls:
@@ -499,64 +477,36 @@ class TestVoicemailBoxSaveMessage:
             mock_ext_db.get.return_value = {"email": "db@example.com"}
             mock_ext_db_cls.return_value = mock_ext_db
 
-            calls = []
-
-            def send_with_transcription(
-                to_email,
-                extension_number,
-                caller_id,
-                timestamp,
-                audio_file_path,
-                duration,
-                transcription=None,
-            ):
-                calls.append({"to_email": to_email})
-
-            mock_email_notifier.send_voicemail_notification = send_with_transcription
-
             voicemail_box.save_message("5551234", b"audio data")
-            assert len(calls) == 1
-            assert calls[0]["to_email"] == "db@example.com"
+
+            mock_mailer.send_async.assert_called_once()
+            assert mock_mailer.send_async.call_args[0][0] == "db@example.com"
 
     def test_save_message_email_db_lookup_error_falls_back(
-        self, voicemail_box, mock_config, mock_database, mock_email_notifier
+        self, voicemail_box, mock_config, mock_database, mock_mailer
     ) -> None:
         voicemail_box.config = mock_config
-        voicemail_box.email_notifier = mock_email_notifier
+        voicemail_box.mailer = mock_mailer
         voicemail_box.database = mock_database
 
         with patch("pbx.utils.database.ExtensionDB") as mock_ext_db_cls:
             mock_ext_db_cls.side_effect = KeyError("db error")
 
-            calls = []
-
-            def send_with_transcription(
-                to_email,
-                extension_number,
-                caller_id,
-                timestamp,
-                audio_file_path,
-                duration,
-                transcription=None,
-            ):
-                calls.append(True)
-
-            mock_email_notifier.send_voicemail_notification = send_with_transcription
-
             voicemail_box.save_message("5551234", b"audio data")
-            # Falls back to config, which has email "test@example.com"
-            assert len(calls) == 1
 
-    def test_save_message_no_email_address(self, voicemail_box, mock_email_notifier) -> None:
+            # Falls back to config, which has email "test@example.com"
+            mock_mailer.send_async.assert_called_once()
+
+    def test_save_message_no_email_address(self, voicemail_box, mock_mailer) -> None:
         config = MagicMock()
         config.get_extension.return_value = {"voicemail_pin": "1234"}
         voicemail_box.config = config
-        voicemail_box.email_notifier = mock_email_notifier
+        voicemail_box.mailer = mock_mailer
         voicemail_box.database = None
 
         voicemail_box.save_message("5551234", b"audio data")
         # No email address in config, so notification should NOT be sent
-        mock_email_notifier.send_voicemail_notification.assert_not_called()
+        mock_mailer.send_voicemail_notification.assert_not_called()
 
 
 @pytest.mark.unit
@@ -831,40 +781,32 @@ class TestVoicemailSystemInit:
     """Tests for VoicemailSystem initialization."""
 
     def test_init_basic(self, tmp_storage) -> None:
-        with patch("pbx.features.voicemail.EMAIL_NOTIFIER_AVAILABLE", False):
-            from pbx.features.voicemail import VoicemailSystem
+        from pbx.features.voicemail import VoicemailSystem
 
-            system = VoicemailSystem(storage_path=tmp_storage)
-            assert system.mailboxes == {}
-            assert system.email_notifier is None
+        system = VoicemailSystem(storage_path=tmp_storage)
+        assert system.mailboxes == {}
+        assert system.mailer is None
 
-    def test_init_with_email_notifier(self, tmp_storage, mock_config) -> None:
-        with (
-            patch("pbx.features.voicemail.EMAIL_NOTIFIER_AVAILABLE", True),
-            patch("pbx.features.voicemail.EmailNotifier") as mock_notifier_cls,
-        ):
-            mock_notifier_cls.return_value = MagicMock()
-            from pbx.features.voicemail import VoicemailSystem
+    def test_init_with_mailer(self, tmp_storage, mock_config) -> None:
+        """The mailer is injected by PBXCore now; voicemail never constructs a transport."""
+        from pbx.features.voicemail import VoicemailSystem
 
-            system = VoicemailSystem(storage_path=tmp_storage, config=mock_config)
-            assert system.email_notifier is not None
+        mailer = MagicMock()
+        system = VoicemailSystem(storage_path=tmp_storage, config=mock_config, mailer=mailer)
+        assert system.mailer is mailer
 
-    def test_init_email_notifier_error(self, tmp_storage, mock_config) -> None:
-        with (
-            patch("pbx.features.voicemail.EMAIL_NOTIFIER_AVAILABLE", True),
-            patch("pbx.features.voicemail.EmailNotifier", side_effect=Exception("init error")),
-        ):
-            from pbx.features.voicemail import VoicemailSystem
+    def test_mailer_is_passed_down_to_each_mailbox(self, tmp_storage, mock_config) -> None:
+        from pbx.features.voicemail import VoicemailSystem
 
-            _system = VoicemailSystem(storage_path=tmp_storage, config=mock_config)
-            assert _system.email_notifier is None
+        mailer = MagicMock()
+        system = VoicemailSystem(storage_path=tmp_storage, config=mock_config, mailer=mailer)
+        assert system.get_mailbox("1001").mailer is mailer
 
     def test_init_creates_storage_directory(self, tmp_storage) -> None:
-        with patch("pbx.features.voicemail.EMAIL_NOTIFIER_AVAILABLE", False):
-            from pbx.features.voicemail import VoicemailSystem
+        from pbx.features.voicemail import VoicemailSystem
 
-            _system = VoicemailSystem(storage_path=tmp_storage)
-            assert Path(tmp_storage).exists()
+        _system = VoicemailSystem(storage_path=tmp_storage)
+        assert Path(tmp_storage).exists()
 
 
 @pytest.mark.unit
@@ -926,7 +868,7 @@ class TestVoicemailSystemDailyReminders:
     """Tests for VoicemailSystem.send_daily_reminders."""
 
     def test_send_daily_reminders_no_notifier(self, voicemail_system) -> None:
-        voicemail_system.email_notifier = None
+        voicemail_system.mailer = None
         count = voicemail_system.send_daily_reminders()
         assert count == 0
 
@@ -936,18 +878,18 @@ class TestVoicemailSystemDailyReminders:
         assert count == 0
 
     def test_send_daily_reminders_with_unread(self, voicemail_system, mock_config) -> None:
-        voicemail_system.email_notifier = MagicMock()
-        voicemail_system.email_notifier.send_reminder.return_value = True
+        voicemail_system.mailer = MagicMock()
         voicemail_system.config = mock_config
 
         voicemail_system.save_message("1001", "caller1", b"audio1")
+        voicemail_system.mailer.send_async.reset_mock()
 
         count = voicemail_system.send_daily_reminders()
         assert count == 1
-        voicemail_system.email_notifier.send_reminder.assert_called_once()
+        voicemail_system.mailer.send_async.assert_called_once()
 
     def test_send_daily_reminders_no_unread(self, voicemail_system, mock_config) -> None:
-        voicemail_system.email_notifier = MagicMock()
+        voicemail_system.mailer = MagicMock()
         voicemail_system.config = mock_config
 
         voicemail_system.save_message("1001", "caller1", b"audio1")
@@ -958,7 +900,7 @@ class TestVoicemailSystemDailyReminders:
         assert count == 0
 
     def test_send_daily_reminders_no_email_in_config(self, voicemail_system) -> None:
-        voicemail_system.email_notifier = MagicMock()
+        voicemail_system.mailer = MagicMock()
         config = MagicMock()
         config.get_extension.return_value = {}  # no email key
         voicemail_system.config = config

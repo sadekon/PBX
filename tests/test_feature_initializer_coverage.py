@@ -181,6 +181,7 @@ class TestFeatureInitializerInitialize:
             storage_path="voicemail",
             config=pbx_core.config,
             database=pbx_core.database,
+            mailer=pbx_core.mailer,
         )
 
     def test_voicemail_with_database_disabled(self) -> None:
@@ -192,6 +193,7 @@ class TestFeatureInitializerInitialize:
             storage_path="voicemail",
             config=pbx_core.config,
             database=None,
+            mailer=pbx_core.mailer,
         )
 
     def test_custom_voicemail_path(self) -> None:
@@ -203,6 +205,7 @@ class TestFeatureInitializerInitialize:
             storage_path="/custom/vm/path",
             config=pbx_core.config,
             database=pbx_core.database,
+            mailer=pbx_core.mailer,
         )
 
     def test_call_recording_enabled(self) -> None:

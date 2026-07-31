@@ -119,7 +119,7 @@ flag. Grouped by gating capability.
 
 | Feature | Module | Config gate | Status | Remaining work | Test rig |
 |---------|--------|------------|--------|----------------|----------|
-| Voicemail | `voicemail.py` + `core/voicemail_handler.py` | `features.voicemail` | ✅ | RFC 2833 + in-band DTMF in IVR, prompts, barge-in, greeting review — merged to DEV via PR #1 (`voicemail-fix`). Remaining: deployed regression test on real phones. Email notify needs SMTP (Rig E); transcription needs a Vosk model on disk (Rig E). | A (+E) |
+| Voicemail | `voicemail.py` + `core/voicemail_handler.py` | `features.voicemail` | ✅ | RFC 2833 + in-band DTMF in IVR, prompts, barge-in, greeting review — merged to DEV via PR #1 (`voicemail-fix`). Remaining: deployed regression test on real phones. Email notify reworked onto `pbx/mail` — sent asynchronously so SMTP no longer blocks call teardown; needs an SMTP host (Rig E). Transcription needs a Vosk model on disk (Rig E), and is stored but not yet included in the email body. | A (+E) |
 | Auto attendant | `auto_attendant.py` + handler | `features.auto_attendant` | 🚧 | Same IVR/DTMF plumbing as voicemail (barge-in landed); DTMF now goes through the shared `DTMFMonitor`. Prompt text config-driven (`auto_attendant.prompts` + `company_name`) via the single `generate_espeak_voices.py` generator. G.711 (PCMU) only — HD/G.722 prompt audio intentionally not supported. Transfers now go via the RTP relay (not REFER) and hold with MOH; transfer-failure UX is still a TODO (`auto_attendant_handler.py` — interim behavior replays the main menu, pending a product decision on voicemail-on-failure vs. apology+hangup). Needs prompt files generated on the box and deployed DTMF/transfer test across phone models. | A |
 | Music on hold | `music_on_hold.py` | `features.music_on_hold` | ✅ | Needs audio files in `moh/`. | A |
 | Call recording | `call_recording.py` | `features.call_recording` | ✅ | Records from RTP relay. Retention (`recording_retention.py`) and announcements (`recording_announcements.py`) wired. Verify storage growth + retention sweeps on Rig F. | A |
@@ -205,7 +205,7 @@ leg, then `apply_mode(...)`. Features never touch sockets.
 | Feature | Module | Config gate | Status | Remaining work | Test rig |
 |---------|--------|------------|--------|----------------|----------|
 | Callback queue | `callback_queue.py` | config | 🔶 | Queue/persistence wired; *completing* a callback now just needs wiring to `CallOriginator.originate_and_bridge()`. | A |
-| Emergency notification | `emergency_notification.py` | `features.emergency_notification` (default on) | 🔶 | **Stub actions**: logs "Would call/email/SMS …" (lines ~485–614). Call/page actions can now use `CallOriginator`; email/SMS still need SMTP + SMS provider (Rig E). | A + E |
+| Emergency notification | `emergency_notification.py` | `features.emergency_notification` (default on) | 🔶 | **Email now sends for real** via `pbx_core.mailer` (`pbx/mail`), synchronously, audit-logged at the call site. Previously read `pbx_core.email_notifier`, an attribute nothing ever set, so it silently logged instead of sending. Call/page actions can use `CallOriginator`; SMS still needs a provider (Rig E). | A + E |
 
 ### C5 — Trunk-gated (outbound 🚧 on branch, inbound 🚧 data layer only)
 
@@ -514,7 +514,7 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 | A1 | Inbound DID routing (finishes C5) | sip-trunk branch | ✅ code-complete (data layer + API + admin UI + SIP dispatch); field-unverified, no carrier account yet |
 | A2 | NAT/public-IP handling for trunk SDP/Via/Contact + symmetric RTP | carrier account (B1) | ❌ untested |
 | A3 | `voicemail-fix` merged to DEV (PR #1); hardware regression on Zultys/Cisco ATA still outstanding | — | 🚧 |
-| A4 | Kari's Law on-site notification: wire `emergency_notification.py` email action to existing SMTP (`email_notification.py`) — legal requirement | SMTP creds | ❌ stubbed |
+| A4 | Kari's Law on-site notification: `emergency_notification.py` email action wired to `pbx/mail` — legal requirement | SMTP host (anonymous relay needs no creds) | ✅ done |
 | A5 | Merge sip-trunk → DEV; cut stabilization branch (dev continues on features, deploy runs frozen release + hotfixes) | A1–A2 | ❌ |
 | A6 | *(Conditional)* International dialing — outbound matcher is NANP-only (`^1?\d{10}$` in `call_router.py:110`) | office need? | ❌ |
 | A7 | Merge `auto-attendant` → DEV (PR #2 — REFER/attended transfer, RTP-relay AA transfer + MOH, call forwarding, unified DTMF); real-phone regression for transfer + forwarding first | — | 🚧 |
@@ -594,7 +594,7 @@ finish Terraform/K8s. *Exit: PRODUCTION_READINESS_CHECKLIST.md passes.*
 - [ ] Outbound trunk validation on test DID: registration, NAT/public-IP in SDP/Via/Contact, DTMF to external IVRs, codec negotiation
 - [ ] `voicemail-fix` merged (PR #1); regression on office phone models still outstanding
 - [ ] Merge `auto-attendant` (PR #2 — REFER/attended transfer, RTP-relay AA transfer + MOH, call forwarding, unified DTMF); regression-test transfer + forwarding on office phone models
-- [ ] **Kari's Law notification** — replace `emergency_notification.py` "Would email…" stubs with real email (SMTP) and/or webhook minimum (call/page notify can now use `CallOriginator`, but treat as post-cutover)
+- [x] **Kari's Law notification** — `emergency_notification.py` now sends real email through `pbx/mail` and audit-logs the attempt; see `docs/EMAIL_SETUP.md` for validation. Webhook path and call/page notify remain post-cutover
 - [ ] E911: register dispatchable address with provider; verify karis_law/e911_location routing; validate via provider test number (933-style — never live 911; keep test-mode protection on until final check)
 - [ ] SIP exposure hardening: 5060/udp restricted to trunk provider IPs; no WAN registrations
 

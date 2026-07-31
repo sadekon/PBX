@@ -81,7 +81,7 @@ api:
   # Example: ["https://admin.yourdomain.com:9000"]
   # 'self' and cdn.jsdelivr.net are always included.
   csp_connect_sources: []
-  
+
   # =============================================================================
   # HTTPS/SSL Configuration
   # =============================================================================
@@ -377,6 +377,28 @@ recording:
   auto_record: false
   storage_path: recordings
   format: wav
+# SMTP transport. Owned by pbx/mail and shared by every feature that sends email
+# (voicemail notification, Kari's Law emergency notification). What each email *says* is
+# configured by the feature that sends it -- see voicemail.email below.
+smtp:
+  host: ${SMTP_HOST}  # SMTP server - set in .env file
+  port: ${SMTP_PORT}  # 587 or 25 for STARTTLS, 465 for implicit TLS (smtps)
+  security: ${SMTP_SECURITY}  # starttls | smtps  (TLS is mandatory; defaults to starttls)
+  auth: ${SMTP_AUTH}  # none | login  (none == anonymous IP-restricted relay; the default)
+  username: ${SMTP_USERNAME}  # Only used when auth is not 'none'
+  # The password is NEVER read from this file. Set SMTP_PASSWORD in .env instead.
+  verify_cert: true  # Leave true; a hostname mismatch is fixed by correcting host, not this
+  ca_file: ${SMTP_CA_FILE}  # PEM bundle for an internal CA, e.g. /etc/ssl/certs/corp-ca.pem
+  # Name the PBX announces itself as in EHLO. Empty = derive it from reverse DNS, which is
+  # nondeterministic and can yield a name that does not exist in your domain. Set this to the
+  # PBX's real FQDN (e.g. pbx.albl.com) if the receive connector validates HELO or rDNS.
+  helo_hostname: 'pbx-server'
+  from_address: 'Voicemail@albl.com'  # Header sender for every email the PBX sends
+  from_name: ABCo Voicemail
+  envelope_from: ''  # Override the envelope sender only if SPF alignment needs it
+  timeout: 10
+  max_retries: 3
+  max_attachment_bytes: 8388608  # 8 MB; Exchange's default receive limit is 10 MB
 voicemail:
   storage_path: voicemail
   max_message_duration: 180
@@ -384,15 +406,9 @@ voicemail:
   allow_custom_greetings: true
   email_notifications: true
   no_answer_timeout: 30
-  smtp:
-    host: ${SMTP_HOST}  # SMTP server - set in .env file (example: smtp.gmail.com)
-    port: ${SMTP_PORT}  # SMTP port (default: 587)
-    use_tls: true
-    username: ${SMTP_USERNAME}  # SMTP username - set in .env file
-    password: ${SMTP_PASSWORD}  # SMTP password - set in .env file
+  # What the voicemail email says. The sender identity and every transport setting moved to
+  # the top-level smtp: section.
   email:
-    from_address: 'Voicemail@albl.com'
-    from_name: ABCo Voicemail
     subject_template: New Voicemail from {caller_id} - {timestamp}
     include_attachment: true
     send_immediately: true
