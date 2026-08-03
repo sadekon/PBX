@@ -518,35 +518,48 @@ webrtc:
 ```yaml
 # config.yml
 voicemail:
-  enabled: true
+  storage_path: voicemail
   email_notifications: true
-  no_answer_timeout: 30  # seconds before routing to VM
-  max_recording_time: 180  # 3 minutes
-  
-  # Email settings
-  smtp:
-    host: "smtp.gmail.com"
-    port: 587
-    use_tls: true
-    username: "voicemail@company.com"
-    password: "${SMTP_PASSWORD}"  # from .env
-  
+  no_answer_timeout: 30       # seconds before routing to VM
+  max_message_duration: 180   # 3 minutes
+
+  # What the email *says*. The sender identity and every transport setting live in the
+  # top-level smtp: block below, not here.
   email:
-    from_address: "voicemail@company.com"
-    from_name: "PBX Voicemail"
+    subject_template: New Voicemail from {caller_id} - {timestamp}
     include_attachment: true
-  
+    include_transcription: true
+
   # Daily reminders
   reminders:
     enabled: true
     time: "09:00"  # 9 AM daily
     unread_only: true
-  
-  # Transcription (optional)
-  transcription:
+
+# Mail transport, shared by voicemail and emergency notification.
+# The password is read from SMTP_PASSWORD in .env and NEVER from this file.
+smtp:
+  host: "smtp.company.com"
+  port: 587
+  security: starttls          # starttls | smtps -- TLS is mandatory
+  auth: none                  # none | login  ('none' == anonymous IP-restricted relay)
+  username: ""                # only used when auth is not 'none'
+  from_address: "voicemail@company.com"
+  from_name: "PBX Voicemail"
+
+# Speech-to-text. Off by default: the Vosk model is a separate ~40 MB download and
+# nothing can transcribe until it is installed. See scripts/install_vosk_model.py
+features:
+  voicemail_transcription:
     enabled: false
-    provider: "vosk"  # "google" or "vosk" (offline)
+    provider: vosk            # 'vosk' (free, offline) or 'google'
+    language: en-US
+    max_audio_seconds: 300
+    vosk_model_path: /opt/warden/models/vosk-model-small-en-us-0.15
 ```
+
+Transcription has no per-extension switch: it follows the extension's voicemail-email
+subscription, since the notification body is its only consumer.
 
 **Recording Custom Greetings:**
 1. Dial `*1001` (your extension)

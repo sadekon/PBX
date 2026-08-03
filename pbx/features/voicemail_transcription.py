@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pbx.utils.audio import read_wav_as_pcm16
+from pbx.utils.audio import read_wav_as_pcm16, resample_pcm16
 from pbx.utils.logger import get_logger
 
 # Constants for Vosk transcription
@@ -15,6 +15,8 @@ VOSK_FRAME_SIZE = 4000  # Number of samples to feed the recognizer per chunk
 VOSK_DEFAULT_CONFIDENCE = 0.95  # Default confidence when Vosk doesn't provide one
 PCM16_BYTES_PER_SAMPLE = 2
 SUPPORTED_SAMPLE_RATES = (8000, 16000, 32000, 44100, 48000)
+#: Rate assumed when a model does not declare one. Effectively every Vosk model is 16 kHz.
+VOSK_DEFAULT_MODEL_SAMPLE_RATE = 16000
 
 # Configuration defaults, all under features.voicemail_transcription in config.yml
 DEFAULT_LANGUAGE = "en-US"
@@ -116,6 +118,25 @@ class VoicemailTranscriptionService:
             return
 
         self.logger.info("  Vosk model loaded successfully (offline transcription ready)")
+
+    def _model_sample_rate(self) -> int:
+        """
+        The sample rate the loaded model expects, read from its ``conf/mfcc.conf``.
+
+        Vosk models are trained at 16 kHz; the PBX records telephony at 8 kHz. Kaldi does not
+        bridge that gap on its own -- it aborts with "Sampling frequency mismatch, expected
+        16000, got 8000" unless the model's own config opts into resampling. Rather than edit
+        a downloaded model's config, the audio is resampled to whatever this reports.
+        """
+        conf = Path(self.vosk_model_path) / "conf" / "mfcc.conf"
+        try:
+            for line in conf.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("--sample-frequency"):
+                    return int(float(stripped.split("=", 1)[1].strip()))
+        except (OSError, ValueError, IndexError) as e:
+            self.logger.debug(f"Could not read model sample rate from {conf}: {e}")
+        return VOSK_DEFAULT_MODEL_SAMPLE_RATE
 
     @property
     def ready(self) -> bool:
@@ -286,6 +307,15 @@ class VoicemailTranscriptionService:
                 )
                 self.logger.error(error_msg)
                 return self._create_error_response(error_msg, language, "vosk")
+
+            # Telephony is 8 kHz and the model is almost certainly 16 kHz. Kaldi treats that
+            # as a fatal mismatch rather than resampling, so bridge it here and hand the
+            # recogniser the rate it was actually trained on.
+            model_rate = self._model_sample_rate()
+            if sample_rate != model_rate:
+                self.logger.info(f"  Resampling {sample_rate} Hz -> {model_rate} Hz for the model")
+                pcm16 = resample_pcm16(pcm16, sample_rate, model_rate)
+                sample_rate = model_rate
 
             # Create recognizer
             rec = KaldiRecognizer(self.vosk_model, sample_rate)

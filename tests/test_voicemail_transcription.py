@@ -8,6 +8,7 @@ import sys
 import tempfile
 import wave
 from datetime import datetime
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
@@ -385,11 +386,22 @@ class TestWavDecoding:
 
 
 class _FakeRecognizer:
-    """Stands in for Kaldi so the audio plumbing can be tested without a real model."""
+    """
+    Stands in for Kaldi so the audio plumbing can be tested without a real model.
+
+    Rejects a sample-rate mismatch exactly as Kaldi does -- it aborts rather than resampling.
+    An earlier version of this stub accepted any rate, which is precisely why the 8 kHz
+    telephony / 16 kHz model mismatch got through the suite and only surfaced on a server.
+    """
 
     transcript = "hello from voicemail"
+    expected_rate = 16000
 
     def __init__(self, model: Any, sample_rate: int) -> None:
+        if sample_rate != self.expected_rate:
+            raise ValueError(
+                f"Sampling frequency mismatch, expected {self.expected_rate}, got {sample_rate}"
+            )
         self.sample_rate = sample_rate
         self.bytes_seen = 0
 
@@ -469,6 +481,87 @@ class TestVoskAcceptsStoredVoicemail:
 
         assert not result["success"]
         assert "Unsupported sample rate" in result["error"]
+
+
+class TestResampling:
+    """
+    Telephony is 8 kHz; Vosk models are 16 kHz. Kaldi will not bridge that itself.
+
+    On a real server this failed with "Sampling frequency mismatch, expected 16000, got 8000"
+    after the audio had decoded perfectly -- the recording was fine, the recogniser simply
+    refused the rate.
+    """
+
+    def test_upsampling_doubles_the_sample_count(self) -> None:
+        from pbx.utils.audio import resample_pcm16
+
+        pcm = _tone_pcm16(seconds=1.0, rate=8000)
+
+        out = resample_pcm16(pcm, 8000, 16000)
+
+        assert len(out) // 2 == pytest.approx(16000, abs=2)
+
+    def test_matching_rates_are_a_no_op(self) -> None:
+        from pbx.utils.audio import resample_pcm16
+
+        pcm = _tone_pcm16(seconds=0.1)
+
+        assert resample_pcm16(pcm, 8000, 8000) is pcm
+
+    def test_empty_audio_is_safe(self) -> None:
+        from pbx.utils.audio import resample_pcm16
+
+        assert resample_pcm16(b"", 8000, 16000) == b""
+
+    def test_resampling_preserves_the_waveform(self) -> None:
+        """A 440 Hz tone must still be a 440 Hz tone, not noise."""
+        from pbx.utils.audio import resample_pcm16
+
+        out = resample_pcm16(_tone_pcm16(seconds=0.5, rate=8000, freq=440), 8000, 16000)
+        samples = struct.unpack(f"<{len(out) // 2}h", out)
+
+        # Zero crossings scale with frequency, not sample rate: ~440 per second either way.
+        crossings = sum(1 for a, b in pairwise(samples) if (a < 0) != (b < 0))
+        assert 400 <= crossings / 0.5 / 2 <= 480
+
+    def test_model_sample_rate_is_read_from_mfcc_conf(self, tmp_path: Any) -> None:
+        conf_dir = tmp_path / "conf"
+        conf_dir.mkdir()
+        (conf_dir / "mfcc.conf").write_text("--sample-frequency=16000\n--use-energy=false\n")
+        service = VoicemailTranscriptionService(
+            _config(enabled=True, provider="vosk", vosk_model_path=str(tmp_path))
+        )
+
+        assert service._model_sample_rate() == 16000
+
+    def test_model_sample_rate_falls_back_when_unreadable(self, tmp_path: Any) -> None:
+        """A model without a readable mfcc.conf is assumed 16 kHz, like every Vosk model."""
+        service = VoicemailTranscriptionService(
+            _config(enabled=True, provider="vosk", vosk_model_path=str(tmp_path))
+        )
+
+        assert service._model_sample_rate() == 16000
+
+    @patch("pbx.features.voicemail_transcription.VOSK_AVAILABLE", True)
+    @patch("pbx.features.voicemail_transcription.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_eight_khz_voicemail_is_resampled_for_the_model(self, tmp_path: Any) -> None:
+        """The end-to-end regression: 8 kHz u-law in, transcript out."""
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+        path = _write_wav(
+            tmp_path / "vm.wav",
+            pcm16_to_ulaw(_tone_pcm16(rate=8000)),
+            WAV_FORMAT_ULAW,
+            8,
+            rate=8000,
+        )
+        service = VoicemailTranscriptionService(_config(enabled=True, provider="vosk"))
+        service.vosk_model = Mock()
+
+        result = service.transcribe(str(path))
+
+        assert result["success"], result["error"]
+        assert result["text"] == _FakeRecognizer.transcript
 
 
 class TestTranscriptionWiring:

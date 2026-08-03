@@ -442,6 +442,53 @@ def generate_beep_tone(
     return b"".join(samples)
 
 
+def resample_pcm16(pcm16: bytes, from_rate: int, to_rate: int) -> bytes:
+    """
+    Resample mono 16-bit little-endian PCM.
+
+    Needed because speech models are almost universally trained at 16 kHz while telephony is
+    8 kHz, and Kaldi refuses the mismatch outright rather than resampling silently::
+
+        Sampling frequency mismatch, expected 16000, got 8000
+
+    Upsampling 8 kHz cannot invent detail above 4 kHz, so accuracy is still below what the
+    same model achieves on true wideband audio -- but it is the difference between a usable
+    transcript and none at all.
+
+    Args:
+        pcm16: Mono PCM16 little-endian samples.
+        from_rate: Sample rate of `pcm16`.
+        to_rate: Desired sample rate.
+
+    Returns:
+        Resampled PCM16 little-endian bytes, or the input unchanged when the rates match.
+    """
+    if from_rate == to_rate or not pcm16:
+        return pcm16
+
+    samples = np.frombuffer(pcm16, dtype="<i2").astype(np.float32)
+
+    try:
+        from math import gcd
+
+        from scipy.signal import resample_poly
+
+        divisor = gcd(from_rate, to_rate)
+        resampled = resample_poly(samples, to_rate // divisor, from_rate // divisor)
+    except ImportError:
+        # scipy is a declared dependency, so this is insurance rather than a supported path.
+        # Linear interpolation passes more imaging noise than a polyphase filter, which costs
+        # some recognition accuracy but still beats refusing to transcribe.
+        target_count = round(len(samples) * to_rate / from_rate)
+        resampled = np.interp(
+            np.linspace(0, len(samples) - 1, target_count),
+            np.arange(len(samples)),
+            samples,
+        )
+
+    return np.clip(np.round(resampled), -32768, 32767).astype("<i2").tobytes()
+
+
 def read_wav_as_pcm16(path: str | Path) -> tuple[bytes, int]:
     """
     Read a WAV file and return its audio as mono 16-bit little-endian PCM.
