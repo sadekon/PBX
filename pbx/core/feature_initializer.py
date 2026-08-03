@@ -23,6 +23,7 @@ from pbx.features.recording_retention import RecordingRetentionManager
 from pbx.features.sip_trunk import SIPTrunkSystem
 from pbx.features.time_based_routing import TimeBasedRouting
 from pbx.features.voicemail import VoicemailSystem
+from pbx.features.voicemail_transcription import VoicemailTranscriptionService
 from pbx.mail import Mailer, SmtpSettings
 
 
@@ -55,6 +56,26 @@ class FeatureInitializer:
         pbx_core.mailer.start()
         logger.info("Mail subsystem initialized (enabled=%s)", pbx_core.mailer.enabled)
 
+        # Transcription is constructed on the same terms as the mailer, and for the same
+        # reasons: unconditionally, so a disabled or model-less service is still a real object
+        # that reports `ready` rather than something callers must guard against; and exactly
+        # once, because the Vosk model is ~40 MB resident and one per mailbox would not
+        # survive a few hundred extensions.
+        pbx_core.transcription_service = VoicemailTranscriptionService(config)
+        transcriber = pbx_core.transcription_service
+        if transcriber.enabled and not transcriber.ready:
+            # Warn here rather than per message. This is the likely failure after a deploy --
+            # the model was never downloaded, or unzipped one level too deep -- and it is
+            # otherwise invisible until someone notices transcripts are missing.
+            logger.warning(
+                "Voicemail transcription is enabled but not ready (provider=%s, model_path=%s); "
+                "voicemail will be stored without transcripts",
+                transcriber.provider,
+                transcriber.vosk_model_path,
+            )
+        else:
+            logger.info("Transcription subsystem initialized (ready=%s)", transcriber.ready)
+
         # Initialize advanced features
         voicemail_path: str = config.get("voicemail.storage_path", "voicemail")
         pbx_core.voicemail_system = VoicemailSystem(
@@ -62,6 +83,7 @@ class FeatureInitializer:
             config=config,
             database=database if hasattr(pbx_core, "database") and database.enabled else None,
             mailer=pbx_core.mailer,
+            transcription_service=pbx_core.transcription_service,
         )
         pbx_core.conference_system = ConferenceSystem()
         pbx_core.recording_system = CallRecordingSystem(

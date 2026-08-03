@@ -442,6 +442,123 @@ def generate_beep_tone(
     return b"".join(samples)
 
 
+def resample_pcm16(pcm16: bytes, from_rate: int, to_rate: int) -> bytes:
+    """
+    Resample mono 16-bit little-endian PCM.
+
+    Needed because speech models are almost universally trained at 16 kHz while telephony is
+    8 kHz, and Kaldi refuses the mismatch outright rather than resampling silently::
+
+        Sampling frequency mismatch, expected 16000, got 8000
+
+    Upsampling 8 kHz cannot invent detail above 4 kHz, so accuracy is still below what the
+    same model achieves on true wideband audio -- but it is the difference between a usable
+    transcript and none at all.
+
+    Args:
+        pcm16: Mono PCM16 little-endian samples.
+        from_rate: Sample rate of `pcm16`.
+        to_rate: Desired sample rate.
+
+    Returns:
+        Resampled PCM16 little-endian bytes, or the input unchanged when the rates match.
+    """
+    if from_rate == to_rate or not pcm16:
+        return pcm16
+
+    samples = np.frombuffer(pcm16, dtype="<i2").astype(np.float32)
+
+    try:
+        from math import gcd
+
+        from scipy.signal import resample_poly
+
+        divisor = gcd(from_rate, to_rate)
+        resampled = resample_poly(samples, to_rate // divisor, from_rate // divisor)
+    except ImportError:
+        # scipy is a declared dependency, so this is insurance rather than a supported path.
+        # Linear interpolation passes more imaging noise than a polyphase filter, which costs
+        # some recognition accuracy but still beats refusing to transcribe.
+        target_count = round(len(samples) * to_rate / from_rate)
+        resampled = np.interp(
+            np.linspace(0, len(samples) - 1, target_count),
+            np.arange(len(samples)),
+            samples,
+        )
+
+    return np.clip(np.round(resampled), -32768, 32767).astype("<i2").tobytes()
+
+
+def read_wav_as_pcm16(path: str | Path) -> tuple[bytes, int]:
+    """
+    Read a WAV file and return its audio as mono 16-bit little-endian PCM.
+
+    This exists because :mod:`wave` supports only linear PCM. The PBX stores voicemail as
+    G.711 -- see ``PBXCore._build_wav_file`` -- so ``wave.open`` on a real recording raises
+    ``wave.Error: unknown format: 7`` for u-law, or ``unknown format: 6`` for A-law. Both are
+    decoded here instead, which lets callers that need linear samples (speech recognition
+    above all) take a recording exactly as the PBX wrote it, with no transcoding step.
+
+    The RIFF walk is deliberately tolerant: chunks other than ``fmt `` and ``data`` are
+    skipped, and the odd-length pad byte is honoured, because recorders vary in what
+    metadata they emit.
+
+    Args:
+        path: Path to the WAV file.
+
+    Returns:
+        Tuple of (PCM16 little-endian bytes, sample rate in Hz).
+
+    Raises:
+        ValueError: If the file is not a WAV, is not mono, or is in a format with no defined
+            conversion to linear PCM.
+    """
+    audio_format = channels = sample_rate = bits_per_sample = None
+    data: bytes | None = None
+
+    with Path(path).open("rb") as f:
+        if f.read(4) != b"RIFF":
+            raise ValueError("Not a RIFF file")
+        f.read(4)  # Declared file size; not trusted, the chunk walk is authoritative.
+        if f.read(4) != b"WAVE":
+            raise ValueError("Not a WAVE file")
+
+        while True:
+            header = f.read(8)
+            if len(header) < 8:
+                break
+            chunk_id, chunk_size = struct.unpack("<4sI", header)
+            payload = f.read(chunk_size)
+            if chunk_size % 2:
+                f.read(1)  # RIFF chunks are word-aligned.
+
+            if chunk_id == b"fmt " and len(payload) >= 16:
+                audio_format, channels, sample_rate = struct.unpack("<HHI", payload[:8])
+                bits_per_sample = struct.unpack("<H", payload[14:16])[0]
+            elif chunk_id == b"data":
+                data = payload
+
+    if audio_format is None or data is None:
+        raise ValueError("WAV file is missing a fmt or data chunk")
+    if channels != 1:
+        raise ValueError(f"Audio must be mono, got {channels} channels")
+
+    if audio_format == WAV_FORMAT_PCM and bits_per_sample == 16:
+        return data, sample_rate
+    if audio_format == WAV_FORMAT_ULAW:
+        return ulaw_to_pcm16(data).astype("<i2").tobytes(), sample_rate
+    if audio_format == WAV_FORMAT_ALAW:
+        return alaw_to_pcm16(data).astype("<i2").tobytes(), sample_rate
+    if audio_format == WAV_FORMAT_PCM and bits_per_sample == 8:
+        # 8-bit PCM in a WAV file is unsigned and centred on 128, unlike every other width.
+        samples = (np.frombuffer(data, dtype=np.uint8).astype(np.int16) - 128) << 8
+        return samples.astype("<i2").tobytes(), sample_rate
+
+    raise ValueError(
+        f"Cannot convert WAV format {audio_format} at {bits_per_sample}-bit to linear PCM"
+    )
+
+
 def build_wav_header(
     data_size: int,
     sample_rate: int = 8000,

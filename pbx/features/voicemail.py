@@ -2,9 +2,10 @@
 Voicemail system
 """
 
+import textwrap
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from pbx.mail import Attachment, EmailError
 from pbx.utils.logger import get_logger, get_vm_ivr_logger
@@ -222,106 +223,134 @@ class VoicemailBox:
             self.logger.warning("Database not available - voicemail metadata NOT saved to database")
             self.logger.warning(f"  Message ID: {message_id} stored as file only")
 
-        # Transcribe voicemail if enabled
+        # Resolved once and shared by the transcription and email gates below.
+        extension_config, email_address = self._lookup_extension()
+
+        # Transcription has no per-extension switch of its own. Its only consumer is the
+        # notification email, so it follows the email subscription: transcribing for an
+        # extension that will not be emailed is work nobody reads. `ready` is the other gate,
+        # separating "the operator turned it off" from "it is on but the model never loaded" --
+        # the second is warned about once at startup, so it stays at debug here rather than
+        # repeating per message.
+        will_be_emailed = bool(email_address) and is_subscribed_to_voicemail_email(extension_config)
+
         transcription_result = None
-        if self.transcription_service:
-            self.logger.info(f"Transcribing voicemail {message_id}...")
-            transcription_result = self.transcription_service.transcribe(file_path)
-
-            if transcription_result["success"]:
-                self.logger.info("✓ Voicemail transcribed successfully")
-                self.logger.info(f"  Confidence: {transcription_result['confidence']:.2%}")
-                self.logger.debug(f"  Text: {transcription_result['text'][:100]}...")
-
-                # Add transcription to message
-                message["transcription"] = transcription_result["text"]
-                message["transcription_confidence"] = transcription_result["confidence"]
-                message["transcription_language"] = transcription_result["language"]
-                message["transcription_provider"] = transcription_result["provider"]
-                message["transcribed_at"] = transcription_result["timestamp"]
-
-                # Update database with transcription
-                if self.database and self.database.enabled:
-                    try:
-                        placeholder = self._get_db_placeholder()
-                        query = f"""
-                        UPDATE voicemail_messages
-                        SET transcription_text = {placeholder},
-                            transcription_confidence = {placeholder},
-                            transcription_language = {placeholder},
-                            transcription_provider = {placeholder},
-                            transcribed_at = {placeholder}
-                        WHERE message_id = {placeholder}
-                        """  # nosec B608 - placeholder is safely parameterized
-                        self.database.execute(
-                            query,
-                            (
-                                transcription_result["text"],
-                                transcription_result["confidence"],
-                                transcription_result["language"],
-                                transcription_result["provider"],
-                                transcription_result["timestamp"],
-                                message_id,
-                            ),
-                        )
-                        self.logger.info("✓ Transcription saved to database")
-                    except Exception as e:
-                        self.logger.error(f"✗ Error saving transcription to database: {e}")
-            else:
-                self.logger.warning(
-                    f"✗ Voicemail transcription failed: {transcription_result['error']}"
+        service = self.transcription_service
+        if service and service.enabled:
+            if not will_be_emailed:
+                self.logger.debug(
+                    f"Extension {self.extension_number} receives no voicemail email; "
+                    f"storing voicemail {message_id} without a transcript"
                 )
+            elif not service.ready:
+                self.logger.debug(
+                    f"Transcription enabled but not ready (provider={service.provider}); "
+                    f"storing voicemail {message_id} without a transcript"
+                )
+            else:
+                self.logger.info(f"Transcribing voicemail {message_id}...")
+                transcription_result = service.transcribe(str(file_path))
 
-        # Send email notification if enabled. The transcription is stored on the message but
-        # is not yet included in the email body -- the old code probed for a `transcription`
-        # parameter that never existed on the notifier, so this never worked.
-        if self.mailer and self.config:
-            # Get extension configuration - check database first, then config
-            # file
-            extension_config = None
-            email_address = None
+        if transcription_result and transcription_result["success"]:
+            self.logger.info("✓ Voicemail transcribed successfully")
+            self.logger.info(f"  Confidence: {transcription_result['confidence']:.2%}")
+            self.logger.debug(f"  Text: {transcription_result['text'][:100]}...")
 
-            # Try database first if available
+            # Add transcription to message
+            message["transcription"] = transcription_result["text"]
+            message["transcription_confidence"] = transcription_result["confidence"]
+            message["transcription_language"] = transcription_result["language"]
+            message["transcription_provider"] = transcription_result["provider"]
+            message["transcribed_at"] = transcription_result["timestamp"]
+
+            # Update database with transcription
             if self.database and self.database.enabled:
                 try:
-                    from pbx.utils.database import ExtensionDB
-
-                    ext_db = ExtensionDB(self.database)
-                    db_extension = ext_db.get(self.extension_number)
-                    if db_extension:
-                        extension_config = db_extension
-                        email_address = db_extension.get("email")
-                        self.logger.debug(
-                            f"Found email address from database for extension {self.extension_number}"
-                        )
+                    placeholder = self._get_db_placeholder()
+                    query = f"""
+                    UPDATE voicemail_messages
+                    SET transcription_text = {placeholder},
+                        transcription_confidence = {placeholder},
+                        transcription_language = {placeholder},
+                        transcription_provider = {placeholder},
+                        transcribed_at = {placeholder}
+                    WHERE message_id = {placeholder}
+                    """  # nosec B608 - placeholder is safely parameterized
+                    self.database.execute(
+                        query,
+                        (
+                            transcription_result["text"],
+                            transcription_result["confidence"],
+                            transcription_result["language"],
+                            transcription_result["provider"],
+                            transcription_result["timestamp"],
+                            message_id,
+                        ),
+                    )
+                    self.logger.info("✓ Transcription saved to database")
                 except Exception as e:
-                    self.logger.error(f"Error getting extension from database: {e}")
+                    self.logger.error(f"✗ Error saving transcription to database: {e}")
+        elif transcription_result:
+            self.logger.warning(
+                f"✗ Voicemail transcription failed: {transcription_result['error']}"
+            )
 
-            # Fallback to config file if not found in database
-            if not extension_config:
-                extension_config = self.config.get_extension(self.extension_number)
-                if extension_config:
-                    email_address = extension_config.get("email")
-                    self.logger.debug(
-                        f"Found email address from config for extension {self.extension_number}"
-                    )
-
-            if extension_config and email_address:
-                if is_subscribed_to_voicemail_email(extension_config):
-                    self._send_notification_email(
-                        to_email=email_address,
-                        caller_id=caller_id,
-                        timestamp=timestamp,
-                        audio_file_path=file_path,
-                        duration=duration,
-                    )
-                else:
-                    self.logger.debug(
-                        f"Extension {self.extension_number} is unsubscribed from voicemail "
-                        "email; skipping notification"
-                    )
+        # Send email notification if enabled. The transcript, when there is one, travels with
+        # it -- `message` is the single source for both, so the email can never disagree with
+        # what was stored.
+        if self.mailer and self.config and extension_config and email_address:
+            if is_subscribed_to_voicemail_email(extension_config):
+                self._send_notification_email(
+                    to_email=email_address,
+                    caller_id=caller_id,
+                    timestamp=timestamp,
+                    audio_file_path=file_path,
+                    duration=duration,
+                    transcription=message.get("transcription"),
+                    confidence=message.get("transcription_confidence"),
+                    provider=message.get("transcription_provider"),
+                )
+            else:
+                self.logger.debug(
+                    f"Extension {self.extension_number} is unsubscribed from voicemail "
+                    "email; skipping notification"
+                )
 
         return message_id
+
+    def _lookup_extension(self) -> tuple[dict | None, str | None]:
+        """
+        Resolve this extension's configuration and email address.
+
+        Database first, then config.yml, matching how the rest of this class resolves
+        extension data. Both lookups are best-effort: a failure costs the notification or the
+        transcript, never the recording, which is already safely on disk by this point.
+
+        Returns:
+            Tuple of (extension config, email address), either of which may be None.
+        """
+        extension_config = None
+        email_address = None
+
+        if self.database and getattr(self.database, "enabled", False):
+            try:
+                from pbx.utils.database import ExtensionDB
+
+                db_extension = ExtensionDB(self.database).get(self.extension_number)
+                if db_extension:
+                    extension_config = db_extension
+                    email_address = db_extension.get("email")
+                    self.logger.debug(f"Found extension {self.extension_number} in database")
+            except Exception as e:
+                self.logger.error(f"Error getting extension from database: {e}")
+
+        if not extension_config and self.config:
+            extension_config = self.config.get_extension(self.extension_number)
+            if extension_config:
+                email_address = extension_config.get("email")
+                self.logger.debug(f"Found extension {self.extension_number} in config")
+
+        return extension_config, email_address
 
     @staticmethod
     def _format_timestamp(timestamp: Any) -> str:
@@ -404,10 +433,52 @@ class VoicemailBox:
             self.logger.warning(f"Invalid voicemail.email.subject_template ({e}); using default")
             return f"New Voicemail from {caller_display}"
 
-    def _notification_body(
-        self, caller_id: str, timestamp: Any, duration: float | None = None
+    #: Human-readable names for the engines behind a transcript. Recipients are told which
+    #: one produced the text so they can judge it -- an offline phone-audio model and a cloud
+    #: service are not equally trustworthy, and the difference matters when acting on it.
+    TRANSCRIPTION_ENGINES: ClassVar[dict[str, str]] = {
+        "vosk": "Vosk, an offline speech recognition engine",
+        "google": "Google Cloud Speech-to-Text",
+    }
+
+    @classmethod
+    def _transcription_disclaimer(
+        cls, provider: str | None = None, confidence: float | None = None
     ) -> str:
-        """Build the plain-text body of a new-voicemail notification."""
+        """
+        Name the engine and warn that its output is not reliable.
+
+        Both halves matter. Naming the engine tells the reader what produced this; the warning
+        stops the transcript being treated as a record of what was said. Phone audio is 8 kHz
+        and narrowband, so names, numbers and unusual words are where it fails first -- which
+        is exactly the content someone is most likely to act on without listening.
+        """
+        engine = cls.TRANSCRIPTION_ENGINES.get(provider or "", provider or "an automated service")
+        note = f"Transcribed automatically by {engine}."
+        if confidence:
+            note += f" Estimated accuracy {confidence:.0%}."
+        return (
+            f"{note} Machine transcription is often wrong about names, numbers and "
+            "spelling -- listen to the recording before acting on anything important."
+        )
+
+    def _notification_body(
+        self,
+        caller_id: str,
+        timestamp: Any,
+        duration: float | None = None,
+        transcription: str | None = None,
+        confidence: float | None = None,
+        provider: str | None = None,
+    ) -> str:
+        """
+        Build the plain-text body of a new-voicemail notification.
+
+        The transcript is rendered as its own section rather than inline with the metadata,
+        because it is the part a recipient reads to decide whether to listen at all. It is
+        labelled as machine-generated: a G.711 phone recording through a small offline model
+        misreads names and numbers often enough that acting on it unverified is a real risk.
+        """
         body = "Hello,\n\n"
         body += "You have received a new voicemail message.\n\n"
         body += "Message Details:\n"
@@ -419,6 +490,22 @@ class VoicemailBox:
             mins = int(duration // 60)
             secs = int(duration % 60)
             body += f"  Duration: {mins}:{secs:02d}\n"
+
+        if transcription:
+            body += "\nTranscription:\n"
+            # Wrapped rather than emitted as one long line: this is plain text, and mail
+            # clients that do not reflow leave an unwrapped paragraph running off-screen.
+            body += textwrap.fill(
+                transcription.strip(), width=78, initial_indent="  ", subsequent_indent="  "
+            )
+            body += "\n\n"
+            body += textwrap.fill(
+                self._transcription_disclaimer(provider, confidence),
+                width=78,
+                initial_indent="  ",
+                subsequent_indent="  ",
+            )
+            body += "\n"
 
         body += f"\nTo listen to this message, please dial *{self.extension_number}\n"
         body += "\nBest regards,\n"
@@ -433,6 +520,9 @@ class VoicemailBox:
         timestamp: Any,
         audio_file_path: str | Path | None = None,
         duration: float | None = None,
+        transcription: str | None = None,
+        confidence: float | None = None,
+        provider: str | None = None,
     ) -> None:
         """
         Queue the new-voicemail notification.
@@ -446,8 +536,13 @@ class VoicemailBox:
 
         attachments = []
         include_attachment = True
+        include_transcription = True
         if self.config:
             include_attachment = self.config.get("voicemail.email.include_attachment", True)
+            # Separate from whether transcription runs at all: a site may want transcripts
+            # stored and searchable but kept out of email, which is a compliance question
+            # rather than a feature toggle.
+            include_transcription = self.config.get("voicemail.email.include_transcription", True)
 
         if include_attachment and audio_file_path:
             audio_path = Path(audio_file_path)
@@ -461,7 +556,14 @@ class VoicemailBox:
         self.mailer.send_async(
             to_email,
             self._notification_subject(caller_id, timestamp),
-            self._notification_body(caller_id, timestamp, duration),
+            self._notification_body(
+                caller_id,
+                timestamp,
+                duration,
+                transcription=transcription if include_transcription else None,
+                confidence=confidence if include_transcription else None,
+                provider=provider if include_transcription else None,
+            ),
             attachments=attachments,
         )
 
@@ -831,6 +933,7 @@ class VoicemailSystem:
         config: Any | None = None,
         database: Any | None = None,
         mailer: Any | None = None,
+        transcription_service: Any | None = None,
     ) -> None:
         """
         Initialize voicemail system
@@ -840,6 +943,7 @@ class VoicemailSystem:
             config: Config object
             database: DatabaseBackend object (optional)
             mailer: pbx.mail.Mailer owned by PBXCore (optional)
+            transcription_service: VoicemailTranscriptionService owned by PBXCore (optional)
         """
         self.storage_path = storage_path
         self.mailboxes = {}
@@ -849,6 +953,9 @@ class VoicemailSystem:
         # The mailer is a PBX-wide subsystem, not something voicemail constructs. Sharing one
         # transport is what lets emergency notification use it too.
         self.mailer = mailer
+        # Same reasoning for the transcriber, plus a hard constraint: the Vosk model is ~40 MB
+        # resident, so one instance per mailbox would not survive a few hundred extensions.
+        self.transcription_service = transcription_service
 
         Path(storage_path).mkdir(parents=True, exist_ok=True)
 
@@ -869,6 +976,7 @@ class VoicemailSystem:
                 config=self.config,
                 mailer=self.mailer,
                 database=self.database,
+                transcription_service=self.transcription_service,
             )
         return self.mailboxes[extension_number]
 

@@ -282,6 +282,172 @@ class TestDailyReminders:
         assert VoicemailSystem._reminder_subject(3).endswith("3 Unread Messages")
 
 
+class StubTranscriber:
+    """Stands in for VoicemailTranscriptionService, recording what it was asked to do."""
+
+    def __init__(
+        self, ready: bool = True, enabled: bool = True, text: str = "call me back"
+    ) -> None:
+        self.ready = ready
+        self.enabled = enabled
+        self.provider = "vosk"
+        self.text = text
+        self.calls: list[str] = []
+
+    def transcribe(self, audio_file_path, language=None):
+        self.calls.append(audio_file_path)
+        return {
+            "success": True,
+            "text": self.text,
+            "confidence": 0.95,
+            "language": "en-US",
+            "provider": "vosk",
+            "timestamp": datetime.now(UTC),
+            "error": None,
+        }
+
+
+@pytest.mark.unit
+class TestTranscriptionInNotification:
+    """
+    The transcript is the part a recipient reads to decide whether to listen.
+
+    It was previously stored and then dropped: the notifier had no parameter to carry it, so
+    every transcript went into the database and nowhere else.
+    """
+
+    def test_body_contains_the_transcript(self, storage, config):
+        box = VoicemailBox("1001", storage, config=config, mailer=RecordingMailer())
+
+        body = box._notification_body(
+            "555",
+            "now",
+            30,
+            transcription="please call the office",
+            confidence=0.95,
+            provider="vosk",
+        )
+
+        assert "please call the office" in body
+        assert "Transcription" in body
+        # The engine is named so the reader can judge the text: an offline model on 8 kHz
+        # phone audio and a cloud service are not equally trustworthy.
+        assert "Vosk" in body
+        assert "95%" in body
+        # Recipients must not act on a machine transcript as though it were verbatim.
+        assert "listen to the recording" in body
+
+    def test_unknown_provider_still_gets_a_disclaimer(self, storage, config):
+        """A transcript whose engine we cannot name must still carry the warning."""
+        box = VoicemailBox("1001", storage, config=config, mailer=RecordingMailer())
+
+        body = box._notification_body("555", "now", 30, transcription="hello", provider=None)
+
+        assert "an automated service" in body
+        assert "listen to the recording" in body
+
+    def test_body_omits_the_section_without_a_transcript(self, storage, config):
+        box = VoicemailBox("1001", storage, config=config, mailer=RecordingMailer())
+
+        assert "Transcription" not in box._notification_body("555", "now", 30)
+
+    def test_confidence_is_optional(self, storage, config):
+        box = VoicemailBox("1001", storage, config=config, mailer=RecordingMailer())
+
+        body = box._notification_body("555", "now", 30, transcription="hello")
+
+        assert "hello" in body
+        # No measured confidence means no accuracy claim -- better silent than invented.
+        assert "accuracy" not in body
+
+    def test_transcript_reaches_the_email(self, storage, config):
+        mailer = RecordingMailer()
+        system = VoicemailSystem(
+            storage_path=storage,
+            config=config,
+            mailer=mailer,
+            transcription_service=StubTranscriber(text="the invoice is overdue"),
+        )
+
+        system.save_message("1001", "555", b"RIFF" + b"\x00" * 100, 5)
+
+        assert "the invoice is overdue" in mailer.calls[0]["body"]
+
+    def test_include_transcription_false_keeps_it_out_of_email(self, storage):
+        """Storing a transcript and emailing it are separate decisions."""
+        stub = MagicMock()
+        stub.get.side_effect = lambda key, default=None: (
+            False if key == "voicemail.email.include_transcription" else default
+        )
+        stub.get_extension.return_value = {"number": "1001", "email": "user@corp.local"}
+        mailer = RecordingMailer()
+        system = VoicemailSystem(
+            storage_path=storage,
+            config=stub,
+            mailer=mailer,
+            transcription_service=StubTranscriber(text="secret contents"),
+        )
+
+        system.save_message("1001", "555", b"RIFF" + b"\x00" * 100, 5)
+
+        assert "secret contents" not in mailer.calls[0]["body"]
+
+    def test_unsubscribed_extension_is_not_transcribed(self, storage, config):
+        """
+        Transcription follows the email subscription rather than having a switch of its own.
+
+        Its only consumer is the notification body, so transcribing for someone who will not
+        be emailed is CPU spent on text nobody reads.
+        """
+        config.get_extension.return_value = {
+            "number": "1001",
+            "email": "user@corp.local",
+            "voicemail_email_enabled": False,
+        }
+        transcriber = StubTranscriber()
+        system = VoicemailSystem(
+            storage_path=storage,
+            config=config,
+            mailer=RecordingMailer(),
+            transcription_service=transcriber,
+        )
+
+        system.save_message("1001", "555", b"RIFF" + b"\x00" * 100, 5)
+
+        assert transcriber.calls == []
+
+    def test_extension_without_an_email_address_is_not_transcribed(self, storage, config):
+        """No address means no notification, so there is nothing for a transcript to go into."""
+        config.get_extension.return_value = {"number": "1001"}
+        transcriber = StubTranscriber()
+        system = VoicemailSystem(
+            storage_path=storage,
+            config=config,
+            mailer=RecordingMailer(),
+            transcription_service=transcriber,
+        )
+
+        system.save_message("1001", "555", b"RIFF" + b"\x00" * 100, 5)
+
+        assert transcriber.calls == []
+
+    def test_not_ready_transcriber_is_skipped_quietly(self, storage, config):
+        transcriber = StubTranscriber(ready=False)
+        mailer = RecordingMailer()
+        system = VoicemailSystem(
+            storage_path=storage,
+            config=config,
+            mailer=mailer,
+            transcription_service=transcriber,
+        )
+
+        system.save_message("1001", "555", b"RIFF" + b"\x00" * 100, 5)
+
+        assert transcriber.calls == []
+        # The notification still goes out; only the transcript is missing.
+        assert len(mailer.calls) == 1
+
+
 @pytest.mark.unit
 class TestStorage:
     def test_message_is_written_to_disk(self, storage, config):

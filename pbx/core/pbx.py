@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from pbx.features.statistics import StatisticsEngine
     from pbx.features.time_based_routing import TimeBasedRouting
     from pbx.features.voicemail import VoicemailSystem
+    from pbx.features.voicemail_transcription import VoicemailTranscriptionService
     from pbx.features.webhooks import WebhookSystem
     from pbx.features.webrtc import WebRTCGateway, WebRTCSignalingServer
     from pbx.integrations.active_directory import ActiveDirectoryIntegration
@@ -81,6 +82,7 @@ class PBXCore:
 
     # Attributes set by FeatureInitializer.initialize()
     voicemail_system: VoicemailSystem
+    transcription_service: VoicemailTranscriptionService
     conference_system: ConferenceSystem
     recording_system: CallRecordingSystem
     queue_system: QueueSystem

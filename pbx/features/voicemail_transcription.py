@@ -3,16 +3,25 @@ Voicemail transcription service using speech-to-text
 """
 
 import json
-import wave
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pbx.utils.audio import read_wav_as_pcm16, resample_pcm16
 from pbx.utils.logger import get_logger
 
 # Constants for Vosk transcription
-VOSK_FRAME_SIZE = 4000  # Number of frames to read per chunk
+VOSK_FRAME_SIZE = 4000  # Number of samples to feed the recognizer per chunk
 VOSK_DEFAULT_CONFIDENCE = 0.95  # Default confidence when Vosk doesn't provide one
+PCM16_BYTES_PER_SAMPLE = 2
+SUPPORTED_SAMPLE_RATES = (8000, 16000, 32000, 44100, 48000)
+#: Rate assumed when a model does not declare one. Effectively every Vosk model is 16 kHz.
+VOSK_DEFAULT_MODEL_SAMPLE_RATE = 16000
+
+# Configuration defaults, all under features.voicemail_transcription in config.yml
+DEFAULT_LANGUAGE = "en-US"
+DEFAULT_MAX_AUDIO_SECONDS = 300  # A stuck recording must not pin a CPU indefinitely
+DEFAULT_VOSK_MODEL_PATH = "models/vosk-model-small-en-us-0.15"
 
 # Import Vosk (free, offline speech recognition)
 try:
@@ -37,67 +46,126 @@ class VoicemailTranscriptionService:
 
     def __init__(self, config: Any | None = None) -> None:
         """
-        Initialize transcription service
+        Initialize transcription service.
+
+        The Vosk model is loaded here rather than from a separate ``start()``. The service is
+        constructed by :class:`~pbx.core.feature_initializer.FeatureInitializer` during PBX
+        startup, which is already the right place to pay for a ~40 MB model load, so a second
+        lifecycle method would only relocate work that is where it belongs.
+
+        Nothing raises. A missing library, a missing model or a corrupt one leaves the service
+        constructed but not :attr:`ready`, which costs transcription and nothing else -- the
+        PBX must still boot and still record voicemail.
 
         Args:
-            config: Config object with transcription settings
+            config: Config object with transcription settings.
         """
         self.logger = get_logger()
         self.config = config
         self.enabled = False
-        self.provider = None
-        self.api_key = None
+        self.provider = "vosk"  # Default to vosk (free, offline)
+        self.language = DEFAULT_LANGUAGE
+        self.max_audio_seconds = DEFAULT_MAX_AUDIO_SECONDS
         self.vosk_model = None
-        self.vosk_model_path = None
+        self.vosk_model_path = DEFAULT_VOSK_MODEL_PATH
 
-        # Load configuration
-        if config:
-            transcription_config = config.get("features", {}).get("voicemail_transcription", {})
-            self.enabled = transcription_config.get("enabled", False)
-            self.provider = transcription_config.get("provider", "vosk")  # Default to vosk (free)
-            self.api_key = transcription_config.get("api_key")
-            self.vosk_model_path = transcription_config.get(
-                "vosk_model_path", "models/vosk-model-small-en-us-0.15"
-            )
+        if not config:
+            return
 
-            if self.enabled:
-                self.logger.info("Voicemail transcription service initialized")
-                self.logger.info(f"  Provider: {self.provider}")
-                if self.provider == "vosk":
-                    self.logger.info(f"  Model path: {self.vosk_model_path}")
-                    # Initialize Vosk model
-                    if VOSK_AVAILABLE:
-                        try:
-                            if Path(self.vosk_model_path).exists():
-                                self.vosk_model = Model(self.vosk_model_path)
-                                self.logger.info(
-                                    "  Vosk model loaded successfully (offline transcription ready)"
-                                )
-                            else:
-                                self.logger.warning(
-                                    f"  Vosk model not found at {self.vosk_model_path}"
-                                )
-                                self.logger.info(
-                                    "  Download model from: https://alphacephei.com/vosk/models"
-                                )
-                        except OSError as e:
-                            self.logger.error(f"  Failed to load Vosk model: {e}")
-                    else:
-                        self.logger.warning(
-                            "  Vosk library not installed. Install with: pip install vosk"
-                        )
-                else:
-                    self.logger.info(f"  API key configured: {bool(self.api_key)}")
-            else:
-                self.logger.debug("Voicemail transcription service disabled in configuration")
+        # Dotted lookups, matching how every other feature reads its configuration.
+        self.enabled = config.get("features.voicemail_transcription.enabled", False)
+        self.provider = config.get("features.voicemail_transcription.provider", "vosk")
+        self.language = config.get("features.voicemail_transcription.language", DEFAULT_LANGUAGE)
+        self.max_audio_seconds = config.get(
+            "features.voicemail_transcription.max_audio_seconds", DEFAULT_MAX_AUDIO_SECONDS
+        )
+        self.vosk_model_path = config.get(
+            "features.voicemail_transcription.vosk_model_path", DEFAULT_VOSK_MODEL_PATH
+        )
 
-    def transcribe(self, audio_file_path: str, language: str = "en-US") -> dict:
+        if not self.enabled:
+            self.logger.debug("Voicemail transcription service disabled in configuration")
+            return
+
+        self.logger.info("Voicemail transcription service initialized")
+        self.logger.info(f"  Provider: {self.provider}")
+        if self.provider == "vosk":
+            self.logger.info(f"  Model path: {self.vosk_model_path}")
+            self._load_vosk_model()
+
+    def _load_vosk_model(self) -> None:
+        """
+        Load the Vosk model, leaving the service not-ready if it cannot be loaded.
+
+        Catches broadly on purpose. Vosk surfaces whatever its native layer raises for a
+        malformed or half-extracted model directory -- the classic being a double-nested
+        unzip -- and that is not reliably an OSError. Narrowing this would turn a recoverable
+        misconfiguration into a failure to start.
+        """
+        if not VOSK_AVAILABLE:
+            self.logger.warning("  Vosk library not installed. Install with: pip install vosk")
+            return
+
+        if not Path(self.vosk_model_path).exists():
+            self.logger.warning(f"  Vosk model not found at {self.vosk_model_path}")
+            self.logger.info("  Download model from: https://alphacephei.com/vosk/models")
+            return
+
+        try:
+            self.vosk_model = Model(self.vosk_model_path)
+        except Exception as e:
+            self.logger.error(f"  Failed to load Vosk model from {self.vosk_model_path}: {e}")
+            return
+
+        self.logger.info("  Vosk model loaded successfully (offline transcription ready)")
+
+    def _model_sample_rate(self) -> int:
+        """
+        The sample rate the loaded model expects, read from its ``conf/mfcc.conf``.
+
+        Vosk models are trained at 16 kHz; the PBX records telephony at 8 kHz. Kaldi does not
+        bridge that gap on its own -- it aborts with "Sampling frequency mismatch, expected
+        16000, got 8000" unless the model's own config opts into resampling. Rather than edit
+        a downloaded model's config, the audio is resampled to whatever this reports.
+        """
+        conf = Path(self.vosk_model_path) / "conf" / "mfcc.conf"
+        try:
+            for line in conf.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("--sample-frequency"):
+                    return int(float(stripped.split("=", 1)[1].strip()))
+        except (OSError, ValueError, IndexError) as e:
+            self.logger.debug(f"Could not read model sample rate from {conf}: {e}")
+        return VOSK_DEFAULT_MODEL_SAMPLE_RATE
+
+    @property
+    def ready(self) -> bool:
+        """
+        Whether a transcription request can actually be served right now.
+
+        Deliberately distinct from :attr:`enabled`, which records only what the operator asked
+        for. The gap between the two is the state worth naming: transcription is switched on
+        but the model is missing or failed to load. That is the most likely failure after a
+        deployment, and consulting ``enabled`` alone makes it indistinguishable from working.
+        Callers gate on this so the case is skipped cleanly rather than producing a failed
+        transcription for every message.
+        """
+        if not self.enabled:
+            return False
+        if self.provider == "vosk":
+            return self.vosk_model is not None
+        if self.provider == "google":
+            return GOOGLE_SPEECH_AVAILABLE
+        return False
+
+    def transcribe(self, audio_file_path: str, language: str | None = None) -> dict:
         """
         Transcribe voicemail audio file to text
 
         Args:
             audio_file_path: Path to audio file (WAV format)
-            language: Language code (default: en-US)
+            language: Language code. Defaults to the configured
+                ``features.voicemail_transcription.language``.
 
         Returns:
             Dictionary with transcription results:
@@ -111,6 +179,8 @@ class VoicemailTranscriptionService:
                 'error': str (if success is False)
             }
         """
+        language = language or self.language
+
         if not self.enabled:
             return {
                 "success": False,
@@ -213,54 +283,85 @@ class VoicemailTranscriptionService:
             return self._create_error_response(error_msg, language, "vosk")
 
         try:
-            # Open WAV file
-            with wave.open(audio_file_path, "rb") as wf:
-                # Validate audio format
-                if wf.getnchannels() != 1:
-                    error_msg = "Audio must be mono channel"
-                    self.logger.error(error_msg)
-                    return self._create_error_response(error_msg, language, "vosk")
+            # Voicemail is stored as G.711, which `wave` cannot open at all, and Vosk needs
+            # linear PCM16 regardless. read_wav_as_pcm16 handles both the u-law/A-law decode
+            # and the mono check, so what comes back is always ready to feed the recogniser.
+            pcm16, sample_rate = read_wav_as_pcm16(audio_file_path)
 
-                # Check sample rate - Vosk works best with 8kHz or 16kHz
-                sample_rate = wf.getframerate()
-                if sample_rate not in [8000, 16000, 32000, 44100, 48000]:
-                    error_msg = f"Unsupported sample rate: {sample_rate}. Use 8000, 16000, 32000, 44100, or 48000 Hz"
-                    self.logger.error(error_msg)
-                    return self._create_error_response(error_msg, language, "vosk")
+            # Vosk works best at 8 kHz or 16 kHz; these are the rates it handles sensibly.
+            if sample_rate not in SUPPORTED_SAMPLE_RATES:
+                error_msg = (
+                    f"Unsupported sample rate: {sample_rate}. Use "
+                    f"{', '.join(str(r) for r in SUPPORTED_SAMPLE_RATES)} Hz"
+                )
+                self.logger.error(error_msg)
+                return self._create_error_response(error_msg, language, "vosk")
 
-                # Create recognizer
-                rec = KaldiRecognizer(self.vosk_model, sample_rate)
-                rec.SetWords(True)  # Enable word-level timestamps
+            # Decoding is CPU-bound and runs to completion, so a recording that never
+            # stopped would occupy a core for as long as it takes to decode. Refuse it.
+            duration_seconds = len(pcm16) / (PCM16_BYTES_PER_SAMPLE * float(sample_rate))
+            if duration_seconds > self.max_audio_seconds:
+                error_msg = (
+                    f"Audio is {duration_seconds:.0f}s, longer than the "
+                    f"{self.max_audio_seconds}s limit"
+                )
+                self.logger.error(error_msg)
+                return self._create_error_response(error_msg, language, "vosk")
 
-                # Process audio in chunks
-                self.logger.info("Processing audio with Vosk (offline)...")
-                results = []
+            # Telephony is 8 kHz and the model is almost certainly 16 kHz. Kaldi treats that
+            # as a fatal mismatch rather than resampling, so bridge it here and hand the
+            # recogniser the rate it was actually trained on.
+            model_rate = self._model_sample_rate()
+            if sample_rate != model_rate:
+                self.logger.info(f"  Resampling {sample_rate} Hz -> {model_rate} Hz for the model")
+                pcm16 = resample_pcm16(pcm16, sample_rate, model_rate)
+                sample_rate = model_rate
 
-                while True:
-                    data = wf.readframes(VOSK_FRAME_SIZE)
-                    if len(data) == 0:
-                        break
-                    if rec.AcceptWaveform(data):
-                        result = json.loads(rec.Result())
-                        if result.get("text"):
-                            results.append(result["text"])
+            # Create recognizer
+            rec = KaldiRecognizer(self.vosk_model, sample_rate)
+            rec.SetWords(True)  # Enable word-level timestamps
 
-                # Get final result
-                final_result = json.loads(rec.FinalResult())
-                if final_result.get("text"):
-                    results.append(final_result["text"])
+            # Process audio in chunks
+            self.logger.info("Processing audio with Vosk (offline)...")
+            results = []
+            word_confidences: list[float] = []
+
+            def collect(payload: dict) -> None:
+                """Take the text and the per-word confidences from one Vosk result."""
+                if payload.get("text"):
+                    results.append(payload["text"])
+                # SetWords(True) makes Vosk emit a `result` array of per-word entries, each
+                # carrying its own `conf`. Averaging them gives a real accuracy signal for
+                # the notification email, which previously showed a hardcoded 95%.
+                word_confidences.extend(
+                    word["conf"] for word in payload.get("result", []) if "conf" in word
+                )
+
+            chunk_bytes = VOSK_FRAME_SIZE * PCM16_BYTES_PER_SAMPLE
+            for offset in range(0, len(pcm16), chunk_bytes):
+                if rec.AcceptWaveform(pcm16[offset : offset + chunk_bytes]):
+                    collect(json.loads(rec.Result()))
+
+            # Get final result
+            collect(json.loads(rec.FinalResult()))
 
             # Combine all text
             text = " ".join(results).strip()
 
             if text:
+                confidence = (
+                    sum(word_confidences) / len(word_confidences)
+                    if word_confidences
+                    else VOSK_DEFAULT_CONFIDENCE
+                )
                 self.logger.info("✓ Transcription successful (offline)")
                 self.logger.info(f"  Text length: {len(text)} characters")
+                self.logger.info(f"  Mean word confidence: {confidence:.2%}")
                 self.logger.debug(f"  Text: {text[:100]}...")
                 return {
                     "success": True,
                     "text": text,
-                    "confidence": VOSK_DEFAULT_CONFIDENCE,  # Vosk doesn't provide confidence
+                    "confidence": confidence,
                     "language": language,
                     "provider": "vosk",
                     "timestamp": datetime.now(UTC),

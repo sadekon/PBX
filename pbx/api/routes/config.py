@@ -132,7 +132,18 @@ def get_full_config() -> tuple[Response, int]:
                     "require_pin": pbx_core.config.get("features.hot_desking.require_pin", True),
                 },
                 "voicemail_transcription": {
-                    "enabled": pbx_core.config.get("features.voicemail_transcription.enabled", True)
+                    "enabled": pbx_core.config.get(
+                        "features.voicemail_transcription.enabled", False
+                    ),
+                    # `enabled` is only intent. `ready` is whether the model actually loaded --
+                    # without it, a missing Vosk model is indistinguishable from a working
+                    # setup until someone notices transcripts are never produced.
+                    "ready": bool(
+                        getattr(getattr(pbx_core, "transcription_service", None), "ready", False)
+                    ),
+                    "provider": pbx_core.config.get(
+                        "features.voicemail_transcription.provider", "vosk"
+                    ),
                 },
             },
             "voicemail": {
@@ -257,7 +268,10 @@ def get_features_config() -> tuple[Response, int]:
             "description": "Log in to any phone with your extension",
         },
         "voicemail_transcription": {
-            "enabled": pbx_core.config.get("features.voicemail_transcription.enabled", True),
+            "enabled": pbx_core.config.get("features.voicemail_transcription.enabled", False),
+            "ready": bool(
+                getattr(getattr(pbx_core, "transcription_service", None), "ready", False)
+            ),
             "description": "Speech-to-text voicemail transcription",
         },
         "call_recording_announcements": {
