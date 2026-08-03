@@ -3,16 +3,18 @@ Voicemail transcription service using speech-to-text
 """
 
 import json
-import wave
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pbx.utils.audio import read_wav_as_pcm16
 from pbx.utils.logger import get_logger
 
 # Constants for Vosk transcription
-VOSK_FRAME_SIZE = 4000  # Number of frames to read per chunk
+VOSK_FRAME_SIZE = 4000  # Number of samples to feed the recognizer per chunk
 VOSK_DEFAULT_CONFIDENCE = 0.95  # Default confidence when Vosk doesn't provide one
+PCM16_BYTES_PER_SAMPLE = 2
+SUPPORTED_SAMPLE_RATES = (8000, 16000, 32000, 44100, 48000)
 
 # Configuration defaults, all under features.voicemail_transcription in config.yml
 DEFAULT_LANGUAGE = "en-US"
@@ -260,53 +262,50 @@ class VoicemailTranscriptionService:
             return self._create_error_response(error_msg, language, "vosk")
 
         try:
-            # Open WAV file
-            with wave.open(audio_file_path, "rb") as wf:
-                # Validate audio format
-                if wf.getnchannels() != 1:
-                    error_msg = "Audio must be mono channel"
-                    self.logger.error(error_msg)
-                    return self._create_error_response(error_msg, language, "vosk")
+            # Voicemail is stored as G.711, which `wave` cannot open at all, and Vosk needs
+            # linear PCM16 regardless. read_wav_as_pcm16 handles both the u-law/A-law decode
+            # and the mono check, so what comes back is always ready to feed the recogniser.
+            pcm16, sample_rate = read_wav_as_pcm16(audio_file_path)
 
-                # Check sample rate - Vosk works best with 8kHz or 16kHz
-                sample_rate = wf.getframerate()
-                if sample_rate not in [8000, 16000, 32000, 44100, 48000]:
-                    error_msg = f"Unsupported sample rate: {sample_rate}. Use 8000, 16000, 32000, 44100, or 48000 Hz"
-                    self.logger.error(error_msg)
-                    return self._create_error_response(error_msg, language, "vosk")
+            # Vosk works best at 8 kHz or 16 kHz; these are the rates it handles sensibly.
+            if sample_rate not in SUPPORTED_SAMPLE_RATES:
+                error_msg = (
+                    f"Unsupported sample rate: {sample_rate}. Use "
+                    f"{', '.join(str(r) for r in SUPPORTED_SAMPLE_RATES)} Hz"
+                )
+                self.logger.error(error_msg)
+                return self._create_error_response(error_msg, language, "vosk")
 
-                # Decoding is CPU-bound and runs to completion, so a recording that never
-                # stopped would occupy a core for as long as it takes to decode. Refuse it.
-                duration_seconds = wf.getnframes() / float(sample_rate)
-                if duration_seconds > self.max_audio_seconds:
-                    error_msg = (
-                        f"Audio is {duration_seconds:.0f}s, longer than the "
-                        f"{self.max_audio_seconds}s limit"
-                    )
-                    self.logger.error(error_msg)
-                    return self._create_error_response(error_msg, language, "vosk")
+            # Decoding is CPU-bound and runs to completion, so a recording that never
+            # stopped would occupy a core for as long as it takes to decode. Refuse it.
+            duration_seconds = len(pcm16) / (PCM16_BYTES_PER_SAMPLE * float(sample_rate))
+            if duration_seconds > self.max_audio_seconds:
+                error_msg = (
+                    f"Audio is {duration_seconds:.0f}s, longer than the "
+                    f"{self.max_audio_seconds}s limit"
+                )
+                self.logger.error(error_msg)
+                return self._create_error_response(error_msg, language, "vosk")
 
-                # Create recognizer
-                rec = KaldiRecognizer(self.vosk_model, sample_rate)
-                rec.SetWords(True)  # Enable word-level timestamps
+            # Create recognizer
+            rec = KaldiRecognizer(self.vosk_model, sample_rate)
+            rec.SetWords(True)  # Enable word-level timestamps
 
-                # Process audio in chunks
-                self.logger.info("Processing audio with Vosk (offline)...")
-                results = []
+            # Process audio in chunks
+            self.logger.info("Processing audio with Vosk (offline)...")
+            results = []
 
-                while True:
-                    data = wf.readframes(VOSK_FRAME_SIZE)
-                    if len(data) == 0:
-                        break
-                    if rec.AcceptWaveform(data):
-                        result = json.loads(rec.Result())
-                        if result.get("text"):
-                            results.append(result["text"])
+            chunk_bytes = VOSK_FRAME_SIZE * PCM16_BYTES_PER_SAMPLE
+            for offset in range(0, len(pcm16), chunk_bytes):
+                if rec.AcceptWaveform(pcm16[offset : offset + chunk_bytes]):
+                    result = json.loads(rec.Result())
+                    if result.get("text"):
+                        results.append(result["text"])
 
-                # Get final result
-                final_result = json.loads(rec.FinalResult())
-                if final_result.get("text"):
-                    results.append(final_result["text"])
+            # Get final result
+            final_result = json.loads(rec.FinalResult())
+            if final_result.get("text"):
+                results.append(final_result["text"])
 
             # Combine all text
             text = " ".join(results).strip()

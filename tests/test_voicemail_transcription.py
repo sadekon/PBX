@@ -2,6 +2,7 @@
 Tests for voicemail transcription functionality
 """
 
+import json
 import struct
 import sys
 import tempfile
@@ -10,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
+
+import pytest
 
 from pbx.features.voicemail_transcription import VoicemailTranscriptionService
 
@@ -275,6 +278,197 @@ class TestTranscriptionConfiguration:
         service = VoicemailTranscriptionService(_config(enabled=True, provider="google"))
 
         assert not hasattr(service, "api_key")
+
+
+def _tone_pcm16(seconds: float = 1.0, rate: int = 8000, freq: int = 440) -> bytes:
+    """A PCM16 sine tone, used as the reference signal for codec round trips."""
+    import math
+
+    return b"".join(
+        struct.pack("<h", int(12000 * math.sin(2 * math.pi * freq * t / rate)))
+        for t in range(int(rate * seconds))
+    )
+
+
+def _write_wav(path: Path, payload: bytes, audio_format: int, bits: int, rate: int = 8000) -> Path:
+    """Write a WAV with an explicit format code, the way PBXCore._build_wav_file does."""
+    from pbx.utils.audio import build_wav_header
+
+    path.write_bytes(build_wav_header(len(payload), rate, 1, bits, audio_format) + payload)
+    return path
+
+
+class TestWavDecoding:
+    """
+    The formats the PBX actually writes must be readable.
+
+    PBXCore._build_wav_file stores voicemail as G.711 u-law (format 7) or A-law (6). Python's
+    `wave` module supports only linear PCM and raises "unknown format: 7" on those files, so
+    every real voicemail failed to transcribe. These fixtures are the regression guard.
+    """
+
+    def test_ulaw_wav_decodes_to_pcm16(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw, read_wav_as_pcm16
+
+        reference = _tone_pcm16()
+        path = _write_wav(tmp_path / "u.wav", pcm16_to_ulaw(reference), WAV_FORMAT_ULAW, 8)
+
+        pcm, rate = read_wav_as_pcm16(path)
+
+        assert rate == 8000
+        assert len(pcm) == len(reference)
+        # G.711 is 8-bit logarithmic, so expect quantisation error but the same waveform.
+        count = len(pcm) // 2
+        ref = struct.unpack(f"<{count}h", reference)
+        got = struct.unpack(f"<{count}h", pcm)
+        assert max(abs(a - b) for a, b in zip(ref, got, strict=True)) < 500
+
+    def test_alaw_wav_decodes_to_pcm16(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_ALAW, pcm16_to_alaw, read_wav_as_pcm16
+
+        reference = _tone_pcm16()
+        path = _write_wav(tmp_path / "a.wav", pcm16_to_alaw(reference), WAV_FORMAT_ALAW, 8)
+
+        pcm, rate = read_wav_as_pcm16(path)
+
+        assert rate == 8000
+        assert len(pcm) == len(reference)
+
+    def test_pcm16_wav_is_returned_unchanged(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_PCM, read_wav_as_pcm16
+
+        reference = _tone_pcm16()
+        path = _write_wav(tmp_path / "p.wav", reference, WAV_FORMAT_PCM, 16)
+
+        pcm, rate = read_wav_as_pcm16(path)
+
+        assert pcm == reference
+        assert rate == 8000
+
+    def test_eight_bit_pcm_is_recentred(self, tmp_path: Any) -> None:
+        """8-bit PCM in a WAV is unsigned around 128, unlike every other width."""
+        from pbx.utils.audio import WAV_FORMAT_PCM, read_wav_as_pcm16
+
+        path = _write_wav(tmp_path / "p8.wav", bytes([128, 255, 0, 128]), WAV_FORMAT_PCM, 8)
+
+        pcm, _ = read_wav_as_pcm16(path)
+
+        assert struct.unpack("<4h", pcm) == (0, 32512, -32768, 0)
+
+    def test_stereo_is_rejected(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_PCM, build_wav_header, read_wav_as_pcm16
+
+        payload = b"\x00\x00" * 100
+        path = tmp_path / "stereo.wav"
+        path.write_bytes(build_wav_header(len(payload), 8000, 2, 16, WAV_FORMAT_PCM) + payload)
+
+        with pytest.raises(ValueError, match="mono"):
+            read_wav_as_pcm16(path)
+
+    def test_unconvertible_format_is_rejected(self, tmp_path: Any) -> None:
+        """G.722 has no linear decode here, and must fail with a clear message."""
+        from pbx.utils.audio import WAV_FORMAT_G722, read_wav_as_pcm16
+
+        path = _write_wav(tmp_path / "g722.wav", b"\x00" * 100, WAV_FORMAT_G722, 8)
+
+        with pytest.raises(ValueError, match="Cannot convert WAV format"):
+            read_wav_as_pcm16(path)
+
+    def test_not_a_wav_is_rejected(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import read_wav_as_pcm16
+
+        path = tmp_path / "nope.wav"
+        path.write_bytes(b"this is not a wav file at all")
+
+        with pytest.raises(ValueError, match="RIFF"):
+            read_wav_as_pcm16(path)
+
+
+class _FakeRecognizer:
+    """Stands in for Kaldi so the audio plumbing can be tested without a real model."""
+
+    transcript = "hello from voicemail"
+
+    def __init__(self, model: Any, sample_rate: int) -> None:
+        self.sample_rate = sample_rate
+        self.bytes_seen = 0
+
+    def SetWords(self, flag: bool) -> None:  # noqa: N802 - mirrors the Vosk API
+        pass
+
+    def AcceptWaveform(self, data: bytes) -> bool:  # noqa: N802 - mirrors the Vosk API
+        self.bytes_seen += len(data)
+        return False
+
+    def Result(self) -> str:  # noqa: N802 - mirrors the Vosk API
+        return json.dumps({"text": ""})
+
+    def FinalResult(self) -> str:  # noqa: N802 - mirrors the Vosk API
+        return json.dumps({"text": self.transcript})
+
+
+class TestVoskAcceptsStoredVoicemail:
+    """End-to-end over the audio plumbing: a real stored voicemail must transcribe."""
+
+    def _service(self) -> VoicemailTranscriptionService:
+        service = VoicemailTranscriptionService(_config(enabled=True, provider="vosk"))
+        service.vosk_model = Mock()
+        return service
+
+    @patch("pbx.features.voicemail_transcription.VOSK_AVAILABLE", True)
+    @patch("pbx.features.voicemail_transcription.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_ulaw_voicemail_transcribes(self, tmp_path: Any) -> None:
+        """
+        The exact regression: a u-law voicemail used to fail with "unknown format: 7".
+        """
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+        path = _write_wav(tmp_path / "vm.wav", pcm16_to_ulaw(_tone_pcm16()), WAV_FORMAT_ULAW, 8)
+
+        result = self._service().transcribe(str(path))
+
+        assert result["success"], result["error"]
+        assert result["text"] == _FakeRecognizer.transcript
+        assert result["provider"] == "vosk"
+
+    @patch("pbx.features.voicemail_transcription.VOSK_AVAILABLE", True)
+    @patch("pbx.features.voicemail_transcription.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_alaw_voicemail_transcribes(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_ALAW, pcm16_to_alaw
+
+        path = _write_wav(tmp_path / "vm.wav", pcm16_to_alaw(_tone_pcm16()), WAV_FORMAT_ALAW, 8)
+
+        assert self._service().transcribe(str(path))["success"]
+
+    @patch("pbx.features.voicemail_transcription.VOSK_AVAILABLE", True)
+    @patch("pbx.features.voicemail_transcription.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_over_long_audio_is_refused(self, tmp_path: Any) -> None:
+        """The duration cap must actually be reachable now that decoding works."""
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+        service = self._service()
+        service.max_audio_seconds = 2
+        path = _write_wav(
+            tmp_path / "long.wav", pcm16_to_ulaw(_tone_pcm16(seconds=5)), WAV_FORMAT_ULAW, 8
+        )
+
+        result = service.transcribe(str(path))
+
+        assert not result["success"]
+        assert "longer than the 2s limit" in result["error"]
+
+    @patch("pbx.features.voicemail_transcription.VOSK_AVAILABLE", True)
+    @patch("pbx.features.voicemail_transcription.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_unsupported_sample_rate_is_refused(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+        payload = pcm16_to_ulaw(_tone_pcm16(seconds=0.5, rate=11025))
+        path = _write_wav(tmp_path / "odd.wav", payload, WAV_FORMAT_ULAW, 8, rate=11025)
+
+        result = self._service().transcribe(str(path))
+
+        assert not result["success"]
+        assert "Unsupported sample rate" in result["error"]
 
 
 class TestTranscriptionWiring:
