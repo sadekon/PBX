@@ -129,13 +129,18 @@ class GracefulShutdownHandler:
 
             time.sleep(2)
 
-        # Timeout reached - force end remaining calls
+        # Timeout reached - force end remaining calls.
+        #
+        # Deliberately PBXCore.end_call, not CallManager.end_call. The latter only drops the
+        # call from the active dict; it does not save a voicemail that was mid-recording, nor
+        # close out the CDR or release the RTP relay. Forcing calls down through the manager
+        # meant a caller who was leaving a message when the PBX was signalled lost it outright.
         active_calls = self.pbx_core.call_manager.get_active_calls()
         if active_calls:
             logger.warning(f"Timeout reached. Force ending {len(active_calls)} active call(s)")
             for call in active_calls:
                 try:
-                    self.pbx_core.call_manager.end_call(call.call_id)
+                    self.pbx_core.end_call(call.call_id)
                 except Exception as e:
                     logger.error(f"Error ending call {call.call_id}: {e}")
 

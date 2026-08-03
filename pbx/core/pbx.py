@@ -567,10 +567,6 @@ class PBXCore:
         # Stop Prometheus metrics collector
         self._stop_metrics_collector()
 
-        # Drain queued mail before the process goes away
-        if hasattr(self, "mailer"):
-            self.mailer.stop()
-
         # Stop security monitor
         if hasattr(self, "security_monitor"):
             self.security_monitor.stop()
@@ -591,6 +587,13 @@ class PBXCore:
         # End all active calls with full cleanup (CDR, voicemail, timers, RTP)
         for call in self.call_manager.get_active_calls():
             self.end_call(call.call_id)
+
+        # Drain queued mail last, and specifically *after* the calls above. Ending a call can
+        # record a voicemail, and saving one queues a notification -- so draining earlier meant
+        # every voicemail left during shutdown went into a Mailer whose worker had already been
+        # joined, and its email was silently lost.
+        if hasattr(self, "mailer"):
+            self.mailer.stop()
 
         self.logger.info("PBX system stopped")
 
