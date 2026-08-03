@@ -222,55 +222,64 @@ class VoicemailBox:
             self.logger.warning("Database not available - voicemail metadata NOT saved to database")
             self.logger.warning(f"  Message ID: {message_id} stored as file only")
 
-        # Transcribe voicemail if enabled
+        # Transcribe when the service can actually serve a request. `ready` is what separates
+        # "the operator turned it off" from "it is on but the model never loaded"; the second
+        # is the likely failure after a deploy and is reported once at startup rather than
+        # once per message, so this stays at debug.
         transcription_result = None
-        if self.transcription_service:
+        service = self.transcription_service
+        if service and service.ready:
             self.logger.info(f"Transcribing voicemail {message_id}...")
-            transcription_result = self.transcription_service.transcribe(file_path)
+            transcription_result = service.transcribe(str(file_path))
+        elif service and service.enabled:
+            self.logger.debug(
+                f"Transcription enabled but not ready (provider={service.provider}); "
+                f"storing voicemail {message_id} without a transcript"
+            )
 
-            if transcription_result["success"]:
-                self.logger.info("✓ Voicemail transcribed successfully")
-                self.logger.info(f"  Confidence: {transcription_result['confidence']:.2%}")
-                self.logger.debug(f"  Text: {transcription_result['text'][:100]}...")
+        if transcription_result and transcription_result["success"]:
+            self.logger.info("✓ Voicemail transcribed successfully")
+            self.logger.info(f"  Confidence: {transcription_result['confidence']:.2%}")
+            self.logger.debug(f"  Text: {transcription_result['text'][:100]}...")
 
-                # Add transcription to message
-                message["transcription"] = transcription_result["text"]
-                message["transcription_confidence"] = transcription_result["confidence"]
-                message["transcription_language"] = transcription_result["language"]
-                message["transcription_provider"] = transcription_result["provider"]
-                message["transcribed_at"] = transcription_result["timestamp"]
+            # Add transcription to message
+            message["transcription"] = transcription_result["text"]
+            message["transcription_confidence"] = transcription_result["confidence"]
+            message["transcription_language"] = transcription_result["language"]
+            message["transcription_provider"] = transcription_result["provider"]
+            message["transcribed_at"] = transcription_result["timestamp"]
 
-                # Update database with transcription
-                if self.database and self.database.enabled:
-                    try:
-                        placeholder = self._get_db_placeholder()
-                        query = f"""
-                        UPDATE voicemail_messages
-                        SET transcription_text = {placeholder},
-                            transcription_confidence = {placeholder},
-                            transcription_language = {placeholder},
-                            transcription_provider = {placeholder},
-                            transcribed_at = {placeholder}
-                        WHERE message_id = {placeholder}
-                        """  # nosec B608 - placeholder is safely parameterized
-                        self.database.execute(
-                            query,
-                            (
-                                transcription_result["text"],
-                                transcription_result["confidence"],
-                                transcription_result["language"],
-                                transcription_result["provider"],
-                                transcription_result["timestamp"],
-                                message_id,
-                            ),
-                        )
-                        self.logger.info("✓ Transcription saved to database")
-                    except Exception as e:
-                        self.logger.error(f"✗ Error saving transcription to database: {e}")
-            else:
-                self.logger.warning(
-                    f"✗ Voicemail transcription failed: {transcription_result['error']}"
-                )
+            # Update database with transcription
+            if self.database and self.database.enabled:
+                try:
+                    placeholder = self._get_db_placeholder()
+                    query = f"""
+                    UPDATE voicemail_messages
+                    SET transcription_text = {placeholder},
+                        transcription_confidence = {placeholder},
+                        transcription_language = {placeholder},
+                        transcription_provider = {placeholder},
+                        transcribed_at = {placeholder}
+                    WHERE message_id = {placeholder}
+                    """  # nosec B608 - placeholder is safely parameterized
+                    self.database.execute(
+                        query,
+                        (
+                            transcription_result["text"],
+                            transcription_result["confidence"],
+                            transcription_result["language"],
+                            transcription_result["provider"],
+                            transcription_result["timestamp"],
+                            message_id,
+                        ),
+                    )
+                    self.logger.info("✓ Transcription saved to database")
+                except Exception as e:
+                    self.logger.error(f"✗ Error saving transcription to database: {e}")
+        elif transcription_result:
+            self.logger.warning(
+                f"✗ Voicemail transcription failed: {transcription_result['error']}"
+            )
 
         # Send email notification if enabled. The transcription is stored on the message but
         # is not yet included in the email body -- the old code probed for a `transcription`
@@ -831,6 +840,7 @@ class VoicemailSystem:
         config: Any | None = None,
         database: Any | None = None,
         mailer: Any | None = None,
+        transcription_service: Any | None = None,
     ) -> None:
         """
         Initialize voicemail system
@@ -840,6 +850,7 @@ class VoicemailSystem:
             config: Config object
             database: DatabaseBackend object (optional)
             mailer: pbx.mail.Mailer owned by PBXCore (optional)
+            transcription_service: VoicemailTranscriptionService owned by PBXCore (optional)
         """
         self.storage_path = storage_path
         self.mailboxes = {}
@@ -849,6 +860,9 @@ class VoicemailSystem:
         # The mailer is a PBX-wide subsystem, not something voicemail constructs. Sharing one
         # transport is what lets emergency notification use it too.
         self.mailer = mailer
+        # Same reasoning for the transcriber, plus a hard constraint: the Vosk model is ~40 MB
+        # resident, so one instance per mailbox would not survive a few hundred extensions.
+        self.transcription_service = transcription_service
 
         Path(storage_path).mkdir(parents=True, exist_ok=True)
 
@@ -869,6 +883,7 @@ class VoicemailSystem:
                 config=self.config,
                 mailer=self.mailer,
                 database=self.database,
+                transcription_service=self.transcription_service,
             )
         return self.mailboxes[extension_number]
 

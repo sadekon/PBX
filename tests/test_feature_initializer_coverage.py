@@ -182,6 +182,7 @@ class TestFeatureInitializerInitialize:
             config=pbx_core.config,
             database=pbx_core.database,
             mailer=pbx_core.mailer,
+            transcription_service=pbx_core.transcription_service,
         )
 
     def test_voicemail_with_database_disabled(self) -> None:
@@ -194,6 +195,7 @@ class TestFeatureInitializerInitialize:
             config=pbx_core.config,
             database=None,
             mailer=pbx_core.mailer,
+            transcription_service=pbx_core.transcription_service,
         )
 
     def test_custom_voicemail_path(self) -> None:
@@ -206,6 +208,29 @@ class TestFeatureInitializerInitialize:
             config=pbx_core.config,
             database=pbx_core.database,
             mailer=pbx_core.mailer,
+            transcription_service=pbx_core.transcription_service,
+        )
+
+    def test_transcription_service_constructed_even_when_disabled(self) -> None:
+        """
+        The transcriber is built unconditionally, like the mailer.
+
+        A disabled service is still a real object that reports `ready`, which is what lets
+        callers drop the guard shape that once made emergency notification fail silently. The
+        same instance is handed to voicemail, because the Vosk model is far too large to load
+        once per mailbox.
+        """
+        pbx_core = _make_pbx_core(
+            config_overrides={"features.voicemail_transcription.enabled": False}
+        )
+        mocks = _run_initialize_with_all_patches(pbx_core)
+
+        assert pbx_core.transcription_service is not None
+        assert not pbx_core.transcription_service.enabled
+        assert not pbx_core.transcription_service.ready
+        assert (
+            mocks["VoicemailSystem"].call_args.kwargs["transcription_service"]
+            is pbx_core.transcription_service
         )
 
     def test_call_recording_enabled(self) -> None:
