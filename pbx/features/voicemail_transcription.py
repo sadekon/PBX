@@ -324,30 +324,44 @@ class VoicemailTranscriptionService:
             # Process audio in chunks
             self.logger.info("Processing audio with Vosk (offline)...")
             results = []
+            word_confidences: list[float] = []
+
+            def collect(payload: dict) -> None:
+                """Take the text and the per-word confidences from one Vosk result."""
+                if payload.get("text"):
+                    results.append(payload["text"])
+                # SetWords(True) makes Vosk emit a `result` array of per-word entries, each
+                # carrying its own `conf`. Averaging them gives a real accuracy signal for
+                # the notification email, which previously showed a hardcoded 95%.
+                word_confidences.extend(
+                    word["conf"] for word in payload.get("result", []) if "conf" in word
+                )
 
             chunk_bytes = VOSK_FRAME_SIZE * PCM16_BYTES_PER_SAMPLE
             for offset in range(0, len(pcm16), chunk_bytes):
                 if rec.AcceptWaveform(pcm16[offset : offset + chunk_bytes]):
-                    result = json.loads(rec.Result())
-                    if result.get("text"):
-                        results.append(result["text"])
+                    collect(json.loads(rec.Result()))
 
             # Get final result
-            final_result = json.loads(rec.FinalResult())
-            if final_result.get("text"):
-                results.append(final_result["text"])
+            collect(json.loads(rec.FinalResult()))
 
             # Combine all text
             text = " ".join(results).strip()
 
             if text:
+                confidence = (
+                    sum(word_confidences) / len(word_confidences)
+                    if word_confidences
+                    else VOSK_DEFAULT_CONFIDENCE
+                )
                 self.logger.info("✓ Transcription successful (offline)")
                 self.logger.info(f"  Text length: {len(text)} characters")
+                self.logger.info(f"  Mean word confidence: {confidence:.2%}")
                 self.logger.debug(f"  Text: {text[:100]}...")
                 return {
                     "success": True,
                     "text": text,
-                    "confidence": VOSK_DEFAULT_CONFIDENCE,  # Vosk doesn't provide confidence
+                    "confidence": confidence,
                     "language": language,
                     "provider": "vosk",
                     "timestamp": datetime.now(UTC),

@@ -320,14 +320,31 @@ class TestTranscriptionInNotification:
         box = VoicemailBox("1001", storage, config=config, mailer=RecordingMailer())
 
         body = box._notification_body(
-            "555", "now", 30, transcription="please call the office", confidence=0.95
+            "555",
+            "now",
+            30,
+            transcription="please call the office",
+            confidence=0.95,
+            provider="vosk",
         )
 
         assert "please call the office" in body
         assert "Transcription" in body
-        assert "95% confidence" in body
+        # The engine is named so the reader can judge the text: an offline model on 8 kHz
+        # phone audio and a cloud service are not equally trustworthy.
+        assert "Vosk" in body
+        assert "95%" in body
         # Recipients must not act on a machine transcript as though it were verbatim.
-        assert "may contain errors" in body
+        assert "listen to the recording" in body
+
+    def test_unknown_provider_still_gets_a_disclaimer(self, storage, config):
+        """A transcript whose engine we cannot name must still carry the warning."""
+        box = VoicemailBox("1001", storage, config=config, mailer=RecordingMailer())
+
+        body = box._notification_body("555", "now", 30, transcription="hello", provider=None)
+
+        assert "an automated service" in body
+        assert "listen to the recording" in body
 
     def test_body_omits_the_section_without_a_transcript(self, storage, config):
         box = VoicemailBox("1001", storage, config=config, mailer=RecordingMailer())
@@ -340,7 +357,8 @@ class TestTranscriptionInNotification:
         body = box._notification_body("555", "now", 30, transcription="hello")
 
         assert "hello" in body
-        assert "confidence" not in body
+        # No measured confidence means no accuracy claim -- better silent than invented.
+        assert "accuracy" not in body
 
     def test_transcript_reaches_the_email(self, storage, config):
         mailer = RecordingMailer()

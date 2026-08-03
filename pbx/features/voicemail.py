@@ -2,9 +2,10 @@
 Voicemail system
 """
 
+import textwrap
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from pbx.mail import Attachment, EmailError
 from pbx.utils.logger import get_logger, get_vm_ivr_logger
@@ -307,6 +308,7 @@ class VoicemailBox:
                     duration=duration,
                     transcription=message.get("transcription"),
                     confidence=message.get("transcription_confidence"),
+                    provider=message.get("transcription_provider"),
                 )
             else:
                 self.logger.debug(
@@ -431,6 +433,35 @@ class VoicemailBox:
             self.logger.warning(f"Invalid voicemail.email.subject_template ({e}); using default")
             return f"New Voicemail from {caller_display}"
 
+    #: Human-readable names for the engines behind a transcript. Recipients are told which
+    #: one produced the text so they can judge it -- an offline phone-audio model and a cloud
+    #: service are not equally trustworthy, and the difference matters when acting on it.
+    TRANSCRIPTION_ENGINES: ClassVar[dict[str, str]] = {
+        "vosk": "Vosk, an offline speech recognition engine",
+        "google": "Google Cloud Speech-to-Text",
+    }
+
+    @classmethod
+    def _transcription_disclaimer(
+        cls, provider: str | None = None, confidence: float | None = None
+    ) -> str:
+        """
+        Name the engine and warn that its output is not reliable.
+
+        Both halves matter. Naming the engine tells the reader what produced this; the warning
+        stops the transcript being treated as a record of what was said. Phone audio is 8 kHz
+        and narrowband, so names, numbers and unusual words are where it fails first -- which
+        is exactly the content someone is most likely to act on without listening.
+        """
+        engine = cls.TRANSCRIPTION_ENGINES.get(provider or "", provider or "an automated service")
+        note = f"Transcribed automatically by {engine}."
+        if confidence:
+            note += f" Estimated accuracy {confidence:.0%}."
+        return (
+            f"{note} Machine transcription is often wrong about names, numbers and "
+            "spelling -- listen to the recording before acting on anything important."
+        )
+
     def _notification_body(
         self,
         caller_id: str,
@@ -438,6 +469,7 @@ class VoicemailBox:
         duration: float | None = None,
         transcription: str | None = None,
         confidence: float | None = None,
+        provider: str | None = None,
     ) -> str:
         """
         Build the plain-text body of a new-voicemail notification.
@@ -460,12 +492,20 @@ class VoicemailBox:
             body += f"  Duration: {mins}:{secs:02d}\n"
 
         if transcription:
-            heading = "Transcription"
-            if confidence:
-                heading += f" ({confidence:.0%} confidence)"
-            body += f"\n{heading}:\n"
-            body += f"  {transcription.strip()}\n"
-            body += "\n  (Automatically transcribed -- may contain errors.)\n"
+            body += "\nTranscription:\n"
+            # Wrapped rather than emitted as one long line: this is plain text, and mail
+            # clients that do not reflow leave an unwrapped paragraph running off-screen.
+            body += textwrap.fill(
+                transcription.strip(), width=78, initial_indent="  ", subsequent_indent="  "
+            )
+            body += "\n\n"
+            body += textwrap.fill(
+                self._transcription_disclaimer(provider, confidence),
+                width=78,
+                initial_indent="  ",
+                subsequent_indent="  ",
+            )
+            body += "\n"
 
         body += f"\nTo listen to this message, please dial *{self.extension_number}\n"
         body += "\nBest regards,\n"
@@ -482,6 +522,7 @@ class VoicemailBox:
         duration: float | None = None,
         transcription: str | None = None,
         confidence: float | None = None,
+        provider: str | None = None,
     ) -> None:
         """
         Queue the new-voicemail notification.
@@ -521,6 +562,7 @@ class VoicemailBox:
                 duration,
                 transcription=transcription if include_transcription else None,
                 confidence=confidence if include_transcription else None,
+                provider=provider if include_transcription else None,
             ),
             attachments=attachments,
         )
