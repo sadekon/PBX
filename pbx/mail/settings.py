@@ -113,6 +113,12 @@ class SmtpSettings:
     retry_backoff: float = 2.0
     max_attachment_bytes: int = 8 * 1024 * 1024
 
+    #: Divert every message to this address instead of its real recipients. A testing aid for
+    #: running against live extensions without mailing their owners -- see build_message().
+    #: Applied at the transport layer so it also covers emergency notification, which must
+    #: not reach real emergency contacts during a test. Never set this in production.
+    redirect_to: str = ""
+
     #: Problems found while coercing the raw config, surfaced through validate(). Populated by
     #: from_dict() so a typo in `security:` is reported rather than silently defaulted.
     config_warnings: tuple[str, ...] = field(default=(), repr=False)
@@ -169,6 +175,7 @@ class SmtpSettings:
             max_retries=_as_int(smtp.get("max_retries"), 3),
             retry_backoff=_as_float(smtp.get("retry_backoff"), 2.0),
             max_attachment_bytes=_as_int(smtp.get("max_attachment_bytes"), 8 * 1024 * 1024),
+            redirect_to=_as_str(smtp.get("redirect_to")),
             config_warnings=tuple(warnings),
         )
 
@@ -223,6 +230,19 @@ class SmtpSettings:
                 "internal CA, set smtp.ca_file instead; if the name does not match, correct "
                 "smtp.host to the name on the certificate"
             )
+
+        if self.redirect_to:
+            if not Config.validate_email(self.redirect_to):
+                problems.append(
+                    f"smtp.redirect_to {self.redirect_to!r} is not a valid address; "
+                    "mail cannot be delivered while it is set"
+                )
+            else:
+                problems.append(
+                    f"smtp.redirect_to is set -- ALL mail is being diverted to "
+                    f"{self.redirect_to} and no real recipient will receive anything. "
+                    "This is a testing aid; unset it before production use"
+                )
 
         if self.timeout <= 0:
             problems.append(f"smtp.timeout {self.timeout} must be greater than zero")

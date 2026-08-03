@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, ClassVar, overload
 
 import yaml
 
@@ -503,48 +503,75 @@ class Config:
             logger.error("Error deleting SIP trunk: %s", e)
             return False
 
+    #: Fields of the top-level ``smtp:`` section the admin UI may write. The password is
+    #: absent on purpose -- it is read from SMTP_PASSWORD and must never reach config.yml.
+    SMTP_TEXT_FIELDS = (
+        "host",
+        "username",
+        "from_address",
+        "from_name",
+        "ca_file",
+        "helo_hostname",
+        "envelope_from",
+    )
+    SMTP_INT_FIELDS = ("port", "timeout", "max_retries", "max_attachment_bytes")
+    SMTP_BOOL_FIELDS = ("verify_cert",)
+    SMTP_CHOICE_FIELDS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "security": ("starttls", "smtps"),
+        "auth": ("none", "login"),
+    }
+
     def update_email_config(self, config_data: dict) -> bool:
         """
-        Update email/SMTP configuration
+        Update the SMTP transport configuration from the admin UI.
+
+        Writes the top-level ``smtp:`` section, which is where transport settings live;
+        ``voicemail.email.*`` remains the feature's own content settings and is untouched
+        here. Values are coerced and choice fields validated, so a malformed submission is
+        rejected rather than persisted.
+
+        The password is never accepted. It comes from the SMTP_PASSWORD environment
+        variable, and writing a submitted secret here would land it in config.yml on save.
 
         Args:
-            config_data: Dictionary with email configuration
+            config_data: ``{"smtp": {...}, "email_notifications": bool}``. Absent keys are
+                left unchanged.
 
         Returns:
-            True if successful, False otherwise
+            True if the configuration was written.
         """
         try:
-            if "voicemail" not in self.config:
-                self.config["voicemail"] = {}
+            smtp_data = config_data.get("smtp")
+            if isinstance(smtp_data, dict):
+                smtp = self.config.setdefault("smtp", {})
 
-            # Update SMTP settings
-            if "smtp" in config_data:
-                if "smtp" not in self.config["voicemail"]:
-                    self.config["voicemail"]["smtp"] = {}
+                for field in self.SMTP_TEXT_FIELDS:
+                    if field in smtp_data:
+                        smtp[field] = str(smtp_data[field] or "").strip()
 
-                smtp = config_data["smtp"]
-                if "host" in smtp:
-                    self.config["voicemail"]["smtp"]["host"] = smtp["host"]
-                if "port" in smtp:
-                    self.config["voicemail"]["smtp"]["port"] = smtp["port"]
-                if "username" in smtp:
-                    self.config["voicemail"]["smtp"]["username"] = smtp["username"]
-                # The password is deliberately not accepted here: writing a submitted
-                # plaintext secret into the config dict would land it in config.yml on the
-                # next save(). SMTP credentials come from SMTP_PASSWORD in the environment.
+                for field in self.SMTP_INT_FIELDS:
+                    if field in smtp_data and str(smtp_data[field]).strip():
+                        try:
+                            smtp[field] = int(smtp_data[field])
+                        except (TypeError, ValueError):
+                            logger.error("Invalid %s for smtp.%s", smtp_data[field], field)
+                            return False
 
-            # Update email settings
-            if "email" in config_data:
-                if "email" not in self.config["voicemail"]:
-                    self.config["voicemail"]["email"] = {}
+                for field in self.SMTP_BOOL_FIELDS:
+                    if field in smtp_data:
+                        smtp[field] = bool(smtp_data[field])
 
-                email = config_data["email"]
-                if "from_address" in email:
-                    self.config["voicemail"]["email"]["from_address"] = email["from_address"]
+                for field, allowed in self.SMTP_CHOICE_FIELDS.items():
+                    if field in smtp_data:
+                        value = str(smtp_data[field] or "").strip().lower()
+                        if value not in allowed:
+                            logger.error("smtp.%s must be one of %s", field, ", ".join(allowed))
+                            return False
+                        smtp[field] = value
 
-            # Update email notifications flag
             if "email_notifications" in config_data:
-                self.config["voicemail"]["email_notifications"] = config_data["email_notifications"]
+                voicemail = self.config.setdefault("voicemail", {})
+                voicemail["email_notifications"] = bool(config_data["email_notifications"])
 
             return self.save()
         except (KeyError, TypeError, ValueError) as e:

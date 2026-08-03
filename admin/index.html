@@ -3307,34 +3307,65 @@ G.726-32</textarea>
                 <form id="email-config-form">
                     <div class="form-group">
                         <label for="smtp-host">SMTP Host:</label>
-                        <input type="text" id="smtp-host" placeholder="smtp.example.com">
+                        <input type="text" id="smtp-host" name="host" placeholder="mail.example.com">
+                        <small>Must match a name on the server's TLS certificate</small>
                     </div>
                     <div class="form-group">
                         <label for="smtp-port">SMTP Port:</label>
-                        <input type="number" id="smtp-port" placeholder="587">
+                        <input type="number" id="smtp-port" name="port" placeholder="587">
+                        <small>587 or 25 for STARTTLS, 465 for implicit TLS</small>
                     </div>
                     <div class="form-group">
-                        <label>
-                            <input type="checkbox" id="smtp-use-tls">
-                            Use TLS/SSL
-                        </label>
+                        <label for="smtp-security">Transport Security:</label>
+                        <select id="smtp-security" name="security">
+                            <option value="starttls">STARTTLS (upgrade after connecting)</option>
+                            <option value="smtps">SMTPS (encrypted from the start)</option>
+                        </select>
+                        <small>TLS is mandatory; there is no plaintext option</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="smtp-auth">Authentication:</label>
+                        <select id="smtp-auth" name="auth">
+                            <option value="none">None (anonymous relay, trusted by IP)</option>
+                            <option value="login">Username and password</option>
+                        </select>
                     </div>
                     <div class="form-group">
                         <label for="smtp-username">Username:</label>
-                        <input type="text" id="smtp-username" placeholder="username">
+                        <input type="text" id="smtp-username" name="username" placeholder="DOMAIN\username">
+                        <small>Only used when authentication is enabled</small>
                     </div>
                     <div class="form-group">
-                        <label for="smtp-password">Password:</label>
-                        <input type="password" id="smtp-password" placeholder="password">
+                        <label>Password:</label>
+                        <input type="text" id="smtp-password-status" disabled>
+                        <small>Set via the SMTP_PASSWORD environment variable, never stored in config.yml</small>
                     </div>
                     <div class="form-group">
                         <label for="email-from">From Address:</label>
-                        <input type="email" id="email-from" placeholder="voicemail@company.com">
+                        <input type="email" id="email-from" name="from_address" placeholder="voicemail@company.com">
                     </div>
                     <div class="form-group">
                         <label for="email-from-name">From Name:</label>
-                        <input type="text" id="email-from-name" placeholder="PBX Voicemail">
+                        <input type="text" id="email-from-name" name="from_name" placeholder="Warden VoIP">
                     </div>
+                    <div class="form-group">
+                        <label for="smtp-ca-file">Internal CA Bundle (optional):</label>
+                        <input type="text" id="smtp-ca-file" name="ca_file" placeholder="/etc/ssl/certs/corp-ca.pem">
+                        <small>Needed when the mail server's certificate is issued by your own PKI</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="smtp-helo">HELO Hostname (optional):</label>
+                        <input type="text" id="smtp-helo" name="helo_hostname" placeholder="pbx.example.com">
+                        <small>Only if the receive connector validates HELO or reverse DNS</small>
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="smtp-verify-cert" name="verify_cert" checked>
+                            Verify server certificate
+                        </label>
+                        <small>Leave enabled. A hostname mismatch is fixed by correcting the host, not by disabling this</small>
+                    </div>
+                    <div id="smtp-config-warnings" class="config-note" style="display: none;"></div>
                     <button type="submit" class="btn btn-success">💾 Save Email Settings</button>
                 </form>
             </div>
@@ -4801,6 +4832,13 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                 </div>
                 <div class="form-group">
                     <label>
+                        <input type="checkbox" id="new-ext-voicemail-email-enabled" checked>
+                        Email new voicemail to this extension
+                    </label>
+                    <small>Sends a notification, with the recording attached, to the address above</small>
+                </div>
+                <div class="form-group">
+                    <label>
                         <input type="checkbox" id="new-ext-allow-external" checked>
                         Allow External Calls
                     </label>
@@ -4850,6 +4888,13 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                     <label for="edit-ext-did-number">DID Number (optional):</label>
                     <input type="text" id="edit-ext-did-number" pattern="[0-9]*" placeholder="e.g., 12125551234">
                     <small>Carrier-assigned number that rings this extension directly. Clear to remove.</small>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="edit-ext-voicemail-email-enabled">
+                        Email new voicemail to this extension
+                    </label>
+                    <small>Sends a notification, with the recording attached, to the address above</small>
                 </div>
                 <div class="form-group">
                     <label>

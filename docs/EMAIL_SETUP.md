@@ -132,6 +132,24 @@ fails is a relay-permission issue, not a PBX fault — see the troubleshooting t
 Check the operational counters at any time via `pbx_core.mailer.get_statistics()` —
 sent, failed, dropped, retries, queue depth, and the last error.
 
+### Redirecting all mail while testing
+
+`smtp.redirect_to` (via `SMTP_REDIRECT_TO`) diverts **every** message — voicemail
+notification, daily summary and emergency notification — to a single address, leaving the
+real recipients in an `X-Original-To` header and prefixing the subject with `[REDIRECTED]`.
+
+```bash
+SMTP_REDIRECT_TO=you@corp.com
+```
+
+It applies at the transport layer deliberately: testing against live extensions must not mail
+their owners, and a test 911 call must not reach the real emergency contacts.
+
+It is loud by design. The Mailer logs a warning naming the address at every startup,
+`validate()` reports it, and it therefore appears in the admin SMTP page's warnings panel and
+at the top of both test scripts. Unset it before production — left on, every notification
+silently stops reaching the person it was meant for.
+
 ---
 
 ## 3. On-premises Exchange

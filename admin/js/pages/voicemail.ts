@@ -44,6 +44,15 @@ export async function loadVoicemailTab(): Promise<void> {
             option.textContent = `${ext.number} - ${ext.name}`;
             select.appendChild(option);
         }
+
+        // Preselect the signed-in user's own mailbox -- the one they almost always want.
+        // Stored at login; absent for a session that predates it, in which case the
+        // placeholder stays selected and nothing is loaded until a choice is made.
+        const ownExtension = localStorage.getItem('pbx_extension');
+        if (ownExtension && extensions.some((ext) => ext.number === ownExtension)) {
+            select.value = ownExtension;
+            await loadVoicemailForExtension();
+        }
     } catch (error: unknown) {
         console.error('Error loading voicemail tab:', error);
         showNotification('Failed to load extensions', 'error');
@@ -120,25 +129,89 @@ function updateVoicemailView(messages: VoicemailMessage[] | undefined, extension
     }).join('');
 }
 
+/**
+ * Fetch a voicemail recording as a blob URL.
+ *
+ * The audio endpoint requires authentication, and the admin API authenticates with a bearer
+ * token. Pointing an <audio src> or window.open() at it makes the browser issue its own
+ * request, which carries no Authorization header and is rejected. Fetching it here means the
+ * header travels with the request, and the caller gets a URL the browser will load.
+ *
+ * The caller must revoke the returned URL when finished, or the blob leaks for the lifetime
+ * of the page.
+ */
+async function fetchVoicemailAudio(extension: string, messageId: string): Promise<string> {
+    const API_BASE = getApiBaseUrl();
+    const response = await fetch(`${API_BASE}/api/voicemail/${extension}/${messageId}/audio`, {
+        headers: getAuthHeaders()
+    });
+
+    if (!response.ok) {
+        throw new Error(
+            response.status === 401
+                ? 'Not authorized to play this voicemail - try signing in again'
+                : `Could not fetch recording (HTTP ${response.status})`
+        );
+    }
+
+    return URL.createObjectURL(await response.blob());
+}
+
 export async function playVoicemail(extension: string, messageId: string): Promise<void> {
+    const player = document.getElementById('vm-audio-player') as HTMLAudioElement | null;
+    if (!player) {
+        showNotification('Audio player unavailable', 'error');
+        return;
+    }
+
+    let objectUrl: string | null = null;
     try {
-        const API_BASE = getApiBaseUrl();
-        const url = `${API_BASE}/api/voicemail/${extension}/${messageId}/audio`;
-        const player = document.getElementById('vm-audio-player') as HTMLAudioElement | null;
-        if (player) {
-            player.src = url;
-            player.play();
-        }
+        objectUrl = await fetchVoicemailAudio(extension, messageId);
+
+        // Release the previous recording's blob before replacing it.
+        if (player.dataset.objectUrl) URL.revokeObjectURL(player.dataset.objectUrl);
+        player.src = objectUrl;
+        player.dataset.objectUrl = objectUrl;
+
+        // Awaited so a playback failure is caught here rather than surfacing as an
+        // unhandled rejection -- and so the message is only marked read once it has
+        // actually started playing.
+        await player.play();
         await markVoicemailRead(extension, messageId);
     } catch (error: unknown) {
+        if (objectUrl) {
+            URL.revokeObjectURL(objectUrl);
+            delete player.dataset.objectUrl;
+        }
         console.error('Error playing voicemail:', error);
-        showNotification('Failed to play voicemail', 'error');
+        showNotification(
+            error instanceof Error ? error.message : 'Failed to play voicemail',
+            'error'
+        );
     }
 }
 
 export async function downloadVoicemail(extension: string, messageId: string): Promise<void> {
-    const API_BASE = getApiBaseUrl();
-    window.open(`${API_BASE}/api/voicemail/${extension}/${messageId}/audio?download=1`, '_blank');
+    let objectUrl: string | null = null;
+    try {
+        objectUrl = await fetchVoicemailAudio(extension, messageId);
+
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = `voicemail_${extension}_${messageId}.wav`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+    } catch (error: unknown) {
+        console.error('Error downloading voicemail:', error);
+        showNotification(
+            error instanceof Error ? error.message : 'Failed to download voicemail',
+            'error'
+        );
+    } finally {
+        // Safe to revoke immediately: the browser has already taken its own reference.
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+    }
 }
 
 export async function markVoicemailRead(extension: string, messageId: string): Promise<void> {
@@ -179,6 +252,11 @@ export function closeVoicemailPlayer(): void {
     const player = document.getElementById('vm-audio-player') as HTMLAudioElement | null;
     if (player) {
         player.pause();
+        // Release the recording's blob; without this it is held until the page reloads.
+        if (player.dataset.objectUrl) {
+            URL.revokeObjectURL(player.dataset.objectUrl);
+            delete player.dataset.objectUrl;
+        }
         player.src = '';
     }
     const playerSection = document.getElementById('voicemail-player-section') as HTMLElement | null;

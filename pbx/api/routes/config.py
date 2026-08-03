@@ -30,7 +30,8 @@ DEFAULT_DTMF_CONFIG = {
 
 # Default config structure to use when not authenticated or PBX not initialized
 DEFAULT_CONFIG = {
-    "smtp": {"host": "", "port": 587, "username": ""},
+    "smtp": {"host": "", "port": 587, "security": "starttls", "auth": "none", "username": ""},
+    "smtp_warnings": [],
     "email": {"from_address": ""},
     "email_notifications": False,
     "integrations": {},
@@ -67,13 +68,16 @@ def get_config() -> tuple[Response, int]:
 
     pbx_core = get_pbx_core()
     if pbx_core:
+        # Reported through SmtpSettings rather than raw config reads, so the UI shows the
+        # values the mailer actually resolved -- including ${VAR} substitution and defaults --
+        # with the password masked by redacted().
+        from pbx.mail import SmtpSettings
+
+        smtp_settings = SmtpSettings.from_dict(pbx_core.config.get("smtp", {}) or {})
         config_data = {
-            "smtp": {
-                "host": pbx_core.config.get("voicemail.smtp.host", ""),
-                "port": pbx_core.config.get("voicemail.smtp.port", 587),
-                "username": pbx_core.config.get("voicemail.smtp.username", ""),
-            },
-            "email": {"from_address": pbx_core.config.get("voicemail.email.from_address", "")},
+            "smtp": smtp_settings.redacted(),
+            "smtp_warnings": smtp_settings.validate(),
+            "email": {"from_address": smtp_settings.from_address},
             "email_notifications": pbx_core.config.get("voicemail.email_notifications", False),
             # Frontend integration loaders (Jitsi, Matrix, EspoCRM) require this field
             "integrations": pbx_core.config.get("integrations", {}),

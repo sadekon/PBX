@@ -214,3 +214,85 @@ class TestMessageSummary:
         assert summary["recipient_count"] == 2
         assert summary["recipient_domains"] == ["corp.local", "other.com"]
         assert "a@corp.local" not in str(summary)
+
+
+@pytest.mark.unit
+class TestRedirectAllMail:
+    """
+    smtp.redirect_to diverts every message to one address.
+
+    A testing aid for running against live extensions. It sits in build_message rather than
+    in any one feature so that emergency notification is diverted too -- a test 911 call
+    must not mail the real emergency contacts.
+    """
+
+    @pytest.fixture
+    def redirected(self):
+        return SmtpSettings(
+            host="mail.corp.local",
+            from_address="pbx@corp.local",
+            redirect_to="tester@corp.local",
+        )
+
+    def test_all_recipients_are_replaced(self, redirected):
+        message = build_message(
+            redirected,
+            ["alice@corp.local", "bob@corp.local"],
+            "Subject",
+            "body",
+            cc="carol@corp.local",
+            bcc="dave@corp.local",
+        )
+
+        delivery = " ".join(str(message.get(h) or "") for h in ("To", "Cc", "Bcc"))
+        assert delivery.strip() == "tester@corp.local"
+        for name in ("alice", "bob", "carol", "dave"):
+            assert name not in delivery
+
+    def test_original_recipients_are_recorded(self, redirected):
+        message = build_message(
+            redirected, "alice@corp.local", "Subject", "body", cc="bob@corp.local"
+        )
+
+        assert message["X-Original-To"] == "alice@corp.local, bob@corp.local"
+
+    def test_subject_is_marked(self, redirected):
+        message = build_message(redirected, "alice@corp.local", "New Voicemail", "body")
+
+        assert str(message["Subject"]).startswith("[REDIRECTED] ")
+
+    def test_emergency_style_message_is_also_diverted(self, redirected):
+        """The whole reason this lives in the transport layer."""
+        message = build_message(
+            redirected, "firechief@corp.local", "EMERGENCY ALERT", "body", importance="high"
+        )
+
+        assert message["To"] == "tester@corp.local"
+        assert message["Importance"] == "high"
+
+    def test_a_malformed_real_recipient_still_fails(self, redirected):
+        """Diversion must not paper over a broken address you are trying to test."""
+        with pytest.raises(EmailConfigError, match="Invalid To address"):
+            build_message(redirected, "not-an-address", "Subject", "body")
+
+    def test_invalid_redirect_address_is_rejected(self):
+        settings = SmtpSettings(
+            host="mail.corp.local", from_address="pbx@corp.local", redirect_to="nonsense"
+        )
+
+        with pytest.raises(EmailConfigError, match="redirect_to"):
+            build_message(settings, "alice@corp.local", "Subject", "body")
+
+    def test_nothing_changes_when_unset(self):
+        settings = SmtpSettings(host="mail.corp.local", from_address="pbx@corp.local")
+
+        message = build_message(settings, "alice@corp.local", "Subject", "body")
+
+        assert message["To"] == "alice@corp.local"
+        assert message["X-Original-To"] is None
+        assert str(message["Subject"]) == "Subject"
+
+    def test_validate_reports_it_loudly(self, redirected):
+        problems = redirected.validate()
+
+        assert any("ALL mail is being diverted" in p for p in problems)

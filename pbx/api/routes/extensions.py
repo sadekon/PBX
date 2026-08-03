@@ -47,6 +47,7 @@ def get_extensions() -> tuple[Response, int]:
                     "allow_external": e.config.get("allow_external", True),
                     "ad_synced": e.config.get("ad_synced", False),
                     "voicemail_enabled": e.config.get("voicemail_pin_hash") is not None,
+                    "voicemail_email_enabled": e.config.get("voicemail_email_enabled", True),
                     "is_admin": e.config.get("is_admin", False),
                     "did_number": e.config.get("did_number"),
                 }
@@ -77,6 +78,7 @@ def add_extension() -> tuple[Response, int]:
         voicemail_pin = body.get("voicemail_pin")
         is_admin = body.get("is_admin", False)
         did_number = body.get("did_number") or None
+        voicemail_email_enabled = body.get("voicemail_email_enabled", True)
 
         if not all([number, name, password]):
             return send_json({"error": "Missing required fields"}, 400), 400
@@ -86,7 +88,9 @@ def add_extension() -> tuple[Response, int]:
             return send_json({"error": "DID number must contain only digits"}, 400), 400
 
         if did_number and pbx_core.extension_db and pbx_core.extension_db.get_by_did(did_number):
-            return send_json({"error": "DID number is already assigned to another extension"}, 400), 400
+            return send_json(
+                {"error": "DID number is already assigned to another extension"}, 400
+            ), 400
 
         # SECURITY: Validate voicemail PIN is provided
         if not voicemail_pin:
@@ -134,6 +138,7 @@ def add_extension() -> tuple[Response, int]:
                 ad_username=None,
                 is_admin=is_admin,
                 did_number=did_number,
+                voicemail_email_enabled=bool(voicemail_email_enabled),
             )
         else:
             # Fall back to config.yml
@@ -166,6 +171,10 @@ def update_extension(number: str) -> tuple[Response, int]:
         is_admin = body.get("is_admin")
         # "" explicitly clears the DID; absent/None leaves it untouched
         did_number = body.get("did_number") if "did_number" in body else None
+        # Absent leaves the subscription untouched; present coerces to a real bool
+        voicemail_email_enabled = (
+            bool(body["voicemail_email_enabled"]) if "voicemail_email_enabled" in body else None
+        )
 
         # Check if extension exists
         extension = pbx_core.extension_registry.get(number)
@@ -215,6 +224,7 @@ def update_extension(number: str) -> tuple[Response, int]:
                 voicemail_pin=voicemail_pin,
                 is_admin=is_admin,
                 did_number=did_number,
+                voicemail_email_enabled=voicemail_email_enabled,
             )
         else:
             # Fall back to config.yml

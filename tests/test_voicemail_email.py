@@ -67,7 +67,77 @@ class TestNotificationContent:
         subject = box._notification_subject("5551234567", datetime(2026, 7, 30, 9, 15, tzinfo=UTC))
 
         assert "5551234567" in subject
-        assert "2026-07-30 09:15:00" in subject
+        assert "09:15 AM, July 30, 2026" in subject
+
+
+@pytest.mark.unit
+class TestTimestampFormat:
+    """Rendered as HH:MM AM/PM, Month DD, YYYY -- shared by subject, body and reminders."""
+
+    def test_morning(self):
+        assert (
+            VoicemailBox._format_timestamp(datetime(2026, 7, 30, 9, 15, tzinfo=UTC))
+            == "09:15 AM, July 30, 2026"
+        )
+
+    def test_afternoon_uses_twelve_hour_clock(self):
+        assert (
+            VoicemailBox._format_timestamp(datetime(2026, 12, 5, 14, 7, tzinfo=UTC))
+            == "02:07 PM, December 05, 2026"
+        )
+
+    def test_midnight_is_am(self):
+        assert VoicemailBox._format_timestamp(datetime(2026, 1, 1, 0, 0, tzinfo=UTC)).startswith(
+            "12:00 AM"
+        )
+
+    def test_non_datetime_passes_through(self):
+        assert VoicemailBox._format_timestamp("some string") == "some string"
+
+
+@pytest.mark.unit
+class TestCallerDisplay:
+    """An internal caller arrives as a bare number, which tells the recipient nothing."""
+
+    def test_known_extension_resolves_to_its_name(self, storage, config):
+        config.get_extension.side_effect = lambda n: (
+            {"number": "1001", "name": "Jane Smith"} if n == "1001" else None
+        )
+        box = VoicemailBox("1002", storage, config=config, mailer=RecordingMailer())
+
+        assert box._caller_display("1001") == "Jane Smith (1001)"
+
+    def test_unknown_caller_is_unchanged(self, storage, config):
+        config.get_extension.side_effect = lambda n: None
+        box = VoicemailBox("1002", storage, config=config, mailer=RecordingMailer())
+
+        assert box._caller_display("5551234567") == "5551234567"
+
+    def test_extension_without_a_name_is_unchanged(self, storage, config):
+        config.get_extension.side_effect = lambda n: {"number": "1001", "name": "   "}
+        box = VoicemailBox("1002", storage, config=config, mailer=RecordingMailer())
+
+        assert box._caller_display("1001") == "1001"
+
+    def test_empty_caller_id_is_unchanged(self, storage, config):
+        box = VoicemailBox("1002", storage, config=config, mailer=RecordingMailer())
+
+        assert box._caller_display("") == ""
+
+    def test_lookup_failure_does_not_lose_the_notification(self, storage, config):
+        """A broken lookup must cost the name, never the email."""
+        box = VoicemailBox("1002", storage, config=config, mailer=RecordingMailer())
+        # Set after construction: __init__ also reads the extension, to load the PIN.
+        config.get_extension.side_effect = RuntimeError("config exploded")
+
+        assert box._caller_display("1001") == "1001"
+
+    def test_non_string_name_is_ignored(self, storage, config):
+        """A DB/mock value that is not a string must not be interpolated into the email."""
+        config.get_extension.side_effect = lambda n: {"number": "1001", "name": object()}
+        box = VoicemailBox("1002", storage, config=config, mailer=RecordingMailer())
+
+        assert box._caller_display("1001") == "1001"
 
     def test_bad_template_falls_back_instead_of_losing_the_notification(self, storage):
         stub = MagicMock()
@@ -185,6 +255,25 @@ class TestDailyReminders:
         assert "5551111111" in body
         assert "5552222222" in body
         assert "2 unread voicemail messages" in body
+
+    def test_body_reports_the_total_when_some_are_already_read(self):
+        """Matches what the desk phone shows -- MWI advertises new and old counts."""
+        messages = [{"caller_id": "555", "timestamp": datetime(2026, 7, 30, 9, 0, tzinfo=UTC)}]
+
+        body = VoicemailSystem._reminder_body("1001", messages, total_count=3)
+
+        assert "1 unread voicemail message" in body
+        assert "3 in total" in body
+
+    def test_body_omits_the_total_when_it_repeats_the_unread_count(self):
+        messages = [{"caller_id": "555", "timestamp": datetime(2026, 7, 30, 9, 0, tzinfo=UTC)}]
+
+        assert "in total" not in VoicemailSystem._reminder_body("1001", messages, total_count=1)
+
+    def test_body_without_a_total_is_unchanged(self):
+        messages = [{"caller_id": "555", "timestamp": datetime(2026, 7, 30, 9, 0, tzinfo=UTC)}]
+
+        assert "in total" not in VoicemailSystem._reminder_body("1001", messages)
 
     def test_reminder_subject_is_singular_for_one_message(self):
         assert VoicemailSystem._reminder_subject(1).endswith("1 Unread Message")

@@ -63,6 +63,7 @@ describe('Voicemail Management', () => {
       document.getElementById(id).style.display = '';
     }
     document.getElementById('vm-current-extension').textContent = '';
+    localStorage.clear();
   });
 
   describe('loadVoicemailTab', () => {
@@ -145,6 +146,45 @@ describe('Voicemail Management', () => {
           })
         })
       );
+    });
+  });
+
+  describe('loadVoicemailTab preselection', () => {
+    const extensions = [
+      { number: '1001', name: 'John Doe' },
+      { number: '1002', name: 'Jane Smith' }
+    ];
+
+    it('preselects the signed-in extension and loads its messages', async () => {
+      localStorage.setItem('pbx_extension', '1002');
+      global.fetch
+        .mockResolvedValueOnce({ ok: true, json: async () => extensions })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ messages: [] }) });
+
+      await loadVoicemailTab();
+
+      expect(document.getElementById('vm-extension-select').value).toBe('1002');
+      // Second call is the message fetch for the preselected mailbox.
+      expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('leaves the placeholder selected when no extension is stored', async () => {
+      global.fetch.mockResolvedValueOnce({ ok: true, json: async () => extensions });
+
+      await loadVoicemailTab();
+
+      expect(document.getElementById('vm-extension-select').value).toBe('');
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('ignores a stored extension that is not in the list', async () => {
+      localStorage.setItem('pbx_extension', '9999');
+      global.fetch.mockResolvedValueOnce({ ok: true, json: async () => extensions });
+
+      await loadVoicemailTab();
+
+      expect(document.getElementById('vm-extension-select').value).toBe('');
+      expect(fetch).toHaveBeenCalledTimes(1);
     });
   });
 

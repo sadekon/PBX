@@ -400,7 +400,7 @@ class TestDeleteExtension:
 
 @pytest.mark.unit
 class TestUpdateEmailConfig:
-    """Tests for update_email_config method."""
+    """Tests for update_email_config. Transport now lives in the top-level smtp: section."""
 
     def test_update_smtp_config(self) -> None:
         """Test updating SMTP configuration."""
@@ -412,21 +412,26 @@ class TestUpdateEmailConfig:
                         "host": "smtp.example.com",
                         "port": 587,
                         "username": "user",
-                        "password": "pass",
                     }
                 }
             )
         assert result is True
-        assert config.config["voicemail"]["smtp"]["host"] == "smtp.example.com"
-        assert config.config["voicemail"]["smtp"]["port"] == 587
+        assert config.config["smtp"]["host"] == "smtp.example.com"
+        assert config.config["smtp"]["port"] == 587
 
-    def test_update_email_config_from_address(self) -> None:
-        """Test updating email from_address."""
+    def test_password_is_never_persisted(self) -> None:
+        """SMTP_PASSWORD is environment-only; a submitted password must be dropped."""
         config = _make_config({})
         with patch.object(config, "save", return_value=True):
-            result = config.update_email_config({"email": {"from_address": "pbx@example.com"}})
+            result = config.update_email_config({"smtp": {"host": "h", "password": "secret"}})
         assert result is True
-        assert config.config["voicemail"]["email"]["from_address"] == "pbx@example.com"
+        assert "password" not in config.config["smtp"]
+
+    def test_security_and_auth_are_validated(self) -> None:
+        config = _make_config({})
+        with patch.object(config, "save", return_value=True):
+            assert config.update_email_config({"smtp": {"security": "plaintext"}}) is False
+            assert config.update_email_config({"smtp": {"auth": "kerberos"}}) is False
 
     def test_update_email_notifications_flag(self) -> None:
         """Test updating email notifications flag."""
@@ -437,14 +442,15 @@ class TestUpdateEmailConfig:
         assert config.config["voicemail"]["email_notifications"] is True
 
     def test_update_email_config_preserves_existing(self) -> None:
-        """Test updating email config preserves existing voicemail settings."""
-        data = {"voicemail": {"smtp": {"host": "old.host"}}}
+        """Fields not present in the submission are left untouched."""
+        data = {"smtp": {"host": "old.host", "from_name": "Keep Me"}}
         config = _make_config(data)
         with patch.object(config, "save", return_value=True):
             result = config.update_email_config({"smtp": {"port": 465}})
         assert result is True
-        assert config.config["voicemail"]["smtp"]["host"] == "old.host"
-        assert config.config["voicemail"]["smtp"]["port"] == 465
+        assert config.config["smtp"]["host"] == "old.host"
+        assert config.config["smtp"]["from_name"] == "Keep Me"
+        assert config.config["smtp"]["port"] == 465
 
 
 @pytest.mark.unit

@@ -95,7 +95,7 @@ def test_extension_registry_reload_after_ad_sync() -> None:
 
 
 def test_reload_preserves_registration_state() -> None:
-    """Test that reloading registry clears registration state (expected behavior)"""
+    """Reloading the registry must not drop live SIP registrations."""
 
     from pbx.features.extensions import ExtensionRegistry
     from pbx.utils.config import Config
@@ -142,8 +142,11 @@ def test_reload_preserves_registration_state() -> None:
     # Now reload the registry
     registry.reload()
 
-    # Check that registration state is LOST (expected behavior - reload clears in-memory state)
-    # This is OK because registrations are transient and phones will re-register
+    # Registration must survive. This test previously asserted the opposite, on the
+    # assumption that "registrations are transient and phones will re-register" -- but a
+    # phone is never told the server forgot it, so one with a long registration interval
+    # stays unreachable until its own expiry. reload() runs after every admin edit.
     ext_after = registry.get("3001")
     assert ext_after is not None, "Extension should still exist after reload"
-    assert ext_after.registered is False, "Extension registration is cleared on reload (expected)"
+    assert ext_after.registered is True, "Registration must survive a config reload"
+    assert ext_after.address == ("192.168.1.100", 5060), "Contact address must survive reload"

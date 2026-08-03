@@ -508,6 +508,7 @@ class DatabaseBackend:
             extension VARCHAR(20) NOT NULL,
             user_agent VARCHAR(255),
             ip_address VARCHAR(50) NOT NULL,
+            sip_port INTEGER,
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             expires_at TIMESTAMP,
             UNIQUE(mac_address, extension),
@@ -684,6 +685,46 @@ class DatabaseBackend:
 
         return success
 
+    def _add_missing_columns(self, table: str, columns: list[tuple[str, str]]) -> None:
+        """
+        Add any of `columns` the table does not already have.
+
+        Idempotent, and non-critical by design: failing to add one column is logged and
+        skipped rather than aborting startup. Covers tables whose schema predates Alembic,
+        and acts as a safety net for columns the query layer names explicitly -- a column
+        missing there would fail every lookup against the table.
+
+        Args:
+            table: Table name.
+            columns: (name, type) pairs, e.g. [("sip_port", "INTEGER")].
+        """
+        check_query = """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name=%s AND column_name=%s
+        """
+
+        for column_name, column_type in columns:
+            try:
+                cursor = self.connection.cursor()
+                cursor.execute(check_query, (table, column_name))
+                exists = cursor.fetchone() is not None
+                cursor.close()
+
+                if exists:
+                    self.logger.debug(f"Column {column_name} already exists in {table}")
+                    continue
+
+                self.logger.info(f"Adding column to {table}: {column_name}")
+                self._execute_with_context(
+                    f"ALTER TABLE {table} ADD COLUMN {column_name} {column_type}",
+                    f"add column {column_name} to {table}",
+                    critical=False,
+                )
+            except Exception as e:
+                self.logger.debug(f"Column check/add for {column_name} in {table}: {e}")
+                self._safe_rollback()
+
     def _migrate_schema(self) -> None:
         """
         Migrate database schema to add new columns
@@ -700,34 +741,7 @@ class DatabaseBackend:
             ("transcribed_at", "TIMESTAMP"),
         ]
 
-        for column_name, column_type in transcription_columns:
-            # Check if column exists
-            check_query = """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name='voicemail_messages' AND column_name=%s
-            """
-
-            try:
-                cursor = self.connection.cursor()
-                cursor.execute(check_query, (column_name,))
-                exists = cursor.fetchone() is not None
-                cursor.close()
-
-                if not exists:
-                    # Add column
-                    alter_query = (
-                        f"ALTER TABLE voicemail_messages ADD COLUMN {column_name} {column_type}"
-                    )
-                    self.logger.info(f"Adding column: {column_name}")
-                    self._execute_with_context(
-                        alter_query, f"add column {column_name}", critical=False
-                    )
-                else:
-                    self.logger.debug(f"Column {column_name} already exists")
-            except Exception as e:
-                self.logger.debug(f"Column check/add for {column_name}: {e}")
-                self._safe_rollback()
+        self._add_missing_columns("voicemail_messages", transcription_columns)
 
         # Migration: Add security columns to extensions table
         extensions_columns = [
@@ -741,34 +755,19 @@ class DatabaseBackend:
             ("failed_login_attempts", "INTEGER DEFAULT 0"),
             ("account_locked_until", "TIMESTAMP"),
             ("sip_password", "VARCHAR(255)"),  # SIP authentication password for phone provisioning
+            # Per-extension subscription to voicemail notification email. Defaults TRUE so
+            # rows predating the column keep the notifications they already received.
+            # Also created by alembic revision 004; kept here because the extension SELECTs
+            # name this column explicitly, so a database missing it would fail every lookup.
+            ("voicemail_email_enabled", "BOOLEAN DEFAULT TRUE"),
         ]
 
-        for column_name, column_type in extensions_columns:
-            # Check if column exists
-            check_query = """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name='extensions' AND column_name=%s
-            """
+        self._add_missing_columns("extensions", extensions_columns)
 
-            try:
-                cursor = self.connection.cursor()
-                cursor.execute(check_query, (column_name,))
-                exists = cursor.fetchone() is not None
-                cursor.close()
-
-                if not exists:
-                    # Add column
-                    alter_query = f"ALTER TABLE extensions ADD COLUMN {column_name} {column_type}"
-                    self.logger.info(f"Adding column to extensions: {column_name}")
-                    self._execute_with_context(
-                        alter_query, f"add column {column_name} to extensions", critical=False
-                    )
-                else:
-                    self.logger.debug(f"Column {column_name} already exists in extensions")
-            except Exception as e:
-                self.logger.debug(f"Column check/add for {column_name} in extensions: {e}")
-                self._safe_rollback()
+        # Migration: Add the registering port to registered_phones. Without it the call
+        # router has to assume 5060 when recovering a registration, which silently sends
+        # INVITEs to the wrong port for any phone that registers from another port.
+        self._add_missing_columns("registered_phones", [("sip_port", "INTEGER")])
 
         # Migration: Add device_type column to provisioned_devices table
         device_type_column = ("device_type", "VARCHAR(20) DEFAULT 'phone'")
@@ -914,7 +913,15 @@ class VIPCallerDB:
 
 
 class RegisteredPhonesDB:
-    """Registered phones database operations"""
+    """Registered phone (SIP endpoint) database operations"""
+
+    # Columns every phone lookup returns. Declared once so the queries below cannot drift
+    # apart -- sip_port in particular has to reach the call router, which needs the port the
+    # phone actually registered from, not an assumed 5060.
+    _PHONE_COLUMNS = (
+        "id, mac_address, extension AS extension_number, user_agent, "
+        "ip_address, sip_port, registered_at"
+    )
 
     def __init__(self, db: DatabaseBackend) -> None:
         """
@@ -933,6 +940,7 @@ class RegisteredPhonesDB:
         mac_address: str | None = None,
         user_agent: str | None = None,
         contact_uri: str | None = None,
+        sip_port: int | None = None,
     ) -> tuple[bool, str | None]:
         """
         Register or update a phone registration
@@ -943,6 +951,8 @@ class RegisteredPhonesDB:
             mac_address: MAC address (optional, can be None)
             user_agent: User-Agent header from SIP message
             contact_uri: Contact URI from SIP message
+            sip_port: Port the phone registered from. Stored so the call router can reach
+                it after a restart; phones do not always use 5060.
 
         Returns:
             tuple[bool, str | None]: Success status and the actual MAC address stored (or None)
@@ -1000,16 +1010,18 @@ class RegisteredPhonesDB:
             updated_user_agent = (
                 user_agent if user_agent is not None else existing.get("user_agent")
             )
+            updated_port = sip_port if sip_port is not None else existing.get("sip_port")
 
             query = """
             UPDATE registered_phones
-            SET mac_address = %s, ip_address = %s, user_agent = %s
+            SET mac_address = %s, ip_address = %s, user_agent = %s, sip_port = %s
             WHERE id = %s
             """
             params = (
                 updated_mac,
                 updated_ip,
                 updated_user_agent,
+                updated_port,
                 existing["id"],
             )
             success = self.db.execute(query, params)
@@ -1017,10 +1029,10 @@ class RegisteredPhonesDB:
         # Insert new registration
         query = """
             INSERT INTO registered_phones
-            (mac_address, extension, ip_address, user_agent)
-            VALUES (%s, %s, %s, %s)
+            (mac_address, extension, ip_address, user_agent, sip_port)
+            VALUES (%s, %s, %s, %s, %s)
             """
-        params = (mac_address, extension_number, ip_address, user_agent)
+        params = (mac_address, extension_number, ip_address, user_agent, sip_port)
         success = self.db.execute(query, params)
         return (success, mac_address)
 
@@ -1036,13 +1048,13 @@ class RegisteredPhonesDB:
             dict: Phone registration data or None
         """
         if extension_number:
-            query = """
-            SELECT id, mac_address, extension as extension_number, user_agent, ip_address, registered_at FROM registered_phones
+            query = f"""
+            SELECT {self._PHONE_COLUMNS} FROM registered_phones
             WHERE mac_address = %s AND extension = %s
             """
             return self.db.fetch_one(query, (mac_address, extension_number))
-        query = """
-            SELECT id, mac_address, extension as extension_number, user_agent, ip_address, registered_at FROM registered_phones WHERE mac_address = %s
+        query = f"""
+            SELECT {self._PHONE_COLUMNS} FROM registered_phones WHERE mac_address = %s
             """
         return self.db.fetch_one(query, (mac_address,))
 
@@ -1058,13 +1070,13 @@ class RegisteredPhonesDB:
             dict: Phone registration data or None
         """
         if extension_number:
-            query = """
-            SELECT id, mac_address, extension as extension_number, user_agent, ip_address, registered_at FROM registered_phones
+            query = f"""
+            SELECT {self._PHONE_COLUMNS} FROM registered_phones
             WHERE ip_address = %s AND extension = %s
             """
             return self.db.fetch_one(query, (ip_address, extension_number))
-        query = """
-            SELECT id, mac_address, extension as extension_number, user_agent, ip_address, registered_at FROM registered_phones WHERE ip_address = %s
+        query = f"""
+            SELECT {self._PHONE_COLUMNS} FROM registered_phones WHERE ip_address = %s
             """
         return self.db.fetch_one(query, (ip_address,))
 
@@ -1078,8 +1090,8 @@ class RegisteredPhonesDB:
         Returns:
             list: list of phone registration data
         """
-        query = """
-        SELECT id, mac_address, extension as extension_number, user_agent, ip_address, registered_at FROM registered_phones
+        query = f"""
+        SELECT {self._PHONE_COLUMNS} FROM registered_phones
         WHERE extension = %s
         ORDER BY registered_at DESC
         """
@@ -1092,8 +1104,8 @@ class RegisteredPhonesDB:
         Returns:
             list: list of all phone registrations
         """
-        query = """
-        SELECT id, mac_address, extension as extension_number, user_agent, ip_address, registered_at FROM registered_phones
+        query = f"""
+        SELECT {self._PHONE_COLUMNS} FROM registered_phones
         ORDER BY registered_at DESC
         """
         return self.db.fetch_all(query)
@@ -1245,6 +1257,8 @@ class ExtensionDB:
         is_admin: bool = False,
         sip_password: str | None = None,
         did_number: str | None = None,
+        *,
+        voicemail_email_enabled: bool = True,
     ) -> bool:
         """
         Add a new extension
@@ -1261,6 +1275,7 @@ class ExtensionDB:
             is_admin: Whether extension has admin privileges (optional)
             sip_password: SIP authentication password for phone provisioning (optional)
             did_number: Carrier-assigned DID this extension answers directly (optional)
+            voicemail_email_enabled: Whether new voicemail is emailed to `email` (optional)
 
         Returns:
             bool: True if successful
@@ -1274,8 +1289,8 @@ class ExtensionDB:
             return False
 
         query = """
-        INSERT INTO extensions (number, name, email, password_hash, allow_external, voicemail_pin_hash, voicemail_pin_salt, ad_synced, ad_username, is_admin, sip_password, did_number)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO extensions (number, name, email, password_hash, allow_external, voicemail_pin_hash, voicemail_pin_salt, ad_synced, ad_username, is_admin, sip_password, did_number, voicemail_email_enabled)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         return self.db.execute(
@@ -1293,6 +1308,7 @@ class ExtensionDB:
                 is_admin,
                 sip_password,
                 did_number,
+                voicemail_email_enabled,
             ),
         )
 
@@ -1307,7 +1323,7 @@ class ExtensionDB:
             dict: Extension data or None
         """
         query = """
-        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions WHERE number = %s
+        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, voicemail_email_enabled, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions WHERE number = %s
         """
         return self.db.fetch_one(query, (number,))
 
@@ -1322,7 +1338,7 @@ class ExtensionDB:
             dict: Extension data or None
         """
         query = """
-        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions WHERE did_number = %s
+        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, voicemail_email_enabled, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions WHERE did_number = %s
         """
         return self.db.fetch_one(query, (did_number,))
 
@@ -1334,7 +1350,7 @@ class ExtensionDB:
             list: list of all extensions
         """
         query = """
-        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions ORDER BY number
+        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, voicemail_email_enabled, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions ORDER BY number
         """
         return self.db.fetch_all(query)
 
@@ -1346,7 +1362,7 @@ class ExtensionDB:
             list: list of AD-synced extensions
         """
         query = """
-        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions WHERE ad_synced = %s ORDER BY number
+        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, voicemail_email_enabled, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions WHERE ad_synced = %s ORDER BY number
         """
         return self.db.fetch_all(query, (True,))
 
@@ -1363,6 +1379,8 @@ class ExtensionDB:
         is_admin: bool | None = None,
         sip_password: str | None = None,
         did_number: str | None = None,
+        *,
+        voicemail_email_enabled: bool | None = None,
     ) -> bool:
         """
         Update an extension
@@ -1381,6 +1399,7 @@ class ExtensionDB:
             did_number: Carrier-assigned DID this extension answers directly (optional).
                 An empty string clears it back to NULL; None leaves it untouched
                 (same convention every other field here uses).
+            voicemail_email_enabled: Whether new voicemail is emailed to `email` (optional)
 
         Returns:
             bool: True if successful
@@ -1439,6 +1458,10 @@ class ExtensionDB:
             updates.append("did_number = %s")
             params.append(did_number if did_number != "" else None)
 
+        if voicemail_email_enabled is not None:
+            updates.append("voicemail_email_enabled = %s")
+            params.append(voicemail_email_enabled)
+
         if not updates:
             return True  # Nothing to update
 
@@ -1483,7 +1506,7 @@ class ExtensionDB:
         """
         search_pattern = f"%{query_str}%"
         query = """
-        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, did_number FROM extensions
+        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, voicemail_email_enabled, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, did_number FROM extensions
         WHERE number LIKE %s OR name LIKE %s OR email LIKE %s
         ORDER BY number
         """

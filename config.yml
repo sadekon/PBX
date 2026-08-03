@@ -399,6 +399,10 @@ smtp:
   timeout: 10
   max_retries: 3
   max_attachment_bytes: 8388608  # 8 MB; Exchange's default receive limit is 10 MB
+  # TESTING ONLY. When set, every email -- voicemail, reminders and emergency notification --
+  # is diverted to this address instead of its real recipients, with the original recipients
+  # kept in an X-Original-To header. Leave empty in production.
+  redirect_to: ${SMTP_REDIRECT_TO}
 voicemail:
   storage_path: voicemail
   max_message_duration: 180

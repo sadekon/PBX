@@ -174,9 +174,7 @@ class CallRouter:
         # with zero DID-specific code.
         if pbx.queue_handler.is_queue_destination(to_ext):
             return bool(
-                pbx.queue_handler.handle_queue_entry(
-                    from_ext, to_ext, call_id, message, from_addr
-                )
+                pbx.queue_handler.handle_queue_entry(from_ext, to_ext, call_id, message, from_addr)
             )
 
         # Check if destination extension is registered and not expired,
@@ -623,7 +621,9 @@ class CallRouter:
                 db_phone = db_phones[0] if db_phones else None
                 if db_phone and db_phone.get("ip_address"):
                     phone_ip = db_phone["ip_address"]
-                    phone_port = 5060  # Default SIP port
+                    # Use the port the phone actually registered from. Older rows predate
+                    # the column, so fall back to the default rather than skipping recovery.
+                    phone_port = int(db_phone.get("sip_port") or 5060)
                     # Ensure the extension object exists in registry
                     if not dest_ext and pbx.extension_db:
                         db_ext = pbx.extension_db.get(to_ext)

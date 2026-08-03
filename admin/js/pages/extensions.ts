@@ -14,6 +14,7 @@ interface Extension {
     registered: boolean;
     allow_external: boolean;
     voicemail_enabled?: boolean;
+    voicemail_email_enabled?: boolean;
     ad_synced?: boolean;
     is_admin?: boolean;
     did_number?: string | null;
@@ -101,6 +102,8 @@ export function editExtension(number: string): void {
     if (el('edit-ext-name')) (el('edit-ext-name') as HTMLInputElement).value = ext.name;
     if (el('edit-ext-email')) (el('edit-ext-email') as HTMLInputElement).value = ext.email ?? '';
     if (el('edit-ext-did-number')) (el('edit-ext-did-number') as HTMLInputElement).value = ext.did_number ?? '';
+    // Absent means an extension predating the column, which was being emailed already.
+    if (el('edit-ext-voicemail-email-enabled')) (el('edit-ext-voicemail-email-enabled') as HTMLInputElement).checked = ext.voicemail_email_enabled ?? true;
     if (el('edit-ext-allow-external')) (el('edit-ext-allow-external') as HTMLInputElement).checked = Boolean(ext.allow_external);
     if (el('edit-ext-is-admin')) (el('edit-ext-is-admin') as HTMLInputElement).checked = Boolean(ext.is_admin);
     if (el('edit-ext-password')) (el('edit-ext-password') as HTMLInputElement).value = '';
@@ -198,6 +201,7 @@ export function initExtensionForms(): void {
                 did_number: val('new-ext-did-number'),
                 allow_external: chk('new-ext-allow-external'),
                 is_admin: chk('new-ext-is-admin'),
+                voicemail_email_enabled: chk('new-ext-voicemail-email-enabled'),
             };
 
             try {
@@ -241,6 +245,7 @@ export function initExtensionForms(): void {
                 did_number: val('edit-ext-did-number'),
                 allow_external: chk('edit-ext-allow-external'),
                 is_admin: chk('edit-ext-is-admin'),
+                voicemail_email_enabled: chk('edit-ext-voicemail-email-enabled'),
             };
             // Only send password/pin if the user entered a value
             if (password) data.password = password;
