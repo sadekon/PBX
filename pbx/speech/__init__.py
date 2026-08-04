@@ -51,4 +51,8 @@ def build_backend(settings: TranscriptionSettings, logger: object | None = None)
         from pbx.speech.backends.vosk import VoskBackend
 
         return VoskBackend(settings, logger=logger)
+    if settings.provider == "faster-whisper":
+        from pbx.speech.backends.whisper import WhisperBackend
+
+        return WhisperBackend(settings, logger=logger)
     return None

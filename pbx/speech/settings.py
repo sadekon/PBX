@@ -27,14 +27,32 @@ DEFAULT_LANGUAGE: Final[str] = "en-US"
 DEFAULT_MAX_AUDIO_SECONDS: Final[int] = 300
 DEFAULT_VOSK_MODEL_PATH: Final[str] = "models/vosk-model-small-en-us-0.15"
 DEFAULT_QUEUE_SIZE: Final[int] = 32
-DEFAULT_DEADLINE_SECONDS: Final[float] = 30.0
+
+DEFAULT_WHISPER_MODEL: Final[str] = "small.en"
+DEFAULT_WHISPER_MODEL_DIR: Final[str] = "models/whisper/small.en"
+DEFAULT_WHISPER_COMPUTE_TYPE: Final[str] = "int8"
+#: CTranslate2 quantisations that make sense on a CPU-only PBX. float16 is a GPU type and
+#: silently falls back, which looks like a working config that is quietly slower.
+WHISPER_COMPUTE_TYPES: Final[tuple[str, ...]] = ("int8", "int8_float32", "float32")
+#: How long a notification waits for its transcript. At the measured RTF of ~0.47 for
+#: whisper small.en this covers roughly two minutes of audio, so a normal voicemail --
+#: plus one queued ahead of it -- still gets its transcript into the email. Anything
+#: slower emails immediately without one; the transcript still reaches the database.
+DEFAULT_DEADLINE_SECONDS: Final[float] = 60.0
 
 #: Providers with a backend behind them. Google Cloud Speech was previously named here, but
 #: ``google-cloud-speech`` has never been a dependency of this project, so that path could not
 #: have run on any standard install -- the import guard simply reported it unavailable. A
 #: config still asking for it is now told so by validate(), and degrades to no transcripts
 #: rather than to a silent no-op.
-KNOWN_PROVIDERS: Final[tuple[str, ...]] = ("vosk",)
+KNOWN_PROVIDERS: Final[tuple[str, ...]] = ("vosk", "faster-whisper")
+
+#: Accepted spellings for the whisper provider, normalised to ``faster-whisper``. The engine
+#: is faster-whisper; "whisper" is what everyone types.
+_PROVIDER_ALIASES: Final[dict[str, str]] = {
+    "whisper": "faster-whisper",
+    "faster_whisper": "faster-whisper",
+}
 
 
 def _is_unresolved(value: str) -> bool:
@@ -103,6 +121,24 @@ class TranscriptionSettings:
     max_audio_seconds: int = DEFAULT_MAX_AUDIO_SECONDS
     vosk_model_path: str = DEFAULT_VOSK_MODEL_PATH
 
+    #: Whisper model name. ``.en`` variants are English-only and are both faster and better
+    #: than the multilingual model of the same size on English telephony.
+    whisper_model: str = DEFAULT_WHISPER_MODEL
+    #: Directory holding the converted CTranslate2 model. Set this: with it, the model loads
+    #: with ``local_files_only`` and a missing model fails loudly at startup. Without it,
+    #: faster-whisper reaches for HuggingFace from a daemon thread on a production PBX.
+    whisper_model_dir: str = DEFAULT_WHISPER_MODEL_DIR
+    whisper_compute_type: str = DEFAULT_WHISPER_COMPUTE_TYPE
+    #: Threads *inside* one transcription. CTranslate2 defaults to every core, which would
+    #: starve the RTP relay threads; 1 is the measured-safe value and the RTF above is quoted
+    #: at it. Raise only with `workers` at 1 and a spare core to give away.
+    whisper_cpu_threads: int = 1
+    #: 1 is greedy decoding. Beam search multiplies runtime for a marginal gain on clean audio.
+    whisper_beam_size: int = 1
+    #: Silero VAD, which drops non-speech before the decoder sees it. Turning this off invites
+    #: confident hallucinated sentences on every silent voicemail -- see backends/whisper.py.
+    whisper_vad_filter: bool = True
+
     #: Worker threads. 0 means run inline on the caller's thread -- used by tests, and a
     #: legitimate production choice for a box that would rather block than queue.
     workers: int = 1
@@ -119,6 +155,7 @@ class TranscriptionSettings:
         warnings: list[str] = []
 
         provider = _as_str(section.get("provider"), "vosk").lower()
+        provider = _PROVIDER_ALIASES.get(provider, provider)
         if provider not in KNOWN_PROVIDERS:
             warnings.append(
                 f"{CONFIG_SECTION}.provider {provider!r} is not one of "
@@ -142,6 +179,14 @@ class TranscriptionSettings:
             language=_as_str(section.get("language"), DEFAULT_LANGUAGE),
             max_audio_seconds=_as_int(section.get("max_audio_seconds"), DEFAULT_MAX_AUDIO_SECONDS),
             vosk_model_path=_as_str(section.get("vosk_model_path"), DEFAULT_VOSK_MODEL_PATH),
+            whisper_model=_as_str(section.get("whisper_model"), DEFAULT_WHISPER_MODEL),
+            whisper_model_dir=_as_str(section.get("whisper_model_dir"), DEFAULT_WHISPER_MODEL_DIR),
+            whisper_compute_type=_as_str(
+                section.get("whisper_compute_type"), DEFAULT_WHISPER_COMPUTE_TYPE
+            ).lower(),
+            whisper_cpu_threads=_as_int(section.get("whisper_cpu_threads"), 1),
+            whisper_beam_size=_as_int(section.get("whisper_beam_size"), 1),
+            whisper_vad_filter=_as_bool(section.get("whisper_vad_filter"), True),
             workers=workers,
             queue_size=_as_int(section.get("queue_size"), DEFAULT_QUEUE_SIZE),
             deadline_seconds=_as_float(section.get("deadline_seconds"), DEFAULT_DEADLINE_SECONDS),
@@ -177,6 +222,49 @@ class TranscriptionSettings:
                     f"{CONFIG_SECTION}.vosk_model_path {self.vosk_model_path!r} is relative; "
                     "prefer an absolute path so a service unit's working directory cannot "
                     "change which model is loaded"
+                )
+
+        if self.provider == "faster-whisper":
+            if not self.whisper_model:
+                problems.append(f"{CONFIG_SECTION}.whisper_model is not set")
+            if self.whisper_model_dir and not Path(self.whisper_model_dir).is_dir():
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_model_dir {self.whisper_model_dir!r} does not "
+                    "exist; stage it with scripts/install_whisper_model.py"
+                )
+            elif not self.whisper_model_dir:
+                # Not fatal, but it means a ~250 MB HuggingFace fetch from a daemon thread the
+                # first time a voicemail arrives, on a host that may have no outbound internet.
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_model_dir is not set; the model will be "
+                    "downloaded from HuggingFace at first use instead of loading locally"
+                )
+            if self.whisper_compute_type not in WHISPER_COMPUTE_TYPES:
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_compute_type {self.whisper_compute_type!r} is "
+                    f"not one of {', '.join(WHISPER_COMPUTE_TYPES)}"
+                )
+            # Caught at startup rather than per message: an .en model given Spanish audio does
+            # not fail, it transcribes confident nonsense, which is far harder to notice.
+            if self.whisper_model.endswith(".en") and not self.language.lower().startswith("en"):
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_model {self.whisper_model!r} is English-only but "
+                    f"language is {self.language!r}; use a multilingual model such as "
+                    f"{self.whisper_model.removesuffix('.en')!r}"
+                )
+            if self.whisper_cpu_threads <= 0:
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_cpu_threads {self.whisper_cpu_threads} "
+                    "must be positive"
+                )
+            if self.whisper_beam_size <= 0:
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_beam_size {self.whisper_beam_size} must be positive"
+                )
+            if not self.whisper_vad_filter:
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_vad_filter is off; whisper will hallucinate "
+                    "sentences on silent recordings"
                 )
 
         if self.max_audio_seconds <= 0:

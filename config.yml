@@ -232,10 +232,30 @@ features:
     # transcribe. Turn it on once the model is in place -- if it is enabled but the model
     # cannot be loaded, the PBX says so once at startup instead of failing per message.
     enabled: true
-    provider: vosk              # Provider: 'vosk' (free, offline). Currently the only one.
+    # Provider: 'vosk' or 'faster-whisper'. Both are free and fully offline.
+    #   vosk           faster (measured RTF ~0.27), no punctuation, no capitalisation.
+    #   faster-whisper slower (RTF ~0.47 for small.en) but markedly more accurate on 8 kHz
+    #                  phone audio, and it punctuates and capitalises. Needs its model staged
+    #                  first: python scripts/install_whisper_model.py
+    provider: faster-whisper
     language: en-US             # Language code passed to the recognizer
     max_audio_seconds: 300      # Skip recordings longer than this rather than occupy a core
     vosk_model_path: models/vosk-model-small-en-us-0.15  # Path to Vosk model (download from https://alphacephei.com/vosk/models)
+    # --- faster-whisper settings (ignored unless provider is faster-whisper) ---
+    whisper_model: small.en     # tiny.en | base.en | small.en | medium.en -- see --list
+    # Directory holding the converted model, staged by scripts/install_whisper_model.py.
+    # Leave it set: with it, the model loads locally and a missing one is a startup warning.
+    # Blank it and faster-whisper fetches ~250 MB from HuggingFace the first time a voicemail
+    # arrives, from a background thread, on a host that may have no outbound internet.
+    whisper_model_dir: models/whisper/
+    whisper_compute_type: int8  # int8 | int8_float32 | float32. int8 is ~4x smaller and fine.
+    # Threads used *inside* one transcription. CTranslate2 defaults to every core, which would
+    # starve the RTP relay threads carrying live audio. The RTF above is measured at 1.
+    whisper_cpu_threads: 1
+    whisper_beam_size: 1        # 1 is greedy. Beam search costs multiples for a marginal gain.
+    # Silero VAD, which drops non-speech before the decoder sees it. Leave this on: without it
+    # whisper emits confident invented sentences ("Thank you.") on every silent recording.
+    whisper_vad_filter: true
     # Transcription runs on its own background thread(s), off the call-teardown path.
     # Keep `workers` low: each one is CPU-bound and competes with the RTP relay threads that
     # carry live audio. Values above (cores - 2) are capped automatically. 0 runs the job
@@ -245,7 +265,7 @@ features:
     # How long the notification email waits for a transcript before going out without one.
     # Bounds the wait, not the work: a running recognition cannot be cancelled, and a late
     # transcript is still written to the database.
-    deadline_seconds: 30
+    deadline_seconds: 60
 
   # Webhook System - Event-driven integrations
   webhooks:

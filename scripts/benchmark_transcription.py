@@ -40,7 +40,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 try:
     from pbx.speech import TranscriptionSettings, build_backend
-    from pbx.speech.settings import DEFAULT_VOSK_MODEL_PATH
+    from pbx.speech.settings import DEFAULT_DEADLINE_SECONDS, DEFAULT_VOSK_MODEL_PATH
     from pbx.utils.audio import read_wav_as_pcm16, resample_pcm16
 except ModuleNotFoundError as exc:
     _venv = _REPO_ROOT / ".venv" / "bin" / "python"
@@ -134,11 +134,18 @@ class WhisperRunner:
 
         self.label = f"whisper:{model_name}"
         kwargs: dict[str, Any] = {"compute_type": "int8", "cpu_threads": threads}
+        # A directory staged by scripts/install_whisper_model.py is passed as the model *id*,
+        # not as a cache root: `download_model` writes a flat converted model, whereas
+        # `download_root` expects HuggingFace's own cache layout. Getting these two confused
+        # produces a "model not found" against a directory that plainly contains the model.
+        target = model_name
         if model_dir:
-            # Never reach for HuggingFace at runtime on a production PBX.
-            kwargs["download_root"] = model_dir
+            staged = Path(model_dir).expanduser()
+            if not (staged / "model.bin").is_file():
+                staged = staged / model_name
+            target = str(staged)
             kwargs["local_files_only"] = True
-        self.model = WhisperModel(model_name, device="cpu", **kwargs)
+        self.model = WhisperModel(target, device="cpu", **kwargs)
 
     def run(self, path: Path, pcm16: bytes, rate: int) -> str:
         import numpy as np
@@ -185,7 +192,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="small.en",
         help="Comma-separated whisper models to compare, e.g. tiny.en,base.en,small.en",
     )
-    parser.add_argument("--whisper-model-dir", help="Local model directory (no HuggingFace)")
+    parser.add_argument(
+        "--whisper-model-dir",
+        help="Directory staged by scripts/install_whisper_model.py (no HuggingFace fetch)",
+    )
     parser.add_argument("--vosk-model", default=DEFAULT_VOSK_MODEL_PATH, help="Vosk model path")
     parser.add_argument("--threads", type=int, default=1, help="cpu_threads for whisper")
     parser.add_argument("--limit", type=int, default=10, help="Maximum recordings to process")
@@ -204,10 +214,13 @@ def main(argv: list[str] | None = None) -> int:
     engines = [e.strip() for e in args.engines.split(",") if e.strip()]
     runners: list[Any] = []
 
+    # Loading catches broadly on purpose. A model name that does not exist, a failed
+    # download or an unreadable cache raises whatever huggingface_hub or ctranslate2 feels
+    # like -- and one bad model must not throw away the measurements for the others.
     if "vosk" in engines:
         try:
             runners.append(VoskRunner(args.vosk_model))
-        except RuntimeError as e:
+        except Exception as e:
             _log(f"skipping vosk: {e}")
 
     if "whisper" in engines:
@@ -215,8 +228,8 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 _log(f"loading {name}...")
                 runners.append(WhisperRunner(name, args.whisper_model_dir, args.threads))
-            except RuntimeError as e:
-                _log(f"skipping whisper:{name}: {e}")
+            except Exception as e:
+                _log(f"skipping whisper:{name}: {type(e).__name__}: {e}")
 
     if not runners:
         print("error: no engine could be loaded", file=sys.stderr)
@@ -259,8 +272,10 @@ def main(argv: list[str] | None = None) -> int:
         wall = sum(e for e, _ in runs)
         audio = sum(d for _, d in runs)
         rtf = wall / audio if audio else 0.0
-        # A 60 s voicemail against the 30 s notification deadline is the practical test.
-        verdict = "ok" if rtf * 60 <= 30 else f"a 60s message takes {rtf * 60:.0f}s"
+        # A 60 s voicemail against the notification deadline is the practical test: past
+        # it, the email goes out without a transcript and the async machine bought nothing.
+        takes = rtf * 60
+        verdict = "ok" if takes <= DEFAULT_DEADLINE_SECONDS else f"a 60s message takes {takes:.0f}s"
         print(f"{label:<18} {audio:7.1f}s {wall:7.1f}s {rtf:6.2f}   {verdict}")
 
     peak = _peak_rss_mb()
@@ -268,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nPeak RSS for this process: {peak:,.0f} MiB (all engines loaded at once)")
     print(
         "\nRTF is processing seconds per audio second. The deadline that matters is\n"
-        "features.voicemail_transcription.deadline_seconds (default 30)."
+        f"features.voicemail_transcription.deadline_seconds (default {DEFAULT_DEADLINE_SECONDS:.0f})."
     )
     return 0
 

@@ -116,7 +116,9 @@ class TestSettings:
         assert any("exceeds the safe ceiling" in w for w in settings.config_warnings)
 
     def test_unknown_provider_is_reported(self) -> None:
-        settings = TranscriptionSettings.from_dict({"enabled": True, "provider": "whisper"})
+        # "google" specifically: it was a documented provider until google-cloud-speech turned
+        # out never to have been a dependency, so old config.yml files still name it.
+        settings = TranscriptionSettings.from_dict({"enabled": True, "provider": "google"})
 
         assert any("is not one of" in w for w in settings.config_warnings)
         assert any("not supported" in p for p in settings.validate())
@@ -148,6 +150,74 @@ class TestSettings:
 
         assert redacted["provider"] == "vosk"
         assert "config_warnings" not in redacted
+
+    @pytest.mark.parametrize("spelling", ["whisper", "faster_whisper", "Faster-Whisper"])
+    def test_whisper_provider_spellings_are_normalised(self, spelling: str) -> None:
+        """The engine is faster-whisper; "whisper" is what everyone types."""
+        settings = TranscriptionSettings.from_dict({"enabled": True, "provider": spelling})
+
+        assert settings.provider == "faster-whisper"
+        assert not settings.config_warnings
+
+    def test_whisper_defaults(self) -> None:
+        settings = TranscriptionSettings.from_dict({"provider": "faster-whisper"})
+
+        assert settings.whisper_model == "small.en"
+        assert settings.whisper_compute_type == "int8"
+        # 1 each: CTranslate2 otherwise takes every core and starves the RTP relay threads.
+        assert settings.whisper_cpu_threads == 1
+        assert settings.whisper_beam_size == 1
+        assert settings.whisper_vad_filter
+
+    def test_missing_whisper_model_dir_is_reported(self) -> None:
+        problems = _settings(provider="faster-whisper", whisper_model_dir="/nonexistent").validate()
+
+        assert any("does not exist" in p for p in problems)
+
+    def test_unset_whisper_model_dir_warns_about_runtime_download(self) -> None:
+        # Constructed directly rather than through from_dict: a blank config value falls back
+        # to the default path, so config.yml cannot express "no directory" at all. The state
+        # is still reachable -- the benchmark script builds settings in code -- and a runtime
+        # HuggingFace fetch from a daemon thread is worth naming wherever it comes from.
+        settings = TranscriptionSettings(
+            enabled=True, provider="faster-whisper", whisper_model_dir=""
+        )
+
+        assert any("downloaded from HuggingFace" in p for p in settings.validate())
+
+    def test_english_only_model_with_other_language_is_flagged(self, tmp_path: Any) -> None:
+        """An .en model given Spanish audio does not fail -- it transcribes confident nonsense."""
+        problems = _settings(
+            provider="faster-whisper",
+            whisper_model="small.en",
+            whisper_model_dir=str(tmp_path),
+            language="es-ES",
+        ).validate()
+
+        assert any("English-only" in p for p in problems)
+
+    def test_vad_disabled_is_flagged(self, tmp_path: Any) -> None:
+        problems = _settings(
+            provider="faster-whisper", whisper_model_dir=str(tmp_path), whisper_vad_filter=False
+        ).validate()
+
+        assert any("hallucinate" in p for p in problems)
+
+    def test_bad_compute_type_is_flagged(self, tmp_path: Any) -> None:
+        """float16 is a GPU type: it silently falls back and looks like a working config."""
+        problems = _settings(
+            provider="faster-whisper",
+            whisper_model_dir=str(tmp_path),
+            whisper_compute_type="float16",
+        ).validate()
+
+        assert any("whisper_compute_type" in p for p in problems)
+
+    def test_whisper_settings_are_ignored_for_vosk(self, tmp_path: Any) -> None:
+        """A vosk deployment must not be nagged about a whisper model it will never load."""
+        problems = _settings(whisper_model_dir="/nonexistent", vosk_model_path=str(tmp_path))
+
+        assert not any("whisper" in p for p in problems.validate())
 
 
 @pytest.mark.unit
@@ -368,7 +438,223 @@ class TestVoskBackend:
         assert not backend.transcribe_file(Path("/tmp/whatever.wav")).success
 
     def test_unknown_provider_yields_no_backend(self) -> None:
-        assert build_backend(_settings(provider="whisper")) is None
+        assert build_backend(_settings(provider="google")) is None
+
+
+class _FakeWhisperSegment:
+    """One decoded window, shaped like faster_whisper's Segment."""
+
+    def __init__(self, text: str, start: float = 0.0, end: float = 1.0, words: Any = None) -> None:
+        self.text = text
+        self.start = start
+        self.end = end
+        self.words = words
+        self.avg_logprob = -0.3
+
+
+class _FakeWhisperWord:
+    def __init__(self, word: str, start: float, end: float, probability: float) -> None:
+        self.word = word
+        self.start = start
+        self.end = end
+        self.probability = probability
+
+
+class _FakeWhisperModel:
+    """
+    Stands in for CTranslate2 so the audio plumbing can be tested without a 250 MB model.
+
+    Records what it was handed, because the arguments *are* the contract here: dropping
+    vad_filter or condition_on_previous_text does not fail, it silently reintroduces
+    hallucinated sentences on silent voicemail.
+    """
+
+    def __init__(self, text: str = "Hello from voicemail.") -> None:
+        self.text = text
+        self.calls: list[dict[str, Any]] = []
+        self.samples: Any = None
+
+    def transcribe(self, samples: Any, **kwargs: Any) -> tuple[Any, Any]:
+        self.calls.append(kwargs)
+        self.samples = samples
+        if not self.text:
+            return iter(()), Mock()
+        words = (
+            [
+                _FakeWhisperWord("Hello", 0.0, 0.4, 0.95),
+                _FakeWhisperWord("from", 0.4, 0.7, 0.88),
+            ]
+            if kwargs.get("word_timestamps")
+            else None
+        )
+        return iter([_FakeWhisperSegment(f" {self.text}", 0.0, 1.0, words)]), Mock()
+
+
+def _whisper_settings(**overrides: Any) -> TranscriptionSettings:
+    base: dict[str, Any] = {"enabled": True, "provider": "faster-whisper", "workers": 0}
+    base.update(overrides)
+    return TranscriptionSettings.from_dict(base)
+
+
+def _ready_whisper(model: Any = None, settings: Any = None) -> Any:
+    """A whisper backend with the model-loading step short-circuited."""
+    from pbx.speech.backends.whisper import WhisperBackend
+
+    backend = WhisperBackend(settings or _whisper_settings(whisper_model_dir=""))
+    backend.model = model or _FakeWhisperModel()
+    return backend
+
+
+def _ulaw_voicemail(tmp_path: Any, seconds: float = 1.0) -> Path:
+    from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+    payload = pcm16_to_ulaw(_tone_pcm16(seconds=seconds))
+    return _write_wav(tmp_path / "vm.wav", payload, WAV_FORMAT_ULAW, 8)
+
+
+@pytest.mark.unit
+class TestWhisperBackend:
+    """The same audio plumbing as Vosk, plus the failure modes that are whisper's alone."""
+
+    def test_ulaw_voicemail_transcribes(self, tmp_path: Any) -> None:
+        result = _ready_whisper().transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert result.success, result.error
+        assert result.text == "Hello from voicemail."
+        assert result.provider == "faster-whisper"
+        assert result.audio_duration == pytest.approx(1.0, abs=0.01)
+
+    def test_audio_is_resampled_to_16k(self, tmp_path: Any) -> None:
+        """8 kHz telephony into a 16 kHz model is the bug that already escaped once."""
+        model = _FakeWhisperModel()
+
+        _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        # One second of 8 kHz audio must arrive as ~16000 float samples, not 8000.
+        assert len(model.samples) == pytest.approx(16000, abs=100)
+        assert model.samples.dtype.name == "float32"
+        assert abs(float(model.samples.max())) <= 1.0
+
+    def test_confidence_is_never_reported(self, tmp_path: Any) -> None:
+        """avg_logprob is not a confidence, and must not become "Estimated accuracy 87%"."""
+        result = _ready_whisper().transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert result.confidence is None
+        assert all(s.confidence is None for s in result.segments)
+
+    def test_anti_hallucination_arguments_are_passed(self, tmp_path: Any) -> None:
+        model = _FakeWhisperModel()
+
+        _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        kwargs = model.calls[0]
+        assert kwargs["vad_filter"] is True
+        assert kwargs["condition_on_previous_text"] is False
+        assert kwargs["no_speech_threshold"] == 0.6
+        assert kwargs["beam_size"] == 1
+
+    def test_silence_hallucination_is_discarded(self, tmp_path: Any) -> None:
+        """A whole transcript of "Thank you." is what whisper says about silence."""
+        result = _ready_whisper(_FakeWhisperModel("Thank you.")).transcribe_file(
+            _ulaw_voicemail(tmp_path)
+        )
+
+        assert result.success
+        assert result.text == ""
+        assert result.segments == ()
+
+    def test_hallucination_phrase_inside_real_speech_is_kept(self, tmp_path: Any) -> None:
+        """ "Thank you" is also an ordinary thing to say -- only a whole-string match counts."""
+        model = _FakeWhisperModel("Call me back on Tuesday. Thank you.")
+
+        result = _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert result.text == "Call me back on Tuesday. Thank you."
+
+    def test_empty_output_is_success(self, tmp_path: Any) -> None:
+        """With VAD on, a caller hanging up on the beep produces no speech at all."""
+        result = _ready_whisper(_FakeWhisperModel("")).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert result.success
+        assert result.text == ""
+
+    def test_words_are_opt_in(self, tmp_path: Any) -> None:
+        model = _FakeWhisperModel()
+        backend = _ready_whisper(model)
+        path = _ulaw_voicemail(tmp_path)
+
+        assert backend.transcribe_file(path).segments[0].words == ()
+        assert model.calls[0]["word_timestamps"] is False
+
+        result = backend.transcribe_file(path, want_words=True)
+        assert len(result.segments[0].words) == 2
+        assert result.segments[0].words[0].confidence == pytest.approx(0.95)
+
+    def test_language_is_reduced_to_iso_639_1(self, tmp_path: Any) -> None:
+        """Config carries en-US; faster-whisper rejects anything but a bare ISO-639-1 code."""
+        model = _FakeWhisperModel()
+
+        result = _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert model.calls[0]["language"] == "en"
+        # The transcript still reports what was asked for, not what the engine was told.
+        assert result.language == "en-US"
+
+    def test_blank_language_lets_whisper_detect(self, tmp_path: Any) -> None:
+        # Direct construction: from_dict substitutes the default for a blank language, so this
+        # state only arises in code. Detection is worse than a fixed code on short, noisy
+        # telephony audio, which is why config.yml cannot reach it by accident.
+        settings = TranscriptionSettings(
+            enabled=True, provider="faster-whisper", whisper_model_dir="", language="", workers=0
+        )
+        model = _FakeWhisperModel()
+
+        _ready_whisper(model, settings).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert model.calls[0]["language"] is None
+
+    def test_over_long_audio_is_refused(self, tmp_path: Any) -> None:
+        settings = _whisper_settings(whisper_model_dir="", max_audio_seconds=2)
+        path = _ulaw_voicemail(tmp_path, seconds=5)
+
+        result = _ready_whisper(settings=settings).transcribe_file(path)
+
+        assert not result.success
+        assert "longer than the 2s limit" in result.error
+
+    def test_backend_without_a_model_is_not_ready(self) -> None:
+        from pbx.speech.backends.whisper import WhisperBackend
+
+        backend = WhisperBackend(_whisper_settings(whisper_model_dir="/nonexistent/whisper"))
+
+        assert not backend.ready
+        assert not backend.transcribe_file(Path("/tmp/whatever.wav")).success
+
+    def test_missing_file_fails_without_raising(self, tmp_path: Any) -> None:
+        result = _ready_whisper().transcribe_file(tmp_path / "gone.wav")
+
+        assert not result.success
+
+    def test_omp_threads_is_pinned_before_ctranslate2_loads(self) -> None:
+        """CTranslate2's OpenMP backend overrides cpu_threads, so this must be set at import."""
+        import os
+
+        import pbx.speech.backends.whisper
+
+        assert os.environ.get("OMP_NUM_THREADS")
+
+    @patch("pbx.speech.backends.whisper.WHISPER_AVAILABLE", True)
+    @patch("pbx.speech.backends.whisper.WhisperModel", create=True)
+    def test_build_backend_selects_whisper(self, whisper_model: Any, tmp_path: Any) -> None:
+        from pbx.speech.backends.whisper import WhisperBackend
+
+        backend = build_backend(_whisper_settings(whisper_model_dir=str(tmp_path)))
+
+        assert isinstance(backend, WhisperBackend)
+        assert whisper_model.call_args.kwargs["cpu_threads"] == 1
+        assert whisper_model.call_args.kwargs["compute_type"] == "int8"
+        # local_files_only is what stops a 250 MB HuggingFace fetch from a daemon thread.
+        assert whisper_model.call_args.kwargs["local_files_only"] is True
 
 
 @pytest.mark.unit

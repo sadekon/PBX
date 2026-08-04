@@ -562,6 +562,7 @@ class VoicemailBox:
     #: service are not equally trustworthy, and the difference matters when acting on it.
     TRANSCRIPTION_ENGINES: ClassVar[dict[str, str]] = {
         "vosk": "Vosk, an offline speech recognition engine",
+        "faster-whisper": "Whisper, an offline speech recognition model",
         "google": "Google Cloud Speech-to-Text",
     }
 
