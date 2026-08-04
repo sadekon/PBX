@@ -553,15 +553,37 @@ class TestWhisperBackend:
         assert kwargs["no_speech_threshold"] == 0.6
         assert kwargs["beam_size"] == 1
 
-    def test_silence_hallucination_is_discarded(self, tmp_path: Any) -> None:
-        """A whole transcript of "Thank you." is what whisper says about silence."""
-        result = _ready_whisper(_FakeWhisperModel("Thank you.")).transcribe_file(
-            _ulaw_voicemail(tmp_path)
-        )
+    def test_pure_artefact_is_always_discarded(self, tmp_path: Any) -> None:
+        """Nobody leaves this on a voicemail, so length is irrelevant."""
+        model = _FakeWhisperModel("Subtitles by the Amara.org community")
+
+        result = _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path))
 
         assert result.success
         assert result.text == ""
         assert result.segments == ()
+
+    def test_ambiguous_phrase_is_kept_on_a_short_recording(self, tmp_path: Any) -> None:
+        """
+        "Thank you." on three seconds of audio is somebody saying thank you.
+
+        The blanket blocklist this replaced threw these away, so a caller ringing back to say
+        thanks got an empty transcript and no indication why.
+        """
+        model = _FakeWhisperModel("Thank you.")
+
+        result = _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path, seconds=3))
+
+        assert result.text == "Thank you."
+
+    def test_ambiguous_phrase_is_discarded_on_a_long_recording(self, tmp_path: Any) -> None:
+        """Twelve seconds yielding nothing but a stock phrase is silence, not a message."""
+        model = _FakeWhisperModel("Thank you.")
+
+        result = _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path, seconds=12))
+
+        assert result.success
+        assert result.text == ""
 
     def test_hallucination_phrase_inside_real_speech_is_kept(self, tmp_path: Any) -> None:
         """ "Thank you" is also an ordinary thing to say -- only a whole-string match counts."""
@@ -648,6 +670,7 @@ class TestWhisperBackend:
     def test_build_backend_selects_whisper(self, whisper_model: Any, tmp_path: Any) -> None:
         from pbx.speech.backends.whisper import WhisperBackend
 
+        (tmp_path / "small.en").mkdir()
         backend = build_backend(_whisper_settings(whisper_model_dir=str(tmp_path)))
 
         assert isinstance(backend, WhisperBackend)
@@ -655,6 +678,26 @@ class TestWhisperBackend:
         assert whisper_model.call_args.kwargs["compute_type"] == "int8"
         # local_files_only is what stops a 250 MB HuggingFace fetch from a daemon thread.
         assert whisper_model.call_args.kwargs["local_files_only"] is True
+
+    def test_model_dir_is_joined_with_the_model_name(self, tmp_path: Any) -> None:
+        """Switching models is one key: the directory follows whisper_model."""
+        from pbx.speech.backends.whisper import WhisperBackend
+
+        (tmp_path / "base.en").mkdir()
+        backend = WhisperBackend(
+            _whisper_settings(whisper_model_dir=str(tmp_path), whisper_model="base.en")
+        )
+
+        assert backend.model_id == str(tmp_path / "base.en")
+
+    def test_a_directory_holding_the_model_is_used_directly(self, tmp_path: Any) -> None:
+        """Back-compat: installs that staged one model into the configured path still load."""
+        from pbx.speech.backends.whisper import WhisperBackend
+
+        (tmp_path / "model.bin").write_bytes(b"")
+        backend = WhisperBackend(_whisper_settings(whisper_model_dir=str(tmp_path)))
+
+        assert backend.model_id == str(tmp_path)
 
     @patch("pbx.speech.backends.whisper.WHISPER_AVAILABLE", True)
     @patch("pbx.speech.backends.whisper.WhisperModel", create=True)

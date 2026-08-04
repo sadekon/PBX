@@ -46,21 +46,15 @@ PCM16_BYTES_PER_SAMPLE: Final[int] = 2
 #: PCM16 is a signed 16-bit integer; whisper wants float32 in [-1, 1).
 PCM16_FULL_SCALE: Final[float] = 32768.0
 
-#: Phrases Whisper emits when it is decoding silence rather than speech. These come from its
-#: training data -- YouTube subtitle tracks -- and appear verbatim, which is what makes them
-#: filterable at all. Matched case-insensitively against the *whole* transcript only: dropping
-#: them mid-sentence would corrupt a genuine transcript that happens to contain "Thank you."
+#: Phrases Whisper emits when decoding silence rather than speech. They come from its training
+#: data -- YouTube subtitle tracks -- and appear verbatim, which is what makes them filterable.
+#: Nobody leaves these on a voicemail, so they are dropped whatever the recording looks like.
+#: Matched case-insensitively against the *whole* transcript: dropping them mid-sentence would
+#: corrupt a genuine message that happens to mention one.
 HALLUCINATION_PHRASES: Final[frozenset[str]] = frozenset(
     {
-        "thank you.",
-        "thank you",
         "thanks for watching!",
         "thanks for watching.",
-        "you",
-        "you.",
-        "bye.",
-        "bye",
-        ".",
         "subtitles by the amara.org community",
         "subtitles by the amara.org community.",
         "amara.org",
@@ -69,6 +63,20 @@ HALLUCINATION_PHRASES: Final[frozenset[str]] = frozenset(
         "www.mooji.org",
     }
 )
+
+#: Phrases that are *both* common silence artefacts and ordinary things to say. "Thank you." is
+#: the single most frequent thing Whisper invents for silence -- and also a perfectly normal
+#: entire voicemail. A blanket blocklist gets one of those two cases wrong every time.
+#:
+#: Length breaks the tie. Someone ringing to say thanks leaves a few seconds of audio; a silent
+#: recording that yields nothing *but* one stock phrase is silence however long it ran. So these
+#: are kept on short recordings and discarded on long ones.
+AMBIGUOUS_PHRASES: Final[frozenset[str]] = frozenset(
+    {"thank you", "thank you.", "you", "you.", "bye", "bye.", "."}
+)
+
+#: Recordings at or under this are short enough that a one-phrase transcript is plausibly real.
+AMBIGUOUS_PHRASE_MAX_SECONDS: Final[float] = 10.0
 
 # Set before ctranslate2 is imported, and therefore here rather than in pbx/main.py: the
 # OpenMP backend reads this at load time and overrides the `cpu_threads` argument, so without
@@ -107,9 +115,8 @@ class WhisperBackend:
         self.settings = settings
         self.logger = logger or get_logger()
         self.model: Any | None = None
-        #: What was actually handed to CTranslate2 -- a directory when the model is staged
-        #: locally, otherwise the bare model name. Reported on the Transcript.
-        self.model_id = settings.whisper_model_dir or settings.whisper_model
+        #: What is actually handed to CTranslate2. Reported on the Transcript.
+        self.model_id = _resolve_model(settings.whisper_model_dir, settings.whisper_model)
 
         if settings.enabled:
             self._load_model()
@@ -124,10 +131,8 @@ class WhisperBackend:
             )
             return
 
-        if self.settings.whisper_model_dir and not Path(self.settings.whisper_model_dir).is_dir():
-            self.logger.warning(
-                f"Whisper model directory not found at {self.settings.whisper_model_dir}"
-            )
+        if self.settings.whisper_model_dir and not Path(self.model_id).is_dir():
+            self.logger.warning(f"Whisper model directory not found at {self.model_id}")
             self.logger.info(
                 "Stage it with: python scripts/install_whisper_model.py "
                 f"--model {self.settings.whisper_model}"
@@ -213,8 +218,14 @@ class WhisperBackend:
             return failed(str(e))
 
         text = " ".join(s.text for s in segments).strip()
-        if _is_hallucination(text):
-            self.logger.debug(f"Discarding likely hallucination from {path.name}: {text!r}")
+        if _is_hallucination(text, audio_duration):
+            # Logged at info, not debug: a discarded transcript is indistinguishable from
+            # "the engine heard nothing" downstream, and that ambiguity has already cost
+            # one debugging session.
+            self.logger.info(
+                f"Discarding likely hallucination from {path.name} "
+                f"({audio_duration:.0f}s of audio): {text!r}"
+            )
             text, segments = "", []
 
         # Empty text is a success: with VAD filtering, a caller who hangs up on the beep
@@ -289,6 +300,26 @@ class WhisperBackend:
         return segments
 
 
+def _resolve_model(model_dir: str, model_name: str) -> str:
+    """
+    Work out what to hand CTranslate2, from a directory and a model name.
+
+    ``whisper_model_dir`` is read as the directory models live *in*, so switching engines is
+    one config key -- change ``whisper_model`` and the path follows. Without this the two keys
+    can disagree silently, and the directory wins: a config naming ``base.en`` while pointing
+    at a ``small.en`` directory loads small.en and says nothing.
+
+    A directory holding ``model.bin`` directly is taken as the model itself, so installs that
+    staged a single model into the configured path keep working untouched.
+    """
+    if not model_dir:
+        return model_name
+    root = Path(model_dir).expanduser()
+    if (root / "model.bin").is_file():
+        return str(root)
+    return str(root / model_name)
+
+
 def _iso_639_1(language: str) -> str | None:
     """
     Reduce a config language code to what faster-whisper accepts.
@@ -303,12 +334,19 @@ def _iso_639_1(language: str) -> str | None:
     return code.split("-", 1)[0].lower()
 
 
-def _is_hallucination(text: str) -> bool:
+def _is_hallucination(text: str, audio_duration: float) -> bool:
     """
-    True when the whole transcript is one of Whisper's known silence artefacts.
+    True when the whole transcript is one of Whisper's silence artefacts.
 
-    Compared against the entire string rather than searching within it. "Thank you." is both
-    the single most common hallucination *and* a perfectly ordinary thing to say on a
-    voicemail, so the only safe rule is that it must be the only thing in the recording.
+    Compared against the entire string rather than searched within it, and split into two
+    cases. A pure artefact ("Subtitles by the Amara.org community") is never real speech and
+    goes whatever the length. An ambiguous one ("Thank you.") is judged on duration: keeping it
+    on a short recording risks a stray transcript, dropping it on a long one risks losing a
+    genuine message -- and only the second is a message somebody was waiting for.
     """
-    return text.strip().lower() in HALLUCINATION_PHRASES
+    candidate = text.strip().lower()
+    if not candidate:
+        return False
+    if candidate in HALLUCINATION_PHRASES:
+        return True
+    return candidate in AMBIGUOUS_PHRASES and audio_duration > AMBIGUOUS_PHRASE_MAX_SECONDS
