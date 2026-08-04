@@ -37,6 +37,7 @@ av==16.1.0
     #   -c constraints.txt
     #   warden-voip (pyproject.toml)
     #   aiortc
+    #   faster-whisper
 babel==2.18.0
     # via sphinx
 blinker==1.9.0
@@ -93,6 +94,8 @@ cryptography==48.0.1
     #   msal
     #   pyjwt
     #   pyopenssl
+ctranslate2==4.8.1
+    # via faster-whisper
 cyclonedx-python-lib==11.11.0
     # via pip-audit
 cymem==2.0.13
@@ -123,6 +126,8 @@ execnet==2.1.2
     # via pytest-xdist
 executing==2.2.1
     # via stack-data
+faster-whisper==1.2.1
+    # via warden-voip (pyproject.toml)
 fido2==2.2.0
     # via
     #   -c constraints.txt
@@ -130,12 +135,17 @@ fido2==2.2.0
 filelock==3.32.2
     # via
     #   cachecontrol
+    #   huggingface-hub
     #   python-discovery
     #   virtualenv
 flask==3.1.3
     # via
     #   -c constraints.txt
     #   warden-voip (pyproject.toml)
+flatbuffers==25.12.19
+    # via onnxruntime
+fsspec==2026.7.0
+    # via huggingface-hub
 google-crc32c==1.8.0
     # via aiortc
 greenlet==3.5.1
@@ -146,10 +156,18 @@ gtts==2.5.4
     #   warden-voip (pyproject.toml)
 h11==0.16.0
     # via httpcore
+hf-xet==1.6.0
+    # via huggingface-hub
 httpcore==1.0.9
     # via httpx
 httpx==0.28.1
-    # via weasel
+    # via
+    #   huggingface-hub
+    #   weasel
+huggingface-hub==1.16.1
+    # via
+    #   faster-whisper
+    #   tokenizers
 hyperlink==21.0.0
     # via twisted
 identify==2.6.19
@@ -263,22 +281,28 @@ numpy==2.4.6
     #   -c constraints.txt
     #   warden-voip (pyproject.toml)
     #   blis
+    #   ctranslate2
     #   librosa
     #   numba
+    #   onnxruntime
     #   scikit-learn
     #   scipy
     #   soundfile
     #   soxr
     #   spacy
     #   thinc
+onnxruntime==1.28.0
+    # via faster-whisper
 opuslib-next==1.3.0
     # via warden-voip (pyproject.toml)
 packageurl-python==0.17.6
     # via cyclonedx-python-lib
 packaging==24.0
     # via
+    #   huggingface-hub
     #   incremental
     #   lazy-loader
+    #   onnxruntime
     #   pip-audit
     #   pip-requirements-parser
     #   pooch
@@ -328,6 +352,8 @@ prometheus-client==0.25.0
     #   warden-voip (pyproject.toml)
 prompt-toolkit==3.0.53
     # via ipython
+protobuf==7.35.1
+    # via onnxruntime
 psutil==7.2.2
     # via
     #   -c constraints.txt
@@ -422,6 +448,8 @@ pyyaml==6.0.3
     # via
     #   -c constraints.txt
     #   warden-voip (pyproject.toml)
+    #   ctranslate2
+    #   huggingface-hub
     #   pre-commit
 redis==8.0.0
     # via
@@ -464,6 +492,7 @@ scipy==1.17.1
     #   scikit-learn
 setuptools==82.0.1
     # via
+    #   ctranslate2
     #   spacy
     #   thinc
 shellingham==1.5.4
@@ -545,12 +574,16 @@ thinc==8.3.13
     # via spacy
 threadpoolctl==3.6.0
     # via scikit-learn
+tokenizers==0.23.1
+    # via faster-whisper
 tomli==2.4.1
     # via pip-audit
 tomli-w==1.2.0
     # via pip-audit
 tqdm==4.68.2
     # via
+    #   faster-whisper
+    #   huggingface-hub
     #   nltk
     #   spacy
     #   vosk
@@ -564,11 +597,13 @@ twisted==26.4.0
     #   warden-voip (pyproject.toml)
 typer==0.26.7
     # via
+    #   huggingface-hub
     #   spacy
     #   weasel
 typing-extensions==4.15.0
     # via
     #   alembic
+    #   huggingface-hub
     #   librosa
     #   mypy
     #   pydantic
