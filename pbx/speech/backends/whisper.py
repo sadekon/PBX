@@ -28,6 +28,7 @@ a second decoding story for the same G.711 files -- the one :mod:`wave` already 
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -79,8 +80,15 @@ try:
     from faster_whisper import WhisperModel
 
     WHISPER_AVAILABLE = True
-except ImportError:  # pragma: no cover - depends on the install, not on logic
+    WHISPER_IMPORT_ERROR = ""
+except ImportError as _exc:  # pragma: no cover - depends on the install, not on logic
     WHISPER_AVAILABLE = False
+    #: Kept verbatim. "Not installed" is only one of the reasons this import fails: a
+    #: ctranslate2 build whose shared library will not load, a CPU without the instructions it
+    #: was compiled for, or a package whose __init__ does not export WhisperModel all raise
+    #: ImportError with quite different messages. Reporting a guess instead of the real text
+    #: sends whoever is reading the log to reinstall a package that is already installed.
+    WHISPER_IMPORT_ERROR = str(_exc)
 
 
 class WhisperBackend:
@@ -109,8 +117,10 @@ class WhisperBackend:
     def _load_model(self) -> None:
         """Load the model, reporting and swallowing every failure."""
         if not WHISPER_AVAILABLE:
-            self.logger.warning(
-                "faster-whisper is not installed. Install with: pip install faster-whisper"
+            self.logger.warning(f"Cannot import faster-whisper: {WHISPER_IMPORT_ERROR}")
+            self.logger.info(
+                "If the package is installed, confirm the PBX runs the interpreter it is "
+                f"installed into -- this process is {sys.executable}"
             )
             return
 
@@ -140,8 +150,8 @@ class WhisperBackend:
                 compute_type=self.settings.whisper_compute_type,
                 # CTranslate2 defaults to *all* cores. Every active call owns an RTP relay
                 # thread that must not miss its 20 ms cadence, so the ceiling is deliberate.
-                # OMP_NUM_THREADS is set in pbx/main.py as well: the OpenMP backend overrides
-                # cpu_threads, so setting only this one is not enough.
+                # This argument alone is not enough -- the OpenMP backend overrides it, which
+                # is why OMP_NUM_THREADS is pinned above, before the import.
                 cpu_threads=self.settings.whisper_cpu_threads,
                 inter_threads=1,
                 local_files_only=bool(self.settings.whisper_model_dir),

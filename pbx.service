@@ -30,11 +30,11 @@ WorkingDirectory=/opt/pbx
 # Load environment variables from .env if it exists (- prefix = no error if missing)
 EnvironmentFile=-/opt/pbx/.env
 # Ensure the venv's bin directory is on PATH so Python can find installed packages
-Environment="PATH=/opt/pbx/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PATH=/opt/pbx/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 SyslogIdentifier=pbx
 # Pre-start script validates prerequisites and runs Alembic migrations
 ExecStartPre=/bin/bash /opt/pbx/scripts/pre-start.sh
-ExecStart=/opt/pbx/venv/bin/python3 /opt/pbx/main.py
+ExecStart=/opt/pbx/.venv/bin/python3 /opt/pbx/main.py
 # IMPORTANT: Update this to the user who owns the PBX files
 # For better security, create a dedicated 'pbx' user:
 #   sudo useradd -r -s /bin/false pbx
