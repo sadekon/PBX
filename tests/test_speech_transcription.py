@@ -656,6 +656,45 @@ class TestWhisperBackend:
         # local_files_only is what stops a 250 MB HuggingFace fetch from a daemon thread.
         assert whisper_model.call_args.kwargs["local_files_only"] is True
 
+    @patch("pbx.speech.backends.whisper.WHISPER_AVAILABLE", True)
+    @patch("pbx.speech.backends.whisper.WhisperModel", create=True)
+    def test_every_kwarg_is_named_by_the_real_signature(
+        self, whisper_model: Any, tmp_path: Any
+    ) -> None:
+        """
+        Guards a bug a mock cannot catch.
+
+        ``WhisperModel.__init__`` ends in ``**model_kwargs``, so it accepts *any* keyword and
+        then forwards the leftovers to CTranslate2 -- where a name faster-whisper already sets
+        under a different alias arrives twice. Passing ``inter_threads`` (the CTranslate2 name)
+        instead of ``num_workers`` (the faster-whisper name) did exactly that, and failed only
+        on a real install: "got multiple values for keyword argument 'inter_threads'".
+
+        So checking that a kwarg is *accepted* proves nothing. It has to be an explicitly
+        named parameter, which is the only way faster-whisper commits to translating it.
+        """
+        import importlib.util
+        import inspect
+
+        if importlib.util.find_spec("faster_whisper") is None:
+            pytest.skip("faster-whisper is not installed; nothing to check the signature against")
+
+        from faster_whisper import WhisperModel as RealWhisperModel
+
+        build_backend(_whisper_settings(whisper_model_dir=str(tmp_path)))
+        passed = set(whisper_model.call_args.kwargs)
+
+        named = {
+            name
+            for name, spec in inspect.signature(RealWhisperModel.__init__).parameters.items()
+            if spec.kind not in (spec.VAR_KEYWORD, spec.VAR_POSITIONAL)
+        }
+
+        assert passed <= named, (
+            f"{sorted(passed - named)} would be swallowed by **model_kwargs and forwarded "
+            "to CTranslate2 raw -- use the faster-whisper parameter name instead"
+        )
+
 
 @pytest.mark.unit
 class TestTranscriptionWorker:

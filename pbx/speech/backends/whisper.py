@@ -153,7 +153,10 @@ class WhisperBackend:
                 # This argument alone is not enough -- the OpenMP backend overrides it, which
                 # is why OMP_NUM_THREADS is pinned above, before the import.
                 cpu_threads=self.settings.whisper_cpu_threads,
-                inter_threads=1,
+                # num_workers, *not* inter_threads. faster-whisper renames it on the way down
+                # to CTranslate2, so passing the CTranslate2 name lands in **model_kwargs and
+                # arrives as a duplicate: "got multiple values for keyword argument".
+                num_workers=1,
                 local_files_only=bool(self.settings.whisper_model_dir),
             )
         except Exception as e:
