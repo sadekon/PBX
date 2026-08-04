@@ -75,6 +75,13 @@ dependencies = [
     "redis>=8.0.0",
     "psutil>=7.2.2",
     "alembic>=1.18.4",
+    # Imported by pbx/integrations/active_directory.py; without it LDAP3_AVAILABLE
+    # is False and the AD integration silently reports disabled/not-connected.
+    "ldap3>=2.9.1",
+    # Imported as `jwt` by pbx/integrations/jitsi.py for meeting-token signing.
+    "PyJWT>=2.11.0",
+    # Imported as `dns.resolver` by pbx/features/dns_srv_failover.py for SRV lookups.
+    "dnspython>=2.8.0",
 ]
 
 [project.optional-dependencies]
@@ -96,6 +103,45 @@ dev = [
     "ipython>=9.14.1",
     "ipdb>=0.13.13",
     "pip-audit>=2.10.1",
+]
+
+# ---------------------------------------------------------------------------
+# Optional feature extras
+#
+# Each group backs a feature module that guards its imports with try/except
+# ImportError and degrades silently when the package is absent.  None of these
+# were installed in any environment before, so these features have never run;
+# they are opt-in rather than core because several are large or proprietary.
+# ---------------------------------------------------------------------------
+aws = [
+    # pbx/features/emergency_notification.py -- AWS SNS notification backend
+    "boto3>=1.40",
+]
+sms = [
+    # pbx/features/emergency_notification.py -- Twilio SMS notification backend
+    "twilio>=9.10",
+]
+push = [
+    # pbx/features/mobile_push.py -- Firebase Cloud Messaging
+    "firebase-admin>=7.0",
+]
+stt = [
+    # pbx/features/voicemail_transcription.py -- Google Cloud Speech-to-Text.
+    # Optional: the module falls back to vosk (a core dependency) when absent.
+    "google-cloud-speech>=2.30",
+]
+bi = [
+    # pbx/features/bi_integration.py -- Excel / Parquet / Tableau data export
+    "openpyxl>=3.1.5",
+    "pyarrow>=18.0",
+    # Left unpinned: tableauhyperapi uses a non-semver scheme (0.0.NNNNN).
+    "tableauhyperapi",
+]
+codecs = [
+    # pbx/features/speex_codec.py
+    "speex>=0.9.1",
+    # NOTE: pbx/features/ilbc_codec.py imports `pyilbc`, which is not published
+    # on PyPI.  That codec cannot be enabled via pip; it needs a manual build.
 ]
 
 [project.scripts]

@@ -337,12 +337,20 @@ typecheck-js: ## Run TypeScript type checking
 # =============================================================================
 
 .PHONY: lock
-lock: ## Generate requirements.lock from pyproject.toml (pinned via constraints.txt, Python 3.13)
-	uv pip compile pyproject.toml -c constraints.txt --python-version 3.13 -o requirements.lock
+lock: ## Generate requirements.lock from pyproject.toml + dev extras (pinned via constraints.txt, Python 3.13, Linux)
+	# --python-platform targets the deployment platform explicitly so the lock is
+	# reproducible from any workstation.  Without it the resolve uses the host
+	# platform and fails on macOS, where vosk publishes no wheels.
+	# For an ARM64 server, swap in: --python-platform aarch64-unknown-linux-gnu
+	uv pip compile pyproject.toml --extra dev -c constraints.txt \
+		--python-version 3.13 --python-platform x86_64-unknown-linux-gnu \
+		-o requirements.lock
 
 .PHONY: sync
-sync: ## Install dependencies from requirements.lock
+sync: ## DESTRUCTIVE: make the venv match requirements.lock exactly, then reinstall the project
+	@echo -e "$(COLOR_YELLOW)Note: 'uv pip sync' uninstalls anything absent from requirements.lock.$(COLOR_RESET)"
 	uv pip sync requirements.lock
+	uv pip install -e . --no-deps
 
 .PHONY: outdated
 outdated: ## Show outdated Python dependencies

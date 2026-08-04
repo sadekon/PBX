@@ -85,7 +85,7 @@ pbx/
 │   ├── paging_handler.py         # Overhead paging logic
 │   └── feature_initializer.py    # Dynamic feature loading
 ├── sip/              # SIP protocol implementation
-│   ├── server.py     # SIP server (Twisted-based)
+│   ├── server.py     # SIP server (socket + threading, ThreadPoolExecutor)
 │   ├── message.py    # SIP message parser
 │   ├── sdp.py        # SDP negotiation
 │   └── transaction.py # SIP transaction state machine
@@ -318,6 +318,29 @@ Per-file overrides:
 | Item | File(s) | Description |
 |------|---------|-------------|
 | SELECT * in BI queries | `pbx/features/bi_integration.py` | A few `SELECT *` queries remain for BI/data warehouse tables (`call_detail_records`, `call_queue_stats`, `qos_metrics`) whose schemas are not defined in the codebase. These are acceptable for generic data export use cases where the code dynamically handles whatever columns are returned. |
+
+### Dependencies
+
+**Declared but never imported** (`pyproject.toml`) — `twisted`, `pyttsx3`, and
+`jinja2` are declared in `[project.dependencies]` but have zero import sites in
+`pbx/`. `redis` likewise appears only in `config.yml` / `docker-compose.yml` as
+an infrastructure service, never as a Python import. Removing them would shrink
+the graph (`twisted` alone pulls `attrs`, `automat`, `constantly`, `hyperlink`,
+`incremental`, and `zope-interface`), but they were deliberately left in place
+so the dependency audit stayed purely additive. Note that `scipy`, `numba`, and
+`websockets` are also unimported yet **must stay**: the first two are resolver
+pins guarding the `librosa → numba → llvmlite` chain, and `websockets` is a real
+transitive requirement of `vosk`.
+
+**`pyilbc` is unavailable on PyPI** (`pbx/features/ilbc_codec.py`) — the module
+imports `pyilbc`, which is not published under that name. The iLBC codec cannot
+be enabled through pip and needs a manual build, so the `codecs` extra covers
+`speex` only.
+
+**Optional feature extras** — `aws`, `sms`, `push`, `stt`, `bi`, and `codecs`
+back feature modules that guard their imports and degrade silently. None were
+installed in any environment before they were declared, so those features have
+never run in this deployment.
 
 ### Database
 
