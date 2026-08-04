@@ -62,7 +62,6 @@ if TYPE_CHECKING:
     from pbx.features.statistics import StatisticsEngine
     from pbx.features.time_based_routing import TimeBasedRouting
     from pbx.features.voicemail import VoicemailSystem
-    from pbx.features.voicemail_transcription import VoicemailTranscriptionService
     from pbx.features.webhooks import WebhookSystem
     from pbx.features.webrtc import WebRTCGateway, WebRTCSignalingServer
     from pbx.integrations.active_directory import ActiveDirectoryIntegration
@@ -71,6 +70,7 @@ if TYPE_CHECKING:
     from pbx.integrations.matrix import MatrixIntegration
     from pbx.integrations.zoom import ZoomIntegration
     from pbx.mail import Mailer
+    from pbx.speech import TranscriptionWorker
     from pbx.utils.database import ExtensionDB
     from pbx.utils.prometheus_exporter import PBXMetricsExporter
     from pbx.utils.security import ThreatDetector
@@ -82,7 +82,7 @@ class PBXCore:
 
     # Attributes set by FeatureInitializer.initialize()
     voicemail_system: VoicemailSystem
-    transcription_service: VoicemailTranscriptionService
+    transcription_service: TranscriptionWorker
     conference_system: ConferenceSystem
     recording_system: CallRecordingSystem
     queue_system: QueueSystem
@@ -588,10 +588,16 @@ class PBXCore:
         for call in self.call_manager.get_active_calls():
             self.end_call(call.call_id)
 
-        # Drain queued mail last, and specifically *after* the calls above. Ending a call can
-        # record a voicemail, and saving one queues a notification -- so draining earlier meant
-        # every voicemail left during shutdown went into a Mailer whose worker had already been
-        # joined, and its email was silently lost.
+        # Then transcription, which releases anything still queued by firing its callbacks
+        # without a transcript. Those callbacks send voicemail notifications, so this must
+        # come before the mailer is drained.
+        if hasattr(self, "transcription_service"):
+            self.transcription_service.stop()
+
+        # Drain queued mail last, and specifically *after* the two steps above. Ending a call
+        # can record a voicemail, and saving one queues a notification -- so draining earlier
+        # meant every voicemail left during shutdown went into a Mailer whose worker had
+        # already been joined, and its email was silently lost.
         if hasattr(self, "mailer"):
             self.mailer.stop()
 

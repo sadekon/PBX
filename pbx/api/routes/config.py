@@ -135,11 +135,14 @@ def get_full_config() -> tuple[Response, int]:
                     "enabled": pbx_core.config.get(
                         "features.voicemail_transcription.enabled", False
                     ),
-                    # `enabled` is only intent. `ready` is whether the model actually loaded --
-                    # without it, a missing Vosk model is indistinguishable from a working
-                    # setup until someone notices transcripts are never produced.
+                    # `enabled` is only intent. `available` is whether the worker would
+                    # actually accept a job -- without it, a missing Vosk model is
+                    # indistinguishable from a working setup until someone notices
+                    # transcripts are never produced.
                     "ready": bool(
-                        getattr(getattr(pbx_core, "transcription_service", None), "ready", False)
+                        getattr(
+                            getattr(pbx_core, "transcription_service", None), "available", False
+                        )
                     ),
                     "provider": pbx_core.config.get(
                         "features.voicemail_transcription.provider", "vosk"
@@ -270,7 +273,7 @@ def get_features_config() -> tuple[Response, int]:
         "voicemail_transcription": {
             "enabled": pbx_core.config.get("features.voicemail_transcription.enabled", False),
             "ready": bool(
-                getattr(getattr(pbx_core, "transcription_service", None), "ready", False)
+                getattr(getattr(pbx_core, "transcription_service", None), "available", False)
             ),
             "description": "Speech-to-text voicemail transcription",
         },

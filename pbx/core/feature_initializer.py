@@ -23,8 +23,9 @@ from pbx.features.recording_retention import RecordingRetentionManager
 from pbx.features.sip_trunk import SIPTrunkSystem
 from pbx.features.time_based_routing import TimeBasedRouting
 from pbx.features.voicemail import VoicemailSystem
-from pbx.features.voicemail_transcription import VoicemailTranscriptionService
 from pbx.mail import Mailer, SmtpSettings
+from pbx.speech import TranscriptionSettings, TranscriptionWorker, build_backend
+from pbx.speech.settings import CONFIG_SECTION as TRANSCRIPTION_CONFIG_SECTION
 
 
 class FeatureInitializer:
@@ -57,24 +58,27 @@ class FeatureInitializer:
         logger.info("Mail subsystem initialized (enabled=%s)", pbx_core.mailer.enabled)
 
         # Transcription is constructed on the same terms as the mailer, and for the same
-        # reasons: unconditionally, so a disabled or model-less service is still a real object
-        # that reports `ready` rather than something callers must guard against; and exactly
-        # once, because the Vosk model is ~40 MB resident and one per mailbox would not
-        # survive a few hundred extensions.
-        pbx_core.transcription_service = VoicemailTranscriptionService(config)
-        transcriber = pbx_core.transcription_service
-        if transcriber.enabled and not transcriber.ready:
-            # Warn here rather than per message. This is the likely failure after a deploy --
-            # the model was never downloaded, or unzipped one level too deep -- and it is
-            # otherwise invisible until someone notices transcripts are missing.
-            logger.warning(
-                "Voicemail transcription is enabled but not ready (provider=%s, model_path=%s); "
-                "voicemail will be stored without transcripts",
-                transcriber.provider,
-                transcriber.vosk_model_path,
-            )
-        else:
-            logger.info("Transcription subsystem initialized (ready=%s)", transcriber.ready)
+        # reasons: unconditionally, so a disabled or model-less worker is still a real object
+        # that reports its own unavailability rather than something callers must guard
+        # against; and exactly once, because the model is far too large to load per mailbox.
+        transcription_settings = TranscriptionSettings.from_dict(
+            config.get(TRANSCRIPTION_CONFIG_SECTION, {}) or {}
+        )
+        backend = build_backend(transcription_settings, logger=logger)
+        pbx_core.transcription_service = TranscriptionWorker(backend, transcription_settings)
+        pbx_core.transcription_service.start()
+
+        # Report configuration problems once, here, rather than per message. A model that was
+        # never downloaded -- or unzipped one level too deep -- is the likely failure after a
+        # deploy and is otherwise invisible until someone notices transcripts are missing.
+        for problem in transcription_settings.validate():
+            logger.warning("Transcription config: %s", problem)
+        logger.info(
+            "Transcription subsystem initialized (enabled=%s, ready=%s, workers=%d)",
+            transcription_settings.enabled,
+            bool(backend is not None and getattr(backend, "ready", False)),
+            transcription_settings.workers,
+        )
 
         # Initialize advanced features
         voicemail_path: str = config.get("voicemail.storage_path", "voicemail")

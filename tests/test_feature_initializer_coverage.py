@@ -226,8 +226,10 @@ class TestFeatureInitializerInitialize:
         mocks = _run_initialize_with_all_patches(pbx_core)
 
         assert pbx_core.transcription_service is not None
-        assert not pbx_core.transcription_service.enabled
-        assert not pbx_core.transcription_service.ready
+        assert not pbx_core.transcription_service.settings.enabled
+        # `available` is the worker's own gate: disabled, or no usable backend, means it will
+        # refuse every submission rather than silently accepting work it cannot do.
+        assert not pbx_core.transcription_service.available
         assert (
             mocks["VoicemailSystem"].call_args.kwargs["transcription_service"]
             is pbx_core.transcription_service

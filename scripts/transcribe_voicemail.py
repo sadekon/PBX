@@ -35,12 +35,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 try:
-    from pbx.features.voicemail_transcription import (
+    from pbx.speech import TranscriptionSettings, build_backend
+    from pbx.speech.backends.vosk import VOSK_AVAILABLE
+    from pbx.speech.settings import (
         DEFAULT_LANGUAGE,
         DEFAULT_MAX_AUDIO_SECONDS,
         DEFAULT_VOSK_MODEL_PATH,
-        VOSK_AVAILABLE,
-        VoicemailTranscriptionService,
     )
     from pbx.utils.audio import read_wav_as_pcm16
 except ModuleNotFoundError as exc:
@@ -106,22 +106,6 @@ def _describe_wav(path: Path) -> dict[str, Any] | None:
     except OSError:
         return None
     return None
-
-
-class _ForcedConfig:
-    """
-    Config stand-in that switches transcription on for this run only.
-
-    features.voicemail_transcription.enabled ships false -- transcription cannot work until a
-    model is installed out of band -- so reading the real setting would make this script
-    refuse to do the one thing it exists for.
-    """
-
-    def __init__(self, values: dict[str, Any]) -> None:
-        self._values = values
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._values.get(key, default)
 
 
 def _resolve_model_path(args: argparse.Namespace) -> str:
@@ -215,19 +199,19 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         _log("")
 
-    service = VoicemailTranscriptionService(
-        _ForcedConfig(
-            {
-                "features.voicemail_transcription.enabled": True,
-                "features.voicemail_transcription.provider": "vosk",
-                "features.voicemail_transcription.vosk_model_path": model_path,
-                "features.voicemail_transcription.language": language,
-                "features.voicemail_transcription.max_audio_seconds": args.max_seconds,
-            }
-        )
+    settings = TranscriptionSettings.from_dict(
+        {
+            "enabled": True,
+            "provider": "vosk",
+            "vosk_model_path": model_path,
+            "language": language,
+            "max_audio_seconds": args.max_seconds,
+            "workers": 0,
+        }
     )
+    service = build_backend(settings)
 
-    if not service.ready:
+    if service is None or not service.ready:
         # Two very different problems reach here, and the remedy for one does nothing for the
         # other. Naming the wrong one sends you off installing a 40 MB model you already have.
         if not VOSK_AVAILABLE:
@@ -249,20 +233,29 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 1
 
-    result = service.transcribe(str(audio_path), language=language)
+    result = service.transcribe_file(audio_path, language=language)
 
-    if not result["success"]:
-        print(f"error: transcription failed: {result['error']}", file=sys.stderr)
+    if not result.success:
+        print(f"error: transcription failed: {result.error}", file=sys.stderr)
         return 1
 
     # The transcript, and only the transcript, on stdout.
-    print(result["text"])
+    print(result.text)
 
     if not quiet:
         _log("")
-        _log(f"Provider:   {result['provider']}")
-        _log(f"Language:   {result['language']}")
-        _log(f"Characters: {len(result['text']):,}")
+        _log(f"Provider:   {result.provider}")
+        _log(f"Language:   {result.language}")
+        _log(f"Characters: {len(result.text):,}")
+        _log(f"Segments:   {len(result.segments)}")
+        if result.confidence is not None:
+            _log(f"Confidence: {result.confidence:.1%}")
+        if result.real_time_factor is not None:
+            _log(
+                f"Speed:      {result.processing_duration:.1f}s for "
+                f"{result.audio_duration:.1f}s of audio "
+                f"(RTF {result.real_time_factor:.2f})"
+            )
 
     return 0
 

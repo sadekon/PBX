@@ -151,7 +151,11 @@ class GracefulShutdownHandler:
 
         # Stop in reverse order of startup
         services = [
-            # Mail first: draining the queue needs the process still alive, and a queued
+            # Transcription before mail, always. Draining it releases queued jobs by firing
+            # their callbacks without a transcript, and those callbacks queue voicemail
+            # notifications -- so the mailer has to still be accepting work at that point.
+            ("Transcription", lambda: self._stop_if_exists("transcription_service")),
+            # Mail next: draining the queue needs the process still alive, and a queued
             # voicemail notification is the kind of thing that must survive a restart.
             ("Mailer", lambda: self._stop_if_exists("mailer")),
             ("Security Monitor", lambda: self._stop_if_exists("security_monitor")),

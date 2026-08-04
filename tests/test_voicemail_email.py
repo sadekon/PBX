@@ -12,11 +12,13 @@ VoicemailBox against a recording stand-in for the Mailer.
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from pbx.features.voicemail import VoicemailBox, VoicemailSystem
+from pbx.speech import Transcript
 
 
 class RecordingMailer:
@@ -283,28 +285,45 @@ class TestDailyReminders:
 
 
 class StubTranscriber:
-    """Stands in for VoicemailTranscriptionService, recording what it was asked to do."""
+    """
+    Stands in for TranscriptionWorker, running the job inline.
 
-    def __init__(
-        self, ready: bool = True, enabled: bool = True, text: str = "call me back"
-    ) -> None:
+    Honours the real contract: submit() returns False when it cannot serve the request, and
+    calls the callback exactly once when it returns True. Those two behaviours are what the
+    notification guarantee rests on, so the stub must not be looser than the worker.
+    """
+
+    def __init__(self, ready: bool = True, accept: bool = True, text: str = "call me back") -> None:
         self.ready = ready
-        self.enabled = enabled
-        self.provider = "vosk"
+        self.accept = accept
         self.text = text
-        self.calls: list[str] = []
+        self.settings = SimpleNamespace(deadline_seconds=30.0)
+        self.calls: list[Path] = []
 
-    def transcribe(self, audio_file_path, language=None):
-        self.calls.append(audio_file_path)
-        return {
-            "success": True,
-            "text": self.text,
-            "confidence": 0.95,
-            "language": "en-US",
-            "provider": "vosk",
-            "timestamp": datetime.now(UTC),
-            "error": None,
-        }
+    def submit(
+        self,
+        path,
+        on_complete,
+        *,
+        language=None,
+        label="",
+        want_words=False,
+        audio_seconds=None,
+    ) -> bool:
+        if not (self.ready and self.accept):
+            return False
+        self.calls.append(path)
+        on_complete(
+            Transcript(
+                text=self.text,
+                confidence=0.95,
+                language="en-US",
+                provider="vosk",
+                audio_duration=5.0,
+                processing_duration=0.5,
+            )
+        )
+        return True
 
 
 @pytest.mark.unit

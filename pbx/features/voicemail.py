@@ -3,19 +3,13 @@ Voicemail system
 """
 
 import textwrap
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
 from pbx.mail import Attachment, EmailError
 from pbx.utils.logger import get_logger, get_vm_ivr_logger
-
-try:
-    from pbx.features.voicemail_transcription import VoicemailTranscriptionService  # noqa: F401
-
-    TRANSCRIPTION_AVAILABLE = True
-except ImportError:
-    TRANSCRIPTION_AVAILABLE = False
 
 try:
     from pbx.utils.database import ExtensionDB
@@ -65,6 +59,71 @@ def is_subscribed_to_voicemail_email(extension_config: dict | None) -> bool:
     return bool(extension_config.get("voicemail_email_enabled", True))
 
 
+class _PendingNotification:
+    """
+    Sends a voicemail notification once, whoever gets there first.
+
+    Several things race to produce the email: the transcript arriving, a deadline expiring,
+    the worker refusing the job, and the worker being drained at shutdown. All of them call
+    :meth:`fire`; the first wins and the rest are no-ops. That compare-and-swap is the only
+    thing standing between this design and either a duplicate email or a lost one.
+    """
+
+    def __init__(self, send: Any, logger: Any, label: str = "") -> None:
+        self._send = send
+        self._logger = logger
+        self._label = label
+        self._lock = threading.Lock()
+        self._sent = False
+        self._timer: threading.Timer | None = None
+
+    def fire(self, transcript: Any | None) -> bool:
+        """Send the notification if nobody has yet. Returns True if this call sent it."""
+        with self._lock:
+            if self._sent:
+                self._logger.debug(f"Notification for {self._label} already sent; ignoring")
+                return False
+            self._sent = True
+            timer, self._timer = self._timer, None
+
+        if timer is not None:
+            timer.cancel()
+
+        try:
+            self._send(transcript)
+        except Exception as e:
+            # Nothing above this catches, and losing the notification is the failure this
+            # class exists to prevent -- so it is reported rather than propagated.
+            self._logger.error(f"Failed to send voicemail notification for {self._label}: {e}")
+        return True
+
+    def arm_deadline(self, seconds: float) -> None:
+        """
+        Send without a transcript if one has not arrived within `seconds`.
+
+        Bounds the *wait*, not the work. A running recognition cannot be cancelled; if it
+        finishes after the deadline the transcript still reaches the database, it just missed
+        the email.
+        """
+        if seconds <= 0:
+            return
+        timer = threading.Timer(seconds, self._on_deadline)
+        # Timer threads are non-daemon by default and would hold the interpreter open for the
+        # full deadline on shutdown.
+        timer.daemon = True
+        with self._lock:
+            if self._sent:
+                return
+            self._timer = timer
+        timer.start()
+
+    def _on_deadline(self) -> None:
+        if self.fire(None):
+            self._logger.warning(
+                f"Transcript for {self._label} did not arrive in time; notification sent without it"
+            )
+
+
 class VoicemailBox:
     """Represents a voicemail box for an extension"""
 
@@ -86,7 +145,7 @@ class VoicemailBox:
             config: Config object
             mailer: pbx.mail.Mailer used to send notifications (optional)
             database: DatabaseBackend object (optional)
-            transcription_service: VoicemailTranscriptionService object (optional)
+            transcription_service: pbx.speech.TranscriptionWorker (optional)
         """
         self.extension_number = extension_number
         self.storage_path = Path(storage_path) / extension_number
@@ -225,98 +284,163 @@ class VoicemailBox:
 
         # Resolved once and shared by the transcription and email gates below.
         extension_config, email_address = self._lookup_extension()
-
-        # Transcription has no per-extension switch of its own. Its only consumer is the
-        # notification email, so it follows the email subscription: transcribing for an
-        # extension that will not be emailed is work nobody reads. `ready` is the other gate,
-        # separating "the operator turned it off" from "it is on but the model never loaded" --
-        # the second is warned about once at startup, so it stays at debug here rather than
-        # repeating per message.
-        will_be_emailed = bool(email_address) and is_subscribed_to_voicemail_email(extension_config)
-
-        transcription_result = None
-        service = self.transcription_service
-        if service and service.enabled:
-            if not will_be_emailed:
-                self.logger.debug(
-                    f"Extension {self.extension_number} receives no voicemail email; "
-                    f"storing voicemail {message_id} without a transcript"
-                )
-            elif not service.ready:
-                self.logger.debug(
-                    f"Transcription enabled but not ready (provider={service.provider}); "
-                    f"storing voicemail {message_id} without a transcript"
-                )
-            else:
-                self.logger.info(f"Transcribing voicemail {message_id}...")
-                transcription_result = service.transcribe(str(file_path))
-
-        if transcription_result and transcription_result["success"]:
-            self.logger.info("✓ Voicemail transcribed successfully")
-            self.logger.info(f"  Confidence: {transcription_result['confidence']:.2%}")
-            self.logger.debug(f"  Text: {transcription_result['text'][:100]}...")
-
-            # Add transcription to message
-            message["transcription"] = transcription_result["text"]
-            message["transcription_confidence"] = transcription_result["confidence"]
-            message["transcription_language"] = transcription_result["language"]
-            message["transcription_provider"] = transcription_result["provider"]
-            message["transcribed_at"] = transcription_result["timestamp"]
-
-            # Update database with transcription
-            if self.database and self.database.enabled:
-                try:
-                    placeholder = self._get_db_placeholder()
-                    query = f"""
-                    UPDATE voicemail_messages
-                    SET transcription_text = {placeholder},
-                        transcription_confidence = {placeholder},
-                        transcription_language = {placeholder},
-                        transcription_provider = {placeholder},
-                        transcribed_at = {placeholder}
-                    WHERE message_id = {placeholder}
-                    """  # nosec B608 - placeholder is safely parameterized
-                    self.database.execute(
-                        query,
-                        (
-                            transcription_result["text"],
-                            transcription_result["confidence"],
-                            transcription_result["language"],
-                            transcription_result["provider"],
-                            transcription_result["timestamp"],
-                            message_id,
-                        ),
-                    )
-                    self.logger.info("✓ Transcription saved to database")
-                except Exception as e:
-                    self.logger.error(f"✗ Error saving transcription to database: {e}")
-        elif transcription_result:
-            self.logger.warning(
-                f"✗ Voicemail transcription failed: {transcription_result['error']}"
-            )
-
-        # Send email notification if enabled. The transcript, when there is one, travels with
-        # it -- `message` is the single source for both, so the email can never disagree with
-        # what was stored.
-        if self.mailer and self.config and extension_config and email_address:
-            if is_subscribed_to_voicemail_email(extension_config):
-                self._send_notification_email(
-                    to_email=email_address,
-                    caller_id=caller_id,
-                    timestamp=timestamp,
-                    audio_file_path=file_path,
-                    duration=duration,
-                    transcription=message.get("transcription"),
-                    confidence=message.get("transcription_confidence"),
-                    provider=message.get("transcription_provider"),
-                )
-            else:
-                self.logger.debug(
-                    f"Extension {self.extension_number} is unsubscribed from voicemail "
-                    "email; skipping notification"
-                )
+        self._dispatch_notification(
+            message=message,
+            message_id=message_id,
+            caller_id=caller_id,
+            timestamp=timestamp,
+            file_path=file_path,
+            duration=duration,
+            extension_config=extension_config,
+            email_address=email_address,
+        )
 
         return message_id
+
+    def _dispatch_notification(
+        self,
+        *,
+        message: dict,
+        message_id: str,
+        caller_id: str,
+        timestamp: Any,
+        file_path: Path,
+        duration: float | None,
+        extension_config: dict | None,
+        email_address: str | None,
+    ) -> None:
+        """
+        Arrange for exactly one notification email, with a transcript when one is available.
+
+        The invariant: **every voicemail written to disk produces exactly one email, exactly
+        once**, no matter what transcription does. A :class:`_PendingNotification` enforces it
+        -- whichever of the transcript, the deadline, or an outright refusal to transcribe
+        gets there first wins, and the rest are no-ops.
+
+        Transcription itself is submitted, never awaited. It used to run inline here, on the
+        thread tearing the call down.
+        """
+        if not (self.mailer and self.config and extension_config and email_address):
+            return
+
+        if not is_subscribed_to_voicemail_email(extension_config):
+            self.logger.debug(
+                f"Extension {self.extension_number} is unsubscribed from voicemail "
+                "email; skipping notification"
+            )
+            return
+
+        # Whether the transcript goes *in* the email is separate from whether we transcribe at
+        # all: a site may want transcripts stored and searchable but kept out of mail. Only
+        # the first case makes the email worth delaying.
+        include_transcription = self.config.get("voicemail.email.include_transcription", True)
+
+        notification = _PendingNotification(
+            send=lambda transcript: self._send_notification_email(
+                to_email=email_address,
+                caller_id=caller_id,
+                timestamp=timestamp,
+                audio_file_path=file_path,
+                duration=duration,
+                transcription=transcript.text if transcript and transcript.text else None,
+                confidence=transcript.confidence if transcript else None,
+                provider=transcript.provider if transcript else None,
+            ),
+            logger=self.logger,
+            label=message_id,
+        )
+
+        submitted = self._submit_transcription(
+            message=message,
+            message_id=message_id,
+            file_path=file_path,
+            duration=duration,
+            notification=notification if include_transcription else None,
+        )
+
+        # The email is only allowed to wait when a job was actually accepted *and* the
+        # transcript is wanted in the body. Anything else sends now.
+        if not (submitted and include_transcription):
+            notification.fire(None)
+
+    def _submit_transcription(
+        self,
+        *,
+        message: dict,
+        message_id: str,
+        file_path: Path,
+        duration: float | None,
+        notification: _PendingNotification | None,
+    ) -> bool:
+        """
+        Hand the recording to the transcription worker.
+
+        Returns True only when the worker accepted the job, which is its guarantee that the
+        callback will fire exactly once. False means nothing was queued and the caller owns
+        the outcome.
+        """
+        worker = self.transcription_service
+        if worker is None:
+            return False
+
+        def on_complete(transcript: Any | None) -> None:
+            # Fire the notification *before* touching the database. send_async never raises,
+            # and a DB failure must not cost the email.
+            if notification is not None:
+                notification.fire(transcript)
+            if transcript is not None and transcript.success:
+                self._store_transcript(message, message_id, transcript)
+            elif transcript is not None:
+                self.logger.warning(
+                    f"Voicemail {message_id} transcription failed: {transcript.error}"
+                )
+
+        accepted = worker.submit(
+            file_path,
+            on_complete,
+            label=message_id,
+            audio_seconds=duration,
+        )
+        if accepted and notification is not None:
+            notification.arm_deadline(getattr(worker.settings, "deadline_seconds", 30.0))
+        return accepted
+
+    def _store_transcript(self, message: dict, message_id: str, transcript: Any) -> None:
+        """Record the transcript on the in-memory message and in the database."""
+        message["transcription"] = transcript.text
+        message["transcription_confidence"] = transcript.confidence
+        message["transcription_language"] = transcript.language
+        message["transcription_provider"] = transcript.provider
+        message["transcribed_at"] = datetime.now(UTC)
+
+        if not (self.database and self.database.enabled):
+            return
+
+        try:
+            placeholder = self._get_db_placeholder()
+            query = f"""
+            UPDATE voicemail_messages
+            SET transcription_text = {placeholder},
+                transcription_confidence = {placeholder},
+                transcription_language = {placeholder},
+                transcription_provider = {placeholder},
+                transcribed_at = {placeholder}
+            WHERE message_id = {placeholder}
+            """  # nosec B608 - placeholder is safely parameterized
+            self.database.execute(
+                query,
+                (
+                    transcript.text,
+                    transcript.confidence,
+                    transcript.language,
+                    transcript.provider,
+                    message["transcribed_at"],
+                    message_id,
+                ),
+            )
+            self.logger.info(f"✓ Transcription saved to database for {message_id}")
+        except Exception as e:
+            self.logger.error(f"✗ Error saving transcription to database: {e}")
 
     def _lookup_extension(self) -> tuple[dict | None, str | None]:
         """
@@ -943,7 +1067,7 @@ class VoicemailSystem:
             config: Config object
             database: DatabaseBackend object (optional)
             mailer: pbx.mail.Mailer owned by PBXCore (optional)
-            transcription_service: VoicemailTranscriptionService owned by PBXCore (optional)
+            transcription_service: pbx.speech.TranscriptionWorker owned by PBXCore (optional)
         """
         self.storage_path = storage_path
         self.mailboxes = {}

@@ -232,11 +232,20 @@ features:
     # transcribe. Turn it on once the model is in place -- if it is enabled but the model
     # cannot be loaded, the PBX says so once at startup instead of failing per message.
     enabled: false
-    provider: vosk              # Provider: 'vosk' (FREE, offline) or 'google'
+    provider: vosk              # Provider: 'vosk' (free, offline). Currently the only one.
     language: en-US             # Language code passed to the recognizer
     max_audio_seconds: 300      # Skip recordings longer than this rather than occupy a core
     vosk_model_path: models/vosk-model-small-en-us-0.15  # Path to Vosk model (download from https://alphacephei.com/vosk/models)
-    # For Google Cloud Speech-to-Text, set GOOGLE_APPLICATION_CREDENTIALS environment variable
+    # Transcription runs on its own background thread(s), off the call-teardown path.
+    # Keep `workers` low: each one is CPU-bound and competes with the RTP relay threads that
+    # carry live audio. Values above (cores - 2) are capped automatically. 0 runs the job
+    # inline on the calling thread, which is mainly useful for tests.
+    workers: 1
+    queue_size: 32              # Backlog before new recordings are stored without a transcript
+    # How long the notification email waits for a transcript before going out without one.
+    # Bounds the wait, not the work: a running recognition cannot be cancelled, and a late
+    # transcript is still written to the database.
+    deadline_seconds: 30
 
   # Webhook System - Event-driven integrations
   webhooks:
