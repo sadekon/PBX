@@ -99,7 +99,9 @@ def check_connection(config: object) -> bool:
                 ORDER BY table_name
                 """
             else:
-                query = "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename"
+                query = (
+                    "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename"
+                )
 
             tables = db.fetch_all(query)
             if tables:

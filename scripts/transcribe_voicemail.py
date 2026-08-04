@@ -132,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Transcribe a voicemail WAV and print the text to stdout.",
         epilog="Voicemail files live under the voicemail/<extension>/ directory.",
     )
-    parser.add_argument("-f", "--file", required=True, help="Path to the WAV file")
+    parser.add_argument("--file", required=True, help="Path to the WAV file")
     parser.add_argument(
         "--model",
         help="Path to the Vosk model directory (default: from config.yml, else models/...)",
@@ -148,7 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Refuse audio longer than this (default: {DEFAULT_MAX_AUDIO_SECONDS})",
     )
     parser.add_argument(
-        "-q", "--quiet", action="store_true", help="Suppress diagnostics; print only the text"
+        "--quiet", action="store_true", help="Suppress diagnostics; print only the text"
     )
     return parser
 

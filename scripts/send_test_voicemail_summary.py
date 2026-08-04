@@ -30,7 +30,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 try:
     from pbx.features.voicemail import VoicemailSystem
-    from pbx.mail import Mailer, SmtpSettings
+    from pbx.mail import Mailer, SmtpSettings, enable_smtp_debug
     from pbx.utils.config import Config
     from pbx.utils.database import DatabaseBackend
 except ModuleNotFoundError as exc:
@@ -141,22 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.verbose:
-        # Reuse the transcript redaction from the SMTP test script rather than duplicating it.
-        import importlib.util
-        import smtplib
-
-        spec = importlib.util.spec_from_file_location(
-            "send_test_email", _REPO_ROOT / "scripts" / "send_test_email.py"
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        redactor = module._Redactor(settings)
-
-        def patched(self, *bits):  # type: ignore[no-untyped-def]
-            print(redactor(" ".join(str(bit) for bit in bits)), file=sys.stderr)
-
-        smtplib.SMTP._print_debug = patched  # type: ignore[method-assign]
-        smtplib.SMTP.debuglevel = 1
+        enable_smtp_debug(settings)
 
     # Sent synchronously so the outcome is reported here rather than swallowed by the queue.
     mailer = Mailer(settings)
