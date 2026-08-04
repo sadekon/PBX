@@ -14,12 +14,11 @@ what production would send. Only the recipient, the recording and the engine are
 Every model setting can be overridden per run, so switching engines costs a flag rather than a
 config edit and a restart::
 
-    python scripts/send_test_voicemail_notification.py -f voicemail/1001/msg.wav --to you@corp.com
-    python scripts/send_test_voicemail_notification.py -f msg.wav --to you@corp.com \\
-        --provider faster-whisper --whisper-model-dir /opt/warden/models/whisper/small.en
-    python scripts/send_test_voicemail_notification.py -f msg.wav --to you@corp.com \\
-        --provider vosk --vosk-model /opt/warden/models/vosk-model-small-en-us-0.15
-    python scripts/send_test_voicemail_notification.py -f msg.wav --to you@corp.com --dry-run
+    python scripts/send_test_voicemail_notification.py -f voicemail/1001/msg.wav -t you@corp.com
+    python scripts/send_test_voicemail_notification.py -f msg.wav -t you@corp.com -n \\
+        -p faster-whisper --whisper-model-dir /opt/warden/models/whisper/small.en
+    python scripts/send_test_voicemail_notification.py -f msg.wav -t you@corp.com \\
+        -p vosk --vosk-model /opt/warden/models/vosk-model-small-en-us-0.15
 
 Transcription runs **inline** here, not on the worker thread, and there is no deadline: the
 point is to see the transcript, not to reproduce the timing. A message that would have missed
@@ -59,7 +58,7 @@ except ModuleNotFoundError as exc:
     print(
         f"error: missing dependency {exc.name!r}.\n"
         f"This script needs the project's virtualenv. Try:\n"
-        f"  {_hint} -f message.wav --to you@example.com\n",
+        f"  {_hint} -f message.wav -t you@example.com\n",
         file=sys.stderr,
     )
     raise SystemExit(2) from exc
@@ -78,10 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Anything not given falls back to features.voicemail_transcription in config.yml."
         ),
     )
-    parser.add_argument("--file", "-f", required=True, help="WAV file to transcribe and attach")
-    parser.add_argument("--to", required=True, help="Where to send the notification")
+    # Short form first, then long -- the GNU order, and what argparse renders as "-f, --file".
+    # Only the options you would type interactively get a short form; the tuning flags below
+    # stay long-only, because a single letter for every one of them stops being a mnemonic and
+    # starts being a lookup table.
+    parser.add_argument("-f", "--file", required=True, help="WAV file to transcribe and attach")
+    parser.add_argument("-t", "--to", required=True, help="Where to send the notification")
     parser.add_argument(
-        "--extension", default="1001", help="Mailbox the message is for (default: 1001)"
+        "-e", "--extension", default="1001", help="Mailbox the message is for (default: 1001)"
     )
     parser.add_argument(
         "--from-number", default="5551234567", help="Caller ID to show (default: 5551234567)"
@@ -89,7 +92,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     engine = parser.add_argument_group("engine selection (overrides config.yml)")
     engine.add_argument(
-        "--provider", choices=["vosk", "faster-whisper", "whisper"], help="Which engine to use"
+        "-p",
+        "--provider",
+        choices=["vosk", "faster-whisper", "whisper"],
+        help="Which engine to use",
     )
     engine.add_argument("--vosk-model", help="Vosk model directory")
     engine.add_argument("--whisper-model", help="Whisper model name, e.g. small.en or base.en")
@@ -99,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     engine.add_argument("--beam-size", type=int, help="Whisper beam size (1 is greedy)")
     engine.add_argument("--cpu-threads", type=int, help="Threads inside one transcription")
-    engine.add_argument("--language", help="Language code, e.g. en-US")
+    engine.add_argument("-l", "--language", help="Language code, e.g. en-US")
     engine.add_argument("--max-seconds", type=int, help="Refuse audio longer than this")
 
     parser.add_argument(
@@ -108,9 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Send the notification without transcribing, to compare against the plain email",
     )
     parser.add_argument(
-        "--dry-run", action="store_true", help="Print the email that would be sent, without sending"
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="Print the email that would be sent, without sending",
     )
-    parser.add_argument("--config", default="config.yml", help="Path to config.yml")
+    parser.add_argument("-c", "--config", default="config.yml", help="Path to config.yml")
     return parser
 
 
