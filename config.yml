@@ -231,7 +231,7 @@ features:
     # downloaded separately, so defaulting this on means a fresh install silently fails to
     # transcribe. Turn it on once the model is in place -- if it is enabled but the model
     # cannot be loaded, the PBX says so once at startup instead of failing per message.
-    enabled: false
+    enabled: true
     provider: vosk              # Provider: 'vosk' (free, offline). Currently the only one.
     language: en-US             # Language code passed to the recognizer
     max_audio_seconds: 300      # Skip recordings longer than this rather than occupy a core

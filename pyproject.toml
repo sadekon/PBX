@@ -43,6 +43,14 @@ dependencies = [
     "fido2>=2.2.0",
     "opuslib-next>=1.3.0",
     "vosk>=0.3.45",
+    # faster-whisper runs Whisper on CTranslate2, not torch -- roughly 50 MB of runtime
+    # instead of ~800 MB, which is why it is preferred here over the reference implementation.
+    # CHECK BEFORE DEPLOYING: ctranslate2 is a C++/oneDNN build with no practical sdist
+    # fallback, so a platform with no matching wheel fails the install outright rather than
+    # compiling. `make lock` targets cp313; confirm ctranslate2 resolves there and on 3.14 if
+    # that is ever the deployment target. It also pulls onnxruntime, for the Silero VAD that
+    # suppresses Whisper's hallucination on silence -- another large binary wheel.
+    "faster-whisper>=1.1.0",
     "spacy>=3.8.11",  # kept lower: spacy 3.8.14 has no cp314 wheel, so a higher floor breaks Python 3.14 (resolver picks 3.8.13 there)
     "nltk>=3.9.4",
     "numpy>=2.4.6,<2.5",
