@@ -526,6 +526,9 @@ class TransferHandler:
         original.bridged_peer_call_id = consult.call_id
         consult.bridged_peer_call_id = original.call_id
         consult.bridge_peer_side = transferor_relay_side
+        # The transfer target joins the conversation already in progress rather than starting
+        # its own, so the whole thing stays one recording and one transcript.
+        consult.join_session(original)
 
         # Move the destination's media onto the original relay's port. A
         # PBX-originated leg already advertised that port in its INVITE, so no

@@ -10,7 +10,7 @@ from typing import Any
 
 from pbx.features.call_parking import CallParkingSystem
 from pbx.features.call_queue import QueueSystem
-from pbx.features.call_recording import CallRecordingSystem
+from pbx.features.call_recording import CONSENT_KEY, CallRecordingSystem
 from pbx.features.cdr import CDRSystem
 from pbx.features.conference import ConferenceSystem
 from pbx.features.find_me_follow_me import FindMeFollowMe
@@ -104,8 +104,10 @@ class FeatureInitializer:
         )
         pbx_core.conference_system = ConferenceSystem()
         pbx_core.recording_system = CallRecordingSystem(
-            auto_record=config.get("features.call_recording", False)
+            auto_record=config.get("features.call_recording", False),
+            consent_acknowledged=config.get(CONSENT_KEY, False),
         )
+        FeatureInitializer._wire_call_recording(pbx_core)
         pbx_core.queue_system = QueueSystem(
             database=database if database.enabled else None, config=config
         )
@@ -369,6 +371,56 @@ class FeatureInitializer:
             logger.info("Skills-Based Routing initialized")
         else:
             pbx_core.skills_router = None
+
+    @staticmethod
+    def _wire_call_recording(pbx_core: Any) -> None:
+        """
+        Have every bridged call start recording itself.
+
+        The trigger lives on the RTP relay rather than in the call router, because the relay
+        is where audio actually is. A router-level hook only covers the one signalling path
+        it was added to -- the earlier version missed WebRTC and PBX-originated calls
+        entirely -- whereas anything that bridges two endpoints necessarily goes through
+        here.
+
+        This function is the only place that knows about both layers. ``pbx/rtp/`` holds a
+        plain callback and never learns that recording exists, which keeps the dependency
+        pointing the right way (features depend on rtp, not the reverse).
+        """
+        relay = getattr(pbx_core, "rtp_relay", None)
+        if relay is None:
+            return
+
+        def on_bridged(handler: Any) -> None:
+            """Called by the relay once both endpoints are known. Must not raise."""
+            recording_system = getattr(pbx_core, "recording_system", None)
+            if recording_system is None or not recording_system.auto_record:
+                return
+
+            # The relay knows a call_id and nothing else; names and the session come from
+            # the call record, which this layer can reach and the RTP layer cannot.
+            call = pbx_core.call_manager.get_call(handler.call_id)
+            caller = getattr(call, "from_extension", None) or "unknown"
+            callee = getattr(call, "to_extension", None) or "unknown"
+
+            tap = recording_system.start_recording(
+                handler.call_id,
+                caller,
+                callee,
+                session_id=getattr(call, "session_id", None) or handler.call_id,
+                # First-generation sources. A transfer bumps these, so the party who
+                # arrives gets their own channel instead of the departed party's.
+                labels={"a0": caller, "b0": callee},
+            )
+            if tap is not None:
+                handler.attach_tap(tap)
+
+        relay.on_bridged = on_bridged
+
+        # Relays allocated before this ran would otherwise never record. Startup order puts
+        # this well before any call, but a reload should not silently stop recording.
+        for entry in getattr(relay, "active_relays", {}).values():
+            entry["handler"].on_bridged = on_bridged
 
     @staticmethod
     def _init_active_directory(pbx_core: Any, config: Any) -> None:

@@ -185,11 +185,14 @@ class GracefulShutdownHandler:
             return
 
         try:
-            # Stop any remaining recordings
-            if hasattr(self.pbx_core, "recording_system"):
-                logger.debug("Stopping any active recordings...")
-                # Get all active recordings and stop them
-                # (recording_system should track this)
+            # Finish any recordings still in progress. Until call recording was wired to the
+            # RTP tap this was a comment with nothing under it; now a recording left open
+            # means a spool file on disk and no playable WAV.
+            recording_system = getattr(self.pbx_core, "recording_system", None)
+            if recording_system is not None:
+                closed = recording_system.stop_all()
+                if closed:
+                    logger.info(f"Finished {closed} recording(s) still in progress")
 
             # Release RTP ports
             if hasattr(self.pbx_core, "rtp_relay"):

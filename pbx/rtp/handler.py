@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
     from pbx.features.qos_monitoring import QoSMetrics, QoSMonitor
     from pbx.rtp.rfc2833 import RFC2833Receiver
+    from pbx.rtp.tap import AudioTap
 
 # Type alias for network address tuples
 type AddrTuple = tuple[str, int]
@@ -229,6 +230,15 @@ class RTPRelay:
         # can call allocate_relay/release_relay concurrently for different calls.
         self._pool_lock: threading.Lock = threading.Lock()
 
+        # Called once per relay, the moment both endpoints are known -- i.e. two parties are
+        # actually bridged and audio can flow. Set by whoever wants to observe calls
+        # (recording, live transcription); this layer never learns what they do with it.
+        #
+        # Living here rather than in the call router means *every* path that bridges a call
+        # is covered -- inbound, PBX-originated, WebRTC, redirected -- instead of only the
+        # one signalling path that happened to be wired up.
+        self.on_bridged: Callable[[RTPRelayHandler], None] | None = None
+
     def allocate_relay(self, call_id: str) -> tuple[int, int] | None:
         """
         Allocate RTP relay for a call.
@@ -252,6 +262,7 @@ class RTPRelay:
         rtcp_port = rtp_port + 1
 
         handler = RTPRelayHandler(rtp_port, call_id, qos_monitor=self.qos_monitor)
+        handler.on_bridged = self.on_bridged
         if handler.start():
             with self._pool_lock:
                 self.active_relays[call_id] = {
@@ -298,6 +309,7 @@ class RTPRelay:
                 return False
 
         handler = RTPRelayHandler(rtp_port, call_id, qos_monitor=self.qos_monitor)
+        handler.on_bridged = self.on_bridged
         if not handler.start():
             self.logger.error(f"Failed to bind adopted port {rtp_port} for call {call_id}")
             return False
@@ -458,6 +470,28 @@ class RTPRelayHandler:
         # resumes it. See pause_relay()/resume_relay().
         self.paused: bool = False
 
+        # Optional audio tap. Set by attach_tap() when something wants a copy of the relayed
+        # audio (recording, live transcription). None costs one attribute read per packet.
+        # See pbx/rtp/tap.py for why nothing heavier than a queue append happens on this
+        # thread.
+        self.tap: AudioTap | None = None
+
+        # Identifies the *party* currently on each side, not the side itself. A transfer
+        # replaces one side's endpoint with a different person (replace_endpoint), so a
+        # recording keyed on "a"/"b" would splice two people onto one channel with nothing
+        # marking the handover. Bumping a generation makes the new party a new source, which
+        # downstream turns into a new channel. Precomputed rather than formatted per packet,
+        # because the relay thread reads these 50 times a second per direction.
+        self._source_a: str = "a0"
+        self._source_b: str = "b0"
+        self._generation_a: int = 0
+        self._generation_b: int = 0
+
+        # Set once both endpoints are known, so observers are told exactly once even though
+        # set_endpoints is called repeatedly during setup and on every re-INVITE.
+        self._bridged_notified: bool = False
+        self.on_bridged: Callable[[RTPRelayHandler], None] | None = None
+
         # Start QoS monitoring if monitor is available
         # We track each direction separately since they have independent RTP
         # sequence numbers
@@ -485,6 +519,34 @@ class RTPRelayHandler:
             if endpoint_b is not None:
                 self.endpoint_b = endpoint_b
 
+        self._notify_bridged()
+
+    def _notify_bridged(self) -> None:
+        """
+        Announce, once, that both endpoints are known and audio can flow.
+
+        Fired outside the lock, because a listener attaches a tap and opens files and must
+        not do that while holding the relay's lock. Never raises: an observer failing is not
+        worth a call.
+
+        Deliberately gated on *both* endpoints. IVR paths -- auto attendant, queue hold,
+        voicemail -- set only side A and leave B as None, so they never fire this and never
+        get recorded. Recording an announcement playing at somebody is not what anyone means
+        by call recording.
+        """
+        if self._bridged_notified or self.endpoint_a is None or self.endpoint_b is None:
+            return
+
+        self._bridged_notified = True
+        callback = self.on_bridged
+        if callback is None:
+            return
+
+        try:
+            callback(self)
+        except Exception as e:
+            self.logger.error(f"Bridged callback for call {self.call_id} failed: {e}")
+
     def replace_endpoint(self, side: str, endpoint: AddrTuple) -> None:
         """
         Replace one side's endpoint with a new party (call transfer).
@@ -503,10 +565,23 @@ class RTPRelayHandler:
             if side == "a":
                 self.endpoint_a = endpoint
                 self.learned_a = None
+                self._generation_a += 1
+                self._source_a = f"a{self._generation_a}"
+                new_source = self._source_a
             else:
                 self.endpoint_b = endpoint
                 self.learned_b = None
+                self._generation_b += 1
+                self._source_b = f"b{self._generation_b}"
+                new_source = self._source_b
             self._start_time = time.time()  # Re-open the learning window
+
+        # A different human is now on this side. Anything recording gets a new source, so
+        # the departed party's channel ends where they left rather than absorbing their
+        # replacement's speech.
+        self.logger.info(
+            f"Call {self.call_id} side {side} replaced; audio source is now {new_source}"
+        )
 
     def start(self) -> bool:
         """
@@ -544,6 +619,10 @@ class RTPRelayHandler:
         self.running = False
         if self.socket:
             self.socket.close()
+
+        # Before QoS, because the tap still has queued audio to flush and its sink -- a
+        # half-written recording, say -- needs closing whether or not the call ended cleanly.
+        self.detach_tap()
 
         # Stop QoS monitoring if active (both directions)
         if self.qos_monitor:
@@ -667,6 +746,12 @@ class RTPRelayHandler:
 
                 sock.sendto(data, target)
 
+                # Forwarding is done. Everything below here is non-critical work that must
+                # not delay a packet, which is why the tap sits with the QoS accounting
+                # rather than above the sendto.
+                if self.tap is not None:
+                    self.tap.feed(self._source_a if side == "a" else self._source_b, data)
+
                 if qos_metrics and len(data) >= 12:
                     try:
                         header = struct.unpack("!BBHII", data[:12])
@@ -682,6 +767,33 @@ class RTPRelayHandler:
             except (KeyError, OSError, TypeError, ValueError, struct.error) as e:
                 if self.running:
                     self.logger.error(f"Error in RTP relay loop: {e}")
+
+    def attach_tap(self, tap: AudioTap) -> None:
+        """
+        Start copying relayed audio to `tap`.
+
+        The tap is started here so a caller cannot attach one that is not draining, which
+        would fill its queue and then silently discard the whole call. Replacing an existing
+        tap stops the old one first, so its sink is closed properly rather than abandoned.
+        """
+        if self.tap is not None:
+            self.detach_tap()
+
+        tap.start()
+        self.tap = tap
+        self.logger.info(f"Audio tap attached to call {self.call_id}")
+
+    def detach_tap(self) -> None:
+        """Stop copying audio and let the tap flush and close its sink."""
+        tap = self.tap
+        if tap is None:
+            return
+
+        # Cleared first: the relay thread stops feeding a tap that is being torn down, so
+        # the flush in stop() sees a queue that is no longer growing.
+        self.tap = None
+        tap.stop()
+        self.logger.info(f"Audio tap detached from call {self.call_id}")
 
     def pause_relay(self) -> None:
         """

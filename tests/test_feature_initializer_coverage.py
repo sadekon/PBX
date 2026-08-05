@@ -139,7 +139,9 @@ class TestFeatureInitializerInitialize:
         mocks["ConferenceSystem"].assert_called_once()
         assert pbx_core.conference_system == mocks["ConferenceSystem"].return_value
 
-        mocks["CallRecordingSystem"].assert_called_once_with(auto_record=False)
+        mocks["CallRecordingSystem"].assert_called_once_with(
+            auto_record=False, consent_acknowledged=False
+        )
         assert pbx_core.recording_system == mocks["CallRecordingSystem"].return_value
 
         mocks["QueueSystem"].assert_called_once()
@@ -240,7 +242,27 @@ class TestFeatureInitializerInitialize:
         pbx_core = _make_pbx_core(config_overrides={"features.call_recording": True})
         mocks = _run_initialize_with_all_patches(pbx_core)
 
-        mocks["CallRecordingSystem"].assert_called_once_with(auto_record=True)
+        mocks["CallRecordingSystem"].assert_called_once_with(
+            auto_record=True, consent_acknowledged=False
+        )
+
+    def test_consent_acknowledgement_is_passed_through(self) -> None:
+        """
+        The feature flag alone must not record. config.yml has had
+        features.call_recording: true since before anything could record, so the second key
+        is what distinguishes a decision from an inherited default.
+        """
+        pbx_core = _make_pbx_core(
+            config_overrides={
+                "features.call_recording": True,
+                "recording.consent_acknowledged": True,
+            }
+        )
+        mocks = _run_initialize_with_all_patches(pbx_core)
+
+        mocks["CallRecordingSystem"].assert_called_once_with(
+            auto_record=True, consent_acknowledged=True
+        )
 
     # ------------------------------------------------------------------ #
     # Optional features: auto_attendant
