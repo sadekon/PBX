@@ -213,10 +213,13 @@ def test_monitor_lifecycle() -> None:
     # Start monitor
     monitor.start()
     assert monitor.running, "Monitor should be running"
-    assert monitor.monitor_thread is not None, "Monitor thread should exist"
+    # The thread itself now lives inside PeriodicTask; `running` is the invariant callers
+    # actually depend on, and the only one the monitor still owns.
+    assert monitor.running, "Monitor loop should be alive"
 
-    # Let it run briefly (2 seconds to ensure thread is active)
-    time.sleep(2)
+    # Long enough to confirm the thread stays alive. This was 2s because the loop used to
+    # sleep in long blocking chunks; PeriodicTask waits on an Event, so it is up promptly.
+    time.sleep(0.1)
 
     # Stop monitor
     monitor.stop()

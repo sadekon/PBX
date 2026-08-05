@@ -764,45 +764,55 @@ class VoicemailBox:
 
     def delete_message(self, message_id: str) -> bool:
         """
-        Delete message
+        Delete a message: remove the audio, keep the record.
+
+        The recording is unlinked immediately and the row is *tombstoned* with
+        ``audio_deleted_at`` rather than deleted. Two reasons. The audio is ~170 KB against a
+        couple of KB of transcript, so the space is entirely in the file; and a mailbox being
+        cleared out should not destroy the record of what was said, which is what retention and
+        any later review depend on.
+
+        The message disappears from the mailbox either way -- it is dropped from the in-memory
+        list here, and ``_load_messages`` filters tombstoned rows out on restart. What survives
+        is the transcript, until the transcript's own retention clock expires it.
 
         Args:
             message_id: Message identifier
 
         Returns:
-            True if deleted
+            True if the message was found and deleted
         """
         for i, msg in enumerate(self.messages):
-            if msg["id"] == message_id:
-                self.logger.info(f"Deleting voicemail {message_id}...")
+            if msg["id"] != message_id:
+                continue
 
-                # Delete file
-                if Path(msg["file_path"]).exists():
-                    Path(msg["file_path"]).unlink()
-                    self.logger.info(f"  ✓ Deleted audio file: {msg['file_path']}")
+            self.logger.info(f"Deleting voicemail {message_id}...")
 
-                # Delete from database if available
-                if self.database and self.database.enabled:
-                    self.logger.info("Deleting voicemail from database...")
-                    try:
-                        placeholder = self._get_db_placeholder()
-                        query = f"""
-                        DELETE FROM voicemail_messages
-                        WHERE message_id = {placeholder}
-                        """  # nosec B608 - placeholder is safely parameterized
-                        self.database.execute(query, (message_id,))
-                        self.logger.info(
-                            f"  ✓ Successfully deleted voicemail {message_id} from {self.database.db_type} database"
-                        )
-                    except Exception as e:
-                        self.logger.error(f"  ✗ Error deleting voicemail from database: {e}")
-                else:
-                    self.logger.warning("  Database not available - only file deleted")
+            if msg.get("file_path") and Path(msg["file_path"]).exists():
+                Path(msg["file_path"]).unlink()
+                self.logger.info(f"  ✓ Deleted audio file: {msg['file_path']}")
 
-                # Remove from list
-                self.messages.pop(i)
-                self.logger.info(f"✓ Voicemail {message_id} deleted successfully")
-                return True
+            if self.database and self.database.enabled:
+                try:
+                    placeholder = self._get_db_placeholder()
+                    query = f"""
+                    UPDATE voicemail_messages
+                    SET audio_deleted_at = {placeholder}
+                    WHERE message_id = {placeholder}
+                    """  # nosec B608 - placeholder is safely parameterized
+                    self.database.execute(query, (datetime.now(UTC), message_id))
+                    self.logger.info(
+                        f"  ✓ Audio removed for {message_id}; transcript retained in "
+                        f"{self.database.db_type} database"
+                    )
+                except Exception as e:
+                    self.logger.error(f"  ✗ Error tombstoning voicemail in database: {e}")
+            else:
+                self.logger.warning("  Database not available - only file deleted")
+
+            self.messages.pop(i)
+            self.logger.info(f"✓ Voicemail {message_id} deleted successfully")
+            return True
         return False
 
     def _load_messages(self) -> None:
@@ -822,6 +832,10 @@ class VoicemailBox:
                        transcription_provider, transcribed_at
                 FROM voicemail_messages
                 WHERE extension_number = {placeholder}
+                  -- Tombstoned rows are deleted as far as the mailbox is concerned; the row
+                  -- survives only so the transcript does. Without this the message reappears
+                  -- on restart, pointing at a recording that is no longer on disk.
+                  AND audio_deleted_at IS NULL
                 ORDER BY created_at DESC
                 """  # nosec B608 - placeholder is safely parameterized
                 self.logger.debug(

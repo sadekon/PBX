@@ -130,7 +130,9 @@ class TranscriptStore:
             return []
 
         try:
-            rows = self.database.execute(
+            # fetch_all, not execute: execute() returns a bool no matter the statement, so a
+            # SELECT run through it yields True rather than rows.
+            rows = self.database.fetch_all(
                 f"SELECT {_COLUMNS} FROM call_transcripts {where} "
                 f"ORDER BY created_at DESC LIMIT {int(limit)}",
                 params,
@@ -144,8 +146,7 @@ class TranscriptStore:
     @staticmethod
     def _row_to_dict(row: Any) -> dict[str, Any]:
         """One row as a dict, with segments decoded back from JSON."""
-        keys = [name.strip() for name in _COLUMNS.split(",")]
-        record = dict(zip(keys, row, strict=False))
+        record = dict(row)
 
         raw = record.get("segments")
         if raw:

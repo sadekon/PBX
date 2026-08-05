@@ -3,12 +3,11 @@ Security Runtime Monitor
 Continuously monitors and enforces security compliance during PBX operation
 """
 
-import threading
-import time
 from datetime import UTC, datetime
 
 from pbx.utils.encryption import CRYPTO_AVAILABLE, get_encryption
 from pbx.utils.logger import get_logger
+from pbx.utils.periodic import PeriodicTask
 
 
 class SecurityMonitor:
@@ -28,13 +27,20 @@ class SecurityMonitor:
         self.logger = get_logger()
         self.config = config or {}
         self.webhook_system = webhook_system
-        self.running = False
-        self.monitor_thread = None
 
         # Monitoring configuration
         self.check_interval = self._get_config(
             "security.monitoring.check_interval", 300
         )  # 5 minutes
+        # Timing lives in PeriodicTask, as it does for every background loop in the PBX.
+        # This previously slept the full interval, so stop() could block for five minutes --
+        # longer than the entire 30s shutdown budget in pbx/utils/graceful_shutdown.py.
+        self._task = PeriodicTask(
+            "SecurityMonitor",
+            self.check_interval,
+            self.perform_security_check,
+            logger=self.logger,
+        )
         self.enforce_fips = self._get_config("security.enforce_fips", True)
         self.fips_mode = self._get_config("security.fips_mode", True)
 
@@ -80,42 +86,18 @@ class SecurityMonitor:
 
     def start(self) -> None:
         """Start security monitoring"""
-        if self.running:
-            self.logger.warning("Security monitor already running")
-            return
-
-        self.running = True
-        self.monitor_thread = threading.Thread(
-            target=self._monitor_loop, name="SecurityMonitor", daemon=True
-        )
-        self.monitor_thread.start()
-        self.logger.info("Security runtime monitor started")
-
-        # The monitor thread will perform the first security check
-        # No need to call it here to avoid duplicate logs at startup
+        # The first check happens one interval in, not at startup: it competes with everything
+        # else booting and would duplicate the log lines the boot sequence already emits.
+        self._task.start()
 
     def stop(self) -> None:
         """Stop security monitoring"""
-        if not self.running:
-            return
+        self._task.stop()
 
-        self.running = False
-        if self.monitor_thread:
-            self.monitor_thread.join(timeout=5)
-        self.logger.info("Security runtime monitor stopped")
-
-    def _monitor_loop(self) -> None:
-        """Main monitoring loop"""
-        while self.running:
-            try:
-                # Perform periodic security check
-                self.perform_security_check()
-
-                # Sleep until next check
-                time.sleep(self.check_interval)
-            except Exception as e:
-                self.logger.error(f"Security monitor error: {e}")
-                time.sleep(60)  # Shorter retry on error
+    @property
+    def running(self) -> bool:
+        """Whether the monitoring loop is alive."""
+        return self._task.running
 
     def perform_security_check(self) -> dict:
         """

@@ -16,6 +16,24 @@
 # UTC, in which case unset means recipients see UTC times with no clue that is what they are.
 timezone: America/New_York
 
+# How long recordings, voicemail and transcripts are kept before being deleted.
+#
+# READ THIS BEFORE ENABLING: retention has never actually run on this system, so the first
+# real sweep deletes everything already past its period -- which may be everything. Leave
+# dry_run on, read a sweep in the log, then turn it off.
+#
+# Two clocks on purpose. Audio is where the bytes and the privacy weight are (~170 KB for a
+# 21-second recording); a transcript is ~2% of that and carries most of the value, so it is
+# kept longer. Deleting a voicemail already keeps its transcript.
+retention:
+  enabled: true           # Master switch. Nothing is swept while this is false.
+  dry_run: true            # Log what would be deleted, delete nothing. Turn off deliberately.
+  interval_hours: 24       # How often the sweep runs
+  audio_days: 90           # Recordings and voicemail .wav files
+  transcript_days: 365     # Transcript rows in call_transcripts
+  voicemail_path: voicemail
+  recording_path: recordings
+
 server:
   sip_host: 0.0.0.0
   sip_port: 5060

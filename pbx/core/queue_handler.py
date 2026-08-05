@@ -79,8 +79,7 @@ REJECT_ABORT_REASON = "target_rejected"
 #: Default hold-announcement text when a queue enables announcements without
 #: a custom message or pre-recorded file (see _resolve_announcement_audio).
 DEFAULT_ANNOUNCEMENT_TEXT = (
-    "Thank you for holding. Your call is important to us and will be "
-    "answered as soon as possible."
+    "Thank you for holding. Your call is important to us and will be answered as soon as possible."
 )
 
 #: Spoken *61/*62 confirmation text (see _star_code_confirm). Falls back to

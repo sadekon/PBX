@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from pbx.features.presence import PresenceSystem
     from pbx.features.recording_announcements import RecordingAnnouncements
     from pbx.features.recording_retention import RecordingRetentionManager
+    from pbx.features.retention import RetentionSweeper
     from pbx.features.session_border_controller import SessionBorderController
     from pbx.features.sip_trunk import SIPTrunkSystem
     from pbx.features.skills_routing import SkillsBasedRouter
@@ -110,6 +111,7 @@ class PBXCore:
     find_me_follow_me: FindMeFollowMe
     time_based_routing: TimeBasedRouting
     recording_retention: RecordingRetentionManager
+    retention_sweeper: RetentionSweeper
     fraud_detection: FraudDetectionSystem
     callback_queue: CallbackQueue
     mobile_push: MobilePushNotifications
@@ -592,6 +594,9 @@ class PBXCore:
         # Then transcription, which releases anything still queued by firing its callbacks
         # without a transcript. Those callbacks send voicemail notifications, so this must
         # come before the mailer is drained.
+        if hasattr(self, "retention_sweeper"):
+            self.retention_sweeper.stop()
+
         if hasattr(self, "transcription_service"):
             self.transcription_service.stop()
 
