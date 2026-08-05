@@ -34,16 +34,6 @@ retention:
   voicemail_path: voicemail
   recording_path: recordings
 
-# Call recording. features.call_recording turns it on; this acknowledges that you have
-# decided recording is appropriate here. Both are required, because features.call_recording
-# was already true for as long as the feature did nothing, so on its own it says nothing
-# about intent.
-#
-# Recording a call without notifying the participants is unlawful in two-party-consent
-# jurisdictions and this PBX plays no announcement yet. Enabled here for testing.
-recording:
-  consent_acknowledged: true
-
 server:
   sip_host: 0.0.0.0
   sip_port: 5060
@@ -447,6 +437,14 @@ recording:
   auto_record: false
   storage_path: recordings
   format: wav
+  # features.call_recording turns recording on; this says an operator decided it is
+  # appropriate here rather than inheriting it. Both are required, because
+  # features.call_recording was already true for the whole time the feature did nothing,
+  # so on its own it says nothing about intent.
+  #
+  # Recording a call without notifying the participants is unlawful in two-party-consent
+  # jurisdictions and this PBX plays no announcement yet. Enabled here for testing.
+  consent_acknowledged: true
 # SMTP transport. Owned by pbx/mail and shared by every feature that sends email
 # (voicemail notification, Kari's Law emergency notification). What each email *says* is
 # configured by the feature that sends it -- see voicemail.email below.
