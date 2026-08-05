@@ -146,9 +146,7 @@ class TestQueueCrud:
     ) -> None:
         queue_system.create_queue("8001", "Sales")
         with patch(AUTH_PATCH, return_value=AUTH_RETURN):
-            response = api_client.put(
-                "/api/queues/8001", json={"announcement_interval": 5000}
-            )
+            response = api_client.put("/api/queues/8001", json={"announcement_interval": 5000})
         assert response.status_code == 400
 
     def test_update_overflow_action(self, api_client: FlaskClient, queue_system) -> None:

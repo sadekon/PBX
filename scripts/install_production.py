@@ -692,9 +692,7 @@ class ProductionInstaller:
             db_name = db_env.get("DB_NAME", "pbx_system")
             db_user = db_env.get("DB_USER", "pbx_user")
             db_pw = urllib.parse.quote_plus(db_env.get("DB_PASSWORD", ""))
-            db_env["DATABASE_URL"] = (
-                f"postgresql://{db_user}:{db_pw}@{db_host}:{db_port}/{db_name}"
-            )
+            db_env["DATABASE_URL"] = f"postgresql://{db_user}:{db_pw}@{db_host}:{db_port}/{db_name}"
 
         # Try Alembic first
         if alembic_ini.exists():

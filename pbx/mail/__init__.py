@@ -20,6 +20,7 @@ Typical use, from a feature holding a reference to ``pbx_core.mailer``::
 """
 
 from pbx.mail.client import SendResult, SmtpClient, SmtpTransport, TransportFactory
+from pbx.mail.debug import Redactor, enable_smtp_debug
 from pbx.mail.dispatcher import Mailer
 from pbx.mail.errors import (
     EmailConfigError,
@@ -38,6 +39,7 @@ __all__ = [
     "EmailPermanentError",
     "EmailTransientError",
     "Mailer",
+    "Redactor",
     "SendResult",
     "SmtpClient",
     "SmtpSettings",
@@ -45,5 +47,6 @@ __all__ = [
     "TransportFactory",
     "build_message",
     "classify",
+    "enable_smtp_debug",
     "sanitize_header",
 ]

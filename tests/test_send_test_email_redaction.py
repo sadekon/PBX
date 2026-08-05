@@ -1,5 +1,5 @@
 """
-Credential redaction in scripts/send_test_email.py --verbose.
+Credential redaction in pbx.mail.debug, used by every script's --verbose flag.
 
 Regression test for a real leak: the first implementation searched the transcript for the
 *literal* password, but SASL base64-encodes credentials before they reach the wire, so the
@@ -11,34 +11,17 @@ server capability lines readable.
 """
 
 import base64
-import importlib.util
-from pathlib import Path
 
 import pytest
 
-from pbx.mail import SmtpSettings
-
-_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "send_test_email.py"
+from pbx.mail import Redactor, SmtpSettings
 
 PASSWORD = "hunter2-not-real!"
 USERNAME = "voicemail@corp.local"
 
 
-def _load_script():
-    """scripts/ is not a package, so load the module by path."""
-    spec = importlib.util.spec_from_file_location("send_test_email", _SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.fixture(scope="module")
-def script():
-    return _load_script()
-
-
 @pytest.fixture
-def redactor(script):
+def redactor():
     settings = SmtpSettings(
         host="mail.corp.local",
         from_address="pbx@corp.local",
@@ -46,7 +29,7 @@ def redactor(script):
         username=USERNAME,
         password=PASSWORD,
     )
-    return script._Redactor(settings)
+    return Redactor(settings)
 
 
 @pytest.mark.unit
@@ -175,9 +158,9 @@ class TestDiagnosticsArePreserved:
 
 @pytest.mark.unit
 class TestNoCredentialsConfigured:
-    def test_anonymous_relay_transcript_is_untouched(self, script):
+    def test_anonymous_relay_transcript_is_untouched(self):
         settings = SmtpSettings(host="h", from_address="a@corp.local", auth="none")
-        redactor = script._Redactor(settings)
+        redactor = Redactor(settings)
         line = "send: 'MAIL FROM:<a@corp.local>'"
 
         assert redactor(line) == line

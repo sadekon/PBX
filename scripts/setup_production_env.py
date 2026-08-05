@@ -44,9 +44,7 @@ class EnvSetup:
 
         # Database configuration
         print("\n--- Database Configuration ---")
-        db_type = self._prompt_choice(
-            "Database type", ["postgresql"], default="postgresql"
-        )
+        db_type = self._prompt_choice("Database type", ["postgresql"], default="postgresql")
 
         if db_type == "postgresql":
             self.variables["DB_HOST"] = self._prompt(

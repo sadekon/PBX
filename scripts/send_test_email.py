@@ -19,8 +19,6 @@ will not start.
 from __future__ import annotations
 
 import argparse
-import base64
-import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,7 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 try:
-    from pbx.mail import SmtpClient, SmtpSettings, build_message
+    from pbx.mail import SmtpClient, SmtpSettings, build_message, enable_smtp_debug
     from pbx.utils.config import Config
 except ModuleNotFoundError as exc:
     # Almost always "run with the system interpreter instead of the project venv". The bare
@@ -44,78 +42,6 @@ except ModuleNotFoundError as exc:
         file=sys.stderr,
     )
     raise SystemExit(2) from exc
-
-
-#: A bare base64 token. Only meaningful inside the AUTH exchange: SMTP verbs such as
-#: STARTTLS, QUIT, DATA and RSET are also pure alphanumerics and must stay visible.
-_BASE64_BLOB = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
-
-#: Commands that look like base64 but are protocol, not payload.
-_SMTP_VERBS = frozenset(
-    {"starttls", "quit", "data", "rset", "noop", "helo", "ehlo", "auth", "vrfy", "bdat"}
-)
-
-#: The AUTH *command* the client issues, whose argument may carry an inline credential.
-#: Deliberately anchored to 'send:' so it cannot match a '250-AUTH' capability line, which
-#: is not secret and is genuinely useful when diagnosing a connector.
-_AUTH_COMMAND = re.compile(r"^send:\s*b?['\"]?AUTH\s", re.IGNORECASE)
-
-
-class _Redactor:
-    """
-    Strip credentials from smtplib's debug transcript.
-
-    Fails safe: rather than searching for the password (which is base64-encoded by SASL and
-    so never appears literally), it suppresses anything that *could* be a credential -- the
-    client's reply to a 334 challenge, any bare base64 payload, and the AUTH command's
-    argument. Server capability lines are left intact.
-    """
-
-    def __init__(self, settings: SmtpSettings) -> None:
-        self._secrets = {value for value in (settings.password, settings.username) if value}
-        # Cover the encodings SASL actually puts on the wire, so a literal match still works
-        # as a backstop: LOGIN sends each field separately, PLAIN sends \0user\0pass.
-        for value in list(self._secrets):
-            self._secrets.add(base64.b64encode(value.encode()).decode())
-        if settings.username and settings.password:
-            plain = f"\0{settings.username}\0{settings.password}".encode()
-            self._secrets.add(base64.b64encode(plain).decode())
-        self._challenged = False
-        self._in_auth = False
-
-    def __call__(self, line: str) -> str:
-        stripped = line.lstrip()
-        is_send = stripped.startswith("send:")
-        payload = line.partition(":")[2].strip().strip("'\"").removesuffix("\\r\\n").strip()
-
-        # The line straight after a 334 challenge is the credential itself.
-        if self._challenged and is_send:
-            self._challenged = False
-            return "send: <credential redacted>"
-        self._challenged = stripped.startswith("reply:") and payload.startswith(("334", "b'334"))
-
-        if _AUTH_COMMAND.match(stripped):
-            self._in_auth = True
-            return "send: AUTH <mechanism and credential redacted>"
-
-        # A bare base64 blob is only a credential mid-AUTH. Outside it, an all-alphanumeric
-        # payload is an ordinary SMTP verb and hiding it would defeat the point of --verbose.
-        if (
-            is_send
-            and self._in_auth
-            and payload.lower() not in _SMTP_VERBS
-            and _BASE64_BLOB.match(payload)
-        ):
-            return "send: <base64 payload redacted>"
-
-        # The AUTH exchange ends at the first non-334 server reply.
-        if stripped.startswith("reply:") and not self._challenged:
-            self._in_auth = False
-
-        for secret in self._secrets:
-            if secret and secret in line:
-                line = line.replace(secret, "***")
-        return line
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -180,16 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.verbose:
-        # smtplib's debug output goes to stderr; the redaction above covers the AUTH lines.
-        import smtplib
-
-        redactor = _Redactor(settings)
-
-        def patched(self, *bits):  # type: ignore[no-untyped-def]
-            print(redactor(" ".join(str(bit) for bit in bits)), file=sys.stderr)
-
-        smtplib.SMTP._print_debug = patched  # type: ignore[method-assign]
-        smtplib.SMTP.debuglevel = 1
+        enable_smtp_debug(settings)
 
     client = SmtpClient(settings)
 

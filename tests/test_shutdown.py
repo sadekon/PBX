@@ -6,10 +6,12 @@ Test PBX shutdown functionality
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import yaml
 
 from pbx.core.pbx import PBXCore
+from pbx.utils.graceful_shutdown import GracefulShutdownHandler
 
 
 def test_pbx_shutdown() -> None:
@@ -140,3 +142,70 @@ def test_signal_handling_simulation() -> None:
         # Clean up
         if Path(config_file).exists():
             Path(config_file).unlink()
+
+
+class TestShutdownPreservesVoicemail:
+    """
+    A voicemail left while the PBX is shutting down must still reach its recipient.
+
+    Both tests drive the shutdown code against a mock rather than a live PBX: the ordering is
+    the whole point, and a real instance adds sockets and multi-second sleeps without making
+    the assertion any stronger.
+    """
+
+    def test_mail_is_drained_after_active_calls_are_ended(self) -> None:
+        """
+        Ending a call can record a voicemail, and saving one queues a notification.
+
+        stop() used to drain the mailer before ending active calls, so those notifications
+        were handed to a worker that had already been joined and were silently lost.
+        """
+        order: list[str] = []
+        core = MagicMock()
+        call = MagicMock()
+        call.call_id = "call-1"
+        core.call_manager.get_active_calls.return_value = [call]
+        core.end_call.side_effect = lambda _cid: order.append("end_call")
+        core.mailer.stop.side_effect = lambda *a, **k: order.append("mailer.stop")
+
+        PBXCore.stop(core)
+
+        assert order == ["end_call", "mailer.stop"], (
+            "active calls must be ended before the mailer is drained, or voicemail "
+            "recorded during shutdown loses its notification"
+        )
+
+    def test_forced_shutdown_ends_calls_through_pbx_core(self) -> None:
+        """
+        The timeout path must use PBXCore.end_call, which saves the voicemail.
+
+        CallManager.end_call only drops the call from the active dict -- no voicemail save, no
+        CDR close, no RTP release -- so a caller mid-message when the PBX was signalled lost
+        the recording outright.
+        """
+        core = MagicMock()
+        call = MagicMock()
+        call.call_id = "call-1"
+        core.call_manager.get_active_calls.return_value = [call]
+        handler = GracefulShutdownHandler(core, shutdown_timeout=30)
+
+        # timeout=0 skips the grace period and goes straight to the force-end branch.
+        handler._wait_for_calls_to_complete(timeout=0)
+
+        core.end_call.assert_called_once_with("call-1")
+        core.call_manager.end_call.assert_not_called()
+
+    def test_forced_shutdown_continues_after_a_failing_call(self) -> None:
+        """One call failing to end must not strand the rest."""
+        core = MagicMock()
+        first, second = MagicMock(), MagicMock()
+        first.call_id, second.call_id = "bad", "good"
+        core.call_manager.get_active_calls.return_value = [first, second]
+        core.end_call.side_effect = lambda cid: (
+            (_ for _ in ()).throw(RuntimeError("boom")) if cid == "bad" else None
+        )
+        handler = GracefulShutdownHandler(core, shutdown_timeout=30)
+
+        handler._wait_for_calls_to_complete(timeout=0)
+
+        assert core.end_call.call_count == 2

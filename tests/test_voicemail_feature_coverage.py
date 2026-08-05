@@ -382,37 +382,59 @@ class TestVoicemailBoxSaveMessage:
         msg_id = voicemail_box.save_message("5551234", b"audio data")
         assert msg_id is not None
 
-    def test_save_message_with_transcription_success(self, voicemail_box) -> None:
-        transcription_svc = MagicMock()
-        transcription_svc.transcribe.return_value = {
-            "success": True,
-            "text": "Hello this is a test message",
-            "confidence": 0.95,
-            "language": "en",
-            "provider": "whisper",
-            "timestamp": "2025-01-01T12:00:00",
-        }
-        voicemail_box.transcription_service = transcription_svc
+    @staticmethod
+    def _inline_worker(text: str = "Hello this is a test message", confidence: float = 0.95):
+        """
+        A TranscriptionWorker stand-in that runs the job on the calling thread.
+
+        Mirrors the real contract: submit() returns True and then calls the callback exactly
+        once. Transcription is no longer awaited inside save_message, so a stub that only
+        offers transcribe() would never be reached.
+        """
+        from pbx.speech import Transcript
+
+        worker = MagicMock()
+        worker.settings.deadline_seconds = 30.0
+
+        def submit(path, on_complete, **kwargs) -> bool:
+            on_complete(
+                Transcript(text=text, confidence=confidence, language="en", provider="vosk")
+            )
+            return True
+
+        worker.submit.side_effect = submit
+        return worker
+
+    def test_save_message_with_transcription_success(self, voicemail_box, mock_mailer) -> None:
+        # A mailer is required: transcription is submitted for the notification's benefit, so
+        # a box with nowhere to send does not spend CPU transcribing.
+        voicemail_box.mailer = mock_mailer
+        voicemail_box.transcription_service = self._inline_worker()
         _msg_id = voicemail_box.save_message("5551234", b"audio data")
         msg = voicemail_box.messages[0]
         assert msg["transcription"] == "Hello this is a test message"
         assert msg["transcription_confidence"] == 0.95
 
-    def test_save_message_with_transcription_db_save(self, voicemail_box, mock_database) -> None:
+    def test_save_message_with_transcription_db_save(
+        self, voicemail_box, mock_database, mock_mailer
+    ) -> None:
         voicemail_box.database = mock_database
-        transcription_svc = MagicMock()
-        transcription_svc.transcribe.return_value = {
-            "success": True,
-            "text": "Hello",
-            "confidence": 0.9,
-            "language": "en",
-            "provider": "whisper",
-            "timestamp": "2025-01-01T12:00:00",
-        }
-        voicemail_box.transcription_service = transcription_svc
+        voicemail_box.mailer = mock_mailer
+        voicemail_box.transcription_service = self._inline_worker(text="Hello", confidence=0.9)
         voicemail_box.save_message("5551234", b"audio data")
         # Should call execute twice: once for message insert, once for transcription update
         assert mock_database.execute.call_count == 2
+
+    def test_save_message_without_a_mailer_skips_transcription(self, voicemail_box) -> None:
+        """No mailer means no notification, so there is nothing a transcript would serve."""
+        worker = self._inline_worker()
+        voicemail_box.mailer = None
+        voicemail_box.transcription_service = worker
+
+        voicemail_box.save_message("5551234", b"audio data")
+
+        worker.submit.assert_not_called()
+        assert "transcription" not in voicemail_box.messages[0]
 
     def test_save_message_transcription_db_error(self, voicemail_box, mock_database) -> None:
         voicemail_box.database = mock_database

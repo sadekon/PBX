@@ -35,12 +35,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 try:
-    from pbx.features.voicemail_transcription import (
+    from pbx.speech import TranscriptionSettings, build_backend
+    from pbx.speech.settings import (
+        CONFIG_SECTION as TRANSCRIPTION_SECTION,
         DEFAULT_LANGUAGE,
         DEFAULT_MAX_AUDIO_SECONDS,
-        DEFAULT_VOSK_MODEL_PATH,
-        VOSK_AVAILABLE,
-        VoicemailTranscriptionService,
     )
     from pbx.utils.audio import read_wav_as_pcm16
 except ModuleNotFoundError as exc:
@@ -108,39 +107,37 @@ def _describe_wav(path: Path) -> dict[str, Any] | None:
     return None
 
 
-class _ForcedConfig:
-    """
-    Config stand-in that switches transcription on for this run only.
-
-    features.voicemail_transcription.enabled ships false -- transcription cannot work until a
-    model is installed out of band -- so reading the real setting would make this script
-    refuse to do the one thing it exists for.
-    """
-
-    def __init__(self, values: dict[str, Any]) -> None:
-        self._values = values
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._values.get(key, default)
-
-
-def _resolve_model_path(args: argparse.Namespace) -> str:
-    """--model wins, then config.yml, then the built-in default."""
-    if args.model:
-        return args.model
-
-    config_path = Path(args.config)
-    if config_path.exists():
+def _build_settings(args: argparse.Namespace, language: str) -> TranscriptionSettings:
+    """Config section first, then whatever the caller overrode on the command line."""
+    section: dict[str, object] = {}
+    if Path(args.config).exists():
         try:
             from pbx.utils.config import Config
 
-            configured = Config(args.config).get("features.voicemail_transcription.vosk_model_path")
-            if configured:
-                return str(configured)
+            section = dict(Config(args.config).get(TRANSCRIPTION_SECTION, {}) or {})
         except Exception as exc:  # A broken config.yml must not stop a diagnostic.
-            _log(f"note: could not read {args.config} ({exc}); using the built-in default")
+            _log(f"note: could not read {args.config} ({exc}); using defaults")
 
-    return DEFAULT_VOSK_MODEL_PATH
+    if args.provider:
+        section["provider"] = args.provider
+    if args.model_dir:
+        section["whisper_model_dir"] = args.model_dir
+    if args.model:
+        # One --model flag for both engines: a directory for vosk, a name for whisper. Which
+        # key it lands in follows the provider, so the flag means "the model" either way.
+        resolved = str(section.get("provider", "vosk")).lower()
+        key = "whisper_model" if resolved.endswith("whisper") else "vosk_model_path"
+        section[key] = args.model
+
+    section.update(
+        {
+            "enabled": True,
+            "language": language,
+            "max_audio_seconds": args.max_seconds,
+            "workers": 0,
+        }
+    )
+    return TranscriptionSettings.from_dict(section)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -148,10 +145,19 @@ def build_parser() -> argparse.ArgumentParser:
         description="Transcribe a voicemail WAV and print the text to stdout.",
         epilog="Voicemail files live under the voicemail/<extension>/ directory.",
     )
-    parser.add_argument("--file", "-f", required=True, help="Path to the WAV file")
+    parser.add_argument("--file", required=True, help="Path to the WAV file")
+    parser.add_argument(
+        "--provider",
+        choices=["vosk", "faster-whisper", "whisper"],
+        help="Engine to use (default: features.voicemail_transcription.provider)",
+    )
     parser.add_argument(
         "--model",
-        help="Path to the Vosk model directory (default: from config.yml, else models/...)",
+        help="Vosk model directory, or the whisper model name (default: from config.yml)",
+    )
+    parser.add_argument(
+        "--model-dir",
+        help="Directory whisper models are staged in (default: from config.yml)",
     )
     parser.add_argument("--config", default="config.yml", help="Path to config.yml")
     parser.add_argument(
@@ -164,7 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Refuse audio longer than this (default: {DEFAULT_MAX_AUDIO_SECONDS})",
     )
     parser.add_argument(
-        "--quiet", "-q", action="store_true", help="Suppress diagnostics; print only the text"
+        "--quiet", action="store_true", help="Suppress diagnostics; print only the text"
     )
     return parser
 
@@ -178,8 +184,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: no such file: {audio_path}", file=sys.stderr)
         return 2
 
-    model_path = _resolve_model_path(args)
     language = args.language or DEFAULT_LANGUAGE
+    settings = _build_settings(args, language)
 
     if not quiet:
         _log(f"File:   {audio_path}")
@@ -204,65 +210,62 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as exc:
             _log(f"Decode:  FAILED -- {exc}")
             _log("")
-            _log("The audio could not be converted to linear PCM, so Vosk was never called.")
+            _log("The audio could not be converted to linear PCM, so the engine never ran.")
             return 1
 
-        _log(f"Model:  {model_path}")
-        if not Path(model_path).is_dir():
-            _log("        ^ this directory does not exist")
-            _log("")
-            _log("Install it with: python scripts/install_vosk_model.py")
-            return 1
+        _log(f"Engine: {settings.provider}")
+        if settings.provider == "vosk":
+            _log(f"Model:  {settings.vosk_model_path}")
+        else:
+            _log(f"Model:  {settings.whisper_model_dir or settings.whisper_model}")
+        for problem in settings.validate():
+            _log(f"  config: {problem}")
         _log("")
 
-    service = VoicemailTranscriptionService(
-        _ForcedConfig(
-            {
-                "features.voicemail_transcription.enabled": True,
-                "features.voicemail_transcription.provider": "vosk",
-                "features.voicemail_transcription.vosk_model_path": model_path,
-                "features.voicemail_transcription.language": language,
-                "features.voicemail_transcription.max_audio_seconds": args.max_seconds,
-            }
-        )
-    )
+    service = build_backend(settings)
 
-    if not service.ready:
-        # Two very different problems reach here, and the remedy for one does nothing for the
-        # other. Naming the wrong one sends you off installing a 40 MB model you already have.
-        if not VOSK_AVAILABLE:
+    if service is None or not service.ready:
+        # The remedy differs completely by engine, and naming the wrong one sends you off
+        # reinstalling a model you already have. The backend has already logged the real cause.
+        print(
+            f"error: the {settings.provider} engine did not load -- see the log lines above.",
+            file=sys.stderr,
+        )
+        if settings.provider == "vosk":
             print(
-                "error: the vosk library is not installed in this interpreter, so no model "
-                "can be loaded.",
+                "Install or repair it with: python scripts/install_vosk_model.py --force",
                 file=sys.stderr,
             )
-            print("Install it with: pip install vosk    (or: make install)", file=sys.stderr)
         else:
             print(
-                f"error: the vosk library is present but the model at {model_path} could not "
-                "be loaded -- see the log lines above.",
-                file=sys.stderr,
-            )
-            print(
-                "Reinstall it with: python scripts/install_vosk_model.py --force",
+                "Stage the model with: python scripts/install_whisper_model.py",
                 file=sys.stderr,
             )
         return 1
 
-    result = service.transcribe(str(audio_path), language=language)
+    result = service.transcribe_file(audio_path, language=language)
 
-    if not result["success"]:
-        print(f"error: transcription failed: {result['error']}", file=sys.stderr)
+    if not result.success:
+        print(f"error: transcription failed: {result.error}", file=sys.stderr)
         return 1
 
     # The transcript, and only the transcript, on stdout.
-    print(result["text"])
+    print(result.text)
 
     if not quiet:
         _log("")
-        _log(f"Provider:   {result['provider']}")
-        _log(f"Language:   {result['language']}")
-        _log(f"Characters: {len(result['text']):,}")
+        _log(f"Provider:   {result.provider}")
+        _log(f"Language:   {result.language}")
+        _log(f"Characters: {len(result.text):,}")
+        _log(f"Segments:   {len(result.segments)}")
+        if result.confidence is not None:
+            _log(f"Confidence: {result.confidence:.1%}")
+        if result.real_time_factor is not None:
+            _log(
+                f"Speed:      {result.processing_duration:.1f}s for "
+                f"{result.audio_duration:.1f}s of audio "
+                f"(RTF {result.real_time_factor:.2f})"
+            )
 
     return 0
 

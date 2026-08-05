@@ -1,0 +1,900 @@
+"""
+Tests for the shared transcription subsystem (``pbx/speech``).
+
+Replaces tests/test_voicemail_transcription.py, which tested the same logic when it lived in
+pbx/features/voicemail_transcription.py. The audio-format coverage is the important part and
+is carried over intact: voicemail is stored as G.711, which Python's `wave` module cannot
+open at all, and that broke every real transcription until it was fixed.
+"""
+
+import json
+import struct
+from itertools import pairwise
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+
+from pbx.speech import Transcript, TranscriptionSettings, TranscriptionWorker, build_backend
+from pbx.speech.backends.vosk import VoskBackend
+
+
+def _settings(**overrides: Any) -> TranscriptionSettings:
+    """Settings with transcription on, overridable per test."""
+    base: dict[str, Any] = {"enabled": True, "provider": "vosk", "workers": 0}
+    base.update(overrides)
+    return TranscriptionSettings.from_dict(base)
+
+
+def _tone_pcm16(seconds: float = 1.0, rate: int = 8000, freq: int = 440) -> bytes:
+    """A PCM16 sine tone, used as the reference signal for codec round trips."""
+    import math
+
+    return b"".join(
+        struct.pack("<h", int(12000 * math.sin(2 * math.pi * freq * t / rate)))
+        for t in range(int(rate * seconds))
+    )
+
+
+def _write_wav(path: Path, payload: bytes, audio_format: int, bits: int, rate: int = 8000) -> Path:
+    """Write a WAV with an explicit format code, the way PBXCore._build_wav_file does."""
+    from pbx.utils.audio import build_wav_header
+
+    path.write_bytes(build_wav_header(len(payload), rate, 1, bits, audio_format) + payload)
+    return path
+
+
+class _FakeRecognizer:
+    """
+    Stands in for Kaldi so the audio plumbing can be tested without a real model.
+
+    Rejects a sample-rate mismatch exactly as Kaldi does -- it aborts rather than resampling.
+    An earlier version of this stub accepted any rate, which is precisely why the 8 kHz
+    telephony / 16 kHz model mismatch got through the suite and only surfaced on a server.
+    """
+
+    transcript = "hello from voicemail"
+    expected_rate = 16000
+
+    def __init__(self, model: Any, sample_rate: int) -> None:
+        if sample_rate != self.expected_rate:
+            raise ValueError(
+                f"Sampling frequency mismatch, expected {self.expected_rate}, got {sample_rate}"
+            )
+        self.sample_rate = sample_rate
+
+    def SetWords(self, flag: bool) -> None:  # noqa: N802 - mirrors the Vosk API
+        pass
+
+    def AcceptWaveform(self, data: bytes) -> bool:  # noqa: N802 - mirrors the Vosk API
+        return False
+
+    def Result(self) -> str:  # noqa: N802 - mirrors the Vosk API
+        return json.dumps({"text": ""})
+
+    def FinalResult(self) -> str:  # noqa: N802 - mirrors the Vosk API
+        return json.dumps(
+            {
+                "text": self.transcript,
+                "result": [
+                    {"word": "hello", "start": 0.0, "end": 0.4, "conf": 0.9},
+                    {"word": "from", "start": 0.4, "end": 0.7, "conf": 0.8},
+                ],
+            }
+        )
+
+
+def _ready_backend(settings: TranscriptionSettings | None = None) -> VoskBackend:
+    """A backend with the model-loading step short-circuited."""
+    backend = VoskBackend(settings or _settings())
+    backend.model = Mock()
+    return backend
+
+
+@pytest.mark.unit
+class TestSettings:
+    def test_defaults_when_nothing_configured(self) -> None:
+        settings = TranscriptionSettings.from_dict({})
+
+        # Off by default: the model is a separate ~40 MB download, so defaulting to on would
+        # mean a fresh install silently fails to transcribe.
+        assert not settings.enabled
+        assert settings.provider == "vosk"
+        assert settings.language == "en-US"
+        assert settings.max_audio_seconds == 300
+        assert settings.workers == 1
+
+    def test_workers_zero_runs_inline(self) -> None:
+        assert TranscriptionSettings.from_dict({"workers": 0}).runs_inline
+
+    def test_workers_are_capped_to_leave_cores_for_media(self) -> None:
+        """A transcription thread per core would starve the RTP relay threads."""
+        settings = TranscriptionSettings.from_dict({"workers": 999})
+
+        assert settings.workers < 999
+        assert any("exceeds the safe ceiling" in w for w in settings.config_warnings)
+
+    def test_unknown_provider_is_reported(self) -> None:
+        # "google" specifically: it was a documented provider until google-cloud-speech turned
+        # out never to have been a dependency, so old config.yml files still name it.
+        settings = TranscriptionSettings.from_dict({"enabled": True, "provider": "google"})
+
+        assert any("is not one of" in w for w in settings.config_warnings)
+        assert any("not supported" in p for p in settings.validate())
+
+    def test_disabled_config_reports_nothing(self) -> None:
+        assert TranscriptionSettings.from_dict({"enabled": False}).validate() == []
+
+    def test_missing_model_is_reported(self) -> None:
+        problems = _settings(vosk_model_path="/nonexistent/model").validate()
+
+        assert any("does not exist" in p for p in problems)
+
+    def test_relative_model_path_is_flagged(self, tmp_path: Any) -> None:
+        """A relative path resolves against the service's working directory, not the repo."""
+        (tmp_path / "m").mkdir()
+        import os
+
+        cwd = Path.cwd()
+        os.chdir(tmp_path)
+        try:
+            problems = _settings(vosk_model_path="m").validate()
+        finally:
+            os.chdir(cwd)
+
+        assert any("is relative" in p for p in problems)
+
+    def test_redacted_is_serialisable(self) -> None:
+        redacted = _settings().redacted()
+
+        assert redacted["provider"] == "vosk"
+        assert "config_warnings" not in redacted
+
+    @pytest.mark.parametrize("spelling", ["whisper", "faster_whisper", "Faster-Whisper"])
+    def test_whisper_provider_spellings_are_normalised(self, spelling: str) -> None:
+        """The engine is faster-whisper; "whisper" is what everyone types."""
+        settings = TranscriptionSettings.from_dict({"enabled": True, "provider": spelling})
+
+        assert settings.provider == "faster-whisper"
+        assert not settings.config_warnings
+
+    def test_whisper_defaults(self) -> None:
+        settings = TranscriptionSettings.from_dict({"provider": "faster-whisper"})
+
+        assert settings.whisper_model == "small.en"
+        assert settings.whisper_compute_type == "int8"
+        # 1 each: CTranslate2 otherwise takes every core and starves the RTP relay threads.
+        assert settings.whisper_cpu_threads == 1
+        assert settings.whisper_beam_size == 1
+        assert settings.whisper_vad_filter
+
+    def test_missing_whisper_model_dir_is_reported(self) -> None:
+        problems = _settings(provider="faster-whisper", whisper_model_dir="/nonexistent").validate()
+
+        assert any("does not exist" in p for p in problems)
+
+    def test_unset_whisper_model_dir_warns_about_runtime_download(self) -> None:
+        # Constructed directly rather than through from_dict: a blank config value falls back
+        # to the default path, so config.yml cannot express "no directory" at all. The state
+        # is still reachable -- the benchmark script builds settings in code -- and a runtime
+        # HuggingFace fetch from a daemon thread is worth naming wherever it comes from.
+        settings = TranscriptionSettings(
+            enabled=True, provider="faster-whisper", whisper_model_dir=""
+        )
+
+        assert any("downloaded from HuggingFace" in p for p in settings.validate())
+
+    def test_english_only_model_with_other_language_is_flagged(self, tmp_path: Any) -> None:
+        """An .en model given Spanish audio does not fail -- it transcribes confident nonsense."""
+        problems = _settings(
+            provider="faster-whisper",
+            whisper_model="small.en",
+            whisper_model_dir=str(tmp_path),
+            language="es-ES",
+        ).validate()
+
+        assert any("English-only" in p for p in problems)
+
+    def test_vad_disabled_is_flagged(self, tmp_path: Any) -> None:
+        problems = _settings(
+            provider="faster-whisper", whisper_model_dir=str(tmp_path), whisper_vad_filter=False
+        ).validate()
+
+        assert any("hallucinate" in p for p in problems)
+
+    def test_bad_compute_type_is_flagged(self, tmp_path: Any) -> None:
+        """float16 is a GPU type: it silently falls back and looks like a working config."""
+        problems = _settings(
+            provider="faster-whisper",
+            whisper_model_dir=str(tmp_path),
+            whisper_compute_type="float16",
+        ).validate()
+
+        assert any("whisper_compute_type" in p for p in problems)
+
+    def test_whisper_settings_are_ignored_for_vosk(self, tmp_path: Any) -> None:
+        """A vosk deployment must not be nagged about a whisper model it will never load."""
+        problems = _settings(whisper_model_dir="/nonexistent", vosk_model_path=str(tmp_path))
+
+        assert not any("whisper" in p for p in problems.validate())
+
+
+@pytest.mark.unit
+class TestWavDecoding:
+    """
+    The formats the PBX actually writes must be readable.
+
+    PBXCore._build_wav_file stores voicemail as G.711 u-law (format 7) or A-law (6). Python's
+    `wave` module supports only linear PCM and raises "unknown format: 7" on those files, so
+    every real voicemail failed to transcribe. These fixtures are the regression guard.
+    """
+
+    def test_ulaw_wav_decodes_to_pcm16(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw, read_wav_as_pcm16
+
+        reference = _tone_pcm16()
+        path = _write_wav(tmp_path / "u.wav", pcm16_to_ulaw(reference), WAV_FORMAT_ULAW, 8)
+
+        pcm, rate = read_wav_as_pcm16(path)
+
+        assert rate == 8000
+        assert len(pcm) == len(reference)
+        # G.711 is 8-bit logarithmic, so expect quantisation error but the same waveform.
+        count = len(pcm) // 2
+        ref = struct.unpack(f"<{count}h", reference)
+        got = struct.unpack(f"<{count}h", pcm)
+        assert max(abs(a - b) for a, b in zip(ref, got, strict=True)) < 500
+
+    def test_alaw_wav_decodes_to_pcm16(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_ALAW, pcm16_to_alaw, read_wav_as_pcm16
+
+        path = _write_wav(tmp_path / "a.wav", pcm16_to_alaw(_tone_pcm16()), WAV_FORMAT_ALAW, 8)
+
+        pcm, rate = read_wav_as_pcm16(path)
+
+        assert rate == 8000
+        assert len(pcm) == len(_tone_pcm16())
+
+    def test_pcm16_wav_is_returned_unchanged(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_PCM, read_wav_as_pcm16
+
+        reference = _tone_pcm16()
+        path = _write_wav(tmp_path / "p.wav", reference, WAV_FORMAT_PCM, 16)
+
+        assert read_wav_as_pcm16(path) == (reference, 8000)
+
+    def test_eight_bit_pcm_is_recentred(self, tmp_path: Any) -> None:
+        """8-bit PCM in a WAV is unsigned around 128, unlike every other width."""
+        from pbx.utils.audio import WAV_FORMAT_PCM, read_wav_as_pcm16
+
+        path = _write_wav(tmp_path / "p8.wav", bytes([128, 255, 0, 128]), WAV_FORMAT_PCM, 8)
+
+        pcm, _ = read_wav_as_pcm16(path)
+
+        assert struct.unpack("<4h", pcm) == (0, 32512, -32768, 0)
+
+    def test_stereo_is_rejected(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_PCM, build_wav_header, read_wav_as_pcm16
+
+        payload = b"\x00\x00" * 100
+        path = tmp_path / "stereo.wav"
+        path.write_bytes(build_wav_header(len(payload), 8000, 2, 16, WAV_FORMAT_PCM) + payload)
+
+        with pytest.raises(ValueError, match="mono"):
+            read_wav_as_pcm16(path)
+
+    def test_unconvertible_format_is_rejected(self, tmp_path: Any) -> None:
+        """G.722 has no linear decode here, and must fail with a clear message."""
+        from pbx.utils.audio import WAV_FORMAT_G722, read_wav_as_pcm16
+
+        path = _write_wav(tmp_path / "g722.wav", b"\x00" * 100, WAV_FORMAT_G722, 8)
+
+        with pytest.raises(ValueError, match="Cannot convert WAV format"):
+            read_wav_as_pcm16(path)
+
+    def test_not_a_wav_is_rejected(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import read_wav_as_pcm16
+
+        path = tmp_path / "nope.wav"
+        path.write_bytes(b"this is not a wav file at all")
+
+        with pytest.raises(ValueError, match="RIFF"):
+            read_wav_as_pcm16(path)
+
+
+@pytest.mark.unit
+class TestResampling:
+    """
+    Telephony is 8 kHz; Vosk models are 16 kHz. Kaldi will not bridge that itself.
+
+    On a real server this failed with "Sampling frequency mismatch, expected 16000, got 8000"
+    after the audio had decoded perfectly -- the recording was fine, the recogniser refused
+    the rate.
+    """
+
+    def test_upsampling_doubles_the_sample_count(self) -> None:
+        from pbx.utils.audio import resample_pcm16
+
+        out = resample_pcm16(_tone_pcm16(seconds=1.0, rate=8000), 8000, 16000)
+
+        assert len(out) // 2 == pytest.approx(16000, abs=2)
+
+    def test_matching_rates_are_a_no_op(self) -> None:
+        from pbx.utils.audio import resample_pcm16
+
+        pcm = _tone_pcm16(seconds=0.1)
+
+        assert resample_pcm16(pcm, 8000, 8000) is pcm
+
+    def test_empty_audio_is_safe(self) -> None:
+        from pbx.utils.audio import resample_pcm16
+
+        assert resample_pcm16(b"", 8000, 16000) == b""
+
+    def test_resampling_preserves_the_waveform(self) -> None:
+        """A 440 Hz tone must still be a 440 Hz tone, not noise."""
+        from pbx.utils.audio import resample_pcm16
+
+        out = resample_pcm16(_tone_pcm16(seconds=0.5, rate=8000, freq=440), 8000, 16000)
+        samples = struct.unpack(f"<{len(out) // 2}h", out)
+
+        # Zero crossings scale with frequency, not sample rate: ~440 per second either way.
+        crossings = sum(1 for a, b in pairwise(samples) if (a < 0) != (b < 0))
+        assert 400 <= crossings / 0.5 / 2 <= 480
+
+    def test_model_sample_rate_is_read_from_mfcc_conf(self, tmp_path: Any) -> None:
+        conf = tmp_path / "conf"
+        conf.mkdir()
+        (conf / "mfcc.conf").write_text("--sample-frequency=16000\n--use-energy=false\n")
+
+        assert (
+            _ready_backend(_settings(vosk_model_path=str(tmp_path)))._model_sample_rate() == 16000
+        )
+
+    def test_model_sample_rate_falls_back_when_unreadable(self, tmp_path: Any) -> None:
+        """A model without a readable mfcc.conf is assumed 16 kHz, like every Vosk model."""
+        assert (
+            _ready_backend(_settings(vosk_model_path=str(tmp_path)))._model_sample_rate() == 16000
+        )
+
+
+@pytest.mark.unit
+class TestVoskBackend:
+    """End-to-end over the audio plumbing: a real stored voicemail must transcribe."""
+
+    @patch("pbx.speech.backends.vosk.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_ulaw_voicemail_transcribes(self, tmp_path: Any) -> None:
+        """The exact regression: a u-law voicemail used to fail with "unknown format: 7"."""
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+        path = _write_wav(tmp_path / "vm.wav", pcm16_to_ulaw(_tone_pcm16()), WAV_FORMAT_ULAW, 8)
+
+        result = _ready_backend().transcribe_file(path)
+
+        assert result.success, result.error
+        assert result.text == _FakeRecognizer.transcript
+        assert result.provider == "vosk"
+        assert result.audio_duration == pytest.approx(1.0, abs=0.01)
+
+    @patch("pbx.speech.backends.vosk.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_alaw_voicemail_transcribes(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_ALAW, pcm16_to_alaw
+
+        path = _write_wav(tmp_path / "vm.wav", pcm16_to_alaw(_tone_pcm16()), WAV_FORMAT_ALAW, 8)
+
+        assert _ready_backend().transcribe_file(path).success
+
+    @patch("pbx.speech.backends.vosk.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_confidence_is_averaged_from_word_scores(self, tmp_path: Any) -> None:
+        """Vosk reports real per-word confidence; it must not be a hardcoded constant."""
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+        path = _write_wav(tmp_path / "vm.wav", pcm16_to_ulaw(_tone_pcm16()), WAV_FORMAT_ULAW, 8)
+
+        result = _ready_backend().transcribe_file(path)
+
+        assert result.confidence == pytest.approx(0.85)  # mean of 0.9 and 0.8
+
+    @patch("pbx.speech.backends.vosk.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_words_are_opt_in(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+        path = _write_wav(tmp_path / "vm.wav", pcm16_to_ulaw(_tone_pcm16()), WAV_FORMAT_ULAW, 8)
+        backend = _ready_backend()
+
+        assert backend.transcribe_file(path).segments[0].words == ()
+        assert len(backend.transcribe_file(path, want_words=True).segments[0].words) == 2
+
+    @patch("pbx.speech.backends.vosk.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_over_long_audio_is_refused(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+        path = _write_wav(
+            tmp_path / "long.wav", pcm16_to_ulaw(_tone_pcm16(seconds=5)), WAV_FORMAT_ULAW, 8
+        )
+
+        result = _ready_backend(_settings(max_audio_seconds=2)).transcribe_file(path)
+
+        assert not result.success
+        assert "longer than the 2s limit" in result.error
+
+    @patch("pbx.speech.backends.vosk.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_unsupported_sample_rate_is_refused(self, tmp_path: Any) -> None:
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+        payload = pcm16_to_ulaw(_tone_pcm16(seconds=0.5, rate=11025))
+        path = _write_wav(tmp_path / "odd.wav", payload, WAV_FORMAT_ULAW, 8, rate=11025)
+
+        result = _ready_backend().transcribe_file(path)
+
+        assert not result.success
+        assert "Unsupported sample rate" in result.error
+
+    def test_backend_without_a_model_is_not_ready(self) -> None:
+        backend = VoskBackend(_settings(vosk_model_path="/nonexistent/model"))
+
+        assert not backend.ready
+        assert not backend.transcribe_file(Path("/tmp/whatever.wav")).success
+
+    def test_unknown_provider_yields_no_backend(self) -> None:
+        assert build_backend(_settings(provider="google")) is None
+
+
+class _FakeWhisperSegment:
+    """One decoded window, shaped like faster_whisper's Segment."""
+
+    def __init__(self, text: str, start: float = 0.0, end: float = 1.0, words: Any = None) -> None:
+        self.text = text
+        self.start = start
+        self.end = end
+        self.words = words
+        self.avg_logprob = -0.3
+
+
+class _FakeWhisperWord:
+    def __init__(self, word: str, start: float, end: float, probability: float) -> None:
+        self.word = word
+        self.start = start
+        self.end = end
+        self.probability = probability
+
+
+class _FakeWhisperModel:
+    """
+    Stands in for CTranslate2 so the audio plumbing can be tested without a 250 MB model.
+
+    Records what it was handed, because the arguments *are* the contract here: dropping
+    vad_filter or condition_on_previous_text does not fail, it silently reintroduces
+    hallucinated sentences on silent voicemail.
+    """
+
+    def __init__(self, text: str = "Hello from voicemail.") -> None:
+        self.text = text
+        self.calls: list[dict[str, Any]] = []
+        self.samples: Any = None
+
+    def transcribe(self, samples: Any, **kwargs: Any) -> tuple[Any, Any]:
+        self.calls.append(kwargs)
+        self.samples = samples
+        if not self.text:
+            return iter(()), Mock()
+        words = (
+            [
+                _FakeWhisperWord("Hello", 0.0, 0.4, 0.95),
+                _FakeWhisperWord("from", 0.4, 0.7, 0.88),
+            ]
+            if kwargs.get("word_timestamps")
+            else None
+        )
+        return iter([_FakeWhisperSegment(f" {self.text}", 0.0, 1.0, words)]), Mock()
+
+
+def _whisper_settings(**overrides: Any) -> TranscriptionSettings:
+    base: dict[str, Any] = {"enabled": True, "provider": "faster-whisper", "workers": 0}
+    base.update(overrides)
+    return TranscriptionSettings.from_dict(base)
+
+
+def _ready_whisper(model: Any = None, settings: Any = None) -> Any:
+    """A whisper backend with the model-loading step short-circuited."""
+    from pbx.speech.backends.whisper import WhisperBackend
+
+    backend = WhisperBackend(settings or _whisper_settings(whisper_model_dir=""))
+    backend.model = model or _FakeWhisperModel()
+    return backend
+
+
+def _ulaw_voicemail(tmp_path: Any, seconds: float = 1.0) -> Path:
+    from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+    payload = pcm16_to_ulaw(_tone_pcm16(seconds=seconds))
+    return _write_wav(tmp_path / "vm.wav", payload, WAV_FORMAT_ULAW, 8)
+
+
+@pytest.mark.unit
+class TestWhisperBackend:
+    """The same audio plumbing as Vosk, plus the failure modes that are whisper's alone."""
+
+    def test_ulaw_voicemail_transcribes(self, tmp_path: Any) -> None:
+        result = _ready_whisper().transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert result.success, result.error
+        assert result.text == "Hello from voicemail."
+        assert result.provider == "faster-whisper"
+        assert result.audio_duration == pytest.approx(1.0, abs=0.01)
+
+    def test_audio_is_resampled_to_16k(self, tmp_path: Any) -> None:
+        """8 kHz telephony into a 16 kHz model is the bug that already escaped once."""
+        model = _FakeWhisperModel()
+
+        _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        # One second of 8 kHz audio must arrive as ~16000 float samples, not 8000.
+        assert len(model.samples) == pytest.approx(16000, abs=100)
+        assert model.samples.dtype.name == "float32"
+        assert abs(float(model.samples.max())) <= 1.0
+
+    def test_confidence_is_never_reported(self, tmp_path: Any) -> None:
+        """avg_logprob is not a confidence, and must not become "Estimated accuracy 87%"."""
+        result = _ready_whisper().transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert result.confidence is None
+        assert all(s.confidence is None for s in result.segments)
+
+    def test_anti_hallucination_arguments_are_passed(self, tmp_path: Any) -> None:
+        model = _FakeWhisperModel()
+
+        _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        kwargs = model.calls[0]
+        assert kwargs["vad_filter"] is True
+        assert kwargs["condition_on_previous_text"] is False
+        assert kwargs["no_speech_threshold"] == 0.6
+        assert kwargs["beam_size"] == 1
+
+    def test_pure_artefact_is_always_discarded(self, tmp_path: Any) -> None:
+        """Nobody leaves this on a voicemail, so length is irrelevant."""
+        model = _FakeWhisperModel("Subtitles by the Amara.org community")
+
+        result = _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert result.success
+        assert result.text == ""
+        assert result.segments == ()
+
+    def test_ambiguous_phrase_is_kept_on_a_short_recording(self, tmp_path: Any) -> None:
+        """
+        "Thank you." on three seconds of audio is somebody saying thank you.
+
+        The blanket blocklist this replaced threw these away, so a caller ringing back to say
+        thanks got an empty transcript and no indication why.
+        """
+        model = _FakeWhisperModel("Thank you.")
+
+        result = _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path, seconds=3))
+
+        assert result.text == "Thank you."
+
+    def test_ambiguous_phrase_is_discarded_on_a_long_recording(self, tmp_path: Any) -> None:
+        """Twelve seconds yielding nothing but a stock phrase is silence, not a message."""
+        model = _FakeWhisperModel("Thank you.")
+
+        result = _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path, seconds=12))
+
+        assert result.success
+        assert result.text == ""
+
+    def test_hallucination_phrase_inside_real_speech_is_kept(self, tmp_path: Any) -> None:
+        """ "Thank you" is also an ordinary thing to say -- only a whole-string match counts."""
+        model = _FakeWhisperModel("Call me back on Tuesday. Thank you.")
+
+        result = _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert result.text == "Call me back on Tuesday. Thank you."
+
+    def test_empty_output_is_success(self, tmp_path: Any) -> None:
+        """With VAD on, a caller hanging up on the beep produces no speech at all."""
+        result = _ready_whisper(_FakeWhisperModel("")).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert result.success
+        assert result.text == ""
+
+    def test_words_are_opt_in(self, tmp_path: Any) -> None:
+        model = _FakeWhisperModel()
+        backend = _ready_whisper(model)
+        path = _ulaw_voicemail(tmp_path)
+
+        assert backend.transcribe_file(path).segments[0].words == ()
+        assert model.calls[0]["word_timestamps"] is False
+
+        result = backend.transcribe_file(path, want_words=True)
+        assert len(result.segments[0].words) == 2
+        assert result.segments[0].words[0].confidence == pytest.approx(0.95)
+
+    def test_language_is_reduced_to_iso_639_1(self, tmp_path: Any) -> None:
+        """Config carries en-US; faster-whisper rejects anything but a bare ISO-639-1 code."""
+        model = _FakeWhisperModel()
+
+        result = _ready_whisper(model).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert model.calls[0]["language"] == "en"
+        # The transcript still reports what was asked for, not what the engine was told.
+        assert result.language == "en-US"
+
+    def test_blank_language_lets_whisper_detect(self, tmp_path: Any) -> None:
+        # Direct construction: from_dict substitutes the default for a blank language, so this
+        # state only arises in code. Detection is worse than a fixed code on short, noisy
+        # telephony audio, which is why config.yml cannot reach it by accident.
+        settings = TranscriptionSettings(
+            enabled=True, provider="faster-whisper", whisper_model_dir="", language="", workers=0
+        )
+        model = _FakeWhisperModel()
+
+        _ready_whisper(model, settings).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert model.calls[0]["language"] is None
+
+    def test_over_long_audio_is_refused(self, tmp_path: Any) -> None:
+        settings = _whisper_settings(whisper_model_dir="", max_audio_seconds=2)
+        path = _ulaw_voicemail(tmp_path, seconds=5)
+
+        result = _ready_whisper(settings=settings).transcribe_file(path)
+
+        assert not result.success
+        assert "longer than the 2s limit" in result.error
+
+    def test_backend_without_a_model_is_not_ready(self) -> None:
+        from pbx.speech.backends.whisper import WhisperBackend
+
+        backend = WhisperBackend(_whisper_settings(whisper_model_dir="/nonexistent/whisper"))
+
+        assert not backend.ready
+        assert not backend.transcribe_file(Path("/tmp/whatever.wav")).success
+
+    def test_missing_file_fails_without_raising(self, tmp_path: Any) -> None:
+        result = _ready_whisper().transcribe_file(tmp_path / "gone.wav")
+
+        assert not result.success
+
+    def test_omp_threads_is_pinned_before_ctranslate2_loads(self) -> None:
+        """CTranslate2's OpenMP backend overrides cpu_threads, so this must be set at import."""
+        import os
+
+        import pbx.speech.backends.whisper
+
+        assert os.environ.get("OMP_NUM_THREADS")
+
+    @patch("pbx.speech.backends.whisper.WHISPER_AVAILABLE", True)
+    @patch("pbx.speech.backends.whisper.WhisperModel", create=True)
+    def test_build_backend_selects_whisper(self, whisper_model: Any, tmp_path: Any) -> None:
+        from pbx.speech.backends.whisper import WhisperBackend
+
+        (tmp_path / "small.en").mkdir()
+        backend = build_backend(_whisper_settings(whisper_model_dir=str(tmp_path)))
+
+        assert isinstance(backend, WhisperBackend)
+        assert whisper_model.call_args.kwargs["cpu_threads"] == 1
+        assert whisper_model.call_args.kwargs["compute_type"] == "int8"
+        # local_files_only is what stops a 250 MB HuggingFace fetch from a daemon thread.
+        assert whisper_model.call_args.kwargs["local_files_only"] is True
+
+    def test_model_dir_is_joined_with_the_model_name(self, tmp_path: Any) -> None:
+        """Switching models is one key: the directory follows whisper_model."""
+        from pbx.speech.backends.whisper import WhisperBackend
+
+        (tmp_path / "base.en").mkdir()
+        backend = WhisperBackend(
+            _whisper_settings(whisper_model_dir=str(tmp_path), whisper_model="base.en")
+        )
+
+        assert backend.model_id == str(tmp_path / "base.en")
+
+    def test_a_directory_holding_the_model_is_used_directly(self, tmp_path: Any) -> None:
+        """Back-compat: installs that staged one model into the configured path still load."""
+        from pbx.speech.backends.whisper import WhisperBackend
+
+        (tmp_path / "model.bin").write_bytes(b"")
+        backend = WhisperBackend(_whisper_settings(whisper_model_dir=str(tmp_path)))
+
+        assert backend.model_id == str(tmp_path)
+
+    @patch("pbx.speech.backends.whisper.WHISPER_AVAILABLE", True)
+    @patch("pbx.speech.backends.whisper.WhisperModel", create=True)
+    def test_every_kwarg_is_named_by_the_real_signature(
+        self, whisper_model: Any, tmp_path: Any
+    ) -> None:
+        """
+        Guards a bug a mock cannot catch.
+
+        ``WhisperModel.__init__`` ends in ``**model_kwargs``, so it accepts *any* keyword and
+        then forwards the leftovers to CTranslate2 -- where a name faster-whisper already sets
+        under a different alias arrives twice. Passing ``inter_threads`` (the CTranslate2 name)
+        instead of ``num_workers`` (the faster-whisper name) did exactly that, and failed only
+        on a real install: "got multiple values for keyword argument 'inter_threads'".
+
+        So checking that a kwarg is *accepted* proves nothing. It has to be an explicitly
+        named parameter, which is the only way faster-whisper commits to translating it.
+        """
+        import importlib.util
+        import inspect
+
+        if importlib.util.find_spec("faster_whisper") is None:
+            pytest.skip("faster-whisper is not installed; nothing to check the signature against")
+
+        from faster_whisper import WhisperModel as RealWhisperModel
+
+        build_backend(_whisper_settings(whisper_model_dir=str(tmp_path)))
+        passed = set(whisper_model.call_args.kwargs)
+
+        named = {
+            name
+            for name, spec in inspect.signature(RealWhisperModel.__init__).parameters.items()
+            if spec.kind not in (spec.VAR_KEYWORD, spec.VAR_POSITIONAL)
+        }
+
+        assert passed <= named, (
+            f"{sorted(passed - named)} would be swallowed by **model_kwargs and forwarded "
+            "to CTranslate2 raw -- use the faster-whisper parameter name instead"
+        )
+
+
+@pytest.mark.unit
+class TestTranscriptionWorker:
+    """
+    submit() returning True is a promise that the callback fires exactly once.
+
+    Every voicemail notification depends on that promise, so each failure mode gets a test.
+    """
+
+    def _worker(self, backend: Any, **overrides: Any) -> TranscriptionWorker:
+        return TranscriptionWorker(backend, _settings(**overrides))
+
+    def test_inline_worker_runs_the_job_and_calls_back(self, tmp_path: Any) -> None:
+        path = tmp_path / "a.wav"
+        path.write_bytes(b"x")
+        backend = Mock(ready=True, provider="vosk")
+        backend.transcribe_file.return_value = Transcript(text="hi", provider="vosk")
+        seen: list[Any] = []
+
+        accepted = self._worker(backend).submit(path, seen.append)
+
+        assert accepted
+        assert len(seen) == 1
+        assert seen[0].text == "hi"
+
+    def test_disabled_worker_refuses(self, tmp_path: Any) -> None:
+        path = tmp_path / "a.wav"
+        path.write_bytes(b"x")
+        seen: list[Any] = []
+
+        accepted = self._worker(Mock(ready=True), enabled=False).submit(path, seen.append)
+
+        assert not accepted
+        assert seen == []
+
+    def test_unready_backend_refuses(self, tmp_path: Any) -> None:
+        path = tmp_path / "a.wav"
+        path.write_bytes(b"x")
+        seen: list[Any] = []
+
+        accepted = self._worker(Mock(ready=False)).submit(path, seen.append)
+
+        assert not accepted
+        assert seen == []
+
+    def test_missing_file_refuses(self, tmp_path: Any) -> None:
+        seen: list[Any] = []
+
+        accepted = self._worker(Mock(ready=True)).submit(tmp_path / "gone.wav", seen.append)
+
+        assert not accepted
+        assert seen == []
+
+    def test_over_long_audio_refuses_at_admission(self, tmp_path: Any) -> None:
+        """Refused on the caller's thread, before it can occupy a worker."""
+        path = tmp_path / "a.wav"
+        path.write_bytes(b"x")
+        backend = Mock(ready=True)
+        seen: list[Any] = []
+
+        accepted = self._worker(backend, max_audio_seconds=10).submit(
+            path, seen.append, audio_seconds=99
+        )
+
+        assert not accepted
+        assert seen == []
+        backend.transcribe_file.assert_not_called()
+
+    def test_backend_raising_still_calls_back(self, tmp_path: Any) -> None:
+        """A crash inside the engine must never swallow the notification."""
+        path = tmp_path / "a.wav"
+        path.write_bytes(b"x")
+        backend = Mock(ready=True, provider="vosk")
+        backend.transcribe_file.side_effect = RuntimeError("boom")
+        seen: list[Any] = []
+
+        accepted = self._worker(backend).submit(path, seen.append)
+
+        assert accepted
+        assert len(seen) == 1
+        assert not seen[0].success
+        assert "boom" in seen[0].error
+
+    def test_callback_raising_is_absorbed(self, tmp_path: Any) -> None:
+        path = tmp_path / "a.wav"
+        path.write_bytes(b"x")
+        backend = Mock(ready=True, provider="vosk")
+        backend.transcribe_file.return_value = Transcript(text="hi")
+
+        def explode(_transcript: Any) -> None:
+            raise RuntimeError("callback boom")
+
+        # Must not propagate to the caller tearing a call down.
+        assert self._worker(backend).submit(path, explode)
+
+    def test_queued_jobs_are_released_on_stop(self, tmp_path: Any) -> None:
+        """
+        Shutdown must fire pending callbacks rather than let daemon threads take them.
+
+        Without this a voicemail queued when the PBX stops would never notify anyone.
+        """
+        path = tmp_path / "a.wav"
+        path.write_bytes(b"x")
+        backend = Mock(ready=True, provider="vosk")
+        worker = self._worker(backend, workers=1)
+        seen: list[Any] = []
+
+        # Never started, so nothing consumes the queue; put a job straight on it.
+        worker._running = True
+        assert worker.submit(path, seen.append)
+        worker._running = False
+        worker.stop(timeout=0.1)
+
+        assert seen == [None]
+        backend.transcribe_file.assert_not_called()
+
+    def test_full_queue_refuses(self, tmp_path: Any) -> None:
+        path = tmp_path / "a.wav"
+        path.write_bytes(b"x")
+        worker = self._worker(Mock(ready=True), workers=1, queue_size=1)
+        worker._running = True
+        seen: list[Any] = []
+
+        assert worker.submit(path, seen.append)  # fills the queue
+        assert not worker.submit(path, seen.append)  # refused
+        assert worker.stats()["dropped"] == 1
+
+    def test_stats_report_the_queue(self, tmp_path: Any) -> None:
+        stats = self._worker(Mock(ready=True)).stats()
+
+        assert stats["enabled"] is True
+        assert stats["queue_capacity"] == 32
+        assert stats["mean_real_time_factor"] is None
+
+
+@pytest.mark.unit
+class TestTranscriptionWiring:
+    """The worker must reach the mailbox that needs it."""
+
+    def test_voicemail_system_forwards_service_to_mailboxes(self, tmp_path: Any) -> None:
+        """
+        VoicemailSystem holds the shared instance and hands it to every mailbox.
+
+        Sharing is a hard requirement, not tidiness: the model is far too large to load once
+        per mailbox on a system with a few hundred extensions.
+        """
+        from pbx.features.voicemail import VoicemailSystem
+
+        worker = MagicMock()
+        system = VoicemailSystem(storage_path=str(tmp_path), transcription_service=worker)
+
+        assert system.get_mailbox("1001").transcription_service is worker
+        assert system.get_mailbox("1002").transcription_service is worker
+
+    def test_voicemail_system_without_a_service_is_safe(self, tmp_path: Any) -> None:
+        from pbx.features.voicemail import VoicemailSystem
+
+        system = VoicemailSystem(storage_path=str(tmp_path))
+
+        assert system.get_mailbox("1001").transcription_service is None

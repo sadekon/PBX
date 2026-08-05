@@ -122,7 +122,9 @@ class TestInboundRoutingSystemLookup:
 
     def test_explicit_route_wins_over_extension_did(self) -> None:
         db = MagicMock()
-        db.get_all.return_value = [_route("12125551234", "auto-attendant-main", destination_type="auto_attendant")]
+        db.get_all.return_value = [
+            _route("12125551234", "auto-attendant-main", destination_type="auto_attendant")
+        ]
         ext_db = MagicMock()
         system = InboundRoutingSystem(inbound_route_db=db, extension_db=ext_db)
         result = system.lookup("12125551234")
@@ -167,7 +169,9 @@ class TestInboundRoutingSystemEffectiveRoutes:
 
     def test_extension_derived_route_marked_shadowed_when_manual_exists(self) -> None:
         db = MagicMock()
-        db.get_all.return_value = [_route("12125551234", "auto-attendant-main", destination_type="auto_attendant")]
+        db.get_all.return_value = [
+            _route("12125551234", "auto-attendant-main", destination_type="auto_attendant")
+        ]
         ext_db = MagicMock()
         ext_db.get_all.return_value = [{"number": "1001", "did_number": "12125551234"}]
         system = InboundRoutingSystem(inbound_route_db=db, extension_db=ext_db)

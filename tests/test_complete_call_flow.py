@@ -31,6 +31,7 @@ def _no_retransmit_timers():
     with patch("pbx.sip.transaction.InviteClientTransaction._schedule_timer_a"):
         yield
 
+
 # Other test modules may inject MagicMock objects into sys.modules for
 # ``pbx.rtp.handler`` (and related SIP/SDP modules) to avoid importing heavy
 # dependencies.  When *this* module is collected later, the top-level

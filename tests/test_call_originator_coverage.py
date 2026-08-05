@@ -162,9 +162,7 @@ class TestOriginateCallExtension:
         pbx = _make_pbx_core()
         originator = CallOriginator(pbx)
 
-        call = originator.originate_call(
-            "1001", "1002", rtp_ports_override=(30000, 30001)
-        )
+        call = originator.originate_call("1001", "1002", rtp_ports_override=(30000, 30001))
 
         assert call is not None
         assert call.rtp_ports == (30000, 30001)
@@ -376,9 +374,7 @@ class TestOriginateAndBridge:
         pbx.call_router.handle_callee_answer(leg_a_call.call_id, response, ("10.0.0.2", 5060))
 
         # leg_b should now have been originated, sharing leg_a's relay.
-        leg_b_call = next(
-            c for c in pbx._test_calls.values() if c.call_id != leg_a_call.call_id
-        )
+        leg_b_call = next(c for c in pbx._test_calls.values() if c.call_id != leg_a_call.call_id)
         assert leg_b_call.rtp_ports == leg_a_call.rtp_ports
         assert leg_b_call.uses_peer_relay is True
 

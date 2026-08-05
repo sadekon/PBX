@@ -39,6 +39,7 @@ def _no_retransmit_timers():
     with patch("pbx.sip.transaction.InviteClientTransaction._schedule_timer_a"):
         yield
 
+
 from pbx.core.call import CallManager, CallState
 from pbx.core.call_router import CallRouter
 from pbx.core.transfer_handler import TransferHandler

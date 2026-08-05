@@ -232,6 +232,7 @@ ignore = [
 "__init__.py" = ["F401"]
 "tests/*" = ["F401", "F811", "ARG", "PLR", "PT", "B011", "PLC0415", "N806", "N803"]
 "pbx/features/*" = ["PLC0415"]  # lazy imports are intentional for dynamic feature loading
+"pbx/speech/*" = ["PLC0415"]  # backend imported on demand so one engine's deps aren't loaded for another
 "pbx/core/*" = ["PLC0415"]  # lazy imports for circular import avoidance
 "pbx/sip/*" = ["PLC0415"]  # lazy imports for circular import avoidance in SIP handlers
 "pbx/api/routes/*" = ["PLC0415"]  # lazy imports in route handlers
