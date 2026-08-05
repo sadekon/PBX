@@ -150,32 +150,57 @@ class TestSweep:
         assert not (tmp_path / "voicemail" / "good.wav").exists()
         assert doomed.exists()
 
-    def test_transcripts_are_counted_but_not_deleted_in_dry_run(self, tmp_path):
+    def _db(self, expired=0):
+        """
+        Shaped like the real DatabaseBackend, which is three methods, not one.
+
+        execute() returns a bool for *every* statement, so counting through it yields True and
+        then fails on subscripting. That reached the server as
+        "transcript sweep failed: 'bool' object is not subscriptable"; a MagicMock returning
+        rows from execute() had happily agreed with the wrong code.
+        """
         db = MagicMock()
         db.enabled = True
-        db.execute.return_value = [(7,)]
+        db.execute.return_value = True
+        db.fetch_one.return_value = {"expired": expired}
+        return db
+
+    def test_transcripts_are_counted_but_not_deleted_in_dry_run(self, tmp_path):
+        db = self._db(expired=7)
 
         result = RetentionSweeper(_settings(tmp_path), database=db).sweep()
 
         assert result.transcripts == 7
-        statements = " ".join(str(c[0][0]) for c in db.execute.call_args_list)
-        assert "DELETE" not in statements
+        db.execute.assert_not_called()
+
+    def test_counting_uses_fetch_not_execute(self, tmp_path):
+        """The regression itself: a SELECT through execute() comes back as True."""
+        db = self._db(expired=2)
+
+        RetentionSweeper(_settings(tmp_path), database=db).sweep()
+
+        db.fetch_one.assert_called_once()
+        assert "SELECT COUNT" in str(db.fetch_one.call_args[0][0])
 
     def test_transcripts_are_deleted_when_not_dry_run(self, tmp_path):
-        db = MagicMock()
-        db.enabled = True
-        db.execute.return_value = [(3,)]
+        db = self._db(expired=3)
 
         RetentionSweeper(_settings(tmp_path, dry_run=False), database=db).sweep()
 
         statements = " ".join(str(c[0][0]) for c in db.execute.call_args_list)
         assert "DELETE FROM call_transcripts" in statements
 
+    def test_nothing_is_deleted_when_nothing_expired(self, tmp_path):
+        db = self._db(expired=0)
+
+        RetentionSweeper(_settings(tmp_path, dry_run=False), database=db).sweep()
+
+        db.execute.assert_not_called()
+
     def test_a_database_failure_does_not_raise(self, tmp_path):
         """This runs on a background thread; an exception here would kill the sweep for good."""
-        db = MagicMock()
-        db.enabled = True
-        db.execute.side_effect = RuntimeError("connection reset")
+        db = self._db()
+        db.fetch_one.side_effect = RuntimeError("connection reset")
 
         result = RetentionSweeper(_settings(tmp_path), database=db).sweep()
 

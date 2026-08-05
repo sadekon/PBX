@@ -38,7 +38,14 @@ def _transcript(**overrides):
 
 
 class _FakeDatabase:
-    """Records what would have been executed, and replays rows for reads."""
+    """
+    Mirrors DatabaseBackend's actual three-method API.
+
+    This originally returned rows from execute(), which the real backend never does -- it
+    returns a bool for every statement. The store read through execute() and the tests agreed
+    with it, so a SELECT returning True got all the way to a production log line reading
+    "'bool' object is not subscriptable". The shape below is the point of the fixture.
+    """
 
     def __init__(self, rows=None, raises=None):
         self.enabled = True
@@ -47,10 +54,25 @@ class _FakeDatabase:
         self._raises = raises
 
     def execute(self, query, params=None):
+        """Writes only. Real signature: -> bool."""
+        self.calls.append((query, params))
+        if self._raises:
+            raise self._raises
+        return True
+
+    def fetch_all(self, query, params=None):
+        """Real signature: -> list[dict]."""
         self.calls.append((query, params))
         if self._raises:
             raise self._raises
         return self._rows
+
+    def fetch_one(self, query, params=None):
+        """Real signature: -> dict | None."""
+        self.calls.append((query, params))
+        if self._raises:
+            raise self._raises
+        return self._rows[0] if self._rows else None
 
 
 @pytest.mark.unit
@@ -185,21 +207,13 @@ class TestTranscriptStore:
         assert stored[0]["words"][0]["text"] == "hello"
 
     def test_segments_are_decoded_on_read(self):
-        row = (
-            1,
-            "c1",
-            "live",
-            None,
-            "vosk",
-            "m",
-            "en",
-            "hi",
-            '[{"text": "hi"}]',
-            None,
-            1.0,
-            0.3,
-            "now",
-        )
+        row = {
+            "id": 1,
+            "call_id": "c1",
+            "source": "live",
+            "transcript_text": "hi",
+            "segments": '[{"text": "hi"}]',
+        }
         db = _FakeDatabase(rows=[row])
 
         record = TranscriptStore(db).for_call("c1")[0]
@@ -208,7 +222,7 @@ class TestTranscriptStore:
         assert record["segments"] == [{"text": "hi"}]
 
     def test_malformed_segments_do_not_lose_the_text(self):
-        row = (1, "c1", "live", None, "vosk", "m", "en", "hi", "{not json", None, 1.0, 0.3, "now")
+        row = {"call_id": "c1", "transcript_text": "hi", "segments": "{not json"}
         db = _FakeDatabase(rows=[row])
 
         record = TranscriptStore(db).for_call("c1")[0]
@@ -224,6 +238,24 @@ class TestTranscriptStore:
         query, params = db.calls[0]
         assert "WHERE source" in query
         assert params == (SOURCE_LIVE,)
+
+    def test_reads_do_not_go_through_execute(self):
+        """
+        execute() returns a bool for every statement, so a SELECT run through it yields True.
+
+        That is the bug this guards: it reached production as
+        "transcript sweep failed: 'bool' object is not subscriptable".
+        """
+        calls = []
+
+        class _Strict(_FakeDatabase):
+            def execute(self, query, params=None):
+                calls.append(query)
+                return super().execute(query, params)
+
+        TranscriptStore(_Strict(rows=[])).recent()
+
+        assert not any("SELECT" in q.upper() for q in calls), "reads must use fetch_all"
 
     def test_a_read_error_returns_nothing_rather_than_raising(self):
         db = _FakeDatabase(raises=RuntimeError("gone"))

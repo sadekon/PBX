@@ -230,10 +230,14 @@ class RetentionSweeper:
 
         cutoff = datetime.now(UTC) - timedelta(days=self.settings.transcript_days)
         try:
-            rows = self.database.execute(
-                "SELECT COUNT(*) FROM call_transcripts WHERE created_at < %s", (cutoff,)
+            # fetch_one for the read, execute for the write. execute() returns a bool
+            # whatever the statement, so counting with it yields True and then explodes on
+            # subscripting -- which is exactly how this failed on the first real sweep.
+            row = self.database.fetch_one(
+                "SELECT COUNT(*) AS expired FROM call_transcripts WHERE created_at < %s",
+                (cutoff,),
             )
-            count = int(rows[0][0]) if rows and rows[0] else 0
+            count = int(row["expired"]) if row else 0
             result.transcripts = count
 
             if count and not self.settings.dry_run:
