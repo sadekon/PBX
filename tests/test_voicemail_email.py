@@ -43,6 +43,9 @@ def config():
         "voicemail.email.subject_template": "New Voicemail from {caller_id} - {timestamp}",
         "voicemail.email.include_attachment": True,
         "voicemail.reminders.enabled": True,
+        # Pinned so rendered times do not depend on the machine running the suite. Unset,
+        # this falls back to the host's zone and every timestamp assertion becomes local.
+        "timezone": "UTC",
     }
     stub = MagicMock()
     stub.get.side_effect = lambda key, default=None: values.get(key, default)
@@ -69,32 +72,67 @@ class TestNotificationContent:
         subject = box._notification_subject("5551234567", datetime(2026, 7, 30, 9, 15, tzinfo=UTC))
 
         assert "5551234567" in subject
-        assert "09:15 AM, July 30, 2026" in subject
+        assert "09:15 AM UTC, July 30, 2026" in subject
 
 
 @pytest.mark.unit
 class TestTimestampFormat:
-    """Rendered as HH:MM AM/PM, Month DD, YYYY -- shared by subject, body and reminders."""
+    """
+    Rendered as HH:MM AM/PM ZONE, Month DD, YYYY -- shared by subject, body and reminders.
+
+    Every case pins an explicit zone. Leaving it to the host would make these pass or fail
+    depending on where they ran, which is the same ambiguity the zone label exists to remove.
+    """
 
     def test_morning(self):
         assert (
-            VoicemailBox._format_timestamp(datetime(2026, 7, 30, 9, 15, tzinfo=UTC))
-            == "09:15 AM, July 30, 2026"
+            VoicemailBox._format_timestamp(datetime(2026, 7, 30, 9, 15, tzinfo=UTC), UTC)
+            == "09:15 AM UTC, July 30, 2026"
         )
 
     def test_afternoon_uses_twelve_hour_clock(self):
         assert (
-            VoicemailBox._format_timestamp(datetime(2026, 12, 5, 14, 7, tzinfo=UTC))
-            == "02:07 PM, December 05, 2026"
+            VoicemailBox._format_timestamp(datetime(2026, 12, 5, 14, 7, tzinfo=UTC), UTC)
+            == "02:07 PM UTC, December 05, 2026"
         )
 
     def test_midnight_is_am(self):
-        assert VoicemailBox._format_timestamp(datetime(2026, 1, 1, 0, 0, tzinfo=UTC)).startswith(
-            "12:00 AM"
-        )
+        assert VoicemailBox._format_timestamp(
+            datetime(2026, 1, 1, 0, 0, tzinfo=UTC), UTC
+        ).startswith("12:00 AM")
 
     def test_non_datetime_passes_through(self):
         assert VoicemailBox._format_timestamp("some string") == "some string"
+
+    def test_utc_is_converted_to_the_display_zone(self):
+        """The actual bug: 13:15 UTC was shown as 1:15 PM to a recipient on Eastern time."""
+        from zoneinfo import ZoneInfo
+
+        rendered = VoicemailBox._format_timestamp(
+            datetime(2026, 7, 30, 13, 15, tzinfo=UTC), ZoneInfo("America/New_York")
+        )
+
+        assert rendered == "09:15 AM EDT, July 30, 2026"
+
+    def test_a_naive_timestamp_is_taken_as_utc(self):
+        """Database drivers hand back naive datetimes for a TIMESTAMP column."""
+        from zoneinfo import ZoneInfo
+
+        naive = datetime(2026, 7, 30, 13, 15)  # noqa: DTZ001 - naive is the whole point
+        rendered = VoicemailBox._format_timestamp(naive, ZoneInfo("America/New_York"))
+
+        assert rendered == "09:15 AM EDT, July 30, 2026"
+
+    def test_the_zone_label_tracks_daylight_saving(self):
+        """EST in January, EDT in July -- the offset differs by an hour and must not be fixed."""
+        from zoneinfo import ZoneInfo
+
+        eastern = ZoneInfo("America/New_York")
+        winter = VoicemailBox._format_timestamp(datetime(2026, 1, 15, 17, 0, tzinfo=UTC), eastern)
+        summer = VoicemailBox._format_timestamp(datetime(2026, 7, 15, 17, 0, tzinfo=UTC), eastern)
+
+        assert "12:00 PM EST" in winter
+        assert "01:00 PM EDT" in summer
 
 
 @pytest.mark.unit

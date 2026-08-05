@@ -227,9 +227,7 @@ class TestInitiateCall:
         mock_db = MagicMock()
         mock_db.db_type = "postgresql"
         mock_pbx = MagicMock()
-        mock_pbx.call_originator.originate_and_bridge.side_effect = ValueError(
-            "Origination failed"
-        )
+        mock_pbx.call_originator.originate_and_bridge.side_effect = ValueError("Origination failed")
         engine = ClickToDialEngine(db_backend=mock_db, config={}, pbx_core=mock_pbx)
         call_id = engine.initiate_call("1001", "5559999")
         # Origination failures are no longer swallowed into a fake success.

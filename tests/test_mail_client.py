@@ -5,8 +5,8 @@ import socket
 import ssl
 
 import pytest
-
 from conftest import FakeSmtp
+
 from pbx.mail import SmtpClient, SmtpSettings, build_message
 from pbx.mail.client import build_ssl_context
 from pbx.mail.errors import (

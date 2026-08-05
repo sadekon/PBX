@@ -33,6 +33,7 @@ try:
     from pbx.mail import Mailer, SmtpSettings, enable_smtp_debug
     from pbx.utils.config import Config
     from pbx.utils.database import DatabaseBackend
+    from pbx.utils.timezone import display_timezone
 except ModuleNotFoundError as exc:
     # Almost always "run with the system interpreter instead of the project venv". The bare
     # traceback names a transitive dependency, which points nowhere useful.
@@ -113,7 +114,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     subject = VoicemailSystem._reminder_subject(len(messages))
-    body = VoicemailSystem._reminder_body(args.extension, messages, total_count=total_count)
+    body = VoicemailSystem._reminder_body(
+        args.extension, messages, total_count=total_count, tz=display_timezone(config)
+    )
 
     print()
     print("=" * 70)

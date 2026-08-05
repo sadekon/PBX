@@ -4,12 +4,13 @@ Voicemail system
 
 import textwrap
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Any, ClassVar
 
 from pbx.mail import Attachment, EmailError
 from pbx.utils.logger import get_logger, get_vm_ivr_logger
+from pbx.utils.timezone import display_timezone, to_display
 
 try:
     from pbx.utils.database import ExtensionDB
@@ -155,6 +156,9 @@ class VoicemailBox:
         self.mailer = mailer
         self.database = database
         self.transcription_service = transcription_service
+        # Resolved once: emails render times in this zone, while everything stored stays
+        # UTC. Reading it per message would re-parse the zone database on every voicemail.
+        self.display_timezone = display_timezone(config)
         self.pin = None  # Voicemail PIN (plaintext, for config file PINs)
         self.pin_hash = None  # Voicemail PIN hash (for database PINs)
         self.pin_salt = None  # Voicemail PIN salt (for database PINs)
@@ -477,15 +481,20 @@ class VoicemailBox:
         return extension_config, email_address
 
     @staticmethod
-    def _format_timestamp(timestamp: Any) -> str:
+    def _format_timestamp(timestamp: Any, tz: tzinfo | None = None) -> str:
         """
-        Render a timestamp as ``09:15 AM, July 30, 2026``.
+        Render a timestamp as ``09:15 AM EDT, July 30, 2026``.
 
-        Shared by the subject and the body so the two can never disagree. Anything that is
-        not a datetime is passed through unchanged rather than guessed at.
+        Converted out of UTC for display, because the recipient reads this against their own
+        clock. The zone abbreviation is included deliberately: an unlabelled time that is four
+        hours out looks like a bug in the PBX rather than a timezone, which is exactly how the
+        original version of this went unnoticed.
+
+        Shared by the subject, the body and the daily summary so none of them can disagree.
+        Anything that is not a datetime is passed through unchanged rather than guessed at.
         """
         if isinstance(timestamp, datetime):
-            return timestamp.strftime("%I:%M %p, %B %d, %Y")
+            return to_display(timestamp, tz).strftime("%I:%M %p %Z, %B %d, %Y")
         return str(timestamp)
 
     def _caller_display(self, caller_id: str) -> str:
@@ -546,7 +555,7 @@ class VoicemailBox:
             )
 
         caller_display = self._caller_display(caller_id)
-        formatted_time = self._format_timestamp(timestamp)
+        formatted_time = self._format_timestamp(timestamp, self.display_timezone)
         try:
             return template.format(
                 caller_id=caller_display,
@@ -609,7 +618,7 @@ class VoicemailBox:
         body += "Message Details:\n"
         body += f"  Extension: {self.extension_number}\n"
         body += f"  From: {self._caller_display(caller_id)}\n"
-        body += f"  Received: {self._format_timestamp(timestamp)}\n"
+        body += f"  Received: {self._format_timestamp(timestamp, self.display_timezone)}\n"
 
         if duration:
             mins = int(duration // 60)
@@ -1081,6 +1090,9 @@ class VoicemailSystem:
         # Same reasoning for the transcriber, plus a hard constraint: the Vosk model is ~40 MB
         # resident, so one instance per mailbox would not survive a few hundred extensions.
         self.transcription_service = transcription_service
+        # Resolved once: emails render times in this zone, while everything stored stays
+        # UTC. Reading it per message would re-parse the zone database on every voicemail.
+        self.display_timezone = display_timezone(config)
 
         Path(storage_path).mkdir(parents=True, exist_ok=True)
 
@@ -1166,6 +1178,7 @@ class VoicemailSystem:
                     extension_number,
                     unread_messages,
                     total_count=len(mailbox.get_messages(unread_only=False)),
+                    tz=self.display_timezone,
                 ),
             )
             count += 1
@@ -1180,7 +1193,10 @@ class VoicemailSystem:
 
     @staticmethod
     def _reminder_body(
-        extension_number: str, messages: list, total_count: int | None = None
+        extension_number: str,
+        messages: list,
+        total_count: int | None = None,
+        tz: tzinfo | None = None,
     ) -> str:
         """
         Body listing each unread message. Content, so it lives with the feature.
@@ -1207,7 +1223,7 @@ class VoicemailSystem:
         for index, msg_info in enumerate(messages, 1):
             caller = msg_info.get("caller_id", "Unknown")
             ts = msg_info.get("timestamp")
-            ts_str = VoicemailBox._format_timestamp(ts)
+            ts_str = VoicemailBox._format_timestamp(ts, tz)
             body += f"{index}. From: {caller}, Received: {ts_str}\n"
 
         body += f"\nPlease check your voicemail by dialing *{extension_number}\n\n"

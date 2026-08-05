@@ -9,6 +9,13 @@
 # See .env.example for the complete list of environment variables
 # =============================================================================
 
+# Timezone that times are *displayed* in -- voicemail emails, summaries, alerts. An IANA
+# name, e.g. America/New_York, Europe/Amsterdam. Everything is stored in UTC regardless;
+# this only affects what a person reads, and DST is handled for you.
+# Leave it unset to use the host's local timezone -- but note that a server is often set to
+# UTC, in which case unset means recipients see UTC times with no clue that is what they are.
+timezone: America/New_York
+
 server:
   sip_host: 0.0.0.0
   sip_port: 5060

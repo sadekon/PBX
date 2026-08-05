@@ -5,8 +5,8 @@ import threading
 import time
 
 import pytest
-
 from conftest import FakeSmtp
+
 from pbx.mail import Mailer, SmtpSettings
 
 

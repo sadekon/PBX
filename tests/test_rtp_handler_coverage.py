@@ -1601,9 +1601,7 @@ class TestRTPPlayerSendAudio:
         p.running = True
 
         with patch("pbx.rtp.handler.time.sleep"):
-            result = p.send_audio(
-                b"\x00" * 800, payload_type=0, interrupt_check=lambda: False
-            )
+            result = p.send_audio(b"\x00" * 800, payload_type=0, interrupt_check=lambda: False)
 
         assert result is True
         assert mock_sock.sendto.call_count == 5
