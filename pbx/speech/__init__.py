@@ -23,15 +23,20 @@ Typical use, from a feature holding ``pbx_core.transcription_service``::
 
 from pbx.speech.protocols import FileTranscriber, StreamSession, StreamTranscriber
 from pbx.speech.settings import TranscriptionSettings
+from pbx.speech.store import SOURCE_LIVE, SOURCE_RECORDING, SOURCE_VOICEMAIL, TranscriptStore
 from pbx.speech.types import Segment, Transcript, Word
 from pbx.speech.worker import TranscriptionJob, TranscriptionWorker
 
 __all__ = [
+    "SOURCE_LIVE",
+    "SOURCE_RECORDING",
+    "SOURCE_VOICEMAIL",
     "FileTranscriber",
     "Segment",
     "StreamSession",
     "StreamTranscriber",
     "Transcript",
+    "TranscriptStore",
     "TranscriptionJob",
     "TranscriptionSettings",
     "TranscriptionWorker",

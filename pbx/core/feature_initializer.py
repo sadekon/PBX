@@ -24,7 +24,12 @@ from pbx.features.sip_trunk import SIPTrunkSystem
 from pbx.features.time_based_routing import TimeBasedRouting
 from pbx.features.voicemail import VoicemailSystem
 from pbx.mail import Mailer, SmtpSettings
-from pbx.speech import TranscriptionSettings, TranscriptionWorker, build_backend
+from pbx.speech import (
+    TranscriptionSettings,
+    TranscriptionWorker,
+    TranscriptStore,
+    build_backend,
+)
 from pbx.speech.settings import CONFIG_SECTION as TRANSCRIPTION_CONFIG_SECTION
 
 
@@ -67,6 +72,9 @@ class FeatureInitializer:
         backend = build_backend(transcription_settings, logger=logger)
         pbx_core.transcription_service = TranscriptionWorker(backend, transcription_settings)
         pbx_core.transcription_service.start()
+        # Reachable from the API the same way every other subsystem is, so admin routes
+        # read transcripts through one place instead of writing their own SQL.
+        pbx_core.transcript_store = TranscriptStore(database, logger)
 
         # Report configuration problems once, here, rather than per message. A model that was
         # never downloaded -- or unzipped one level too deep -- is the likely failure after a

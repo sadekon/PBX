@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from pbx.mail import Attachment, EmailError
+from pbx.speech.store import SOURCE_VOICEMAIL, TranscriptStore
 from pbx.utils.logger import get_logger, get_vm_ivr_logger
 from pbx.utils.timezone import display_timezone, to_display
 
@@ -445,6 +446,17 @@ class VoicemailBox:
             self.logger.info(f"✓ Transcription saved to database for {message_id}")
         except Exception as e:
             self.logger.error(f"✗ Error saving transcription to database: {e}")
+
+        # Also written to call_transcripts. The columns above stay because the email path
+        # reads them and changing that is not worth the churn; this second write is what gives
+        # retention one table to sweep and the admin view one table to query, across voicemail,
+        # recordings and -- when it lands -- live transcription.
+        TranscriptStore(self.database, self.logger).save(
+            transcript,
+            source=SOURCE_VOICEMAIL,
+            call_id=message_id,
+            media_path=str(message.get("file_path") or ""),
+        )
 
     def _lookup_extension(self) -> tuple[dict | None, str | None]:
         """

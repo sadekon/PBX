@@ -770,3 +770,60 @@ def register_all_migrations(manager: MigrationManager) -> None:
         ALTER TABLE call_queues ADD COLUMN max_redials INTEGER DEFAULT 0;
     """),
     )
+
+    # Migration 1017: Transcript storage
+    #
+    # Three things at once because they are one concern. call_summaries is not new -- it is
+    # written at speech_analytics.py:452 and read at :521, and has never been created by any
+    # migration, so every summary write has failed silently on every install since.
+    #
+    # call_transcripts is deliberately shaped so live transcription can use it unchanged when
+    # that lands. A live session has no file on disk and no duration until it ends, so
+    # media_path and both duration columns are nullable, source is a plain VARCHAR rather than
+    # a constrained enum, and call_id is *not* unique -- one call can hold several transcripts
+    # (per leg, or a live pass plus a better post-call re-run). StreamSession.close() already
+    # returns a Transcript, so a finished live session stores through exactly this shape.
+    manager.register_migration(
+        1017,
+        "Transcript Storage",
+        manager._build_migration_sql("""
+        -- One row per transcription run, not per media file: re-transcribing a recording
+        -- with a better model appends rather than overwriting what was read before.
+        CREATE TABLE IF NOT EXISTS call_transcripts (
+            id {SERIAL},
+            call_id VARCHAR(100),
+            source VARCHAR(20) NOT NULL DEFAULT 'recording',
+            media_path VARCHAR(255),
+            provider VARCHAR(30),
+            model VARCHAR(255),
+            language VARCHAR(20),
+            transcript_text {TEXT},
+            -- JSON, stored as text: _build_table_sql has no JSON placeholder and SQLite has
+            -- no JSON column type. Nullable because word/segment timing is opt-in.
+            segments {TEXT},
+            -- Null when the engine cannot report one. Whisper genuinely cannot, and a 0.0
+            -- default would be rendered to a user as "Estimated accuracy 0%".
+            confidence FLOAT,
+            audio_duration FLOAT,
+            processing_duration FLOAT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_transcripts_call ON call_transcripts(call_id);
+        CREATE INDEX IF NOT EXISTS idx_transcripts_created ON call_transcripts(created_at);
+        CREATE INDEX IF NOT EXISTS idx_transcripts_source ON call_transcripts(source);
+
+        -- Referenced by speech_analytics since it was written; created here for the first time.
+        CREATE TABLE IF NOT EXISTS call_summaries (
+            id {SERIAL},
+            call_id VARCHAR(100) NOT NULL,
+            transcript {TEXT},
+            summary {TEXT},
+            sentiment VARCHAR(20),
+            sentiment_score FLOAT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_summaries_call ON call_summaries(call_id);
+    """),
+    )

@@ -70,7 +70,7 @@ if TYPE_CHECKING:
     from pbx.integrations.matrix import MatrixIntegration
     from pbx.integrations.zoom import ZoomIntegration
     from pbx.mail import Mailer
-    from pbx.speech import TranscriptionWorker
+    from pbx.speech import TranscriptionWorker, TranscriptStore
     from pbx.utils.database import ExtensionDB
     from pbx.utils.prometheus_exporter import PBXMetricsExporter
     from pbx.utils.security import ThreatDetector
@@ -83,6 +83,7 @@ class PBXCore:
     # Attributes set by FeatureInitializer.initialize()
     voicemail_system: VoicemailSystem
     transcription_service: TranscriptionWorker
+    transcript_store: TranscriptStore
     conference_system: ConferenceSystem
     recording_system: CallRecordingSystem
     queue_system: QueueSystem

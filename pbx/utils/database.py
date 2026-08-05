@@ -494,7 +494,8 @@ class DatabaseBackend:
             transcription_confidence FLOAT,
             transcription_language VARCHAR(10),
             transcription_provider VARCHAR(20),
-            transcribed_at TIMESTAMP
+            transcribed_at TIMESTAMP,
+            audio_deleted_at TIMESTAMP
         )
         """
         )
@@ -739,6 +740,10 @@ class DatabaseBackend:
             ("transcription_language", "VARCHAR(10)"),
             ("transcription_provider", "VARCHAR(20)"),
             ("transcribed_at", "TIMESTAMP"),
+            # Set when the recording is deleted but the transcript is kept. Retention treats
+            # audio and text on separate clocks: the .wav is ~170 KB against ~2 KB of text,
+            # and deleting a mailbox should not destroy the record of what was said.
+            ("audio_deleted_at", "TIMESTAMP"),
         ]
 
         self._add_missing_columns("voicemail_messages", transcription_columns)

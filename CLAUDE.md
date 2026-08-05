@@ -104,7 +104,7 @@ pbx/
 │   └── registered_phone.py
 ├── utils/            # Cross-cutting concerns (24 modules)
 │   ├── config.py     # YAML config management
-│   ├── database.py   # DB abstraction (PostgreSQL/SQLite)
+│   ├── database.py   # DB access (PostgreSQL only, despite the name)
 │   ├── encryption.py # FIPS 140-2 encryption
 │   ├── tls_support.py
 │   ├── migrations.py # Runtime CREATE TABLE IF NOT EXISTS
@@ -147,7 +147,9 @@ tests/                # Python test suite (228 test files)
 
 - **PBXCore** is the central coordinator/singleton that owns all subsystems
 - **Feature modules** in `pbx/features/` are loaded dynamically via `FeatureInitializer`
-- **Database abstraction** supports PostgreSQL (production) and SQLite (fallback)
+- **Database access is PostgreSQL-only.** `DatabaseBackend` hardcodes `db_type = "postgresql"`
+  and returns early without `psycopg2`; neither `database.py` nor `migrations.py` contains any
+  SQLite branch, and `_build_migration_sql` emits PostgreSQL syntax. There is no fallback
 - **Configuration** is YAML-based (`config.yml`) with `.env` file support
 - **API routes** are organized by feature domain in `pbx/api/routes/`
 - **Flask app** uses a factory pattern via `create_app(pbx_core)`
@@ -241,7 +243,7 @@ System dependencies required in CI: `espeak`, `ffmpeg`, `libopus-dev`, `portaudi
 - **ORM**: SQLAlchemy 2.0 with models in `pbx/models/`
 - **Migrations**: Alembic (config in `alembic/`)
 - **Production**: PostgreSQL 17
-- **Development fallback**: SQLite
+- **Development**: also PostgreSQL. There is no SQLite fallback in the code
 - **Models**: `Base` (declarative base), `Extension`, `Voicemail`, `CallRecord`, `RegisteredPhone`
 
 ## Pre-commit Hooks

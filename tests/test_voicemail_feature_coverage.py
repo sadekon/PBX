@@ -422,8 +422,14 @@ class TestVoicemailBoxSaveMessage:
         voicemail_box.mailer = mock_mailer
         voicemail_box.transcription_service = self._inline_worker(text="Hello", confidence=0.9)
         voicemail_box.save_message("5551234", b"audio data")
-        # Should call execute twice: once for message insert, once for transcription update
-        assert mock_database.execute.call_count == 2
+
+        # Three writes: the message row, the transcription columns on it, and the row in
+        # call_transcripts. The last is the dual-write -- voicemail_messages stays because the
+        # email reads it, while call_transcripts is the one table retention and the admin view
+        # have to know about.
+        assert mock_database.execute.call_count == 3
+        statements = " ".join(str(call[0][0]) for call in mock_database.execute.call_args_list)
+        assert "INSERT INTO call_transcripts" in statements
 
     def test_save_message_without_a_mailer_skips_transcription(self, voicemail_box) -> None:
         """No mailer means no notification, so there is nothing a transcript would serve."""
