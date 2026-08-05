@@ -117,6 +117,11 @@ class WhisperBackend:
         self.model: Any | None = None
         #: What is actually handed to CTranslate2. Reported on the Transcript.
         self.model_id = _resolve_model(settings.whisper_model_dir, settings.whisper_model)
+        #: What gets recorded against a transcript. The *name*, not the path: a stored
+        #: transcript is compared against others months later, and "models/whisper" says
+        #: nothing about whether it came from small.en or tiny.en, while a path is also
+        #: specific to one host. The path stays in the logs, where it helps.
+        self.model_name = settings.whisper_model or self.model_id
 
         if settings.enabled:
             self._load_model()
@@ -138,6 +143,22 @@ class WhisperBackend:
                 f"--model {self.settings.whisper_model}"
             )
             return
+
+        if (
+            self.model_id == self.settings.whisper_model_dir.rstrip("/")
+            and (Path(self.model_id) / "model.bin").is_file()
+        ):
+            # The directory holds a model directly, so its name identifies nothing and
+            # whisper_model is taken on trust. Nothing here can check it: a converted model
+            # carries alignment heads and language ids, never its own name. Supported, because
+            # existing installs are laid out this way, but the transcript record is only as
+            # honest as the config.
+            self.logger.warning(
+                f"{self.model_id} holds a model directly, so its name cannot confirm this is "
+                f"{self.settings.whisper_model!r}. Transcripts will record that name on trust. "
+                f"Stage models as {self.model_id}/<model-name> and point whisper_model_dir at "
+                f"{self.model_id} so the two cannot disagree."
+            )
 
         if not self.settings.whisper_model_dir:
             # Loading by name reaches for HuggingFace, and this runs at startup on a production
@@ -193,7 +214,7 @@ class WhisperBackend:
         def failed(message: str) -> Transcript:
             self.logger.error(f"Whisper transcription failed: {message}")
             return Transcript.failure(
-                message, provider=self.provider, language=requested, model=self.model_id
+                message, provider=self.provider, language=requested, model=self.model_name
             )
 
         if not self.ready:
@@ -235,7 +256,7 @@ class WhisperBackend:
             segments=tuple(segments),
             language=requested,
             provider=self.provider,
-            model=self.model_id,
+            model=self.model_name,
             # Deliberately None -- see the module docstring. Word-level probabilities exist
             # below and are real, but averaging them into a headline "accuracy" figure is the
             # fabrication this field is guarding against.

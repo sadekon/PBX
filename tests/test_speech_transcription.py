@@ -431,6 +431,18 @@ class TestVoskBackend:
         assert not result.success
         assert "Unsupported sample rate" in result.error
 
+    @patch("pbx.speech.backends.vosk.KaldiRecognizer", _FakeRecognizer, create=True)
+    def test_the_model_name_is_recorded_not_the_full_path(self, tmp_path: Any) -> None:
+        """Same reasoning as whisper: an identity survives a host change, a path does not."""
+        from pbx.utils.audio import WAV_FORMAT_ULAW, pcm16_to_ulaw
+
+        path = _write_wav(tmp_path / "vm.wav", pcm16_to_ulaw(_tone_pcm16()), WAV_FORMAT_ULAW, 8)
+        settings = _settings(vosk_model_path="/opt/warden/models/vosk-model-small-en-us-0.15")
+
+        result = _ready_backend(settings).transcribe_file(path)
+
+        assert result.model == "vosk-model-small-en-us-0.15"
+
     def test_backend_without_a_model_is_not_ready(self) -> None:
         backend = VoskBackend(_settings(vosk_model_path="/nonexistent/model"))
 
@@ -679,6 +691,22 @@ class TestWhisperBackend:
         # local_files_only is what stops a 250 MB HuggingFace fetch from a daemon thread.
         assert whisper_model.call_args.kwargs["local_files_only"] is True
 
+    def test_the_model_name_is_recorded_not_the_path(self, tmp_path: Any) -> None:
+        """
+        A stored transcript is compared against others months later.
+
+        "models/whisper" says nothing about whether the text came from small.en or tiny.en,
+        and a path is specific to one host besides. This reported the path until a real
+        transcript landed in call_transcripts with an unusable model column.
+        """
+        (tmp_path / "model.bin").write_bytes(b"")
+        settings = _whisper_settings(whisper_model_dir=str(tmp_path), whisper_model="small.en")
+
+        result = _ready_whisper(settings=settings).transcribe_file(_ulaw_voicemail(tmp_path))
+
+        assert result.model == "small.en"
+        assert str(tmp_path) not in result.model
+
     def test_model_dir_is_joined_with_the_model_name(self, tmp_path: Any) -> None:
         """Switching models is one key: the directory follows whisper_model."""
         from pbx.speech.backends.whisper import WhisperBackend
@@ -689,6 +717,43 @@ class TestWhisperBackend:
         )
 
         assert backend.model_id == str(tmp_path / "base.en")
+
+    @patch("pbx.speech.backends.whisper.WHISPER_AVAILABLE", True)
+    @patch("pbx.speech.backends.whisper.WhisperModel", create=True)
+    def test_an_unverifiable_layout_is_warned_about(
+        self, whisper_model: Any, tmp_path: Any
+    ) -> None:
+        """
+        A directory holding the model directly cannot corroborate whisper_model.
+
+        Nothing in a converted model names it -- config.json carries alignment heads and
+        language ids -- so the name is taken on trust and the transcript record inherits that.
+        Supported for existing installs, but it should say so rather than look verified.
+        """
+        (tmp_path / "model.bin").write_bytes(b"")
+        logger = Mock()
+
+        from pbx.speech.backends.whisper import WhisperBackend
+
+        WhisperBackend(_whisper_settings(whisper_model_dir=str(tmp_path)), logger=logger)
+
+        warnings = " ".join(str(c) for c in logger.warning.call_args_list)
+        assert "cannot confirm" in warnings
+
+    @patch("pbx.speech.backends.whisper.WHISPER_AVAILABLE", True)
+    @patch("pbx.speech.backends.whisper.WhisperModel", create=True)
+    def test_the_root_layout_is_not_warned_about(self, whisper_model: Any, tmp_path: Any) -> None:
+        """<root>/<model-name> proves the name, so there is nothing to flag."""
+        (tmp_path / "small.en").mkdir()
+        (tmp_path / "small.en" / "model.bin").write_bytes(b"")
+        logger = Mock()
+
+        from pbx.speech.backends.whisper import WhisperBackend
+
+        WhisperBackend(_whisper_settings(whisper_model_dir=str(tmp_path)), logger=logger)
+
+        warnings = " ".join(str(c) for c in logger.warning.call_args_list)
+        assert "cannot confirm" not in warnings
 
     def test_a_directory_holding_the_model_is_used_directly(self, tmp_path: Any) -> None:
         """Back-compat: installs that staged one model into the configured path still load."""

@@ -61,6 +61,9 @@ class VoskBackend:
         self.logger = logger or get_logger()
         self.model: Any | None = None
         self.model_path = settings.vosk_model_path
+        #: Recorded against a transcript: the directory name identifies the model
+        #: (vosk-model-small-en-us-0.15) while the full path is specific to one host.
+        self.model_name = Path(self.model_path).name or self.model_path
 
         if settings.enabled:
             self._load_model()
@@ -118,7 +121,7 @@ class VoskBackend:
         def failed(message: str) -> Transcript:
             self.logger.error(f"Vosk transcription failed: {message}")
             return Transcript.failure(
-                message, provider=self.provider, language=language, model=self.model_path
+                message, provider=self.provider, language=language, model=self.model_name
             )
 
         if not self.ready:
@@ -161,7 +164,7 @@ class VoskBackend:
             segments=tuple(segments),
             language=language,
             provider=self.provider,
-            model=self.model_path,
+            model=self.model_name,
             confidence=(sum(confidences) / len(confidences)) if confidences else None,
             audio_duration=audio_duration,
             processing_duration=time.monotonic() - started,
