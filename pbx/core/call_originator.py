@@ -177,9 +177,7 @@ class CallOriginator:
                 body=invite_sdp,
             )
             sip_port = pbx.config.get("server.sip_port", 5060)
-            invite_request.set_header(
-                "Contact", f"<sip:{from_context}@{server_ip}:{sip_port}>"
-            )
+            invite_request.set_header("Contact", f"<sip:{from_context}@{server_ip}:{sip_port}>")
             SIPMessageBuilder.add_caller_id_headers(
                 invite_request, from_context, from_context, server_ip
             )
@@ -263,7 +261,9 @@ class CallOriginator:
         )
         return leg_a_call, None
 
-    def _complete_bridge(self, leg_a_call: Any, leg_b_call: Any, on_leg_b_answer: Callable[[Any], None] | None) -> None:
+    def _complete_bridge(
+        self, leg_a_call: Any, leg_b_call: Any, on_leg_b_answer: Callable[[Any], None] | None
+    ) -> None:
         """
         Cross-link two answered, PBX-originated legs and hand media on
         leg_a's relay over to leg_b, mirroring TransferHandler.bridge()'s

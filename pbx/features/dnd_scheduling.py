@@ -3,13 +3,12 @@ Do Not Disturb (DND) Scheduling System
 Automatically sets DND status based on calendar events and scheduled rules
 """
 
-import threading
-import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pbx.features.presence import PresenceStatus
 from pbx.utils.logger import get_logger
+from pbx.utils.periodic import PeriodicTask
 
 
 class DNDRule:
@@ -104,8 +103,11 @@ class CalendarMonitor:
         self.logger = get_logger()
         self.outlook = outlook_integration
         self.check_interval = check_interval
-        self.running = False
-        self.thread = None
+        # Timing lives in PeriodicTask so every background loop in the PBX stops the same
+        # way; this class keeps only the calendar logic.
+        self._task = PeriodicTask(
+            "DNDCalendarMonitor", check_interval, self._check_all_calendars, logger=self.logger
+        )
         self.extension_email_map = {}  # extension -> email address
         self.active_meetings = {}  # extension -> meeting_info
 
@@ -143,31 +145,16 @@ class CalendarMonitor:
             )
             return
 
-        self.running = True
-        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.thread.start()
-        self.logger.info("Calendar monitoring started")
+        self._task.start()
 
     def stop(self) -> None:
         """Stop calendar monitoring thread"""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=5)
-        self.logger.info("Calendar monitoring stopped")
+        self._task.stop()
 
-    def _monitor_loop(self) -> None:
-        """Main monitoring loop"""
-        while self.running:
-            try:
-                self._check_all_calendars()
-            except Exception as e:
-                self.logger.error(f"Error in calendar monitoring: {e}")
-
-            # Sleep in small increments to allow quick shutdown
-            for _ in range(self.check_interval):
-                if not self.running:
-                    break
-                time.sleep(1)
+    @property
+    def running(self) -> bool:
+        """Whether the monitoring loop is alive."""
+        return self._task.running
 
     def _check_all_calendars(self) -> None:
         """Check calendars for all registered users"""
@@ -286,9 +273,10 @@ class DNDScheduler:
             outlook_integration=outlook_integration, check_interval=self.check_interval
         )
 
-        # Monitoring thread
-        self.running = False
-        self.thread = None
+        # Timing lives in PeriodicTask, as it does for every background loop in the PBX.
+        self._task = PeriodicTask(
+            "DNDRuleMonitor", self.check_interval, self._check_all_rules, logger=self.logger
+        )
 
         if self.enabled:
             self.logger.info("DND Scheduler initialized")
@@ -334,25 +322,19 @@ class DNDScheduler:
         if self.calendar_dnd_enabled and self.outlook:
             self.calendar_monitor.start()
 
-        # Start rule checking thread
-        self.running = True
-        self.thread = threading.Thread(target=self._monitoring_loop, daemon=True)
-        self.thread.start()
-
+        self._task.start()
         self.logger.info("DND Scheduler started")
 
     def stop(self) -> None:
         """Stop DND scheduler"""
-        self.running = False
-
-        # Stop calendar monitor
         self.calendar_monitor.stop()
-
-        # Stop monitoring thread
-        if self.thread:
-            self.thread.join(timeout=5)
-
+        self._task.stop()
         self.logger.info("DND Scheduler stopped")
+
+    @property
+    def running(self) -> bool:
+        """Whether the rule-checking loop is alive."""
+        return self._task.running
 
     def add_rule(self, extension: str, rule_type: str, config: dict) -> str:
         """
@@ -466,20 +448,6 @@ class DNDScheduler:
         if extension in self.manual_overrides:
             del self.manual_overrides[extension]
             self.logger.info(f"Cleared manual override for {extension}")
-
-    def _monitoring_loop(self) -> None:
-        """Main monitoring loop for rule checking"""
-        while self.running:
-            try:
-                self._check_all_rules()
-            except Exception as e:
-                self.logger.error(f"Error in DND monitoring: {e}")
-
-            # Sleep in small increments
-            for _ in range(self.check_interval):
-                if not self.running:
-                    break
-                time.sleep(1)
 
     def _check_manual_override(self, extension: str, now: datetime) -> bool:
         """Check if extension has active manual override. Returns True if override is active."""

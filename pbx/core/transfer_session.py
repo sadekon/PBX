@@ -496,9 +496,7 @@ class TransferSession:
                 try:
                     callback()
                 except Exception as exc:
-                    self.pbx.logger.error(
-                        f"Transfer {self.session_id}: on_complete raised: {exc}"
-                    )
+                    self.pbx.logger.error(f"Transfer {self.session_id}: on_complete raised: {exc}")
             return True
 
     # ------------------------------------------------------------------

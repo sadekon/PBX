@@ -618,6 +618,28 @@ class TestVoicemailBoxDeleteMessage:
         voicemail_box.delete_message(msg_id)
         mock_database.execute.assert_called_once()
 
+    def test_delete_message_tombstones_rather_than_deleting_the_row(
+        self, voicemail_box, mock_database
+    ) -> None:
+        """
+        The audio goes, the record stays.
+
+        Deleting the row destroyed the transcript along with the recording, so clearing a
+        mailbox erased the only remaining evidence of what was said. The row now survives with
+        audio_deleted_at set, and _load_messages filters it out so the mailbox still looks empty.
+        """
+        voicemail_box.database = mock_database
+        msg_id = voicemail_box.save_message("caller1", b"data1")
+        mock_database.execute.reset_mock()
+
+        voicemail_box.delete_message(msg_id)
+
+        query = str(mock_database.execute.call_args[0][0])
+        assert "UPDATE voicemail_messages" in query
+        assert "audio_deleted_at" in query
+        # "DELETE FROM", not "DELETE": audio_deleted_at contains the word.
+        assert "DELETE FROM" not in query.upper()
+
     def test_delete_message_db_error(self, voicemail_box, mock_database) -> None:
         voicemail_box.database = mock_database
         msg_id = voicemail_box.save_message("caller1", b"data1")

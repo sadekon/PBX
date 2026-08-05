@@ -20,6 +20,11 @@ from pbx.features.music_on_hold import MusicOnHold
 from pbx.features.phone_provisioning import PhoneProvisioning
 from pbx.features.presence import PresenceSystem
 from pbx.features.recording_retention import RecordingRetentionManager
+from pbx.features.retention import (
+    CONFIG_SECTION as RETENTION_CONFIG_SECTION,
+    RetentionSettings,
+    RetentionSweeper,
+)
 from pbx.features.sip_trunk import SIPTrunkSystem
 from pbx.features.time_based_routing import TimeBasedRouting
 from pbx.features.voicemail import VoicemailSystem
@@ -251,6 +256,15 @@ class FeatureInitializer:
             logger.info("Time-based routing initialized")
 
         # Initialize Recording Retention Manager
+        # Retention owns the only thing in the PBX that deletes user data on a timer, so it
+        # is constructed with dry_run defaulted on and says so at startup.
+        pbx_core.retention_sweeper = RetentionSweeper(
+            RetentionSettings.from_dict(config.get(RETENTION_CONFIG_SECTION, {}) or {}),
+            database=database,
+            logger=logger,
+        )
+        pbx_core.retention_sweeper.start()
+
         pbx_core.recording_retention = RecordingRetentionManager(config=config)
         if pbx_core.recording_retention.enabled:
             logger.info("Recording retention manager initialized")
