@@ -575,6 +575,9 @@ class CallRecordingSystem:
         self.active_recordings: dict[str, CallRecording] = {}
         self.recording_metadata: list[dict[str, Any]] = []
         self.logger = get_logger()
+        #: Called with the finished file whenever a recording completes. How transcription is
+        #: started, without this module having to know that transcription exists.
+        self.on_recording_finished: Callable[[Path], None] | None = None
 
         if self.requested and not self.consent_acknowledged:
             self.logger.warning(
@@ -658,6 +661,15 @@ class CallRecordingSystem:
         call that ended normally.
         """
         self.active_recordings.pop(recording.session_id, None)
+
+        if file_path and self.on_recording_finished is not None:
+            # Runs on the tap's drain thread, at the end of a call. Guarded because a
+            # transcription problem must not lose the recording that just succeeded.
+            try:
+                self.on_recording_finished(file_path)
+            except Exception as e:
+                self.logger.error(f"Recording follow-up for {recording.session_id} failed: {e}")
+
         if file_path:
             self.recording_metadata.append(
                 {

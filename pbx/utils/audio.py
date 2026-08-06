@@ -489,6 +489,62 @@ def resample_pcm16(pcm16: bytes, from_rate: int, to_rate: int) -> bytes:
     return np.clip(np.round(resampled), -32768, 32767).astype("<i2").tobytes()
 
 
+#: RMS below which a 20 ms frame is treated as silence rather than speech, for int16 samples.
+#:
+#: G.711 idle and comfort noise sit well under 100; telephone speech runs in the low thousands.
+#: 200 is comfortably between the two, and deliberately near the noise end -- the cost of
+#: calling silence speech is one wasted transcription, while the cost of calling speech silence
+#: is a transcript that is missing what somebody said.
+SILENCE_RMS_FLOOR = 200.0
+
+#: Frame length used when measuring activity. Matches one RTP packet of G.711.
+_ACTIVITY_FRAME_SAMPLES = 160
+
+
+def active_speech_seconds(
+    pcm16: bytes, sample_rate: int = 8000, floor: float = SILENCE_RMS_FLOOR
+) -> float:
+    """
+    How many seconds of this audio are above the noise floor.
+
+    Used to decide whether audio is worth handing to a speech model at all. It answers only
+    "is there anything here", not "where is the speech" -- the recogniser does the second part
+    far better, and faster-whisper's ``vad_filter`` already skips non-speech internally.
+
+    This matters most when a call is transcribed per participant: each channel is silent for
+    the whole time the other party is speaking, and a channel where somebody never spoke at
+    all -- a leg on hold, a participant who only listened -- would otherwise cost a full model
+    run to produce nothing, or worse, produce a hallucination.
+
+    Args:
+        pcm16: Mono PCM16 little-endian samples.
+        sample_rate: Samples per second.
+        floor: RMS below which a frame counts as silence.
+
+    Returns:
+        Seconds of audio above the floor. 0.0 for empty input.
+    """
+    if not pcm16 or sample_rate <= 0:
+        return 0.0
+
+    samples = np.frombuffer(pcm16, dtype="<i2")
+    if samples.size == 0:
+        return 0.0
+
+    # Trim to a whole number of frames so the reshape is exact; the remainder is at most one
+    # 20 ms frame and cannot change the decision.
+    frames = samples.size // _ACTIVITY_FRAME_SAMPLES
+    if frames == 0:
+        rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+        return samples.size / sample_rate if rms > floor else 0.0
+
+    block = samples[: frames * _ACTIVITY_FRAME_SAMPLES].astype(np.float64)
+    block = block.reshape(frames, _ACTIVITY_FRAME_SAMPLES)
+    rms = np.sqrt(np.mean(block**2, axis=1))
+
+    return float(np.count_nonzero(rms > floor) * _ACTIVITY_FRAME_SAMPLES / sample_rate)
+
+
 def read_wav_as_pcm16(path: str | Path) -> tuple[bytes, int]:
     """
     Read a WAV file and return its audio as mono 16-bit little-endian PCM.

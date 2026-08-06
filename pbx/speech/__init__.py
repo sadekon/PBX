@@ -22,6 +22,7 @@ Typical use, from a feature holding ``pbx_core.transcription_service``::
 """
 
 from pbx.speech.protocols import FileTranscriber, StreamSession, StreamTranscriber
+from pbx.speech.recording import RecordingTranscriber
 from pbx.speech.settings import TranscriptionSettings
 from pbx.speech.store import SOURCE_LIVE, SOURCE_RECORDING, SOURCE_VOICEMAIL, TranscriptStore
 from pbx.speech.types import Segment, Transcript, Word
@@ -32,6 +33,7 @@ __all__ = [
     "SOURCE_RECORDING",
     "SOURCE_VOICEMAIL",
     "FileTranscriber",
+    "RecordingTranscriber",
     "Segment",
     "StreamSession",
     "StreamTranscriber",

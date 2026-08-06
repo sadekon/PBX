@@ -422,6 +422,33 @@ class FeatureInitializer:
         for entry in getattr(relay, "active_relays", {}).values():
             entry["handler"].on_bridged = on_bridged
 
+        FeatureInitializer._wire_recording_transcription(pbx_core)
+
+    @staticmethod
+    def _wire_recording_transcription(pbx_core: Any) -> None:
+        """
+        Transcribe each recording once it is finished.
+
+        Post-call rather than live: a completed recording is just a file, and the shared
+        worker already transcribes files. One pass per participant, because the recording
+        already separated them and that is what makes the transcript say who spoke.
+        """
+        from pbx.speech.recording import RecordingTranscriber
+        from pbx.speech.store import TranscriptStore
+
+        recording_system = getattr(pbx_core, "recording_system", None)
+        worker = getattr(pbx_core, "transcription_service", None)
+        if recording_system is None or worker is None:
+            return
+
+        database = getattr(pbx_core, "database", None)
+        transcriber = RecordingTranscriber(
+            worker=worker,
+            store=TranscriptStore(database if getattr(database, "enabled", False) else None),
+        )
+        pbx_core.recording_transcriber = transcriber
+        recording_system.on_recording_finished = transcriber.submit
+
     @staticmethod
     def _init_active_directory(pbx_core: Any, config: Any) -> None:
         """Initialize Active Directory integration"""
