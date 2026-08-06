@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from pbx.features.retention import RetentionSettings, RetentionSweeper
+from pbx.features.retention import SKIP_DIR_NAMES, RetentionSettings, RetentionSweeper
 from pbx.utils.periodic import PeriodicTask
 
 
@@ -112,6 +112,38 @@ class TestSweep:
         RetentionSweeper(_settings(tmp_path, dry_run=False)).sweep()
 
         assert note.exists()
+
+    def test_transcription_scratch_is_skipped(self, tmp_path):
+        """
+        Transcription cuts a recording into per-participant regions under
+        recordings/.transcribe/. Those are .wav and live under a swept root, so without an
+        exclusion the sweep would delete the input of a job in progress and count its bytes
+        as if they were recordings.
+        """
+        working = _aged(tmp_path / "recordings" / ".transcribe" / "job-1" / "1001-0.wav", days=200)
+
+        result = RetentionSweeper(_settings(tmp_path, dry_run=False)).sweep()
+
+        assert working.exists()
+        assert result.audio_files == 0
+
+    def test_a_real_recording_beside_the_scratch_is_still_swept(self, tmp_path):
+        _aged(tmp_path / "recordings" / ".transcribe" / "job-1" / "region.wav", days=200)
+        real = _aged(tmp_path / "recordings" / "call.wav", days=200)
+
+        result = RetentionSweeper(_settings(tmp_path, dry_run=False)).sweep()
+
+        assert not real.exists()
+        assert result.audio_files == 1
+
+    def test_the_skip_name_matches_the_transcriber(self):
+        """
+        Two modules agreeing on a string by convention. If either changes, the sweep starts
+        deleting working files -- or stops skipping a directory that no longer exists.
+        """
+        from pbx.speech.recording import SCRATCH_DIRNAME
+
+        assert SCRATCH_DIRNAME in SKIP_DIR_NAMES
 
     def test_both_roots_are_swept(self, tmp_path):
         _aged(tmp_path / "voicemail" / "a.wav", days=200)

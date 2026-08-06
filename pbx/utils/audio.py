@@ -531,18 +531,165 @@ def active_speech_seconds(
     if samples.size == 0:
         return 0.0
 
-    # Trim to a whole number of frames so the reshape is exact; the remainder is at most one
-    # 20 ms frame and cannot change the decision.
-    frames = samples.size // _ACTIVITY_FRAME_SAMPLES
-    if frames == 0:
-        rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
-        return samples.size / sample_rate if rms > floor else 0.0
-
-    block = samples[: frames * _ACTIVITY_FRAME_SAMPLES].astype(np.float64)
-    block = block.reshape(frames, _ACTIVITY_FRAME_SAMPLES)
-    rms = np.sqrt(np.mean(block**2, axis=1))
+    # The remainder that does not fill a frame is at most 20 ms and cannot change the
+    # decision, except when the whole clip is shorter than one frame.
+    rms = _frame_rms(samples, _ACTIVITY_FRAME_SAMPLES)
+    if rms.size == 0:
+        whole = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+        return samples.size / sample_rate if whole > floor else 0.0
 
     return float(np.count_nonzero(rms > floor) * _ACTIVITY_FRAME_SAMPLES / sample_rate)
+
+
+#: Silence that must elapse before audio either side of it is treated as separate speech.
+#:
+#: Deliberately generous. Splitting audio before it reaches a speech model costs quality: the
+#: model punctuates and capitalises from context, so a cut mid-sentence produces a lowercase
+#: fragment with no closing punctuation and worse accuracy on the words either side. The only
+#: safe place to cut is a gap no sentence would contain.
+#:
+#: Pauses inside ordinary speech run to about 0.3 s, and clause boundaries to about 1 s.
+#: A conversational turn -- the case this exists for, where the gap is the other participant's
+#: entire turn -- is several seconds. 1.5 s sits clearly above the first and below the second.
+#: Raising it is the safe direction; lowering it risks cutting sentences in half.
+DEFAULT_SPLIT_GAP_SECONDS = 1.5
+
+#: Audio kept either side of a region, so a cut never lands on a leading consonant.
+#: Must stay below half of the gap threshold or padded regions merge back together.
+DEFAULT_REGION_PAD_SECONDS = 0.2
+
+#: Regions shorter than this are dropped. A fragment this brief carries no context for the
+#: model, which is the condition under which it invents words.
+DEFAULT_MIN_REGION_SECONDS = 0.3
+
+
+def _frame_rms(samples: "np.ndarray", frame: int) -> "np.ndarray":
+    """RMS per fixed-length frame. Trailing samples that do not fill a frame are ignored."""
+    frames = samples.size // frame
+    if frames == 0:
+        return np.zeros(0)
+    block = samples[: frames * frame].astype(np.float64).reshape(frames, frame)
+    return np.sqrt(np.mean(block**2, axis=1))
+
+
+def frame_rms(pcm16: bytes) -> "np.ndarray":
+    """
+    RMS per 20 ms frame, for callers measuring audio they are reading in pieces.
+
+    One float per 20 ms is about 400 KB per hour per channel, so a caller can summarise a
+    whole call this way and never hold the audio itself. That is the difference between
+    bounded memory and holding every channel of every simultaneously-ending call.
+    """
+    return _frame_rms(np.frombuffer(pcm16, dtype="<i2"), _ACTIVITY_FRAME_SAMPLES)
+
+
+def frame_seconds(sample_rate: int = 8000) -> float:
+    """How much time one :func:`frame_rms` frame covers."""
+    return _ACTIVITY_FRAME_SAMPLES / sample_rate
+
+
+def regions_from_rms(
+    rms: "np.ndarray",
+    *,
+    seconds_per_frame: float,
+    duration: float,
+    floor: float = SILENCE_RMS_FLOOR,
+    min_gap_seconds: float = DEFAULT_SPLIT_GAP_SECONDS,
+    pad_seconds: float = DEFAULT_REGION_PAD_SECONDS,
+    min_region_seconds: float = DEFAULT_MIN_REGION_SECONDS,
+) -> list[tuple[float, float]]:
+    """
+    Speech regions from precomputed frame energies. See :func:`speech_regions` for the why.
+
+    Split out so a caller streaming a long file can summarise it frame by frame and decide
+    where to cut without ever holding the audio.
+    """
+    if rms.size == 0:
+        return []
+
+    active = rms > floor
+    if not active.any():
+        return []
+
+    # Runs of consecutive active frames. diff on the padded boolean array marks every
+    # transition, so starts and ends come out in pairs.
+    edges = np.diff(np.concatenate(([0], active.view(np.int8), [0])))
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+
+    # Join runs separated by less than the gap threshold: those are pauses within speech,
+    # not turn boundaries, and cutting there is what damages the transcript.
+    merged: list[list[float]] = []
+    for start, end in zip(starts * seconds_per_frame, ends * seconds_per_frame, strict=True):
+        if merged and start - merged[-1][1] < min_gap_seconds:
+            merged[-1][1] = end
+        else:
+            merged.append([start, end])
+
+    regions: list[tuple[float, float]] = []
+    for start, end in merged:
+        if end - start < min_region_seconds:
+            continue
+        padded_start = float(max(0.0, start - pad_seconds))
+        padded_end = float(min(duration, end + pad_seconds))
+        # Padding cannot reintroduce an overlap while pad_seconds stays below half the gap
+        # threshold, but clamp anyway rather than trust the caller's arithmetic.
+        if regions and padded_start <= regions[-1][1]:
+            regions[-1] = (regions[-1][0], padded_end)
+        else:
+            regions.append((padded_start, padded_end))
+
+    return regions
+
+
+def speech_regions(
+    pcm16: bytes,
+    sample_rate: int = 8000,
+    *,
+    floor: float = SILENCE_RMS_FLOOR,
+    min_gap_seconds: float = DEFAULT_SPLIT_GAP_SECONDS,
+    pad_seconds: float = DEFAULT_REGION_PAD_SECONDS,
+    min_region_seconds: float = DEFAULT_MIN_REGION_SECONDS,
+) -> list[tuple[float, float]]:
+    """
+    Find stretches of speech separated by gaps long enough to be real turn boundaries.
+
+    Exists because a speech model will not split a segment across silence it never receives.
+    faster-whisper's VAD removes non-speech and transcribes what remains as one stream, so two
+    utterances either side of a long pause arrive adjacent and come back as a single segment
+    spanning both. On a per-participant recording that pause is the other person's entire turn,
+    which makes the merged output actively wrong rather than merely ugly.
+
+    Splitting the audio *before* the model sees it is the only way to force the boundary. The
+    cost is that every cut removes context the model uses for punctuation and capitalisation,
+    so this cuts as rarely as possible: only at gaps of `min_gap_seconds`, which no sentence
+    contains, and never inside continuous speech however long it runs.
+
+    Args:
+        pcm16: Mono PCM16 little-endian samples.
+        sample_rate: Samples per second.
+        floor: RMS below which a frame counts as silence.
+        min_gap_seconds: Silence shorter than this never splits a region.
+        pad_seconds: Audio kept either side of each region.
+        min_region_seconds: Regions shorter than this are discarded.
+
+    Returns:
+        (start, end) pairs in seconds, in order, non-overlapping. Empty when there is no
+        speech. A single region covering everything means there was nothing safe to split on.
+    """
+    if not pcm16 or sample_rate <= 0:
+        return []
+
+    samples = np.frombuffer(pcm16, dtype="<i2")
+    return regions_from_rms(
+        _frame_rms(samples, _ACTIVITY_FRAME_SAMPLES),
+        seconds_per_frame=frame_seconds(sample_rate),
+        duration=samples.size / sample_rate,
+        floor=floor,
+        min_gap_seconds=min_gap_seconds,
+        pad_seconds=pad_seconds,
+        min_region_seconds=min_region_seconds,
+    )
 
 
 def read_wav_as_pcm16(path: str | Path) -> tuple[bytes, int]:

@@ -1060,7 +1060,10 @@ def update_inbound_route(route_id: int) -> tuple[Response, int]:
             data = get_request_body()
 
             destination_type = data.get("destination_type")
-            if destination_type is not None and destination_type not in _INBOUND_ROUTE_DESTINATION_TYPES:
+            if (
+                destination_type is not None
+                and destination_type not in _INBOUND_ROUTE_DESTINATION_TYPES
+            ):
                 return send_json(
                     {
                         "error": "destination_type must be one of: "
@@ -1083,9 +1086,7 @@ def update_inbound_route(route_id: int) -> tuple[Response, int]:
                 return send_json({"error": "Failed to update inbound route"}, 500), 500
 
             pbx_core.inbound_routing.reload_routes()
-            return send_json(
-                {"success": True, "message": f"Inbound route {route_id} updated"}
-            ), 200
+            return send_json({"success": True, "message": f"Inbound route {route_id} updated"}), 200
 
         except (KeyError, TypeError, ValueError) as e:
             logger.error(f"Error updating inbound route: {e}")
@@ -1109,9 +1110,7 @@ def delete_inbound_route(route_id: int) -> tuple[Response, int]:
                 return send_json({"error": "Failed to delete inbound route"}, 500), 500
 
             pbx_core.inbound_routing.reload_routes()
-            return send_json(
-                {"success": True, "message": f"Inbound route {route_id} removed"}
-            ), 200
+            return send_json({"success": True, "message": f"Inbound route {route_id} removed"}), 200
 
         except (KeyError, TypeError, ValueError) as e:
             logger.error(f"Error deleting inbound route: {e}")

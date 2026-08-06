@@ -165,10 +165,15 @@ class TranscriptionSettings:
     whisper_vad_threshold: float = 0.5
     #: Milliseconds of audio kept either side of a detected speech chunk.
     #:
-    #: Matters more now that `whisper_vad_min_silence_ms` is short: cutting closer to the
-    #: speech means more chances to clip a leading consonant, and a clipped onset is how
-    #: "seven" becomes "eleven". faster-whisper's default is 400.
-    whisper_vad_speech_pad_ms: int = 400
+    #: **Must stay below half of `whisper_vad_min_silence_ms`.** Padding is applied to both
+    #: ends and overlapping chunks are then merged, so a gap shorter than twice this value is
+    #: padded shut and the chunks rejoin -- detecting a boundary and then erasing it.
+    #: faster-whisper defaults to 400, which silently undoes any silence threshold under
+    #: 800 ms.
+    #:
+    #: Below that ceiling, higher is safer: cutting close to the speech clips leading
+    #: consonants, and a clipped onset is how "seven" becomes "eleven".
+    whisper_vad_speech_pad_ms: int = 200
     #: RMS below which a 20 ms frame counts as silence when deciding whether a recording
     #: channel is worth transcribing at all. A real power threshold, unlike the VAD one above.
     #:
@@ -227,7 +232,7 @@ class TranscriptionSettings:
             whisper_vad_filter=_as_bool(section.get("whisper_vad_filter"), True),
             whisper_vad_min_silence_ms=_as_int(section.get("whisper_vad_min_silence_ms"), 500),
             whisper_vad_threshold=_as_float(section.get("whisper_vad_threshold"), 0.5),
-            whisper_vad_speech_pad_ms=_as_int(section.get("whisper_vad_speech_pad_ms"), 400),
+            whisper_vad_speech_pad_ms=_as_int(section.get("whisper_vad_speech_pad_ms"), 200),
             silence_rms_floor=_as_float(section.get("silence_rms_floor"), SILENCE_RMS_FLOOR),
             workers=workers,
             queue_size=_as_int(section.get("queue_size"), DEFAULT_QUEUE_SIZE),
@@ -315,6 +320,17 @@ class TranscriptionSettings:
                 problems.append(
                     f"{CONFIG_SECTION}.whisper_vad_speech_pad_ms "
                     f"{self.whisper_vad_speech_pad_ms} must not be negative"
+                )
+            # The silent failure this exists to catch: padding is added to both ends and
+            # overlapping chunks merge, so a gap under twice the padding is closed again and
+            # the silence threshold does nothing.
+            if self.whisper_vad_speech_pad_ms * 2 >= self.whisper_vad_min_silence_ms > 0:
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_vad_speech_pad_ms "
+                    f"({self.whisper_vad_speech_pad_ms}ms) is at least half of "
+                    f"whisper_vad_min_silence_ms ({self.whisper_vad_min_silence_ms}ms), so "
+                    "padding closes every gap the silence threshold finds and speech chunks "
+                    "never split"
                 )
             if self.whisper_beam_size <= 0:
                 problems.append(

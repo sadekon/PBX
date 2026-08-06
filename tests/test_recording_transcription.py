@@ -14,9 +14,14 @@ import wave
 import numpy as np
 import pytest
 
-from pbx.speech.recording import RecordingTranscriber, merge_channels
+from pbx.speech.recording import (
+    SCRATCH_DIRNAME,
+    RecordingTranscriber,
+    combine_regions,
+    merge_channels,
+)
 from pbx.speech.types import Segment, Transcript
-from pbx.utils.audio import active_speech_seconds
+from pbx.utils.audio import active_speech_seconds, speech_regions
 
 RATE = 8000
 
@@ -65,14 +70,21 @@ class FakeWorker:
         self.available = available
         self.accept = accept
         self.texts = texts or {}
+        #: One entry per region file, named "<speaker>-<n>".
         self.submitted: list[str] = []
+
+    @property
+    def speakers(self) -> list[str]:
+        """Who was transcribed, without the per-region suffix."""
+        return sorted({name.rsplit("-", 1)[0] for name in self.submitted})
 
     def submit(self, path, on_complete, *, label="", audio_seconds=None, **_kwargs):
         self.submitted.append(path.stem)
         if not self.accept:
             return False
 
-        text = self.texts.get(path.stem, f"{path.stem} speaking")
+        speaker = path.stem.rsplit("-", 1)[0]
+        text = self.texts.get(speaker, f"{speaker} speaking")
         on_complete(
             Transcript(
                 text=text,
@@ -124,6 +136,123 @@ class TestActiveSpeechSeconds:
 
     def test_empty_input(self):
         assert active_speech_seconds(b"", RATE) == 0.0
+
+
+@pytest.mark.unit
+class TestSpeechRegions:
+    """
+    Where the audio gets cut before a model ever sees it.
+
+    Every cut costs the model the context it uses for punctuation and capitalisation, so the
+    rule is: only cut at a gap no sentence would contain, and never inside continuous speech
+    however long it runs.
+    """
+
+    def test_a_turn_gap_splits(self):
+        clip = np.concatenate([speech(2.0), silence(4.0), speech(2.0)])
+
+        regions = speech_regions(clip.tobytes(), RATE)
+
+        assert len(regions) == 2
+
+    def test_a_pause_within_a_sentence_does_not(self):
+        """0.4s is a breath, not a turn. Cutting here is what mangles punctuation."""
+        clip = np.concatenate([speech(2.0), silence(0.4), speech(2.0)])
+
+        regions = speech_regions(clip.tobytes(), RATE)
+
+        assert len(regions) == 1
+
+    def test_a_clause_pause_does_not_split_either(self):
+        clip = np.concatenate([speech(1.5), silence(1.0), speech(1.5)])
+
+        regions = speech_regions(clip.tobytes(), RATE)
+
+        assert len(regions) == 1
+
+    def test_continuous_speech_is_never_cut(self):
+        regions = speech_regions(speech(30.0).tobytes(), RATE)
+
+        assert len(regions) == 1
+
+    def test_the_gap_threshold_is_configurable(self):
+        clip = np.concatenate([speech(1.0), silence(1.0), speech(1.0)])
+
+        assert len(speech_regions(clip.tobytes(), RATE, min_gap_seconds=0.5)) == 2
+        assert len(speech_regions(clip.tobytes(), RATE, min_gap_seconds=2.0)) == 1
+
+    def test_regions_are_padded_but_do_not_overlap(self):
+        clip = np.concatenate([speech(2.0), silence(4.0), speech(2.0)])
+
+        (first_start, first_end), (second_start, _) = speech_regions(clip.tobytes(), RATE)
+
+        assert first_start == 0.0, "padding must clamp at the start of the audio"
+        assert first_end > 2.0, "the tail of speech should be padded, not clipped"
+        assert second_start < 6.0, "the onset should be padded, or consonants get clipped"
+        assert second_start > first_end, "regions must not overlap"
+
+    def test_a_brief_click_is_discarded(self):
+        """Too short to carry context, which is exactly when a model invents words."""
+        clip = np.concatenate([speech(0.05), silence(4.0), speech(2.0)])
+
+        regions = speech_regions(clip.tobytes(), RATE)
+
+        assert len(regions) == 1
+
+    def test_silence_yields_nothing(self):
+        assert speech_regions(silence(5.0).tobytes(), RATE) == []
+
+    def test_empty_input(self):
+        assert speech_regions(b"", RATE) == []
+
+
+@pytest.mark.unit
+class TestCombineRegions:
+    def _t(self, *segments, duration=5.0):
+        return Transcript(
+            text=" ".join(s.text for s in segments),
+            segments=segments,
+            provider="p",
+            model="m",
+            language="en",
+            audio_duration=duration,
+            processing_duration=1.0,
+        )
+
+    def test_timestamps_are_offset_back_onto_the_call_timeline(self):
+        """
+        Each region is transcribed as its own file, so its timestamps start at zero. Without
+        the offset every region would claim to have happened at the start of the call.
+        """
+        combined = combine_regions(
+            [
+                (0.0, self._t(Segment("first", 0.0, 2.0))),
+                (30.0, self._t(Segment("later", 0.0, 2.0))),
+            ]
+        )
+
+        assert [(s.start, s.end) for s in combined.segments] == [(0.0, 2.0), (30.0, 32.0)]
+
+    def test_regions_are_ordered_by_offset(self):
+        combined = combine_regions(
+            [
+                (30.0, self._t(Segment("later", 0.0, 1.0))),
+                (0.0, self._t(Segment("first", 0.0, 1.0))),
+            ]
+        )
+
+        assert [s.text for s in combined.segments] == ["first", "later"]
+
+    def test_duration_spans_the_gap_between_regions(self):
+        """The silence between regions is part of the call even though none was transcribed."""
+        combined = combine_regions([(0.0, self._t(duration=2.0)), (30.0, self._t(duration=2.0))])
+
+        assert combined.audio_duration == 32.0
+
+    def test_processing_cost_is_the_sum(self):
+        combined = combine_regions([(0.0, self._t()), (30.0, self._t())])
+
+        assert combined.processing_duration == 2.0
 
 
 @pytest.mark.unit
@@ -242,7 +371,7 @@ class TestRecordingTranscriber:
 
         assert RecordingTranscriber(worker, store).submit(path)
 
-        assert sorted(worker.submitted) == ["1001", "1002"]
+        assert worker.speakers == ["1001", "1002"]
 
     def test_the_result_is_one_attributed_transcript(self, tmp_path):
         path = self._recording(tmp_path, [speech(1.0), speech(1.0)], ["1001", "1002"])
@@ -266,7 +395,7 @@ class TestRecordingTranscriber:
 
         RecordingTranscriber(worker, FakeStore()).submit(path)
 
-        assert worker.submitted == ["1001"]
+        assert worker.speakers == ["1001"]
 
     def test_an_entirely_silent_recording_submits_nothing(self, tmp_path):
         path = self._recording(tmp_path, [silence(1.0), silence(1.0)], ["1001", "1002"])
@@ -281,7 +410,37 @@ class TestRecordingTranscriber:
 
         RecordingTranscriber(FakeWorker(), FakeStore()).submit(path)
 
-        assert {p.name for p in tmp_path.iterdir()} == {"call.wav", "call.json"}
+        scratch = tmp_path / SCRATCH_DIRNAME
+        assert list(scratch.iterdir()) == [], "a workspace survived the job"
+        assert {p.name for p in tmp_path.iterdir()} == {"call.wav", "call.json", SCRATCH_DIRNAME}
+
+    def test_working_files_live_in_the_scratch_directory(self, tmp_path):
+        """
+        They must not sit loose in recordings/, where retention's *.wav sweep would treat
+        them as recordings and delete a running job's input.
+        """
+        path = self._recording(tmp_path, [speech(1.0)], ["1001"])
+        seen: list[str] = []
+
+        class Watcher(FakeWorker):
+            def submit(self, region_path, on_complete, **kwargs):
+                seen.append(str(region_path.relative_to(tmp_path)))
+                return super().submit(region_path, on_complete, **kwargs)
+
+        RecordingTranscriber(Watcher(), FakeStore()).submit(path)
+
+        assert seen and all(name.startswith(f"{SCRATCH_DIRNAME}/") for name in seen)
+
+    def test_channels_are_split_by_their_own_audio(self, tmp_path):
+        """Each mono file must carry that channel's audio, not the interleaved stream."""
+        path = self._recording(
+            tmp_path, [speech(1.0, amplitude=9000), silence(1.0)], ["loud", "quiet"]
+        )
+        worker = FakeWorker()
+
+        RecordingTranscriber(worker, FakeStore()).submit(path)
+
+        assert worker.speakers == ["loud"]
 
     def test_a_refused_channel_does_not_strand_the_merge(self, tmp_path):
         """
@@ -344,7 +503,7 @@ class TestRecordingTranscriber:
 
         RecordingTranscriber(worker, store).submit(path)
 
-        assert sorted(worker.submitted) == ["1001", "1002"]
+        assert worker.speakers == ["1001", "1002"]
         assert {s.speaker for s in store.saved[0]["transcript"].segments} == {"1001", "1002"}
 
     def test_the_silence_floor_is_configurable(self, tmp_path):
@@ -357,11 +516,11 @@ class TestRecordingTranscriber:
 
         default = FakeWorker()
         RecordingTranscriber(default, FakeStore()).submit(path)
-        assert default.submitted == [], "expected the default floor to skip this"
+        assert default.speakers == [], "expected the default floor to skip this"
 
         sensitive = FakeWorker()
         RecordingTranscriber(sensitive, FakeStore(), silence_floor=50.0).submit(path)
-        assert sensitive.submitted == ["1001"]
+        assert sensitive.speakers == ["1001"]
 
     def test_raising_the_floor_skips_more(self, tmp_path):
         path = self._recording(tmp_path, [speech(1.0, amplitude=6000)], ["1001"])
@@ -371,13 +530,36 @@ class TestRecordingTranscriber:
 
         assert worker.submitted == []
 
-    def test_channels_are_split_by_their_own_audio(self, tmp_path):
-        """Each mono file must carry that channel's audio, not the interleaved stream."""
-        path = self._recording(
-            tmp_path, [speech(1.0, amplitude=9000), silence(1.0)], ["loud", "quiet"]
-        )
-        worker = FakeWorker()
 
-        RecordingTranscriber(worker, FakeStore()).submit(path)
+@pytest.mark.unit
+class TestScratchCleanup:
+    """
+    A crash between creating a workspace and finishing with it leaks region files that are
+    the same size as the recording. Nothing can be transcribing in a process that has just
+    started, so anything still there at startup is orphaned.
+    """
 
-        assert worker.submitted == ["loud"]
+    def test_stale_workspaces_are_removed(self, tmp_path):
+        scratch = tmp_path / SCRATCH_DIRNAME
+        (scratch / "job-dead").mkdir(parents=True)
+        (scratch / "job-dead" / "1001-0.wav").write_bytes(b"x" * 1024)
+
+        removed = RecordingTranscriber(FakeWorker(), FakeStore()).clear_scratch(tmp_path)
+
+        assert removed == 1
+        assert list(scratch.iterdir()) == []
+
+    def test_recordings_themselves_are_untouched(self, tmp_path):
+        keep = tmp_path / "call.wav"
+        keep.write_bytes(b"x")
+        (tmp_path / SCRATCH_DIRNAME / "job-dead").mkdir(parents=True)
+
+        RecordingTranscriber(FakeWorker(), FakeStore()).clear_scratch(tmp_path)
+
+        assert keep.exists()
+
+    def test_no_scratch_directory_is_fine(self, tmp_path):
+        assert RecordingTranscriber(FakeWorker(), FakeStore()).clear_scratch(tmp_path) == 0
+
+    def test_a_missing_recordings_directory_is_fine(self, tmp_path):
+        assert RecordingTranscriber(FakeWorker(), FakeStore()).clear_scratch(tmp_path / "nope") == 0

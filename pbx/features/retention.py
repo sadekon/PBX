@@ -48,6 +48,19 @@ AUDIO_SUFFIX = "*.wav"
 #: Never expired: a greeting is configuration a user recorded, not a message that arrived.
 KEEP_FOREVER = frozenset({"greeting.wav"})
 
+#: Directories skipped whole, whatever is inside them.
+#:
+#: Transcription cuts a finished recording into per-participant regions and works on them
+#: under ``recordings/.transcribe/``, on the same filesystem as the recording so the copies
+#: are not cross-device. Those region files are ``.wav`` and would otherwise be swept on the
+#: audio clock as though they were recordings -- deleting the input of a job in progress, and
+#: counting bytes twice in the process. They are owned by
+#: :class:`~pbx.speech.recording.RecordingTranscriber`, which removes each workspace when it
+#: finishes and clears any survivors at startup.
+#:
+#: Must match ``pbx.speech.recording.SCRATCH_DIRNAME``; a test asserts they do.
+SKIP_DIR_NAMES = frozenset({".transcribe"})
+
 
 @dataclass(frozen=True, slots=True)
 class RetentionSettings:
@@ -205,6 +218,11 @@ class RetentionSweeper:
 
         for path in root.rglob(AUDIO_SUFFIX):
             if path.name in KEEP_FOREVER:
+                continue
+            # relative_to(root) so a skip name appearing above the sweep root -- someone's
+            # recordings living under a path that happens to contain it -- does not exempt
+            # everything below it.
+            if SKIP_DIR_NAMES.intersection(path.relative_to(root).parts[:-1]):
                 continue
             try:
                 stat = path.stat()

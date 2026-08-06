@@ -452,6 +452,10 @@ class FeatureInitializer:
         pbx_core.recording_transcriber = transcriber
         recording_system.on_recording_finished = transcriber.submit
 
+        # Anything still in the scratch directory belongs to a run that died; nothing can be
+        # transcribing in a process that has only just started.
+        transcriber.clear_scratch(recording_system.recording_path)
+
     @staticmethod
     def _init_active_directory(pbx_core: Any, config: Any) -> None:
         """Initialize Active Directory integration"""

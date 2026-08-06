@@ -33,7 +33,7 @@ import shutil
 import tempfile
 import threading
 import wave
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -42,13 +42,25 @@ import numpy as np
 from pbx.speech.dialogue import format_dialogue
 from pbx.speech.store import SOURCE_RECORDING, TranscriptStore
 from pbx.speech.types import Segment, Transcript
-from pbx.utils.audio import SILENCE_RMS_FLOOR, active_speech_seconds
+from pbx.utils.audio import (
+    DEFAULT_SPLIT_GAP_SECONDS,
+    SILENCE_RMS_FLOOR,
+    frame_rms,
+    frame_seconds,
+    regions_from_rms,
+)
 from pbx.utils.logger import get_logger
 
 if TYPE_CHECKING:
     from pbx.speech.worker import TranscriptionWorker
 
-__all__ = ["MIN_SPEECH_SECONDS", "RecordingTranscriber"]
+__all__ = ["MIN_SPEECH_SECONDS", "RecordingTranscriber", "combine_regions", "merge_channels"]
+
+
+def _safe(name: str) -> str:
+    """A filename-safe form of a speaker label, which may be a phone number or anything."""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:40] or "channel"
+
 
 #: A channel with less speech than this is not transcribed at all.
 #:
@@ -60,15 +72,37 @@ MIN_SPEECH_SECONDS = 0.3
 #: Samples read at a time when splitting channels, so a long call is never held whole.
 _SPLIT_CHUNK = 16000
 
+#: Directory the per-region working files live in, created beneath the recording's own
+#: directory so they land on the same filesystem -- a scratch dir on another mount turns every
+#: region into a cross-device copy.
+#:
+#: Named, rather than a bare mkdtemp, for two reasons. Retention skips it by name, so the
+#: half-finished region files inside are never mistaken for recordings and swept on the audio
+#: clock (:data:`pbx.features.retention.SKIP_DIR_NAMES` must match this). And a crash between
+#: creating one and removing it leaves an identifiable directory, which
+#: :meth:`RecordingTranscriber.clear_scratch` removes at the next startup.
+SCRATCH_DIRNAME = ".transcribe"
+
+
+@dataclass(frozen=True, slots=True)
+class _Region:
+    """One stretch of one participant's speech, written out for transcription."""
+
+    speaker: str
+    path: Path
+    #: Where this region begins in the recording. Every timestamp the model returns is
+    #: relative to the region, so this is what puts it back on the call's timeline.
+    offset: float
+    seconds: float
+
 
 class _PendingTranscription:
     """
-    One recording's worth of per-channel jobs, and what came back.
+    One recording's worth of jobs, and what came back.
 
     Jobs complete on worker threads in any order, so this collects them under a lock and the
-    last one in triggers the merge. Counting submissions rather than channels matters: a
-    channel that was skipped as silent, or that the worker refused, never reports back, and
-    waiting for it would strand the whole transcript.
+    last one in triggers the merge. Counting submissions rather than regions matters: a region
+    the worker refused never reports back, and waiting for it would strand the transcript.
     """
 
     def __init__(self, session_id: str, media_path: Path, workspace: Path) -> None:
@@ -76,15 +110,16 @@ class _PendingTranscription:
         self.media_path = media_path
         self.workspace = workspace
         self.expected = 0
-        self.results: dict[str, Transcript] = {}
+        #: Per speaker, one entry per region: (offset, transcript).
+        self.results: dict[str, list[tuple[float, Transcript]]] = {}
         self.lock = threading.Lock()
         self.finished = False
 
-    def record(self, speaker: str, transcript: Transcript | None) -> bool:
+    def record(self, region: _Region, transcript: Transcript | None) -> bool:
         """Store one result. Returns True when this was the last one outstanding."""
         with self.lock:
             if transcript is not None and transcript.success:
-                self.results[speaker] = transcript
+                self.results.setdefault(region.speaker, []).append((region.offset, transcript))
             self.expected -= 1
             if self.expected > 0 or self.finished:
                 return False
@@ -107,11 +142,15 @@ class RecordingTranscriber:
         logger: Any | None = None,
         min_speech_seconds: float = MIN_SPEECH_SECONDS,
         silence_floor: float = SILENCE_RMS_FLOOR,
+        split_gap_seconds: float = DEFAULT_SPLIT_GAP_SECONDS,
     ) -> None:
         self.worker = worker
         self.store = store or TranscriptStore()
         self.logger = logger or get_logger()
         self.min_speech_seconds = min_speech_seconds
+        #: Silence that must elapse before a channel is cut into separate regions. Raising it
+        #: cuts less and protects punctuation; lowering it risks splitting sentences.
+        self.split_gap_seconds = split_gap_seconds
         #: RMS floor for the whole-channel gate. A genuine power threshold, unlike Silero's,
         #: and the only one that decides whether a model runs at all.
         self.silence_floor = silence_floor
@@ -120,6 +159,34 @@ class RecordingTranscriber:
     def enabled(self) -> bool:
         """Whether a submission could be accepted right now."""
         return bool(self.worker is not None and getattr(self.worker, "available", False))
+
+    def clear_scratch(self, recording_path: str | Path) -> int:
+        """
+        Remove working directories left behind by a previous run. Returns how many.
+
+        Called at startup, where any surviving workspace is by definition orphaned -- nothing
+        can be transcribing in a process that has only just begun. Without it, a crash or a
+        kill between creating a workspace and finishing with it leaks the region files forever,
+        and they are the same size as the recording they came from.
+        """
+        scratch = Path(recording_path) / SCRATCH_DIRNAME
+        if not scratch.is_dir():
+            return 0
+
+        removed = 0
+        for entry in scratch.iterdir():
+            try:
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink()
+                removed += 1
+            except OSError as e:
+                self.logger.warning(f"Could not remove stale transcription scratch {entry}: {e}")
+
+        if removed:
+            self.logger.info(f"Removed {removed} transcription workspace(s) left by a previous run")
+        return removed
 
     # ---------------------------------------------------------------- submission
 
@@ -146,13 +213,15 @@ class RecordingTranscriber:
             self.logger.debug(f"No channel manifest for {media_path}; not transcribing")
             return False
 
-        workspace = Path(tempfile.mkdtemp(prefix="transcribe-", dir=str(media_path.parent)))
+        scratch = media_path.parent / SCRATCH_DIRNAME
+        scratch.mkdir(parents=True, exist_ok=True)
+        workspace = Path(tempfile.mkdtemp(prefix="job-", dir=str(scratch)))
         pending = _PendingTranscription(
             session_id=self._session_id(media_path), media_path=media_path, workspace=workspace
         )
 
-        jobs = self._split(media_path, channels, workspace)
-        if not jobs:
+        regions = self._split(media_path, channels, workspace)
+        if not regions:
             shutil.rmtree(workspace, ignore_errors=True)
             self.logger.info(
                 f"Recording {media_path.name}: every channel was silent; nothing transcribed"
@@ -161,28 +230,30 @@ class RecordingTranscriber:
 
         # Counted up front, before anything is submitted. Incrementing as each job is accepted
         # would let an early completion see expected==0 and merge a partial transcript.
-        pending.expected = len(jobs)
+        pending.expected = len(regions)
         accepted = 0
 
-        for speaker, path, seconds in jobs:
+        for region in regions:
             if self.worker.submit(
-                path,
-                lambda transcript, speaker=speaker: self._on_channel(pending, speaker, transcript),
-                label=f"{media_path.stem}:{speaker}",
-                audio_seconds=seconds,
+                region.path,
+                lambda transcript, region=region: self._on_region(pending, region, transcript),
+                label=f"{media_path.stem}:{region.speaker}@{region.offset:.0f}s",
+                audio_seconds=region.seconds,
             ):
                 accepted += 1
             else:
                 # Refused -- queue full, over the length cap, service stopping. Its callback
                 # will never fire, so release the slot here or the merge never happens.
-                self._on_channel(pending, speaker, None)
+                self._on_region(pending, region, None)
 
         if accepted == 0:
-            self.logger.warning(f"Recording {media_path.name}: no channel was accepted")
+            self.logger.warning(f"Recording {media_path.name}: no region was accepted")
             return False
 
+        speakers = {region.speaker for region in regions}
         self.logger.info(
-            f"Recording {media_path.name}: transcribing {accepted} channel(s) of {len(channels)}"
+            f"Recording {media_path.name}: transcribing {accepted} region(s) "
+            f"across {len(speakers)} speaker(s)"
         )
         return True
 
@@ -209,65 +280,161 @@ class RecordingTranscriber:
         except (OSError, TypeError, ValueError):
             return media_path.stem
 
-    def _split(
-        self, media_path: Path, labels: list[str], workspace: Path
-    ) -> list[tuple[str, Path, float]]:
+    def _split(self, media_path: Path, labels: list[str], workspace: Path) -> list[_Region]:
         """
-        Write each channel that contains speech to its own mono WAV.
+        Write each stretch of each participant's speech to its own mono WAV.
 
-        Returns (speaker, path, seconds) per channel worth transcribing. Silent channels are
-        dropped here, which is the whole point: they never reach a model.
+        Two cuts happen here, for two different reasons. A channel with nothing above the
+        noise floor is dropped entirely, so no model runs on silence. A channel that does
+        contain speech is then cut at gaps long enough to be turn boundaries, because a model
+        will not split a segment across silence it never receives -- and on a per-participant
+        recording that silence is the other person's whole turn.
+
+        Cutting is kept rare on purpose: every cut costs the model context it uses for
+        punctuation and capitalisation, so only unambiguous gaps qualify and continuous
+        speech is never broken however long it runs.
+
+        Two passes over the file, neither of which holds it. The first reduces each channel
+        to one energy figure per 20 ms -- about 400 KB per channel per hour -- and decides
+        where the cuts go. The second seeks to each region and copies only that span out.
+        Holding whole channels instead would be ~19 MB per ten-minute call, and this runs on
+        the teardown thread, so every call ending at the same moment would pay it at once.
         """
         with wave.open(str(media_path), "rb") as source:
-            count = source.getnchannels()
+            channels = source.getnchannels()
             rate = source.getframerate()
             width = source.getsampwidth()
+            total_frames = source.getnframes()
             if width != 2:
                 self.logger.warning(f"{media_path.name}: expected PCM16, got {width * 8}-bit")
                 return []
 
-            columns: list[bytearray] = [bytearray() for _ in range(count)]
-            while True:
-                raw = source.readframes(_SPLIT_CHUNK)
-                if not raw:
-                    break
-                block = np.frombuffer(raw, dtype="<i2").reshape(-1, count)
-                for index in range(count):
-                    columns[index].extend(block[:, index].tobytes())
+            spans = self._measure(source, channels, rate, media_path, labels)
+            return self._extract(source, spans, labels, channels, rate, total_frames, workspace)
 
-        jobs: list[tuple[str, Path, float]] = []
-        for index, column in enumerate(columns):
+    def _measure(
+        self,
+        source: wave.Wave_read,
+        channels: int,
+        rate: int,
+        media_path: Path,
+        labels: list[str],
+    ) -> dict[int, list[tuple[float, float]]]:
+        """Stream the file once, reducing each channel to frame energies, and pick regions."""
+        per_channel: list[list[np.ndarray]] = [[] for _ in range(channels)]
+
+        source.rewind()
+        while True:
+            raw = source.readframes(_SPLIT_CHUNK)
+            if not raw:
+                break
+            block = np.frombuffer(raw, dtype="<i2").reshape(-1, channels)
+            for index in range(channels):
+                per_channel[index].append(frame_rms(block[:, index].tobytes()))
+
+        seconds = frame_seconds(rate)
+        spans: dict[int, list[tuple[float, float]]] = {}
+
+        for index, pieces in enumerate(per_channel):
             speaker = labels[index] if index < len(labels) else f"channel{index}"
-            speech = active_speech_seconds(bytes(column), rate, self.silence_floor)
+            rms = np.concatenate(pieces) if pieces else np.zeros(0)
+
+            # Derived from the same frames rather than re-reading: a channel nobody spoke on
+            # must never reach a model.
+            speech = float(np.count_nonzero(rms > self.silence_floor) * seconds)
             if speech < self.min_speech_seconds:
                 self.logger.debug(
                     f"{media_path.name}: {speaker} has {speech:.1f}s of speech; skipping"
                 )
                 continue
 
-            path = workspace / f"{speaker}.wav"
-            try:
-                with wave.open(str(path), "wb") as out:
-                    out.setnchannels(1)
-                    out.setsampwidth(2)
-                    out.setframerate(rate)
-                    out.writeframes(bytes(column))
-            except (OSError, wave.Error) as e:
-                self.logger.error(f"Could not write channel {speaker}: {e}")
-                continue
+            found = regions_from_rms(
+                rms,
+                seconds_per_frame=seconds,
+                duration=rms.size * seconds,
+                floor=self.silence_floor,
+                min_gap_seconds=self.split_gap_seconds,
+                min_region_seconds=self.min_speech_seconds,
+            )
+            if found:
+                spans[index] = found
+                self.logger.debug(f"{media_path.name}: {speaker} split into {len(found)} region(s)")
 
-            jobs.append((speaker, path, len(column) / 2 / rate))
+        return spans
 
-        return jobs
+    def _extract(
+        self,
+        source: wave.Wave_read,
+        spans: dict[int, list[tuple[float, float]]],
+        labels: list[str],
+        channels: int,
+        rate: int,
+        total_frames: int,
+        workspace: Path,
+    ) -> list[_Region]:
+        """Copy each region out by seeking to it, so only one region is in memory at a time."""
+        regions: list[_Region] = []
+
+        for index, found in spans.items():
+            speaker = labels[index] if index < len(labels) else f"channel{index}"
+            for number, (start, end) in enumerate(found):
+                first = max(0, int(start * rate))
+                last = min(total_frames, int(end * rate))
+                if last <= first:
+                    continue
+
+                path = workspace / f"{_safe(speaker)}-{number}.wav"
+                try:
+                    written = self._copy_span(source, index, channels, first, last, rate, path)
+                except (OSError, wave.Error) as e:
+                    self.logger.error(f"Could not write region {number} for {speaker}: {e}")
+                    continue
+
+                if written:
+                    regions.append(
+                        _Region(speaker=speaker, path=path, offset=start, seconds=written / rate)
+                    )
+
+        return regions
+
+    @staticmethod
+    def _copy_span(
+        source: wave.Wave_read,
+        channel: int,
+        channels: int,
+        first: int,
+        last: int,
+        rate: int,
+        path: Path,
+    ) -> int:
+        """Write one channel's samples between two frame positions. Returns frames written."""
+        source.setpos(first)
+        remaining = last - first
+        written = 0
+
+        with wave.open(str(path), "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(rate)
+            while remaining > 0:
+                raw = source.readframes(min(_SPLIT_CHUNK, remaining))
+                if not raw:
+                    break
+                block = np.frombuffer(raw, dtype="<i2").reshape(-1, channels)
+                out.writeframes(block[:, channel].tobytes())
+                written += block.shape[0]
+                remaining -= block.shape[0]
+
+        return written
 
     # ---------------------------------------------------------------- completion
 
-    def _on_channel(
-        self, pending: _PendingTranscription, speaker: str, transcript: Transcript | None
+    def _on_region(
+        self, pending: _PendingTranscription, region: _Region, transcript: Transcript | None
     ) -> None:
-        """One channel finished. Merges and stores when it was the last one."""
+        """One region finished. Merges and stores when it was the last one."""
         try:
-            if not pending.record(speaker, transcript):
+            if not pending.record(region, transcript):
                 return
             self._finish(pending)
         except Exception as e:
@@ -277,12 +444,15 @@ class RecordingTranscriber:
                 shutil.rmtree(pending.workspace, ignore_errors=True)
 
     def _finish(self, pending: _PendingTranscription) -> None:
-        """Merge every channel into one transcript and store it."""
+        """Merge every region of every speaker into one transcript and store it."""
         if not pending.results:
             self.logger.info(f"Recording {pending.media_path.name}: no speech recognised")
             return
 
-        merged = merge_channels(pending.results)
+        per_speaker = {
+            speaker: combine_regions(entries) for speaker, entries in pending.results.items()
+        }
+        merged = merge_channels(per_speaker)
         self.store.save(
             merged,
             source=SOURCE_RECORDING,
@@ -293,6 +463,38 @@ class RecordingTranscriber:
             f"Transcribed {pending.media_path.name}: "
             f"{len(merged.segments)} segment(s) across {len(pending.results)} speaker(s)"
         )
+
+
+def combine_regions(entries: list[tuple[float, Transcript]]) -> Transcript:
+    """
+    Put one speaker's regions back onto the call's timeline as a single transcript.
+
+    Each region was transcribed as its own file, so every timestamp it returned is relative
+    to that region's start. Adding the offset is what makes the times comparable again --
+    both against this speaker's other regions and against everybody else's.
+    """
+    entries = sorted(entries, key=lambda entry: entry[0])
+
+    segments: list[Segment] = []
+    for offset, transcript in entries:
+        segments.extend(
+            replace(segment, start=segment.start + offset, end=segment.end + offset)
+            for segment in transcript.segments
+        )
+
+    first = entries[0][1]
+    return Transcript(
+        text=" ".join(t.text.strip() for _, t in entries if t.text.strip()),
+        segments=tuple(segments),
+        language=first.language,
+        provider=first.provider,
+        model=first.model,
+        confidence=None,
+        # The end of the last region, not the sum of their lengths: the silence between them
+        # is part of the call even though none of it was transcribed.
+        audio_duration=max((offset + t.audio_duration for offset, t in entries), default=0.0),
+        processing_duration=sum(t.processing_duration for _, t in entries),
+    )
 
 
 def merge_channels(results: dict[str, Transcript]) -> Transcript:
