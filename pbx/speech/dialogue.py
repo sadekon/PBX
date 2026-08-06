@@ -91,11 +91,19 @@ def group_turns(
     # which happens whenever timings are absent and everything sits at 0.0.
     usable.sort(key=lambda segment: (segment.start, segment.speaker))
 
+    # Who else was talking during each segment. Computed up front because a single forward
+    # pass cannot see it: when two people speak at once their segments share a start time, so
+    # the second speaker's segment sorts *after* the first speaker's and has not been reached
+    # yet at the moment the merge decision is made. Without this, A-then-B-then-A-then-both
+    # silently glues A's solo turn onto A's half of the overlap.
+    concurrency = _concurrent_speakers(usable)
+
     turns: list[Turn] = []
     speaker = usable[0].speaker
     parts = [usable[0].text.strip()]
     start = usable[0].start
     end = usable[0].end
+    others = concurrency[0]
 
     def flush(previous_end: float | None) -> None:
         """Close the turn being built, marking it if it started before the last one ended."""
@@ -110,9 +118,17 @@ def group_turns(
             )
         )
 
-    for segment in usable[1:]:
+    for index, segment in enumerate(usable[1:], start=1):
         text = segment.text.strip()
-        continues = segment.speaker == speaker and segment.start - end <= max_gap_seconds
+        continues = (
+            segment.speaker == speaker
+            and segment.start - end <= max_gap_seconds
+            # Only merge while the conversation around this speaker is unchanged. Someone
+            # else starting or stopping is a new situation and belongs in its own turn --
+            # otherwise a solo remark and the speaker's half of a subsequent argument read
+            # as one uninterrupted sentence.
+            and concurrency[index] == others
+        )
 
         if continues:
             parts.append(text)
@@ -121,9 +137,30 @@ def group_turns(
 
         flush(turns[-1].end if turns else None)
         speaker, parts, start, end = segment.speaker, [text], segment.start, segment.end
+        others = concurrency[index]
 
     flush(turns[-1].end if turns else None)
     return turns
+
+
+def _concurrent_speakers(segments: list[Segment]) -> list[frozenset[str]]:
+    """
+    For each segment, the other speakers talking at the same time.
+
+    Zero-length segments never overlap anything, which is what keeps untimed transcripts --
+    where everything sits at 0.0 -- from being read as one continuous interruption.
+    """
+    result: list[frozenset[str]] = []
+    for segment in segments:
+        others = {
+            other.speaker
+            for other in segments
+            if other.speaker != segment.speaker
+            and other.start < segment.end
+            and segment.start < other.end
+        }
+        result.append(frozenset(others))
+    return result
 
 
 def format_dialogue(

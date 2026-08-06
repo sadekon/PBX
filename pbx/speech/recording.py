@@ -42,7 +42,7 @@ import numpy as np
 from pbx.speech.dialogue import format_dialogue
 from pbx.speech.store import SOURCE_RECORDING, TranscriptStore
 from pbx.speech.types import Segment, Transcript
-from pbx.utils.audio import active_speech_seconds
+from pbx.utils.audio import SILENCE_RMS_FLOOR, active_speech_seconds
 from pbx.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -106,11 +106,15 @@ class RecordingTranscriber:
         store: TranscriptStore | None = None,
         logger: Any | None = None,
         min_speech_seconds: float = MIN_SPEECH_SECONDS,
+        silence_floor: float = SILENCE_RMS_FLOOR,
     ) -> None:
         self.worker = worker
         self.store = store or TranscriptStore()
         self.logger = logger or get_logger()
         self.min_speech_seconds = min_speech_seconds
+        #: RMS floor for the whole-channel gate. A genuine power threshold, unlike Silero's,
+        #: and the only one that decides whether a model runs at all.
+        self.silence_floor = silence_floor
 
     @property
     def enabled(self) -> bool:
@@ -234,7 +238,7 @@ class RecordingTranscriber:
         jobs: list[tuple[str, Path, float]] = []
         for index, column in enumerate(columns):
             speaker = labels[index] if index < len(labels) else f"channel{index}"
-            speech = active_speech_seconds(bytes(column), rate)
+            speech = active_speech_seconds(bytes(column), rate, self.silence_floor)
             if speech < self.min_speech_seconds:
                 self.logger.debug(
                     f"{media_path.name}: {speaker} has {speech:.1f}s of speech; skipping"

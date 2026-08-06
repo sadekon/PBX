@@ -347,6 +347,30 @@ class TestRecordingTranscriber:
         assert sorted(worker.submitted) == ["1001", "1002"]
         assert {s.speaker for s in store.saved[0]["transcript"].segments} == {"1001", "1002"}
 
+    def test_the_silence_floor_is_configurable(self, tmp_path):
+        """
+        A quiet talker's channel should not be silently dropped. Lowering the floor is the
+        lever, and it is a real power threshold -- unlike Silero's, which is a probability.
+        """
+        quiet = speech(1.0, amplitude=150)  # RMS ~106, under the default floor of 200
+        path = self._recording(tmp_path, [quiet], ["1001"])
+
+        default = FakeWorker()
+        RecordingTranscriber(default, FakeStore()).submit(path)
+        assert default.submitted == [], "expected the default floor to skip this"
+
+        sensitive = FakeWorker()
+        RecordingTranscriber(sensitive, FakeStore(), silence_floor=50.0).submit(path)
+        assert sensitive.submitted == ["1001"]
+
+    def test_raising_the_floor_skips_more(self, tmp_path):
+        path = self._recording(tmp_path, [speech(1.0, amplitude=6000)], ["1001"])
+        worker = FakeWorker()
+
+        RecordingTranscriber(worker, FakeStore(), silence_floor=20000.0).submit(path)
+
+        assert worker.submitted == []
+
     def test_channels_are_split_by_their_own_audio(self, tmp_path):
         """Each mono file must carry that channel's audio, not the interleaved stream."""
         path = self._recording(

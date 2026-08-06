@@ -435,6 +435,7 @@ class FeatureInitializer:
         """
         from pbx.speech.recording import RecordingTranscriber
         from pbx.speech.store import TranscriptStore
+        from pbx.utils.audio import SILENCE_RMS_FLOOR
 
         recording_system = getattr(pbx_core, "recording_system", None)
         worker = getattr(pbx_core, "transcription_service", None)
@@ -442,9 +443,11 @@ class FeatureInitializer:
             return
 
         database = getattr(pbx_core, "database", None)
+        settings = getattr(worker, "settings", None)
         transcriber = RecordingTranscriber(
             worker=worker,
             store=TranscriptStore(database if getattr(database, "enabled", False) else None),
+            silence_floor=getattr(settings, "silence_rms_floor", SILENCE_RMS_FLOOR),
         )
         pbx_core.recording_transcriber = transcriber
         recording_system.on_recording_finished = transcriber.submit

@@ -118,6 +118,62 @@ class TestOverlap:
 
         assert all(not t.overlaps_previous for t in turns)
 
+    def test_a_solo_turn_does_not_absorb_the_overlap_that_follows(self):
+        """
+        Regression, found on real audio: speak on one end, then the other, then the first,
+        then both. A's solo turn and A's half of the overlap sort adjacently -- B's half
+        shares a start time and sorts *after* A's -- so a gap-only rule merged them before
+        B was ever looked at, and the transcript read as if A talked straight through.
+        """
+        turns = group_turns(
+            [
+                seg("first", 0.0, 5.0, "1001"),
+                seg("second", 6.0, 10.0, "1002"),
+                seg("third", 11.0, 15.0, "1001"),
+                seg("talking over", 16.0, 25.0, "1001"),
+                seg("me too", 16.0, 25.0, "1002"),
+            ]
+        )
+
+        assert [(t.speaker, t.text) for t in turns] == [
+            ("1001", "first"),
+            ("1002", "second"),
+            ("1001", "third"),
+            ("1001", "talking over"),
+            ("1002", "me too"),
+        ]
+
+    def test_sustained_overlap_still_merges(self):
+        """
+        The rule is "the situation changed", not "anyone overlapped at all". While the same
+        person is talking over you throughout, your own segments still read as one turn --
+        otherwise every overlap shreds both speakers into fragments.
+        """
+        turns = group_turns(
+            [
+                seg("talking throughout", 0.0, 20.0, "1002"),
+                seg("part one", 5.0, 8.0, "1001"),
+                seg("part two", 9.0, 12.0, "1001"),
+            ]
+        )
+
+        assert [t.text for t in turns if t.speaker == "1001"] == ["part one part two"]
+
+    def test_a_speaker_stopping_breaks_the_turn(self):
+        """
+        Same speaker, small enough gap to merge on the old rule -- but the other party
+        stopped talking in between, so the second half is a different situation.
+        """
+        turns = group_turns(
+            [
+                seg("talking over you", 0.0, 6.0, "1002"),
+                seg("while they talk", 2.0, 5.0, "1001"),
+                seg("now alone", 7.0, 10.0, "1001"),
+            ]
+        )
+
+        assert [t.text for t in turns if t.speaker == "1001"] == ["while they talk", "now alone"]
+
     def test_untimed_segments_are_not_all_called_overlapping(self):
         """
         A backend that reports no timings puts everything at 0.0. Marking every line as an
