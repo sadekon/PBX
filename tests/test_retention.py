@@ -136,6 +136,65 @@ class TestSweep:
         assert not real.exists()
         assert result.audio_files == 1
 
+    def test_a_manifest_goes_with_its_recording(self, tmp_path):
+        """
+        The sidecar names every participant on every channel. Leaving it once the audio is
+        gone keeps a record of who spoke to whom indefinitely, on a system whose whole
+        retention design is that things provably expire.
+        """
+        audio = _aged(tmp_path / "recordings" / "call.wav", days=200)
+        sidecar = _aged(tmp_path / "recordings" / "call.json", days=200)
+
+        result = RetentionSweeper(_settings(tmp_path, dry_run=False)).sweep()
+
+        assert not audio.exists()
+        assert not sidecar.exists()
+        assert result.audio_files == 1, "the manifest must not inflate the recording count"
+        assert result.sidecars == 1
+
+    def test_a_manifest_survives_while_its_recording_does(self, tmp_path):
+        audio = _aged(tmp_path / "recordings" / "call.wav", days=3)
+        sidecar = _aged(tmp_path / "recordings" / "call.json", days=3)
+
+        RetentionSweeper(_settings(tmp_path, dry_run=False)).sweep()
+
+        assert audio.exists()
+        assert sidecar.exists()
+
+    def test_an_orphaned_manifest_expires_on_its_own(self, tmp_path):
+        """Catches the ones whose audio was removed before this existed, or by hand."""
+        sidecar = _aged(tmp_path / "recordings" / "gone.json", days=200)
+
+        result = RetentionSweeper(_settings(tmp_path, dry_run=False)).sweep()
+
+        assert not sidecar.exists()
+        assert result.sidecars == 1
+
+    def test_a_recent_orphan_is_left_alone(self, tmp_path):
+        sidecar = _aged(tmp_path / "recordings" / "fresh.json", days=3)
+
+        RetentionSweeper(_settings(tmp_path, dry_run=False)).sweep()
+
+        assert sidecar.exists()
+
+    def test_dry_run_does_not_delete_manifests(self, tmp_path):
+        audio = _aged(tmp_path / "recordings" / "call.wav", days=200)
+        sidecar = _aged(tmp_path / "recordings" / "call.json", days=200)
+
+        result = RetentionSweeper(_settings(tmp_path)).sweep()
+
+        assert audio.exists()
+        assert sidecar.exists()
+        assert result.sidecars == 1
+        assert "manifest" in result.summary()
+
+    def test_manifests_in_the_scratch_directory_are_skipped(self, tmp_path):
+        working = _aged(tmp_path / "recordings" / ".transcribe" / "job-1" / "x.json", days=200)
+
+        RetentionSweeper(_settings(tmp_path, dry_run=False)).sweep()
+
+        assert working.exists()
+
     def test_the_skip_name_matches_the_transcriber(self):
         """
         Two modules agreeing on a string by convention. If either changes, the sweep starts

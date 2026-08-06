@@ -45,6 +45,11 @@ DEFAULT_INTERVAL_HOURS = 24.0
 #: you lose a greeting, a prompt or somebody's music-on-hold.
 AUDIO_SUFFIX = "*.wav"
 
+#: The manifest a recording writes beside itself, naming which channel holds which participant.
+#: Swept with the audio it describes -- it is the only other file that identifies the people on
+#: a call, and it must not outlive the recording.
+SIDECAR_SUFFIX = ".json"
+
 #: Never expired: a greeting is configuration a user recorded, not a message that arrived.
 KEEP_FOREVER = frozenset({"greeting.wav"})
 
@@ -125,6 +130,9 @@ class SweepResult:
     dry_run: bool = True
     audio_files: int = 0
     audio_bytes: int = 0
+    #: Channel manifests removed alongside their recording, or orphaned ones expired on their
+    #: own. Counted separately so the audio figure stays a count of recordings.
+    sidecars: int = 0
     transcripts: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -134,9 +142,10 @@ class SweepResult:
 
     def summary(self) -> str:
         verb = "would delete" if self.dry_run else "deleted"
+        sidecars = f", {self.sidecars} manifest(s)" if self.sidecars else ""
         return (
-            f"{verb} {self.audio_files} audio file(s) ({self.audio_megabytes:,.1f} MB) "
-            f"and {self.transcripts} transcript(s)"
+            f"{verb} {self.audio_files} audio file(s) ({self.audio_megabytes:,.1f} MB)"
+            f"{sidecars} and {self.transcripts} transcript(s)"
         )
 
 
@@ -237,9 +246,63 @@ class RetentionSweeper:
                 else:
                     path.unlink()
                     self.logger.debug(f"  deleted {path}")
+
+                self._sweep_sidecar(path, result)
             except OSError as e:
                 # One unreadable file must not end the sweep; the rest still expire.
                 result.errors.append(f"{path}: {e}")
+
+        self._sweep_orphan_sidecars(root, cutoff, result)
+
+    def _sweep_sidecar(self, audio: Path, result: SweepResult) -> None:
+        """
+        Remove the manifest written beside a recording, when the recording goes.
+
+        The sidecar names every participant on every channel. Leaving it once the audio is
+        gone keeps a record of who spoke to whom, indefinitely, on a system whose whole
+        retention design is that things provably expire. It is a few hundred bytes, so this
+        was easy to miss and is not about disk.
+        """
+        sidecar = audio.with_suffix(SIDECAR_SUFFIX)
+        if not sidecar.is_file():
+            return
+
+        try:
+            result.sidecars += 1
+            result.audio_bytes += sidecar.stat().st_size
+            if not self.settings.dry_run:
+                sidecar.unlink()
+                self.logger.debug(f"  deleted {sidecar}")
+        except OSError as e:
+            result.errors.append(f"{sidecar}: {e}")
+
+    def _sweep_orphan_sidecars(self, root: Path, cutoff: datetime, result: SweepResult) -> None:
+        """
+        Expire manifests whose recording is already gone.
+
+        Catches the ones deleted before this existed, and any whose audio was removed by hand.
+        Only manifests that sit beside a recording are considered -- an unrelated .json under
+        the same root is somebody else's file.
+        """
+        for sidecar in root.rglob(f"*{SIDECAR_SUFFIX}"):
+            if SKIP_DIR_NAMES.intersection(sidecar.relative_to(root).parts[:-1]):
+                continue
+            if sidecar.with_suffix(AUDIO_SUFFIX.removeprefix("*")).exists():
+                continue
+            try:
+                stat = sidecar.stat()
+                if datetime.fromtimestamp(stat.st_mtime, tz=UTC) >= cutoff:
+                    continue
+
+                result.sidecars += 1
+                result.audio_bytes += stat.st_size
+                if self.settings.dry_run:
+                    self.logger.debug(f"  would delete orphaned {sidecar}")
+                else:
+                    sidecar.unlink()
+                    self.logger.debug(f"  deleted orphaned {sidecar}")
+            except OSError as e:
+                result.errors.append(f"{sidecar}: {e}")
 
     def _sweep_transcripts(self, result: SweepResult) -> None:
         """Delete transcripts past their own, longer period."""

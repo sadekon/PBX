@@ -169,9 +169,16 @@ def get_full_config() -> tuple[Response, int]:
                 },
             },
             "recording": {
-                "auto_record": pbx_core.config.get("recording.auto_record", False),
-                "format": pbx_core.config.get("recording.format", "wav"),
+                # The two switches that actually gate recording. Both must be true; see
+                # pbx/features/call_recording.py. This used to report recording.auto_record,
+                # which nothing read, so the UI showed a setting that did nothing.
+                "enabled": pbx_core.config.get("features.call_recording", False),
+                "consent_acknowledged": pbx_core.config.get(
+                    "recording.consent_acknowledged", False
+                ),
                 "storage_path": pbx_core.config.get("recording.storage_path", "recordings"),
+                # Not configurable: always PCM16 8 kHz, one channel per participant.
+                "format": "wav",
             },
             "security": {
                 "password": {

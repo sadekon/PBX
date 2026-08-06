@@ -76,7 +76,8 @@ class TranscriptStore:
         A failed transcript is not stored: there is no text to keep, and a row recording that
         an engine errored belongs in the log, not in the table the admin UI reads.
         """
-        if not self.enabled or not transcript.success:
+        database = self.database
+        if database is None or not self.enabled or not transcript.success:
             return False
 
         segments = None
@@ -88,7 +89,7 @@ class TranscriptStore:
                 self.logger.warning(f"Could not serialise transcript segments: {e}")
 
         try:
-            self.database.execute(
+            database.execute(
                 f"INSERT INTO call_transcripts (call_id, source, media_path, provider, model, "
                 f"language, transcript_text, segments, confidence, audio_duration, "
                 f"processing_duration) VALUES ({', '.join([_PH] * 11)})",
@@ -126,13 +127,14 @@ class TranscriptStore:
 
     def _select(self, where: str, params: tuple, limit: int) -> list[dict[str, Any]]:
         """Run a read and shape the rows. Returns empty on any failure."""
-        if not self.enabled:
+        database = self.database
+        if database is None or not self.enabled:
             return []
 
         try:
             # fetch_all, not execute: execute() returns a bool no matter the statement, so a
             # SELECT run through it yields True rather than rows.
-            rows = self.database.fetch_all(
+            rows = database.fetch_all(
                 f"SELECT {_COLUMNS} FROM call_transcripts {where} "
                 f"ORDER BY created_at DESC LIMIT {int(limit)}",
                 params,

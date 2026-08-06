@@ -435,6 +435,48 @@ class TestRelayIntegration:
 
         assert fired == []
 
+    def test_current_source_reports_the_party_on_a_side(self):
+        """
+        What a transfer needs in order to label the new arrival: the source id their channel
+        will be opened under.
+        """
+        handler = self._handler()
+
+        assert handler.current_source("a") == "a0"
+        assert handler.current_source("b") == "b0"
+
+        handler.replace_endpoint("b", ("2.2.2.2", 200))
+
+        assert handler.current_source("b") == "b1"
+        assert handler.current_source("a") == "a0", "the other side is unaffected"
+
+    def test_replacing_an_endpoint_can_complete_a_bridge(self):
+        """
+        CallOriginator never calls set_endpoints -- it fills the second side in through
+        replace_endpoint. Without notifying here, a click-to-dial call would never record.
+        """
+        handler = self._handler()
+        fired = []
+        handler.on_bridged = fired.append
+
+        handler.set_endpoints(("1.1.1.1", 100), None)
+        assert fired == []
+
+        handler.replace_endpoint("b", ("2.2.2.2", 200))
+
+        assert len(fired) == 1
+
+    def test_replacing_an_endpoint_on_a_bridged_call_does_not_refire(self):
+        """A transfer must not start a second recording of a call already being recorded."""
+        handler = self._handler()
+        fired = []
+        handler.on_bridged = fired.append
+        handler.set_endpoints(("1.1.1.1", 100), ("2.2.2.2", 200))
+
+        handler.replace_endpoint("b", ("3.3.3.3", 300))
+
+        assert len(fired) == 1
+
     def test_a_raising_callback_does_not_break_the_call(self):
         handler = self._handler()
 

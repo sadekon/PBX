@@ -140,7 +140,7 @@ class TestFeatureInitializerInitialize:
         assert pbx_core.conference_system == mocks["ConferenceSystem"].return_value
 
         mocks["CallRecordingSystem"].assert_called_once_with(
-            auto_record=False, consent_acknowledged=False
+            recording_path="recordings", requested=False, consent_acknowledged=False
         )
         assert pbx_core.recording_system == mocks["CallRecordingSystem"].return_value
 
@@ -238,12 +238,12 @@ class TestFeatureInitializerInitialize:
         )
 
     def test_call_recording_enabled(self) -> None:
-        """CallRecordingSystem receives auto_record=True from config."""
+        """CallRecordingSystem receives requested=True from config."""
         pbx_core = _make_pbx_core(config_overrides={"features.call_recording": True})
         mocks = _run_initialize_with_all_patches(pbx_core)
 
         mocks["CallRecordingSystem"].assert_called_once_with(
-            auto_record=True, consent_acknowledged=False
+            recording_path="recordings", requested=True, consent_acknowledged=False
         )
 
     def test_consent_acknowledgement_is_passed_through(self) -> None:
@@ -261,7 +261,7 @@ class TestFeatureInitializerInitialize:
         mocks = _run_initialize_with_all_patches(pbx_core)
 
         mocks["CallRecordingSystem"].assert_called_once_with(
-            auto_record=True, consent_acknowledged=True
+            recording_path="recordings", requested=True, consent_acknowledged=True
         )
 
     # ------------------------------------------------------------------ #

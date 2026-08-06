@@ -36,6 +36,7 @@ try:
     from pbx.speech import TranscriptionSettings, TranscriptionWorker, build_backend
     from pbx.speech.recording import RecordingTranscriber
     from pbx.speech.settings import CONFIG_SECTION as TRANSCRIPTION_SECTION
+    from pbx.utils.audio import DEFAULT_SPLIT_GAP_SECONDS
 except ImportError as exc:  # pragma: no cover - depends on the environment
     print(f"error: could not import the PBX speech package ({exc})", file=sys.stderr)
     raise SystemExit(2) from exc
@@ -126,6 +127,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Silence before Silero ends a speech chunk; lower splits turns more readily",
     )
     parser.add_argument(
+        "--split-gap",
+        type=float,
+        default=None,
+        help=(
+            "Silence, in seconds, before a channel is cut into separate regions "
+            "(default 1.5). Raising it cuts less and protects punctuation"
+        ),
+    )
+    parser.add_argument(
         "--segments",
         action="store_true",
         help="Also print the raw segment timings, for diagnosing grouping",
@@ -174,13 +184,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     floor = args.silence_floor if args.silence_floor is not None else settings.silence_rms_floor
+    gap = args.split_gap if args.split_gap is not None else DEFAULT_SPLIT_GAP_SECONDS
+
     _log(f"Engine    : {settings.provider} ({getattr(backend, 'model_name', '?')})", quiet=quiet)
     _log(f"Floor     : {floor:.0f} RMS below which a channel is skipped", quiet=quiet)
-    _log("Transcribing, one pass per channel...", quiet=quiet)
+    _log(f"Split gap : {gap:.1f}s of silence before a channel is cut", quiet=quiet)
+    _log("Transcribing, one region per stretch of speech...", quiet=quiet)
 
     worker = TranscriptionWorker(backend, settings)
     capture = _Capture()
-    transcriber = RecordingTranscriber(worker=worker, store=capture, silence_floor=floor)
+    transcriber = RecordingTranscriber(
+        worker=worker, store=capture, silence_floor=floor, split_gap_seconds=gap
+    )
 
     transcriber.submit(path)
 

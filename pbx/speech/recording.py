@@ -34,6 +34,7 @@ import tempfile
 import threading
 import wave
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -298,10 +299,16 @@ class RecordingTranscriber:
         pending.expected = len(regions)
         accepted = 0
 
+        worker = self.worker
+        if worker is None:  # pragma: no cover - enabled already checked this
+            return False
+
         for region in regions:
-            if self.worker.submit(
+            if worker.submit(
                 region.path,
-                lambda transcript, region=region: self._on_region(pending, region, transcript),
+                # partial rather than a lambda with a default argument: the callback takes
+                # only the transcript, and this is the one shape mypy can infer.
+                partial(self._on_region, pending, region),
                 label=f"{media_path.stem}:{region.speaker}@{region.offset:.0f}s",
                 audio_seconds=region.seconds,
             ):

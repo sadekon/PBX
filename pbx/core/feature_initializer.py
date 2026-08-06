@@ -104,7 +104,10 @@ class FeatureInitializer:
         )
         pbx_core.conference_system = ConferenceSystem()
         pbx_core.recording_system = CallRecordingSystem(
-            auto_record=config.get("features.call_recording", False),
+            # Was never passed, so recordings always landed in ./recordings regardless of
+            # what recording.storage_path said.
+            recording_path=config.get("recording.storage_path", "recordings"),
+            requested=config.get("features.call_recording", False),
             consent_acknowledged=config.get(CONSENT_KEY, False),
         )
         FeatureInitializer._wire_call_recording(pbx_core)

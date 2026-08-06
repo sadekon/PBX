@@ -271,7 +271,11 @@ class WhisperBackend:
 
         samples = np.frombuffer(pcm16, dtype="<i2").astype("float32") / PCM16_FULL_SCALE
 
-        raw_segments, _info = self.model.transcribe(
+        model = self.model
+        if model is None:  # pragma: no cover - `ready` is checked before every call
+            return []
+
+        raw_segments, _info = model.transcribe(
             samples,
             language=language,
             # beam_size=1 is greedy decoding. Beam search costs multiples of the runtime for a

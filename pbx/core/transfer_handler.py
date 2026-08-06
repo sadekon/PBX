@@ -452,6 +452,36 @@ class TransferHandler:
     # Media: the bridge
     # ------------------------------------------------------------------
 
+    def _label_transferred_party(self, original: Call, extension: str, side: str) -> None:
+        """
+        Tell the recording who just arrived on `side`.
+
+        Replacing an endpoint puts a different human on that side of the relay, so the handler
+        stamps a new source id and the recorder opens a fresh channel for them -- which is the
+        part that keeps attribution honest. But only here is it known *who* they are, so
+        without this the channel is labelled with the raw source ("b1") and the transcript
+        reads "b1: ..." instead of their extension.
+
+        Never raises: a mislabelled channel is a worse transcript, not a failed transfer.
+        """
+        pbx = self.pbx_core
+        recording_system = getattr(pbx, "recording_system", None)
+        if recording_system is None or not extension:
+            return
+
+        try:
+            handler = pbx.rtp_relay.get_handler(original.call_id)
+            if handler is None:
+                return
+
+            source = handler.current_source(side)
+            recording_system.label(original.session_id, source, extension)
+            pbx.logger.debug(
+                f"Recording for session {original.session_id}: {source} is now {extension}"
+            )
+        except Exception as e:
+            pbx.logger.error(f"Could not label transferred party on {original.call_id}: {e}")
+
     def bridge(self, session: TransferSession, original: Call, consult: Call) -> bool:
         """
         Re-point media so the transferee and the target are talking.
@@ -501,6 +531,7 @@ class TransferHandler:
         # Retarget the original relay's transferor side to the destination.
         dest_endpoint = (dest_rtp["address"], dest_rtp["port"])
         pbx.rtp_relay.replace_endpoint(original.call_id, transferor_relay_side, dest_endpoint)
+        self._label_transferred_party(original, consult.to_extension, transferor_relay_side)
 
         # Rewrite the transferor's side of the original record to the target.
         if transferor_is_caller:

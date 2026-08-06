@@ -583,6 +583,11 @@ class RTPRelayHandler:
             f"Call {self.call_id} side {side} replaced; audio source is now {new_source}"
         )
 
+        # This can be the moment a bridge *completes*, not merely changes: CallOriginator
+        # never calls set_endpoints at all, it fills the second side in here. The notify is
+        # latched, so an already-bridged call (the transfer case) is unaffected.
+        self._notify_bridged()
+
     def start(self) -> bool:
         """
         Start RTP relay handler.
@@ -767,6 +772,17 @@ class RTPRelayHandler:
             except (KeyError, OSError, TypeError, ValueError, struct.error) as e:
                 if self.running:
                     self.logger.error(f"Error in RTP relay loop: {e}")
+
+    def current_source(self, side: str) -> str:
+        """
+        The source id currently carrying `side`, e.g. "b0" before a transfer and "b1" after.
+
+        Needed because the source is what a recording keys a channel on, but only the caller
+        knows *who* the new party is. After a transfer completes, the transfer handler asks
+        for this and gives the channel their extension -- otherwise the transcript labels
+        them with the raw source id.
+        """
+        return self._source_a if side == "a" else self._source_b
 
     def attach_tap(self, tap: AudioTap) -> None:
         """

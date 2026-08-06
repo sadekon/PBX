@@ -564,12 +564,16 @@ class CallRecordingSystem:
     def __init__(
         self,
         recording_path: str = "recordings",
-        auto_record: bool = False,
+        requested: bool = False,
         consent_acknowledged: bool = False,
     ) -> None:
         self.recording_path = recording_path
         #: Requested by ``features.call_recording``.
-        self.requested = auto_record
+        #:
+        #: Named ``requested`` rather than ``auto_record`` because config.yml had a dead
+        #: ``recording.auto_record`` key that nothing read, and the two being spelled the same
+        #: made an inert setting look like the switch that works.
+        self.requested = requested
         #: Set by ``recording.consent_acknowledged``. See :data:`CONSENT_KEY`.
         self.consent_acknowledged = consent_acknowledged
         self.active_recordings: dict[str, CallRecording] = {}

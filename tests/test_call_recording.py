@@ -498,7 +498,7 @@ class TestRelayTriggersRecording:
         pbx = SimpleNamespace(
             rtp_relay=RTPRelay(port_range_start=30000, port_range_end=30100),
             recording_system=CallRecordingSystem(
-                str(tmp_path), auto_record=True, consent_acknowledged=consent
+                str(tmp_path), requested=True, consent_acknowledged=consent
             ),
             call_manager=SimpleNamespace(get_call=lambda _id: call),
         )
@@ -583,6 +583,87 @@ class TestRelayTriggersRecording:
 
 
 @pytest.mark.unit
+class TestTransferLabelling:
+    """
+    A transfer puts a different human on one side of the relay. The recorder already gives
+    them their own channel -- what was missing is their name, so the transcript read
+    "b1: ..." instead of the extension.
+    """
+
+    def _setup(self, tmp_path, *, with_recording=True):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from pbx.core.transfer_handler import TransferHandler
+        from pbx.rtp.handler import RTPRelayHandler
+
+        handler = RTPRelayHandler(local_port=0, call_id="leg-1")
+        handler.set_endpoints(("1.1.1.1", 100), ("2.2.2.2", 200))
+
+        system = CallRecordingSystem(str(tmp_path), requested=True, consent_acknowledged=True)
+        tap = system.start_recording(
+            "leg-1", "1001", "1002", session_id="conv-1", labels={"a0": "1001", "b0": "1002"}
+        )
+
+        pbx = SimpleNamespace(
+            logger=MagicMock(),
+            recording_system=system if with_recording else None,
+            rtp_relay=SimpleNamespace(get_handler=lambda _id: handler),
+        )
+        original = SimpleNamespace(call_id="leg-1", session_id="conv-1")
+        return TransferHandler(pbx), handler, system, original, tap
+
+    def test_the_new_party_gets_their_extension(self, tmp_path):
+        transfers, handler, system, original, tap = self._setup(tmp_path)
+        handler.replace_endpoint("b", ("3.3.3.3", 300))
+
+        transfers._label_transferred_party(original, "1003", "b")
+
+        assert system.get("conv-1").labels == {"a0": "1001", "b0": "1002", "b1": "1003"}
+        tap.stop()
+
+    def test_the_departed_party_keeps_their_label(self, tmp_path):
+        """Their channel still holds their audio; only the new arrival is new."""
+        transfers, handler, system, original, tap = self._setup(tmp_path)
+        handler.replace_endpoint("b", ("3.3.3.3", 300))
+
+        transfers._label_transferred_party(original, "1003", "b")
+
+        assert system.get("conv-1").labels["b0"] == "1002"
+        tap.stop()
+
+    def test_no_recording_system_is_harmless(self, tmp_path):
+        transfers, _handler, _system, original, _tap = self._setup(tmp_path, with_recording=False)
+
+        transfers._label_transferred_party(original, "1003", "b")  # must not raise
+
+    def test_an_empty_extension_is_ignored(self, tmp_path):
+        transfers, handler, system, original, tap = self._setup(tmp_path)
+        handler.replace_endpoint("b", ("3.3.3.3", 300))
+
+        transfers._label_transferred_party(original, "", "b")
+
+        assert "b1" not in system.get("conv-1").labels
+        tap.stop()
+
+    def test_the_label_reaches_the_manifest(self, tmp_path):
+        """End to end: the transcript reads the manifest, so this is what it will show."""
+        transfers, handler, _system, original, tap = self._setup(tmp_path)
+        tap.start()
+        tap.feed("a0", rtp_packet())
+        tap.feed("b0", rtp_packet())
+        handler.replace_endpoint("b", ("3.3.3.3", 300))
+        transfers._label_transferred_party(original, "1003", "b")
+        tap.feed("b1", rtp_packet())
+        tap.stop()
+
+        path = next(iter(tmp_path.glob("*.wav")))
+        labels = [c["label"] for c in read_manifest(path)["channels"]]
+
+        assert labels == ["1001", "1002", "1003"]
+
+
+@pytest.mark.unit
 class TestConsentGate:
     """
     features.call_recording has been true in config.yml the whole time this feature did
@@ -591,13 +672,13 @@ class TestConsentGate:
     """
 
     def test_the_feature_flag_alone_does_not_record(self, tmp_path):
-        system = CallRecordingSystem(str(tmp_path), auto_record=True)
+        system = CallRecordingSystem(str(tmp_path), requested=True)
 
         assert system.requested is True
         assert system.auto_record is False, "recording without acknowledged consent"
 
     def test_both_switches_on_records(self, tmp_path):
-        system = CallRecordingSystem(str(tmp_path), auto_record=True, consent_acknowledged=True)
+        system = CallRecordingSystem(str(tmp_path), requested=True, consent_acknowledged=True)
 
         assert system.auto_record is True
 
@@ -615,7 +696,7 @@ class TestConsentGate:
 
         logger = MagicMock()
         with patch("pbx.features.call_recording.get_logger", return_value=logger):
-            CallRecordingSystem(str(tmp_path), auto_record=True)
+            CallRecordingSystem(str(tmp_path), requested=True)
 
         warning = " ".join(str(c) for c in logger.warning.call_args_list)
         assert "consent" in warning.lower()

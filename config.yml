@@ -434,9 +434,12 @@ features:
   find_me_follow_me:
     enabled: true                      # Enable Find Me/Follow Me feature
 recording:
-  auto_record: false
+  # Where two-channel call recordings and their .json channel manifests are written.
   storage_path: recordings
-  format: wav
+  # Format is not configurable: recordings are always PCM16 at 8 kHz, one channel per
+  # participant, because the two legs can negotiate different codecs and there is no single
+  # wire format to preserve. See pbx/features/call_recording.py.
+  #
   # features.call_recording turns recording on; this says an operator decided it is
   # appropriate here rather than inheriting it. Both are required, because
   # features.call_recording was already true for the whole time the feature did nothing,
