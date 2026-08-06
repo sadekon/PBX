@@ -433,7 +433,7 @@ class FeatureInitializer:
         worker already transcribes files. One pass per participant, because the recording
         already separated them and that is what makes the transcript say who spoke.
         """
-        from pbx.speech.recording import RecordingTranscriber
+        from pbx.speech.recording import DEFAULT_MAX_REGION_SECONDS, RecordingTranscriber
         from pbx.speech.store import TranscriptStore
         from pbx.utils.audio import SILENCE_RMS_FLOOR
 
@@ -444,10 +444,20 @@ class FeatureInitializer:
 
         database = getattr(pbx_core, "database", None)
         settings = getattr(worker, "settings", None)
+
+        # Stay clear of the worker's own limit: it refuses anything longer, and a refused
+        # region is audio that never gets transcribed at all. 90% leaves room for the padding
+        # a region carries either side of its speech.
+        cap = getattr(settings, "max_audio_seconds", 0) or 0
+        max_region = (
+            min(DEFAULT_MAX_REGION_SECONDS, cap * 0.9) if cap else DEFAULT_MAX_REGION_SECONDS
+        )
+
         transcriber = RecordingTranscriber(
             worker=worker,
             store=TranscriptStore(database if getattr(database, "enabled", False) else None),
             silence_floor=getattr(settings, "silence_rms_floor", SILENCE_RMS_FLOOR),
+            max_region_seconds=max_region,
         )
         pbx_core.recording_transcriber = transcriber
         recording_system.on_recording_finished = transcriber.submit

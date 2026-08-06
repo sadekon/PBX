@@ -84,6 +84,67 @@ _SPLIT_CHUNK = 16000
 SCRATCH_DIRNAME = ".transcribe"
 
 
+#: Longest a merged region may become, in seconds.
+#:
+#: Two reasons for a ceiling. The worker refuses anything over
+#: ``transcription.max_audio_seconds`` (300 by default), and a refused region is audio that
+#: never gets transcribed at all. And a single enormous job blocks the one worker thread for
+#: its whole duration while every other recording waits behind it.
+DEFAULT_MAX_REGION_SECONDS = 240.0
+
+
+def merge_uninterrupted(
+    spans: dict[int, list[tuple[float, float]]],
+    max_seconds: float = DEFAULT_MAX_REGION_SECONDS,
+) -> dict[int, list[tuple[float, float]]]:
+    """
+    Rejoin a speaker's regions across gaps where nobody else was talking.
+
+    Splitting exists for exactly one reason: whisper merges utterances either side of silence
+    it never receives, and on a per-participant recording that silence is usually the other
+    person's turn. A gap where *nobody* spoke is not that case -- it is one person pausing,
+    and merging across it is not merely harmless but better, because the model keeps the
+    context it uses for punctuation and capitalisation.
+
+    It is also much cheaper. Whisper's encoder always processes a 30-second window and pads
+    anything shorter, so a two-second region costs about what a thirty-second one costs.
+    Cutting a channel at every pause turns one window pass into ten. Cutting it only where
+    somebody actually interjected keeps the regions few and long, which is where the model is
+    both fastest per second of audio and most accurate.
+
+    Args:
+        spans: Regions per channel index, each sorted and non-overlapping.
+        max_seconds: Never merge past this length -- see :data:`DEFAULT_MAX_REGION_SECONDS`.
+
+    Returns:
+        The same shape, with adjacent regions joined where the gap was quiet.
+    """
+    merged: dict[int, list[tuple[float, float]]] = {}
+
+    for index, regions in spans.items():
+        others = [span for other, rest in spans.items() if other != index for span in rest]
+        joined: list[tuple[float, float]] = []
+
+        for start, end in regions:
+            if (
+                joined
+                and end - joined[-1][0] <= max_seconds
+                and not _anyone_speaking(others, joined[-1][1], start)
+            ):
+                joined[-1] = (joined[-1][0], end)
+            else:
+                joined.append((start, end))
+
+        merged[index] = joined
+
+    return merged
+
+
+def _anyone_speaking(spans: list[tuple[float, float]], start: float, end: float) -> bool:
+    """Whether any of `spans` overlaps the open interval between `start` and `end`."""
+    return any(other_start < end and start < other_end for other_start, other_end in spans)
+
+
 @dataclass(frozen=True, slots=True)
 class _Region:
     """One stretch of one participant's speech, written out for transcription."""
@@ -143,6 +204,7 @@ class RecordingTranscriber:
         min_speech_seconds: float = MIN_SPEECH_SECONDS,
         silence_floor: float = SILENCE_RMS_FLOOR,
         split_gap_seconds: float = DEFAULT_SPLIT_GAP_SECONDS,
+        max_region_seconds: float = DEFAULT_MAX_REGION_SECONDS,
     ) -> None:
         self.worker = worker
         self.store = store or TranscriptStore()
@@ -154,6 +216,9 @@ class RecordingTranscriber:
         #: RMS floor for the whole-channel gate. A genuine power threshold, unlike Silero's,
         #: and the only one that decides whether a model runs at all.
         self.silence_floor = silence_floor
+        #: Ceiling on a merged region. Must stay under the worker's max_audio_seconds, which
+        #: refuses anything longer -- and a refused region is audio nobody ever transcribes.
+        self.max_region_seconds = max_region_seconds
 
     @property
     def enabled(self) -> bool:
@@ -310,6 +375,17 @@ class RecordingTranscriber:
                 return []
 
             spans = self._measure(source, channels, rate, media_path, labels)
+            # Only somebody else speaking justifies a cut. Rejoining the rest keeps context
+            # for the model and, because whisper pays a full 30-second window per region,
+            # keeps the cost proportional to the audio rather than to the number of pauses.
+            before = sum(len(found) for found in spans.values())
+            spans = merge_uninterrupted(spans, self.max_region_seconds)
+            after = sum(len(found) for found in spans.values())
+            if after < before:
+                self.logger.debug(
+                    f"{media_path.name}: rejoined {before} region(s) into {after} "
+                    "across gaps nobody spoke in"
+                )
             return self._extract(source, spans, labels, channels, rate, total_frames, workspace)
 
     def _measure(

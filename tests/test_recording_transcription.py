@@ -19,6 +19,7 @@ from pbx.speech.recording import (
     RecordingTranscriber,
     combine_regions,
     merge_channels,
+    merge_uninterrupted,
 )
 from pbx.speech.types import Segment, Transcript
 from pbx.utils.audio import active_speech_seconds, speech_regions
@@ -204,6 +205,76 @@ class TestSpeechRegions:
 
     def test_empty_input(self):
         assert speech_regions(b"", RATE) == []
+
+
+@pytest.mark.unit
+class TestMergeUninterrupted:
+    """
+    Splitting exists only to stop whisper merging across somebody else's turn. A gap where
+    nobody spoke is not that case, and cutting there costs accuracy *and* time: whisper pays a
+    full 30-second encoder window per region regardless of how short the region is.
+    """
+
+    def test_a_quiet_gap_is_rejoined(self):
+        spans = {0: [(0.0, 5.0), (8.0, 12.0)], 1: []}
+
+        merged = merge_uninterrupted(spans)
+
+        assert merged[0] == [(0.0, 12.0)]
+
+    def test_a_gap_the_other_speaker_filled_is_kept(self):
+        spans = {0: [(0.0, 5.0), (12.0, 16.0)], 1: [(6.0, 11.0)]}
+
+        merged = merge_uninterrupted(spans)
+
+        assert merged[0] == [(0.0, 5.0), (12.0, 16.0)]
+
+    def test_the_realistic_case(self):
+        """
+        A speaks, pauses, speaks again, then B replies, then A again. Only the exchange with
+        B should survive as a cut; A's own pause should not.
+        """
+        spans = {0: [(0.0, 4.0), (7.0, 10.0), (20.0, 24.0)], 1: [(12.0, 18.0)]}
+
+        merged = merge_uninterrupted(spans)
+
+        assert merged[0] == [(0.0, 10.0), (20.0, 24.0)]
+
+    def test_a_partial_overlap_still_counts_as_speaking(self):
+        """The other party need only overlap the gap, not sit wholly inside it."""
+        spans = {0: [(0.0, 5.0), (10.0, 14.0)], 1: [(4.0, 7.0)]}
+
+        merged = merge_uninterrupted(spans)
+
+        assert merged[0] == [(0.0, 5.0), (10.0, 14.0)]
+
+    def test_merging_stops_at_the_length_ceiling(self):
+        """
+        The worker refuses anything over max_audio_seconds, and a refused region is audio
+        nobody ever transcribes.
+        """
+        spans = {0: [(0.0, 100.0), (110.0, 200.0)], 1: []}
+
+        merged = merge_uninterrupted(spans, max_seconds=150.0)
+
+        assert merged[0] == [(0.0, 100.0), (110.0, 200.0)]
+
+    def test_a_third_participant_also_blocks_merging(self):
+        spans = {0: [(0.0, 4.0), (12.0, 16.0)], 1: [], 2: [(6.0, 9.0)]}
+
+        merged = merge_uninterrupted(spans)
+
+        assert merged[0] == [(0.0, 4.0), (12.0, 16.0)]
+
+    def test_a_lone_speaker_collapses_to_one_region(self):
+        spans = {0: [(0.0, 2.0), (5.0, 7.0), (10.0, 12.0)]}
+
+        merged = merge_uninterrupted(spans)
+
+        assert merged[0] == [(0.0, 12.0)]
+
+    def test_nothing_to_merge(self):
+        assert merge_uninterrupted({0: [], 1: []}) == {0: [], 1: []}
 
 
 @pytest.mark.unit
