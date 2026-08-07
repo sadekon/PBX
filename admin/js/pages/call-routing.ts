@@ -879,12 +879,12 @@ export async function loadRetentionPolicies(): Promise<void> {
             const banner = document.getElementById('retention-mode-banner') as HTMLElement | null;
             if (banner) {
                 if (statsData.enabled === false) {
-                    banner.className = 'alert alert-warning';
+                    banner.className = 'alert-box warning';
                     banner.textContent =
                         'Retention is DISABLED. Nothing is being deleted, and these policies '
                         + 'do not apply. Set retention.enabled in config.yml to turn it on.';
                 } else if (statsData.dry_run) {
-                    banner.className = 'alert alert-warning';
+                    banner.className = 'alert-box warning';
                     banner.textContent =
                         'Retention is in DRY RUN mode: it reports what it would delete and '
                         + 'deletes nothing. Policies below are evaluated but never acted on. '
@@ -892,7 +892,7 @@ export async function loadRetentionPolicies(): Promise<void> {
                             ? `Last sweep: ${statsData.last_sweep_summary}`
                             : 'No sweep has run yet.');
                 } else {
-                    banner.className = 'alert alert-info';
+                    banner.className = 'alert-box';
                     banner.textContent =
                         'Retention is ACTIVE and deleting on schedule. '
                         + (statsData.last_sweep_summary
