@@ -536,11 +536,17 @@ class RecordingTranscriber:
             speaker: combine_regions(entries) for speaker, entries in pending.results.items()
         }
         merged = merge_channels(per_speaker)
+        # The speakers are the participants: each region was cut from one participant's
+        # channel, so the keys here are exactly the labels the recording manifest named.
+        # Stored on the row because the manifest expires with the audio, long before the
+        # transcript does, and retention still has to know whose call this was.
         self.store.save(
             merged,
             source=SOURCE_RECORDING,
             call_id=pending.session_id,
             media_path=str(pending.media_path),
+            session_id=pending.session_id,
+            participants=sorted(pending.results),
         )
         self.logger.info(
             f"Transcribed {pending.media_path.name}: "

@@ -827,3 +827,87 @@ def register_all_migrations(manager: MigrationManager) -> None:
         CREATE INDEX IF NOT EXISTS idx_summaries_call ON call_summaries(call_id);
     """),
     )
+
+    # Migration 1018: Retention policies, legal holds, transcript participants
+    #
+    # Retention policies existed before this only as a dict on RecordingRetentionManager, so
+    # the admin UI's "Add Policy" wrote to memory and lost it on restart -- and, because
+    # features.recording_retention was never in config.yml, the manager was disabled and the
+    # write failed outright. Policies are operator configuration; they belong in a table.
+    #
+    # Two periods, not one. Audio is the bytes and the privacy weight; transcripts are ~2% of
+    # the size and carry most of the value. Either may be NULL, meaning "inherit the fallback
+    # from the retention: config block", so a policy can extend audio without touching text.
+    #
+    # match_rules is JSON, evaluated in Python rather than SQL: the facts it matches against
+    # live in a sidecar file on disk, not in this database, so the join could not happen here
+    # anyway. Policy counts are in the tens, so a linear scan per file costs nothing.
+    manager.register_migration(
+        1018,
+        "Retention Policies and Legal Holds",
+        manager._build_migration_sql("""
+        CREATE TABLE IF NOT EXISTS retention_policies (
+            id {SERIAL},
+            policy_id VARCHAR(100) NOT NULL UNIQUE,
+            name VARCHAR(255) NOT NULL,
+            description {TEXT},
+            -- NULL means inherit the corresponding retention.* fallback rather than "delete
+            -- immediately". A policy that only lengthens audio leaves transcript_days NULL.
+            audio_days INTEGER,
+            transcript_days INTEGER,
+            -- Lowest number wins. The seeded catch-all sits at 1000 so anything added later
+            -- outranks it without the operator having to think about ordering.
+            priority INTEGER NOT NULL DEFAULT 100,
+            -- JSON object of ANDed conditions; '{}' matches every recording. Keys are a fixed
+            -- vocabulary (media, extensions, min/max_duration_seconds) -- deliberately closed,
+            -- because an open expression language would mean evaluating operator-supplied
+            -- strings on a live PBX and could not be rendered as a form.
+            match_rules {TEXT} NOT NULL DEFAULT '{}',
+            enabled BOOLEAN NOT NULL DEFAULT {BOOLEAN_TRUE},
+            -- 'config' rows were seeded from config.yml on a first, empty run; 'api' rows came
+            -- from an operator. Seeding happens only when the table is empty, so an operator
+            -- editing a seeded row keeps that edit across restarts.
+            origin VARCHAR(20) NOT NULL DEFAULT 'api',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_retention_policies_priority
+            ON retention_policies(enabled, priority);
+
+        -- A legal hold is not a retention policy and must not be modelled as one: it applies
+        -- to one specific call rather than a class, it is placed by a person after an event,
+        -- it suspends expiry rather than setting a period, and it has to be releasable. The
+        -- tag vocabulary this replaces mapped 'legal' to a fixed 2555 days, which is wrong in
+        -- both directions -- a dispute lasting longer still lost the audio, and one settled in
+        -- a month held the recording for another seven years with no way to let it go.
+        CREATE TABLE IF NOT EXISTS retention_holds (
+            id {SERIAL},
+            -- session_id, not call_id: a session spans transfers and re-INVITEs, so holding a
+            -- conversation holds every leg of it. Recordings are named by session.
+            session_id VARCHAR(100) NOT NULL,
+            reason {TEXT} NOT NULL,
+            placed_by VARCHAR(100) NOT NULL,
+            placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            -- NULL means active. Released rows are kept, never deleted: the audit value of a
+            -- hold is the record that it existed and who lifted it.
+            released_at TIMESTAMP,
+            released_by VARCHAR(100)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_retention_holds_session
+            ON retention_holds(session_id, released_at);
+
+        -- Who was on the call, as a JSON array of extension labels. Two consumers: the
+        -- transcript sweep, which cannot re-read the sidecar because audio expires first and
+        -- the manifest goes with it; and the review surface, where "was I on this call?" must
+        -- not mean parsing the segments JSON of every row.
+        ALTER TABLE call_transcripts ADD COLUMN IF NOT EXISTS participants {TEXT};
+
+        -- The session this transcript belongs to, so a hold placed on a conversation covers
+        -- its text as well as its audio.
+        ALTER TABLE call_transcripts ADD COLUMN IF NOT EXISTS session_id VARCHAR(100);
+
+        CREATE INDEX IF NOT EXISTS idx_transcripts_session ON call_transcripts(session_id);
+    """),
+    )

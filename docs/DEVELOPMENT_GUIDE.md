@@ -417,6 +417,91 @@ forwarding across supported phone models before merge to `DEV`.
 
 ---
 
+## Next up — call transcript review (design agreed 2026-08-06, not built)
+
+Backend post-call transcription is **complete**: tap → per-participant recording → per-region
+transcription → one speaker-attributed transcript in `call_transcripts`. Nothing reads it yet.
+
+### Retention — reconciled 2026-08-07 (was: two systems, one of them inert)
+
+There were two retention systems and only one of them deleted anything.
+`recording_retention.RecordingRetentionManager` owned policies in a **plain Python dict** and
+exposed them through `/api/recording-retention/*` and a live admin tab; `cleanup_old_recordings`
+had no caller anywhere. `retention.RetentionSweeper` deleted on a `PeriodicTask` but knew only
+a single flat `audio_days`. So an operator could add a policy in the UI, watch it save, and
+have it govern nothing — and because policies were never persisted, it vanished on restart
+anyway. That is why no `retention_policies` table ever appeared in pgAdmin: there was no table.
+
+Now one subsystem in two modules with distinct jobs:
+
+| | `features/retention_policies.py` | `features/retention.py` |
+|---|---|---|
+| Owns | policies, legal holds, match facts | the timer and the deletion |
+| Storage | `retention_policies` / `retention_holds` (migration 1018) | — |
+| Entry point | `PolicyStore`, `HoldStore` | `RetentionSweeper.sweep()` |
+
+`recording_retention.py` is **deleted**. `pbx_core.recording_retention` and
+`pbx_core.retention_sweeper` are now the same object, so the existing API and admin tab drive
+the thing that actually deletes.
+
+**How it resolves.** Every file is matched against enabled policies in priority order (lowest
+number wins, ties on `policy_id`); the first match supplies the period, and no match falls back
+to `retention:` in config.yml. Match rules are a **closed** vocabulary — `media`,
+`extensions`, `min_duration_seconds`, `max_duration_seconds` — validated on save, with unknown
+keys rejected rather than ignored, because a dropped condition makes a policy match *more*
+files and the thing on the other end is deletion. Facts come from the sidecar manifest the
+recorder already writes (participants, duration, session) and from the path layout for
+voicemail.
+
+**Two periods per policy**, `audio_days` and `transcript_days`, either nullable to inherit the
+fallback — null means inherit, never "delete now". Transcripts resolve policy from
+`call_transcripts.participants` and `.session_id` (also migration 1018) rather than from the
+sidecar, because audio expires first and the manifest goes with it.
+
+**Legal holds replace the old tag vocabulary.** Tags mapped `legal` to a fixed 2555 days, which
+is wrong in both directions: a dispute lasting longer still lost the audio, and one settled in
+a month held the recording for another seven years with no way to release it. A hold is keyed
+on `session_id` (so it covers every leg of a transferred call), requires a reason and an actor,
+suspends expiry entirely at any age, and is released explicitly — released rows are stamped,
+never deleted. Both placement and release go through `AuditLogger`.
+
+**Config seeds once.** On the first start against an empty table, `retention.audio_days` and
+`transcript_days` are written out as a catch-all policy `default` at priority 1000. After that
+the table is authoritative and the UI owns it; editing that policy survives restarts, and
+changing config.yml afterwards does **not** move it.
+
+`RecordingTranscriber` now writes `session_id` and `participants` on every transcript it
+stores, so transcript policies match on participants from the day this lands. Voicemail
+transcripts still store neither, so those match on `source` and duration only.
+
+Remaining gaps: `dry_run` is still on in config.yml, so nothing is deleted yet — read a dry-run
+log before turning it off, because the first real sweep on a system that has never expired
+anything removes everything already past its period. There is no admin UI for holds yet, only
+the API (`GET/POST /api/recording-retention/hold[s]`, `DELETE .../hold/<session_id>`). And rows
+written before migration 1018 have `participants` null, so a participant policy will not match
+any historical transcript — it will fall through to the catch-all, which is the safe direction.
+
+**Design decisions taken** for the review surface, all still to implement:
+
+- **Purpose: call review / QA.** Supervisors browse and search transcripts, flag or comment on
+  a call, mark it reviewed. Operational health monitoring (queue depth, RTF, drops) is a
+  separate concern — `TranscriptionWorker.stats()` already exposes it for a later panel.
+- **Transcripts only; no audio playback.** Text carries most of the review value at a fraction
+  of the privacy exposure, and audio expires at 90 days while transcripts live a year. Serving
+  someone's voice over an API is its own decision, deliberately deferred.
+- **New `can_read_transcripts` JWT claim**, beside `is_admin` rather than folded into it —
+  granting HR full PBX administration to read a transcript is the trade this avoids. Three
+  tiers: your own calls always; the claim (or `is_admin`) for anyone else's.
+- **Every cross-extension read goes through `AuditLogger.log_data_export`.** This is what makes
+  a written retention/access policy enforceable rather than aspirational.
+
+Implied schema work: "was I on this call?" is not cheaply answerable — participants live inside
+the `segments` JSON. Access control should not parse JSON per row, so `call_transcripts` needs
+an indexed `participants` column (migration 1018).
+
+Note `admin/js/pages/recordings.ts` is **not** about call recordings — it is fraud detection and
+callback queue. The review page is new work, not an extension of it.
+
 ## Cross-cutting platform limitations
 
 These constrain *every* feature's deployed testing and should be scheduled as platform work:

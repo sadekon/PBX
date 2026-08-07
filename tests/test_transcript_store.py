@@ -261,3 +261,92 @@ class TestTranscriptStore:
         db = _FakeDatabase(raises=RuntimeError("gone"))
 
         assert TranscriptStore(db).recent() == []
+
+
+@pytest.mark.unit
+class TestParticipantsAndSession:
+    """
+    Who was on the call, denormalised onto the transcript row.
+
+    Both are derivable from the recording's sidecar manifest -- but audio expires on a far
+    shorter clock than text, so by the time a transcript comes up for retention the manifest
+    is gone. These columns are the only surviving record, and both retention matching and the
+    review surface's "was I on this call?" read them here.
+    """
+
+    def test_participants_are_stored_as_json(self):
+        db = _FakeDatabase()
+
+        TranscriptStore(db).save(
+            _transcript(),
+            source=SOURCE_RECORDING,
+            call_id="c1",
+            session_id="sess-1",
+            participants=["1512", "1513"],
+        )
+
+        query, params = db.calls[0]
+        assert "participants" in query
+        assert json.loads(params[-1]) == ["1512", "1513"]
+
+    def test_session_id_is_stored(self):
+        db = _FakeDatabase()
+
+        TranscriptStore(db).save(_transcript(), source=SOURCE_RECORDING, session_id="sess-1")
+
+        assert db.calls[0][1][-2] == "sess-1"
+
+    def test_speakers_are_inferred_when_participants_are_not_given(self):
+        """A caller that knows nothing about the recording still stores something matchable."""
+        db = _FakeDatabase()
+        segments = (
+            Segment(text="hello", start=0.0, end=0.5, speaker="1512"),
+            Segment(text="hi", start=1.0, end=1.5, speaker="1513"),
+        )
+
+        TranscriptStore(db).save(_transcript(segments=segments), source=SOURCE_RECORDING)
+
+        assert json.loads(db.calls[0][1][-1]) == ["1512", "1513"]
+
+    def test_inferred_speakers_keep_first_heard_order_without_duplicates(self):
+        db = _FakeDatabase()
+        segments = (
+            Segment(text="a", start=0.0, end=0.5, speaker="1513"),
+            Segment(text="b", start=1.0, end=1.5, speaker="1512"),
+            Segment(text="c", start=2.0, end=2.5, speaker="1513"),
+        )
+
+        TranscriptStore(db).save(_transcript(segments=segments), source=SOURCE_RECORDING)
+
+        assert json.loads(db.calls[0][1][-1]) == ["1513", "1512"]
+
+    def test_no_participants_stores_null_not_an_empty_array(self):
+        """Null is 'unknown'; [] would claim the call provably had nobody on it."""
+        db = _FakeDatabase()
+
+        TranscriptStore(db).save(_transcript(), source=SOURCE_VOICEMAIL)
+
+        assert db.calls[0][1][-1] is None
+
+    def test_explicit_participants_win_over_inferred_speakers(self):
+        db = _FakeDatabase()
+        segments = (Segment(text="hello", start=0.0, end=0.5, speaker="a0"),)
+
+        TranscriptStore(db).save(
+            _transcript(segments=segments),
+            source=SOURCE_RECORDING,
+            participants=["1512"],
+        )
+
+        assert json.loads(db.calls[0][1][-1]) == ["1512"]
+
+    def test_1018_adds_the_columns_the_store_writes(self):
+        from pbx.utils.migrations import MigrationManager, register_all_migrations
+
+        manager = MigrationManager(MagicMock())
+        manager.migrations = []
+        register_all_migrations(manager)
+
+        sql = next(m["sql"] for m in manager.migrations if m["version"] == 1018)
+        assert "participants" in sql
+        assert "session_id" in sql

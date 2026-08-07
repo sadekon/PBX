@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Any, Final
 from pbx.utils.logger import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from pbx.speech.types import Transcript
 
 __all__ = ["SOURCE_LIVE", "SOURCE_RECORDING", "SOURCE_VOICEMAIL", "TranscriptStore"]
@@ -69,12 +71,20 @@ class TranscriptStore:
         source: str,
         call_id: str | None = None,
         media_path: str | None = None,
+        session_id: str | None = None,
+        participants: Sequence[str] | None = None,
     ) -> bool:
         """
         Store one transcript. Returns whether it was written.
 
         A failed transcript is not stored: there is no text to keep, and a row recording that
         an engine errored belongs in the log, not in the table the admin UI reads.
+
+        `session_id` and `participants` are denormalised onto the row on purpose. Both are
+        derivable from the recording's sidecar manifest today, but audio expires on a far
+        shorter clock than text -- by the time a transcript comes up for retention its manifest
+        is long gone, and these are the only surviving record of whose call it was. Retention
+        matching and the review surface's "was I on this call?" both read them here.
         """
         database = self.database
         if database is None or not self.enabled or not transcript.success:
@@ -88,11 +98,16 @@ class TranscriptStore:
                 # Timing is a nice-to-have; the text is not. Keep the row, drop the segments.
                 self.logger.warning(f"Could not serialise transcript segments: {e}")
 
+        # Fall back to the speakers the transcript itself names, so a caller that knows nothing
+        # about the recording still stores something matchable.
+        speakers = list(participants) if participants else self._speakers(transcript)
+
         try:
             database.execute(
                 f"INSERT INTO call_transcripts (call_id, source, media_path, provider, model, "
                 f"language, transcript_text, segments, confidence, audio_duration, "
-                f"processing_duration) VALUES ({', '.join([_PH] * 11)})",
+                f"processing_duration, session_id, participants) "
+                f"VALUES ({', '.join([_PH] * 13)})",
                 (
                     call_id,
                     source,
@@ -105,6 +120,8 @@ class TranscriptStore:
                     transcript.confidence,
                     transcript.audio_duration,
                     transcript.processing_duration,
+                    session_id,
+                    json.dumps(speakers) if speakers else None,
                 ),
             )
         except Exception as e:
@@ -114,6 +131,16 @@ class TranscriptStore:
             return False
 
         return True
+
+    @staticmethod
+    def _speakers(transcript: Transcript) -> list[str]:
+        """Distinct speaker labels named by the transcript, in first-heard order."""
+        seen: list[str] = []
+        for segment in transcript.segments or ():
+            speaker = getattr(segment, "speaker", "")
+            if speaker and speaker not in seen:
+                seen.append(speaker)
+        return seen
 
     def for_call(self, call_id: str, limit: int = 50) -> list[dict[str, Any]]:
         """Every transcript for one call, newest first."""

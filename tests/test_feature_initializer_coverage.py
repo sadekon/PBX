@@ -71,7 +71,7 @@ _TOP_LEVEL_PATCHES = {
     "SIPTrunkSystem": "pbx.core.feature_initializer.SIPTrunkSystem",
     "FindMeFollowMe": "pbx.core.feature_initializer.FindMeFollowMe",
     "TimeBasedRouting": "pbx.core.feature_initializer.TimeBasedRouting",
-    "RecordingRetentionManager": "pbx.core.feature_initializer.RecordingRetentionManager",
+    "RetentionSweeper": "pbx.core.feature_initializer.RetentionSweeper",
     "FraudDetectionSystem": "pbx.core.feature_initializer.FraudDetectionSystem",
     "PhoneProvisioning": "pbx.core.feature_initializer.PhoneProvisioning",
 }
@@ -168,8 +168,12 @@ class TestFeatureInitializerInitialize:
         mocks["TimeBasedRouting"].assert_called_once()
         assert pbx_core.time_based_routing == mocks["TimeBasedRouting"].return_value
 
-        mocks["RecordingRetentionManager"].assert_called_once()
-        assert pbx_core.recording_retention == mocks["RecordingRetentionManager"].return_value
+        # One object under both names. recording_retention used to be a separate manager
+        # that owned policies and never deleted anything, while the sweeper deleted and knew
+        # no policies; the reconciliation is precisely that they are now the same thing.
+        mocks["RetentionSweeper"].assert_called_once()
+        assert pbx_core.retention_sweeper == mocks["RetentionSweeper"].return_value
+        assert pbx_core.recording_retention is pbx_core.retention_sweeper
 
         mocks["FraudDetectionSystem"].assert_called_once()
         assert pbx_core.fraud_detection == mocks["FraudDetectionSystem"].return_value

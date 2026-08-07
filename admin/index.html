@@ -2773,6 +2773,13 @@ G.726-32</textarea>
         <div id="recording-retention" class="tab-content">
             <h2>📁 Recording Retention Policies</h2>
 
+            <!-- Whether retention is actually deleting. Without this, "0 deleted / never
+                 cleaned" reads as "working, nothing to do" when it usually means disabled
+                 or dry-run. Populated by loadRetentionPolicies(). -->
+            <div id="retention-mode-banner" class="alert alert-info" style="margin-bottom: 20px;">
+                Loading retention status&hellip;
+            </div>
+
             <div class="action-buttons" style="margin-bottom: 20px;">
                 <button class="btn btn-primary" onclick="loadRetentionPolicies()">🔄 Refresh</button>
                 <button class="btn btn-success" onclick="showAddRetentionPolicyModal()">➕ Add Policy</button>
@@ -2805,10 +2812,11 @@ G.726-32</textarea>
                     <table class="data-table">
                         <thead>
                             <tr>
-                                <th>Policy Name</th>
-                                <th>Retention Period</th>
-                                <th>Tags</th>
-                                <th>Created</th>
+                                <th>Policy</th>
+                                <th>Audio</th>
+                                <th>Transcripts</th>
+                                <th>Applies To</th>
+                                <th>Priority</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
@@ -5476,15 +5484,46 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                 </div>
 
                 <div class="form-group">
-                    <label for="retention-days">Retention Period (Days):</label>
-                    <input type="number" id="retention-days" required min="1" max="3650" value="90" placeholder="90">
-                    <small>Number of days to retain recordings (1-3650 days, max 10 years)</small>
+                    <label for="retention-audio-days">Audio Retention (Days):</label>
+                    <input type="number" id="retention-audio-days" min="1" max="3650" placeholder="90">
+                    <small>How long the .wav files live. Leave blank to inherit the default.</small>
                 </div>
 
                 <div class="form-group">
-                    <label for="retention-tags">Tags (Optional):</label>
-                    <input type="text" id="retention-tags" placeholder="critical, compliance, training">
-                    <small>Comma-separated tags for special handling</small>
+                    <label for="retention-transcript-days">Transcript Retention (Days):</label>
+                    <input type="number" id="retention-transcript-days" min="1" max="3650" placeholder="365">
+                    <small>Transcripts are ~2% of the size and usually outlive the audio. Leave blank to inherit the default.</small>
+                </div>
+
+                <hr>
+                <p><small><strong>Applies to</strong> &mdash; leave every field below empty to make this
+                    a catch-all governing everything. Conditions combine with AND.</small></p>
+
+                <div class="form-group">
+                    <label for="retention-match-media">Media Type:</label>
+                    <select id="retention-match-media">
+                        <option value="">Any</option>
+                        <option value="recording">Call recordings only</option>
+                        <option value="voicemail">Voicemail only</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label for="retention-match-extensions">Extensions (Optional):</label>
+                    <input type="text" id="retention-match-extensions" placeholder="1500, 1501">
+                    <small>Matches when any listed extension was on the call</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="retention-match-max-duration">Maximum Duration (Seconds, Optional):</label>
+                    <input type="number" id="retention-match-max-duration" min="0" placeholder="5">
+                    <small>Matches only calls shorter than this &mdash; useful for expiring misdials quickly</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="retention-priority">Priority (Optional):</label>
+                    <input type="number" id="retention-priority" min="1" value="100" placeholder="100">
+                    <small>Lower numbers win. The default catch-all sits at 1000, so anything here outranks it.</small>
                 </div>
 
                 <div class="modal-actions">

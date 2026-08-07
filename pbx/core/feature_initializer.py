@@ -19,7 +19,6 @@ from pbx.features.inbound_routing import InboundRoutingSystem
 from pbx.features.music_on_hold import MusicOnHold
 from pbx.features.phone_provisioning import PhoneProvisioning
 from pbx.features.presence import PresenceSystem
-from pbx.features.recording_retention import RecordingRetentionManager
 from pbx.features.retention import (
     CONFIG_SECTION as RETENTION_CONFIG_SECTION,
     RetentionSettings,
@@ -260,9 +259,10 @@ class FeatureInitializer:
         if pbx_core.time_based_routing.enabled:
             logger.info("Time-based routing initialized")
 
-        # Initialize Recording Retention Manager
+        # Initialize retention: one sweeper, one policy store, one set of holds.
         # Retention owns the only thing in the PBX that deletes user data on a timer, so it
-        # is constructed with dry_run defaulted on and says so at startup.
+        # is constructed with dry_run defaulted on and says so at startup. start() seeds the
+        # policy table from config the first time it finds it empty.
         pbx_core.retention_sweeper = RetentionSweeper(
             RetentionSettings.from_dict(config.get(RETENTION_CONFIG_SECTION, {}) or {}),
             database=database,
@@ -270,9 +270,10 @@ class FeatureInitializer:
         )
         pbx_core.retention_sweeper.start()
 
-        pbx_core.recording_retention = RecordingRetentionManager(config=config)
-        if pbx_core.recording_retention.enabled:
-            logger.info("Recording retention manager initialized")
+        # The admin UI and the retention API address the sweeper through this name. It used to
+        # point at a second, policy-owning manager that never deleted anything; both halves are
+        # the same object now, which is the entire point of the reconciliation.
+        pbx_core.recording_retention = pbx_core.retention_sweeper
 
         # Initialize Fraud Detection System
         pbx_core.fraud_detection = FraudDetectionSystem(config=config)

@@ -16,6 +16,15 @@ from unittest.mock import MagicMock
 import pytest
 
 from pbx.features.retention import SKIP_DIR_NAMES, RetentionSettings, RetentionSweeper
+from pbx.features.retention_policies import (
+    MEDIA_RECORDING,
+    MEDIA_VOICEMAIL,
+    HoldStore,
+    PolicyStore,
+    RetentionPolicy,
+    facts_for,
+    validate_match_rules,
+)
 from pbx.utils.periodic import PeriodicTask
 
 
@@ -245,15 +254,41 @@ class TestSweep:
         """
         Shaped like the real DatabaseBackend, which is three methods, not one.
 
-        execute() returns a bool for *every* statement, so counting through it yields True and
+        execute() returns a bool for *every* statement, so a SELECT through it yields True and
         then fails on subscripting. That reached the server as
         "transcript sweep failed: 'bool' object is not subscriptable"; a MagicMock returning
         rows from execute() had happily agreed with the wrong code.
+
+        The sweep now fetches candidate rows rather than a COUNT, because each row's period
+        depends on the policy that matches it -- a single cutoff cannot express that.
+
+        A sweep now issues three different reads -- policies, holds, transcripts -- so the
+        fake has to dispatch on the statement. A single return_value would hand transcript
+        rows back to the hold query, which reads every row's session_id as an active legal
+        hold and quietly protects everything from deletion.
         """
+        rows = [
+            {
+                "id": i,
+                "session_id": f"s-{i}",
+                "source": "recording",
+                "participants": None,
+                "audio_duration": 30.0,
+                "created_at": datetime.now(UTC) - timedelta(days=900),
+            }
+            for i in range(expired)
+        ]
+
+        def fetch_all(query, params=None):
+            if "call_transcripts" in query:
+                return rows
+            return []
+
         db = MagicMock()
         db.enabled = True
         db.execute.return_value = True
-        db.fetch_one.return_value = {"expired": expired}
+        db.fetch_all.side_effect = fetch_all
+        db.fetch_one.return_value = None
         return db
 
     def test_transcripts_are_counted_but_not_deleted_in_dry_run(self, tmp_path):
@@ -264,14 +299,15 @@ class TestSweep:
         assert result.transcripts == 7
         db.execute.assert_not_called()
 
-    def test_counting_uses_fetch_not_execute(self, tmp_path):
+    def test_reading_uses_fetch_not_execute(self, tmp_path):
         """The regression itself: a SELECT through execute() comes back as True."""
         db = self._db(expired=2)
 
         RetentionSweeper(_settings(tmp_path), database=db).sweep()
 
-        db.fetch_one.assert_called_once()
-        assert "SELECT COUNT" in str(db.fetch_one.call_args[0][0])
+        queries = [str(c[0][0]) for c in db.fetch_all.call_args_list]
+        assert any("FROM call_transcripts" in q for q in queries)
+        db.execute.assert_not_called()
 
     def test_transcripts_are_deleted_when_not_dry_run(self, tmp_path):
         db = self._db(expired=3)
@@ -280,6 +316,22 @@ class TestSweep:
 
         statements = " ".join(str(c[0][0]) for c in db.execute.call_args_list)
         assert "DELETE FROM call_transcripts" in statements
+
+    def test_transcripts_are_deleted_by_id(self, tmp_path):
+        """
+        By id, not by a shared cutoff.
+
+        Two rows of the same age can be governed by different policies, so the set that
+        expires is decided per row and the delete has to name exactly that set.
+        """
+        db = self._db(expired=3)
+
+        RetentionSweeper(_settings(tmp_path, dry_run=False), database=db).sweep()
+
+        delete = next(
+            c for c in db.execute.call_args_list if "DELETE FROM call_transcripts" in str(c[0][0])
+        )
+        assert sorted(delete[0][1]) == [0, 1, 2]
 
     def test_nothing_is_deleted_when_nothing_expired(self, tmp_path):
         db = self._db(expired=0)
@@ -291,7 +343,7 @@ class TestSweep:
     def test_a_database_failure_does_not_raise(self, tmp_path):
         """This runs on a background thread; an exception here would kill the sweep for good."""
         db = self._db()
-        db.fetch_one.side_effect = RuntimeError("connection reset")
+        db.fetch_all.side_effect = RuntimeError("connection reset")
 
         result = RetentionSweeper(_settings(tmp_path), database=db).sweep()
 
@@ -359,3 +411,354 @@ class TestPeriodicTask:
 
     def test_stop_without_start_is_harmless(self):
         PeriodicTask("never", 1, lambda: None).stop()
+
+
+def _recording(
+    root: Path, name: str, *, session: str, labels: list[str], seconds: float, days: float
+) -> Path:
+    """A recording plus the sidecar manifest the recorder writes beside it."""
+    import json
+    import os
+
+    wav = _aged(root / f"{name}.wav", days=days)
+    sidecar = wav.with_suffix(".json")
+    sidecar.write_text(
+        json.dumps(
+            {
+                "session_id": session,
+                "duration_seconds": seconds,
+                "channels": [{"channel": i, "label": name} for i, name in enumerate(labels)],
+            }
+        )
+    )
+    old = (datetime.now(UTC) - timedelta(days=days)).timestamp()
+    os.utime(sidecar, (old, old))
+    return wav
+
+
+@pytest.mark.unit
+class TestMatchRuleValidation:
+    """
+    Unknown keys are rejected rather than ignored.
+
+    This is the one validation rule here that is a safety property rather than a nicety:
+    dropping an unrecognised condition makes a policy match *more* files, and the thing on the
+    other end of a match is deletion. A typo would silently widen a narrow policy into a
+    catch-all governing every recording on the system.
+    """
+
+    def test_known_keys_pass(self):
+        assert validate_match_rules({"media": "recording", "extensions": ["1500"]}) == []
+
+    def test_empty_rules_pass(self):
+        """No conditions is legitimate -- that is how a catch-all is expressed."""
+        assert validate_match_rules({}) == []
+
+    def test_misspelled_key_is_an_error(self):
+        problems = validate_match_rules({"medai": "recording"})
+        assert len(problems) == 1
+        assert "medai" in problems[0]
+
+    def test_unknown_media_value_rejected(self):
+        assert validate_match_rules({"media": "video"})
+
+    def test_inverted_duration_bounds_rejected(self):
+        assert validate_match_rules({"min_duration_seconds": 60, "max_duration_seconds": 10})
+
+    def test_non_object_rejected(self):
+        assert validate_match_rules(["media"])
+
+
+@pytest.mark.unit
+class TestFacts:
+    def test_recording_facts_come_from_the_sidecar(self, tmp_path):
+        wav = _recording(
+            tmp_path, "call", session="s-1", labels=["1512", "1513"], seconds=42.0, days=1
+        )
+
+        facts = facts_for(wav, MEDIA_RECORDING)
+
+        assert facts.session_id == "s-1"
+        assert set(facts.participants) == {"1512", "1513"}
+        assert facts.duration_seconds == 42.0
+
+    def test_missing_sidecar_yields_empty_facts(self, tmp_path):
+        """An unreadable manifest must not abort the sweep; it just cannot match rules."""
+        wav = _aged(tmp_path / "orphan.wav", days=1)
+
+        facts = facts_for(wav, MEDIA_RECORDING)
+
+        assert facts.participants == ()
+        assert facts.session_id == ""
+
+    def test_corrupt_sidecar_yields_empty_facts(self, tmp_path):
+        wav = _aged(tmp_path / "bad.wav", days=1)
+        wav.with_suffix(".json").write_text("{not json")
+
+        assert facts_for(wav, MEDIA_RECORDING).participants == ()
+
+    def test_voicemail_facts_come_from_the_path(self, tmp_path):
+        """voicemail/<mailbox>/<caller>_<timestamp>.wav -- no manifest exists here."""
+        vm = _aged(tmp_path / "voicemail" / "1500" / "5551234_20260101_101010.wav", days=1)
+
+        facts = facts_for(vm, MEDIA_VOICEMAIL)
+
+        assert set(facts.participants) == {"1500", "5551234"}
+
+
+@pytest.mark.unit
+class TestPolicyResolution:
+    def _store(self, *policies) -> PolicyStore:
+        store = PolicyStore()
+        for policy in policies:
+            store.save(policy)
+        return store
+
+    def test_lowest_priority_number_wins(self, tmp_path):
+        store = self._store(
+            RetentionPolicy("catch", "Catch all", audio_days=90, priority=1000),
+            RetentionPolicy(
+                "vip",
+                "VIP",
+                audio_days=400,
+                priority=5,
+                match_rules={"extensions": ["1513"]},
+            ),
+        )
+        wav = _recording(tmp_path, "c", session="s", labels=["1512", "1513"], seconds=10.0, days=1)
+
+        assert store.resolve(facts_for(wav, MEDIA_RECORDING)).policy_id == "vip"
+
+    def test_unmatched_file_falls_through_to_catch_all(self, tmp_path):
+        store = self._store(
+            RetentionPolicy("catch", "Catch all", audio_days=90, priority=1000),
+            RetentionPolicy(
+                "vip",
+                "VIP",
+                audio_days=400,
+                priority=5,
+                match_rules={"extensions": ["1513"]},
+            ),
+        )
+        wav = _recording(tmp_path, "c", session="s", labels=["1400"], seconds=10.0, days=1)
+
+        assert store.resolve(facts_for(wav, MEDIA_RECORDING)).policy_id == "catch"
+
+    def test_no_policy_at_all_resolves_to_none(self, tmp_path):
+        """None means 'use the configured fallback', which is what an empty table must do."""
+        wav = _recording(tmp_path, "c", session="s", labels=["1400"], seconds=10.0, days=1)
+
+        assert PolicyStore().resolve(facts_for(wav, MEDIA_RECORDING)) is None
+
+    def test_disabled_policies_are_skipped(self, tmp_path):
+        store = self._store(
+            RetentionPolicy(
+                "off",
+                "Disabled",
+                audio_days=400,
+                priority=1,
+                enabled=False,
+                match_rules={"extensions": ["1513"]},
+            ),
+        )
+        wav = _recording(tmp_path, "c", session="s", labels=["1513"], seconds=10.0, days=1)
+
+        assert store.resolve(facts_for(wav, MEDIA_RECORDING)) is None
+
+    def test_duration_rules_match(self, tmp_path):
+        store = self._store(
+            RetentionPolicy(
+                "short",
+                "Short calls",
+                audio_days=7,
+                priority=1,
+                match_rules={"max_duration_seconds": 5},
+            ),
+        )
+        brief = _recording(tmp_path, "brief", session="s", labels=["1400"], seconds=3.0, days=1)
+        long = _recording(tmp_path, "long", session="s", labels=["1400"], seconds=300.0, days=1)
+
+        assert store.resolve(facts_for(brief, MEDIA_RECORDING)).policy_id == "short"
+        assert store.resolve(facts_for(long, MEDIA_RECORDING)) is None
+
+    def test_invalid_rules_are_refused_at_save(self):
+        store = PolicyStore()
+
+        assert store.save(RetentionPolicy("bad", "Bad", match_rules={"nope": 1})) is False
+        assert store.get("bad") is None
+
+
+@pytest.mark.unit
+class TestPolicyAwareSweep:
+    def test_a_policy_can_extend_retention_past_the_fallback(self, tmp_path):
+        """The whole point of policies: the same directory, two different periods."""
+        rec_root = tmp_path / "recordings"
+        normal = _recording(
+            rec_root, "normal", session="s1", labels=["1400"], seconds=30.0, days=120
+        )
+        vip = _recording(rec_root, "vip", session="s2", labels=["1513"], seconds=30.0, days=120)
+
+        sweeper = RetentionSweeper(_settings(tmp_path, dry_run=False, audio_days=90))
+        sweeper.policies.save(
+            RetentionPolicy(
+                "vip",
+                "VIP",
+                audio_days=3650,
+                priority=5,
+                match_rules={"extensions": ["1513"]},
+            )
+        )
+        result = sweeper.sweep()
+
+        assert not normal.exists()
+        assert vip.exists()
+        assert result.audio_files == 1
+
+    def test_a_policy_can_shorten_retention(self, tmp_path):
+        rec_root = tmp_path / "recordings"
+        brief = _recording(rec_root, "brief", session="s1", labels=["1400"], seconds=2.0, days=30)
+
+        sweeper = RetentionSweeper(_settings(tmp_path, dry_run=False, audio_days=90))
+        sweeper.policies.save(
+            RetentionPolicy(
+                "misdials",
+                "Misdials",
+                audio_days=7,
+                priority=5,
+                match_rules={"max_duration_seconds": 5},
+            )
+        )
+        sweeper.sweep()
+
+        assert not brief.exists()
+
+    def test_media_rule_separates_voicemail_from_recordings(self, tmp_path):
+        vm = _aged(tmp_path / "voicemail" / "1500" / "msg_20260101_101010.wav", days=45)
+        rec = _recording(
+            tmp_path / "recordings", "call", session="s", labels=["1400"], seconds=30.0, days=45
+        )
+
+        sweeper = RetentionSweeper(_settings(tmp_path, dry_run=False, audio_days=90))
+        sweeper.policies.save(
+            RetentionPolicy(
+                "vm",
+                "Voicemail",
+                audio_days=30,
+                priority=5,
+                match_rules={"media": "voicemail"},
+            )
+        )
+        sweeper.sweep()
+
+        assert not vm.exists(), "voicemail policy at 30 days should have expired it"
+        assert rec.exists(), "the recording is still inside the 90-day fallback"
+
+    def test_lifetime_counters_ignore_dry_runs(self, tmp_path):
+        """
+        A "Deleted (All Time)" figure that counts files still sitting on disk is worse than
+        no figure, and the previous admin page showed exactly that kind of number.
+        """
+        _recording(
+            tmp_path / "recordings", "old", session="s", labels=["1400"], seconds=30.0, days=120
+        )
+
+        sweeper = RetentionSweeper(_settings(tmp_path, dry_run=True, audio_days=90))
+        sweeper.sweep()
+
+        assert sweeper.last_result.audio_files == 1
+        assert sweeper.lifetime_audio_deleted == 0
+
+    def test_statistics_report_dry_run_and_enabled(self, tmp_path):
+        sweeper = RetentionSweeper(_settings(tmp_path, dry_run=True))
+
+        stats = sweeper.statistics()
+
+        assert stats["dry_run"] is True
+        assert stats["enabled"] is True
+        assert stats["last_sweep"] is None
+
+
+@pytest.mark.unit
+class TestLegalHolds:
+    def test_a_held_session_is_never_swept(self, tmp_path):
+        old = _recording(
+            tmp_path / "recordings",
+            "old",
+            session="case-1",
+            labels=["1400"],
+            seconds=30.0,
+            days=9999,
+        )
+
+        sweeper = RetentionSweeper(_settings(tmp_path, dry_run=False, audio_days=90))
+        sweeper.holds.place("case-1", "Case 2026-14", "admin")
+        result = sweeper.sweep()
+
+        assert old.exists()
+        assert result.held == 1
+        assert result.audio_files == 0
+
+    def test_releasing_a_hold_lets_the_file_expire(self, tmp_path):
+        old = _recording(
+            tmp_path / "recordings",
+            "old",
+            session="case-1",
+            labels=["1400"],
+            seconds=30.0,
+            days=9999,
+        )
+        sweeper = RetentionSweeper(_settings(tmp_path, dry_run=False, audio_days=90))
+        sweeper.holds.place("case-1", "Case 2026-14", "admin")
+        sweeper.sweep()
+
+        sweeper.holds.release("case-1", "admin")
+        sweeper.sweep()
+
+        assert not old.exists()
+
+    def test_a_hold_beats_a_short_policy(self, tmp_path):
+        """A hold suspends expiry entirely; it is not merely a longer period."""
+        old = _recording(
+            tmp_path / "recordings",
+            "brief",
+            session="case-1",
+            labels=["1400"],
+            seconds=2.0,
+            days=9999,
+        )
+        sweeper = RetentionSweeper(_settings(tmp_path, dry_run=False, audio_days=90))
+        sweeper.policies.save(
+            RetentionPolicy(
+                "misdials",
+                "Misdials",
+                audio_days=1,
+                priority=5,
+                match_rules={"max_duration_seconds": 5},
+            )
+        )
+        sweeper.holds.place("case-1", "Case 2026-14", "admin")
+        sweeper.sweep()
+
+        assert old.exists()
+
+    def test_a_hold_needs_a_reason_and_an_actor(self):
+        holds = HoldStore()
+
+        assert holds.place("s-1", "", "admin") is False
+        assert holds.place("s-1", "reason", "") is False
+        assert holds.held("s-1") is False
+
+    def test_a_failed_refresh_keeps_the_previous_holds(self):
+        """
+        Clearing the set on a read error would mean a transient database fault silently lifts
+        every legal hold moments before the sweep deletes what they were protecting.
+        """
+        db = MagicMock()
+        db.enabled = True
+        db.fetch_all.side_effect = RuntimeError("connection lost")
+
+        holds = HoldStore(db)
+        holds._active = {"case-1"}
+        holds.refresh()
+
+        assert holds.held("case-1")

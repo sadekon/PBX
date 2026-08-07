@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from flask.testing import FlaskClient
 
+from pbx.features.retention_policies import RetentionPolicy
+
 
 @pytest.mark.unit
 class TestAutoAttendantConfigRoutes:
@@ -1621,25 +1623,68 @@ class TestTimeRoutingRoutes:
 
 @pytest.mark.unit
 class TestRecordingRetentionRoutes:
-    """Tests for Recording Retention endpoints."""
+    """
+    Tests for the retention endpoints.
+
+    These address the sweeper, which is now the single retention object: `recording_retention`
+    and `retention_sweeper` are the same instance. Policies come off a persisted store rather
+    than the in-memory dict that used to lose them on restart.
+    """
+
+    @staticmethod
+    def _auth():
+        return patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        )
+
+    @staticmethod
+    def _retention(mock_pbx_core: MagicMock) -> MagicMock:
+        rr = MagicMock()
+        rr.settings.audio_days = 90
+        rr.settings.transcript_days = 365
+        rr.policies.all.return_value = []
+        mock_pbx_core.recording_retention = rr
+        return rr
 
     def test_get_retention_policies_success(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
     ) -> None:
-        rr = MagicMock()
-        rr.retention_policies = {
-            "p1": {"name": "Default", "retention_days": 30, "tags": ["default"]},
-        }
-        mock_pbx_core.recording_retention = rr
+        rr = self._retention(mock_pbx_core)
+        rr.policies.all.return_value = [
+            RetentionPolicy(
+                policy_id="default",
+                name="Default retention",
+                audio_days=90,
+                transcript_days=365,
+                priority=1000,
+                origin="config",
+            )
+        ]
 
-        with patch(
-            "pbx.api.utils.verify_authentication",
-            return_value=(True, {"extension": "1001", "is_admin": True}),
-        ):
+        with self._auth():
             resp = api_client.get("/api/recording-retention/policies")
         assert resp.status_code == 200
         data = json.loads(resp.data)
         assert data["count"] == 1
+        policy = data["policies"][0]
+        assert policy["policy_id"] == "default"
+        assert policy["audio_days"] == 90
+        assert policy["transcript_days"] == 365
+        # A policy with no rules governs everything; the UI has to be able to say so.
+        assert policy["catch_all"] is True
+
+    def test_policies_report_the_fallback_periods(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        """A null period on a policy means 'inherit', so the page needs the inherited value."""
+        self._retention(mock_pbx_core)
+
+        with self._auth():
+            resp = api_client.get("/api/recording-retention/policies")
+        data = json.loads(resp.data)
+        assert data["fallback_audio_days"] == 90
+        assert data["fallback_transcript_days"] == 365
 
     def test_get_retention_policies_not_initialized(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
@@ -1647,66 +1692,172 @@ class TestRecordingRetentionRoutes:
         if hasattr(mock_pbx_core, "recording_retention"):
             del mock_pbx_core.recording_retention
 
-        with patch(
-            "pbx.api.utils.verify_authentication",
-            return_value=(True, {"extension": "1001", "is_admin": True}),
-        ):
+        with self._auth():
             resp = api_client.get("/api/recording-retention/policies")
         assert resp.status_code == 500
 
     def test_get_retention_statistics_success(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
     ) -> None:
-        rr = MagicMock()
-        rr.get_statistics.return_value = {
+        rr = self._retention(mock_pbx_core)
+        rr.statistics.return_value = {
+            "enabled": True,
+            "dry_run": False,
             "policies": 1,
-            "total_recordings": 100,
-            "lifetime_deleted": 50,
-            "last_cleanup": None,
+            "active_holds": 2,
+            "managed_recordings": 100,
+            "fallback_audio_days": 90,
+            "fallback_transcript_days": 365,
+            "last_sweep": None,
+            "lifetime_audio_deleted": 50,
+            "lifetime_transcripts_deleted": 5,
+            "last_sweep_summary": None,
         }
-        mock_pbx_core.recording_retention = rr
 
-        with patch(
-            "pbx.api.utils.verify_authentication",
-            return_value=(True, {"extension": "1001", "is_admin": True}),
-        ):
+        with self._auth():
             resp = api_client.get("/api/recording-retention/statistics")
         assert resp.status_code == 200
         data = json.loads(resp.data)
         assert data["total_policies"] == 1
         assert data["total_recordings"] == 100
+        assert data["deleted_count"] == 50
+        assert data["active_holds"] == 2
+
+    def test_statistics_surface_dry_run(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        """
+        The most important field on the page.
+
+        Without it "0 deleted, never cleaned" reads as "retention ran and had nothing to do",
+        when it actually means retention is in report-only mode. The old UI showed exactly
+        that ambiguous zero.
+        """
+        rr = self._retention(mock_pbx_core)
+        rr.statistics.return_value = {
+            "enabled": True,
+            "dry_run": True,
+            "policies": 1,
+            "active_holds": 0,
+            "managed_recordings": 7,
+            "fallback_audio_days": 90,
+            "fallback_transcript_days": 365,
+            "last_sweep": "2026-08-07T00:00:00+00:00",
+            "lifetime_audio_deleted": 0,
+            "lifetime_transcripts_deleted": 0,
+            "last_sweep_summary": "would delete 3 audio file(s) (1.0 MB) and 0 transcript(s)",
+        }
+
+        with self._auth():
+            resp = api_client.get("/api/recording-retention/statistics")
+        data = json.loads(resp.data)
+        assert data["dry_run"] is True
+        assert data["enabled"] is True
+        assert data["deleted_count"] == 0
+        assert "would delete" in data["last_sweep_summary"]
 
     def test_add_retention_policy_success(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
     ) -> None:
-        rr = MagicMock()
-        rr.add_policy.return_value = "p1"
-        mock_pbx_core.recording_retention = rr
+        rr = self._retention(mock_pbx_core)
+        rr.policies.save.return_value = True
 
-        with patch(
-            "pbx.api.utils.verify_authentication",
-            return_value=(True, {"extension": "1001", "is_admin": True}),
-        ):
+        with self._auth():
             resp = api_client.post(
                 "/api/recording-retention/policy",
-                data=json.dumps({"name": "Default", "retention_days": 30}),
+                data=json.dumps(
+                    {"name": "Support calls", "audio_days": 30, "transcript_days": 180}
+                ),
                 content_type="application/json",
             )
         assert resp.status_code == 200
+        saved = rr.policies.save.call_args[0][0]
+        assert saved.audio_days == 30
+        assert saved.transcript_days == 180
+        assert saved.origin == "api"
+
+    def test_add_policy_accepts_match_rules(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        rr = self._retention(mock_pbx_core)
+        rr.policies.save.return_value = True
+
+        with self._auth():
+            resp = api_client.post(
+                "/api/recording-retention/policy",
+                data=json.dumps(
+                    {
+                        "name": "Voicemail",
+                        "audio_days": 30,
+                        "match_rules": {"media": "voicemail"},
+                    }
+                ),
+                content_type="application/json",
+            )
+        assert resp.status_code == 200
+        assert rr.policies.save.call_args[0][0].match_rules == {"media": "voicemail"}
+
+    def test_add_policy_rejects_unknown_match_key(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        """
+        A typo must not be silently dropped.
+
+        Ignoring an unrecognised condition makes a policy match *more* files, and this
+        subsystem deletes them -- so a misspelled key would quietly widen a narrow policy
+        into a catch-all.
+        """
+        rr = self._retention(mock_pbx_core)
+
+        with self._auth():
+            resp = api_client.post(
+                "/api/recording-retention/policy",
+                data=json.dumps(
+                    {"name": "Typo", "audio_days": 30, "match_rules": {"medai": "voicemail"}}
+                ),
+                content_type="application/json",
+            )
+        assert resp.status_code == 400
+        rr.policies.save.assert_not_called()
+
+    def test_add_policy_allows_one_period_only(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        """Setting only audio_days leaves transcripts on the fallback, not on zero days."""
+        rr = self._retention(mock_pbx_core)
+        rr.policies.save.return_value = True
+
+        with self._auth():
+            resp = api_client.post(
+                "/api/recording-retention/policy",
+                data=json.dumps({"name": "Audio only", "audio_days": 30}),
+                content_type="application/json",
+            )
+        assert resp.status_code == 200
+        assert rr.policies.save.call_args[0][0].transcript_days is None
 
     def test_add_retention_policy_missing_fields(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
     ) -> None:
-        rr = MagicMock()
-        mock_pbx_core.recording_retention = rr
+        self._retention(mock_pbx_core)
 
-        with patch(
-            "pbx.api.utils.verify_authentication",
-            return_value=(True, {"extension": "1001", "is_admin": True}),
-        ):
+        with self._auth():
             resp = api_client.post(
                 "/api/recording-retention/policy",
-                data=json.dumps({"name": "Default"}),
+                data=json.dumps({"audio_days": 30}),
+                content_type="application/json",
+            )
+        assert resp.status_code == 400
+
+    def test_add_policy_requires_at_least_one_period(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        self._retention(mock_pbx_core)
+
+        with self._auth():
+            resp = api_client.post(
+                "/api/recording-retention/policy",
+                data=json.dumps({"name": "Empty"}),
                 content_type="application/json",
             )
         assert resp.status_code == 400
@@ -1714,16 +1865,12 @@ class TestRecordingRetentionRoutes:
     def test_add_retention_policy_invalid_days(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
     ) -> None:
-        rr = MagicMock()
-        mock_pbx_core.recording_retention = rr
+        self._retention(mock_pbx_core)
 
-        with patch(
-            "pbx.api.utils.verify_authentication",
-            return_value=(True, {"extension": "1001", "is_admin": True}),
-        ):
+        with self._auth():
             resp = api_client.post(
                 "/api/recording-retention/policy",
-                data=json.dumps({"name": "Bad", "retention_days": 9999}),
+                data=json.dumps({"name": "Bad", "audio_days": 9999}),
                 content_type="application/json",
             )
         assert resp.status_code == 400
@@ -1731,16 +1878,14 @@ class TestRecordingRetentionRoutes:
     def test_add_retention_policy_invalid_name(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
     ) -> None:
-        rr = MagicMock()
-        mock_pbx_core.recording_retention = rr
+        self._retention(mock_pbx_core)
 
-        with patch(
-            "pbx.api.utils.verify_authentication",
-            return_value=(True, {"extension": "1001", "is_admin": True}),
-        ):
+        with self._auth():
             resp = api_client.post(
                 "/api/recording-retention/policy",
-                data=json.dumps({"name": "<script>alert(1)</script>", "retention_days": 30}),
+                data=json.dumps(
+                    {"name": "<script>alert(1)</script>", "audio_days": 30}
+                ),
                 content_type="application/json",
             )
         assert resp.status_code == 400
@@ -1748,30 +1893,123 @@ class TestRecordingRetentionRoutes:
     def test_delete_retention_policy_success(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
     ) -> None:
-        rr = MagicMock()
-        rr.retention_policies = {"p1": {"name": "Default"}}
-        mock_pbx_core.recording_retention = rr
+        rr = self._retention(mock_pbx_core)
+        rr.policies.delete.return_value = True
 
-        with patch(
-            "pbx.api.utils.verify_authentication",
-            return_value=(True, {"extension": "1001", "is_admin": True}),
-        ):
+        with self._auth():
             resp = api_client.delete("/api/recording-retention/policy/p1")
         assert resp.status_code == 200
 
     def test_delete_retention_policy_not_found(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
     ) -> None:
-        rr = MagicMock()
-        rr.retention_policies = {}
-        mock_pbx_core.recording_retention = rr
+        rr = self._retention(mock_pbx_core)
+        rr.policies.delete.return_value = False
 
-        with patch(
-            "pbx.api.utils.verify_authentication",
-            return_value=(True, {"extension": "1001", "is_admin": True}),
-        ):
+        with self._auth():
             resp = api_client.delete("/api/recording-retention/policy/nonexistent")
         assert resp.status_code == 404
+
+
+@pytest.mark.unit
+class TestRetentionHoldRoutes:
+    """
+    Tests for legal holds.
+
+    A hold is not a long retention period: it suspends expiry entirely and must be released
+    deliberately. That is why both a reason and an actor are mandatory.
+    """
+
+    @staticmethod
+    def _auth():
+        return patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        )
+
+    def test_place_hold_success(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        rr = MagicMock()
+        rr.holds.place.return_value = True
+        mock_pbx_core.recording_retention = rr
+
+        with self._auth():
+            resp = api_client.post(
+                "/api/recording-retention/hold",
+                data=json.dumps({"session_id": "abc-123", "reason": "Case 2026-14"}),
+                content_type="application/json",
+            )
+        assert resp.status_code == 200
+        rr.holds.place.assert_called_once()
+        assert rr.holds.place.call_args[0][0] == "abc-123"
+
+    def test_place_hold_requires_a_reason(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        """A hold nobody can explain is one nobody will ever dare release."""
+        rr = MagicMock()
+        mock_pbx_core.recording_retention = rr
+
+        with self._auth():
+            resp = api_client.post(
+                "/api/recording-retention/hold",
+                data=json.dumps({"session_id": "abc-123"}),
+                content_type="application/json",
+            )
+        assert resp.status_code == 400
+        rr.holds.place.assert_not_called()
+
+    def test_place_hold_requires_a_session(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        rr = MagicMock()
+        mock_pbx_core.recording_retention = rr
+
+        with self._auth():
+            resp = api_client.post(
+                "/api/recording-retention/hold",
+                data=json.dumps({"reason": "Case 2026-14"}),
+                content_type="application/json",
+            )
+        assert resp.status_code == 400
+        rr.holds.place.assert_not_called()
+
+    def test_release_hold_success(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        rr = MagicMock()
+        rr.holds.release.return_value = True
+        mock_pbx_core.recording_retention = rr
+
+        with self._auth():
+            resp = api_client.delete("/api/recording-retention/hold/abc-123")
+        assert resp.status_code == 200
+
+    def test_list_holds_excludes_released_by_default(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        rr = MagicMock()
+        rr.holds.list_holds.return_value = [{"session_id": "abc-123"}]
+        mock_pbx_core.recording_retention = rr
+
+        with self._auth():
+            resp = api_client.get("/api/recording-retention/holds")
+        assert resp.status_code == 200
+        assert json.loads(resp.data)["count"] == 1
+        rr.holds.list_holds.assert_called_once_with(False)
+
+    def test_list_holds_can_include_released(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        rr = MagicMock()
+        rr.holds.list_holds.return_value = []
+        mock_pbx_core.recording_retention = rr
+
+        with self._auth():
+            resp = api_client.get("/api/recording-retention/holds?include_released=true")
+        assert resp.status_code == 200
+        rr.holds.list_holds.assert_called_once_with(True)
 
 
 @pytest.mark.unit

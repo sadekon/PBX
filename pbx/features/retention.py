@@ -1,9 +1,13 @@
 """
 Deleting recordings, voicemail and transcripts once they are old enough.
 
-Nothing in this PBX has ever actually expired. ``RecordingRetentionManager`` has policies, a
-scanner and a working ``cleanup_old_recordings`` -- and no caller, anywhere. Voicemail never
-had retention at all. So both ``recordings/`` and ``voicemail/`` grow until the disk does not.
+This is the *executor*; :mod:`pbx.features.retention_policies` is the policy store it acts on.
+Until those two were joined there were two retention systems that never met: one owned
+policies and had no caller, the other deleted on a timer and knew no policies. The admin UI
+edited the first while the second did the deleting, so a saved policy governed nothing.
+
+Every file is now resolved against the policy table, falling back to the periods below when no
+policy matches. Anything under an unreleased legal hold is skipped whatever its age.
 
 Two clocks, deliberately, not one:
 
@@ -24,12 +28,21 @@ before flipping it.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pbx.features.retention_policies import (
+    MEDIA_RECORDING,
+    MEDIA_VOICEMAIL,
+    HoldStore,
+    PolicyStore,
+    RecordingFacts,
+    facts_for,
+)
 from pbx.utils.logger import get_logger
 from pbx.utils.periodic import PeriodicTask
 
@@ -40,6 +53,10 @@ CONFIG_SECTION = "retention"
 DEFAULT_AUDIO_DAYS = 90
 DEFAULT_TRANSCRIPT_DAYS = 365
 DEFAULT_INTERVAL_HOURS = 24.0
+
+#: Transcript rows deleted per statement. Bounds the IN list on a first sweep, which on a
+#: long-neglected install can expire everything at once.
+TRANSCRIPT_DELETE_CHUNK = 500
 
 #: Only these are swept. A retention sweep walking a directory it does not understand is how
 #: you lose a greeting, a prompt or somebody's music-on-hold.
@@ -134,6 +151,10 @@ class SweepResult:
     #: own. Counted separately so the audio figure stays a count of recordings.
     sidecars: int = 0
     transcripts: int = 0
+    #: Items left alone because their session is under an unreleased legal hold. Reported
+    #: because "nothing expired this week" and "nothing expired because 400 calls are frozen
+    #: for a lawsuit" need to look different in the log.
+    held: int = 0
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -143,9 +164,10 @@ class SweepResult:
     def summary(self) -> str:
         verb = "would delete" if self.dry_run else "deleted"
         sidecars = f", {self.sidecars} manifest(s)" if self.sidecars else ""
+        held = f", {self.held} held" if self.held else ""
         return (
             f"{verb} {self.audio_files} audio file(s) ({self.audio_megabytes:,.1f} MB)"
-            f"{sidecars} and {self.transcripts} transcript(s)"
+            f"{sidecars} and {self.transcripts} transcript(s){held}"
         )
 
 
@@ -163,10 +185,24 @@ class RetentionSweeper:
         settings: RetentionSettings,
         database: Any | None = None,
         logger: Any | None = None,
+        policies: PolicyStore | None = None,
+        holds: HoldStore | None = None,
     ) -> None:
         self.settings = settings
         self.database = database
         self.logger = logger or get_logger()
+        # Constructed rather than required, so a caller that only wants the flat periods still
+        # gets a working sweeper -- an empty policy store resolves to the fallback every time.
+        self.policies = policies if policies is not None else PolicyStore(database, self.logger)
+        self.holds = holds if holds is not None else HoldStore(database, self.logger)
+
+        # Reported to the admin UI. Lifetime counters advance only on real deletions, never on
+        # dry runs -- a "Deleted (All Time)" figure that counts things still sitting on disk is
+        # worse than no figure, and the previous UI showed exactly that kind of number.
+        self.last_sweep: datetime | None = None
+        self.last_result: SweepResult | None = None
+        self.lifetime_audio_deleted = 0
+        self.lifetime_transcripts_deleted = 0
         self._task = PeriodicTask(
             "RetentionSweeper",
             settings.interval_hours * 3600,
@@ -187,10 +223,15 @@ class RetentionSweeper:
         for problem in self.settings.validate():
             self.logger.warning(f"Retention config: {problem}")
 
+        # Load before seeding: seed() only writes into an empty table, so it has to know
+        # whether one is already there. After the first start this is a no-op.
+        self.policies.load()
+        self.policies.seed(self.settings.audio_days, self.settings.transcript_days)
+
         mode = "DRY RUN - nothing will be deleted" if self.settings.dry_run else "deleting"
         self.logger.info(
-            f"Retention: audio {self.settings.audio_days}d, "
-            f"transcripts {self.settings.transcript_days}d ({mode})"
+            f"Retention: {len(self.policies.all())} policy/policies, fallback audio "
+            f"{self.settings.audio_days}d, transcripts {self.settings.transcript_days}d ({mode})"
         )
         self._task.start()
 
@@ -207,11 +248,25 @@ class RetentionSweeper:
         result = SweepResult(dry_run=self.settings.dry_run)
         started = time.monotonic()
 
-        cutoff = datetime.now(UTC) - timedelta(days=self.settings.audio_days)
-        for root in (self.settings.voicemail_path, self.settings.recording_path):
-            self._sweep_audio(Path(root), cutoff, result)
+        # Re-read both on every sweep, so an operator's policy edit or a hold placed this
+        # morning takes effect tonight rather than at the next restart.
+        self.policies.load()
+        self.holds.refresh()
 
-        self._sweep_transcripts(result)
+        now = datetime.now(UTC)
+        for root, media in (
+            (self.settings.voicemail_path, MEDIA_VOICEMAIL),
+            (self.settings.recording_path, MEDIA_RECORDING),
+        ):
+            self._sweep_audio(Path(root), media, now, result)
+
+        self._sweep_transcripts(now, result)
+
+        self.last_sweep = now
+        self.last_result = result
+        if not result.dry_run:
+            self.lifetime_audio_deleted += result.audio_files
+            self.lifetime_transcripts_deleted += result.transcripts
 
         self.logger.info(
             f"Retention sweep: {result.summary()} in {time.monotonic() - started:.1f}s"
@@ -220,10 +275,52 @@ class RetentionSweeper:
             self.logger.warning(f"Retention: {error}")
         return result
 
-    def _sweep_audio(self, root: Path, cutoff: datetime, result: SweepResult) -> None:
-        """Delete recordings under `root` last modified before `cutoff`."""
+    def statistics(self) -> dict[str, Any]:
+        """
+        What the admin UI shows. Deliberately reports `dry_run`.
+
+        Without it the page cannot distinguish "retention ran and had nothing to remove" from
+        "retention is in report-only mode and has never removed anything" -- and those look
+        identical in every counter here.
+        """
+        managed = 0
+        for root in (self.settings.voicemail_path, self.settings.recording_path):
+            path = Path(root)
+            if not path.is_dir():
+                continue
+            managed += sum(
+                1
+                for f in path.rglob(AUDIO_SUFFIX)
+                if f.name not in KEEP_FOREVER
+                and not SKIP_DIR_NAMES.intersection(f.relative_to(path).parts[:-1])
+            )
+
+        return {
+            "enabled": self.settings.enabled,
+            "running": self.running,
+            "dry_run": self.settings.dry_run,
+            "policies": len(self.policies.all()),
+            "active_holds": len(self.holds.active),
+            "managed_recordings": managed,
+            "fallback_audio_days": self.settings.audio_days,
+            "fallback_transcript_days": self.settings.transcript_days,
+            "last_sweep": self.last_sweep.isoformat() if self.last_sweep else None,
+            "lifetime_audio_deleted": self.lifetime_audio_deleted,
+            "lifetime_transcripts_deleted": self.lifetime_transcripts_deleted,
+            "last_sweep_summary": self.last_result.summary() if self.last_result else None,
+        }
+
+    def _sweep_audio(self, root: Path, media: str, now: datetime, result: SweepResult) -> None:
+        """
+        Delete recordings under `root` that are past whatever period governs each of them.
+
+        The cutoff is per file, not per sweep: two recordings in the same directory can be
+        governed by different policies, so each one's age is compared against its own period.
+        """
         if not root.is_dir():
             return
+
+        fallback = timedelta(days=self.settings.audio_days)
 
         for path in root.rglob(AUDIO_SUFFIX):
             if path.name in KEEP_FOREVER:
@@ -236,13 +333,33 @@ class RetentionSweeper:
             try:
                 stat = path.stat()
                 modified = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
-                if modified >= cutoff:
+
+                # Cheapest test first: nothing younger than the shortest possible period can
+                # expire under any policy, and that skips almost every file on a daily sweep
+                # without reading a single sidecar.
+                if modified >= now - self._shortest_audio_period():
+                    continue
+
+                facts = facts_for(path, media)
+                if self.holds.held(facts.session_id):
+                    result.held += 1
+                    self.logger.debug(f"  holding {path} (session {facts.session_id})")
+                    continue
+
+                policy = self.policies.resolve(facts)
+                period = fallback
+                if policy is not None and policy.audio_days is not None:
+                    period = timedelta(days=policy.audio_days)
+                if modified >= now - period:
                     continue
 
                 result.audio_files += 1
                 result.audio_bytes += stat.st_size
                 if self.settings.dry_run:
-                    self.logger.debug(f"  would delete {path} ({modified:%Y-%m-%d})")
+                    self.logger.debug(
+                        f"  would delete {path} ({modified:%Y-%m-%d}, "
+                        f"policy {policy.policy_id if policy else 'fallback'})"
+                    )
                 else:
                     path.unlink()
                     self.logger.debug(f"  deleted {path}")
@@ -252,7 +369,20 @@ class RetentionSweeper:
                 # One unreadable file must not end the sweep; the rest still expire.
                 result.errors.append(f"{path}: {e}")
 
-        self._sweep_orphan_sidecars(root, cutoff, result)
+        self._sweep_orphan_sidecars(root, now - fallback, result)
+
+    def _shortest_audio_period(self) -> timedelta:
+        """
+        The shortest audio period any policy could impose.
+
+        Used only as a pre-filter, so it must never be *longer* than a real period or files
+        would be skipped before their policy was ever consulted.
+        """
+        days = [self.settings.audio_days]
+        days.extend(
+            p.audio_days for p in self.policies.all() if p.enabled and p.audio_days is not None
+        )
+        return timedelta(days=max(1, min(days)))
 
     def _sweep_sidecar(self, audio: Path, result: SweepResult) -> None:
         """
@@ -304,28 +434,109 @@ class RetentionSweeper:
             except OSError as e:
                 result.errors.append(f"{sidecar}: {e}")
 
-    def _sweep_transcripts(self, result: SweepResult) -> None:
-        """Delete transcripts past their own, longer period."""
+    def _sweep_transcripts(self, now: datetime, result: SweepResult) -> None:
+        """
+        Delete transcripts past their own, longer period.
+
+        Policy is resolved per row from columns rather than from the sidecar, because by the
+        time a transcript expires its recording is long gone -- audio runs on the short clock
+        and the manifest goes with it. That is why migration 1018 puts ``participants`` and
+        ``session_id`` on the row: they are the only surviving record of who was on the call.
+        """
         if not (self.database and getattr(self.database, "enabled", False)):
             return
 
-        cutoff = datetime.now(UTC) - timedelta(days=self.settings.transcript_days)
+        # Widest net first, then decide per row. Fetching by the shortest period keeps the scan
+        # bounded without letting a short policy's rows escape the query.
+        horizon = now - self._shortest_transcript_period()
         try:
-            # fetch_one for the read, execute for the write. execute() returns a bool
-            # whatever the statement, so counting with it yields True and then explodes on
-            # subscripting -- which is exactly how this failed on the first real sweep.
-            row = self.database.fetch_one(
-                "SELECT COUNT(*) AS expired FROM call_transcripts WHERE created_at < %s",
-                (cutoff,),
+            rows = self.database.fetch_all(
+                """
+                SELECT id, session_id, source, participants, audio_duration, created_at
+                  FROM call_transcripts
+                 WHERE created_at < %s
+                """,
+                (horizon,),
             )
-            count = int(row["expired"]) if row else 0
-            result.transcripts = count
-
-            if count and not self.settings.dry_run:
-                self.database.execute(
-                    "DELETE FROM call_transcripts WHERE created_at < %s", (cutoff,)
-                )
         except Exception as e:
             # Broad: every driver raises its own type, and a failed sweep must not take the
             # background thread -- or the PBX -- down with it.
             result.errors.append(f"transcript sweep failed: {e}")
+            return
+
+        fallback = timedelta(days=self.settings.transcript_days)
+        expired: list[Any] = []
+
+        for row in rows or []:
+            created = row.get("created_at")
+            if not isinstance(created, datetime):
+                continue
+            if created.tzinfo is None:
+                # The column is a naive TIMESTAMP; every writer stores UTC.
+                created = created.replace(tzinfo=UTC)
+
+            session_id = str(row.get("session_id") or "")
+            if self.holds.held(session_id):
+                result.held += 1
+                continue
+
+            policy = self.policies.resolve(self._transcript_facts(row))
+            period = fallback
+            if policy is not None and policy.transcript_days is not None:
+                period = timedelta(days=policy.transcript_days)
+
+            if created < now - period:
+                expired.append(row["id"])
+
+        result.transcripts = len(expired)
+        if not expired or self.settings.dry_run:
+            return
+
+        try:
+            # Chunked: a first sweep on a long-neglected install can expire tens of thousands
+            # of rows, and one IN list that size is a statement no driver enjoys.
+            for start in range(0, len(expired), TRANSCRIPT_DELETE_CHUNK):
+                chunk = expired[start : start + TRANSCRIPT_DELETE_CHUNK]
+                placeholders = ", ".join(["%s"] * len(chunk))
+                self.database.execute(
+                    f"DELETE FROM call_transcripts WHERE id IN ({placeholders})",
+                    tuple(chunk),
+                )
+        except Exception as e:
+            result.errors.append(f"transcript delete failed: {e}")
+
+    def _shortest_transcript_period(self) -> timedelta:
+        """Shortest transcript period any policy could impose. See `_shortest_audio_period`."""
+        days = [self.settings.transcript_days]
+        days.extend(
+            p.transcript_days
+            for p in self.policies.all()
+            if p.enabled and p.transcript_days is not None
+        )
+        return timedelta(days=max(1, min(days)))
+
+    def _transcript_facts(self, row: dict) -> RecordingFacts:
+        """
+        Rebuild match facts from a transcript row.
+
+        ``source`` is 'recording', 'voicemail' or 'live'; the first two line up with the media
+        vocabulary, and a live transcript simply matches no media rule.
+        """
+        raw = row.get("participants")
+        participants: tuple[str, ...] = ()
+        if raw:
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(parsed, list):
+                    participants = tuple(str(p) for p in parsed)
+            except (TypeError, ValueError):
+                participants = ()
+
+        duration = row.get("audio_duration")
+        return RecordingFacts(
+            path=Path(),
+            media=str(row.get("source") or ""),
+            session_id=str(row.get("session_id") or ""),
+            participants=participants,
+            duration_seconds=float(duration) if isinstance(duration, int | float) else None,
+        )

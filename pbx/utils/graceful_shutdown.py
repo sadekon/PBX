@@ -160,7 +160,7 @@ class GracefulShutdownHandler:
             ("Mailer", lambda: self._stop_if_exists("mailer")),
             ("Security Monitor", lambda: self._stop_if_exists("security_monitor")),
             ("DND Scheduler", lambda: self._stop_if_exists("dnd_scheduler")),
-            ("Recording Retention", lambda: self._stop_if_exists("recording_retention")),
+            ("Retention Sweeper", lambda: self._stop_if_exists("retention_sweeper")),
             ("API Server", lambda: self._stop_if_exists("api_server")),
             ("SIP Server", lambda: self._stop_if_exists("sip_server")),
         ]

@@ -25,8 +25,18 @@ timezone: America/New_York
 # Two clocks on purpose. Audio is where the bytes and the privacy weight are (~170 KB for a
 # 21-second recording); a transcript is ~2% of that and carries most of the value, so it is
 # kept longer. Deleting a voicemail already keeps its transcript.
+# Retention. The periods below are the *fallback*, used for anything no policy matches.
+#
+# On the first start against an empty retention_policies table these two values are written
+# out as a catch-all policy named "default". From then on the table is authoritative and the
+# admin UI owns it: editing the policy there survives restarts, and changing audio_days here
+# afterwards will NOT move an already-seeded policy. Edit it in the UI, or delete the row to
+# have it re-seeded.
+#
+# Legal holds override everything here. A held session is never swept, at any age, until it
+# is explicitly released.
 retention:
-  enabled: true           # Master switch. Nothing is swept while this is false.
+  enabled: true            # Master switch. Nothing is swept while this is false.
   dry_run: true            # Log what would be deleted, delete nothing. Turn off deliberately.
   interval_hours: 24       # How often the sweep runs
   audio_days: 90           # Recordings and voicemail .wav files

@@ -76,23 +76,45 @@ interface HotDeskSessionsResponse {
     sessions?: HotDeskSession[];
 }
 
+interface RetentionMatchRules {
+    media?: string;
+    extensions?: string[];
+    min_duration_seconds?: number;
+    max_duration_seconds?: number;
+}
+
 interface RetentionPolicy {
     policy_id: string;
     name: string;
-    retention_days: number;
-    tags?: string[];
-    created_at?: string;
+    description?: string;
+    // Null means "inherit the fallback", which is not the same as zero days.
+    audio_days: number | null;
+    transcript_days: number | null;
+    priority: number;
+    match_rules?: RetentionMatchRules;
+    enabled: boolean;
+    origin?: string;
+    catch_all?: boolean;
 }
 
 interface RetentionPoliciesResponse {
     policies?: RetentionPolicy[];
+    fallback_audio_days?: number;
+    fallback_transcript_days?: number;
 }
 
 interface RetentionStatisticsResponse {
     total_policies?: number;
     total_recordings?: number;
     deleted_count?: number;
+    transcripts_deleted?: number;
     last_cleanup?: string;
+    last_sweep_summary?: string | null;
+    active_holds?: number;
+    enabled?: boolean;
+    dry_run?: boolean;
+    fallback_audio_days?: number;
+    fallback_transcript_days?: number;
 }
 
 interface CallbackEntry {
@@ -845,10 +867,43 @@ export async function loadRetentionPolicies(): Promise<void> {
             if (deleted) deleted.textContent = String(statsData.deleted_count || 0);
 
             const lastCleanup = statsData.last_cleanup
-                ? new Date(statsData.last_cleanup).toLocaleDateString()
+                ? new Date(statsData.last_cleanup).toLocaleString()
                 : 'Never';
             const cleanupEl = document.getElementById('retention-last-cleanup') as HTMLElement | null;
             if (cleanupEl) cleanupEl.textContent = lastCleanup;
+
+            // The mode banner is the most important thing on this page. Without it, a
+            // "0 deleted / never cleaned" reading looks like retention is working and has had
+            // nothing to do -- when it usually means retention is disabled, or is in
+            // report-only mode and will never delete anything at all.
+            const banner = document.getElementById('retention-mode-banner') as HTMLElement | null;
+            if (banner) {
+                if (statsData.enabled === false) {
+                    banner.className = 'alert alert-warning';
+                    banner.textContent =
+                        'Retention is DISABLED. Nothing is being deleted, and these policies '
+                        + 'do not apply. Set retention.enabled in config.yml to turn it on.';
+                } else if (statsData.dry_run) {
+                    banner.className = 'alert alert-warning';
+                    banner.textContent =
+                        'Retention is in DRY RUN mode: it reports what it would delete and '
+                        + 'deletes nothing. Policies below are evaluated but never acted on. '
+                        + (statsData.last_sweep_summary
+                            ? `Last sweep: ${statsData.last_sweep_summary}`
+                            : 'No sweep has run yet.');
+                } else {
+                    banner.className = 'alert alert-info';
+                    banner.textContent =
+                        'Retention is ACTIVE and deleting on schedule. '
+                        + (statsData.last_sweep_summary
+                            ? `Last sweep: ${statsData.last_sweep_summary}`
+                            : 'No sweep has run yet.');
+                }
+                if (statsData.active_holds) {
+                    banner.textContent +=
+                        ` ${statsData.active_holds} session(s) under legal hold are exempt.`;
+                }
+            }
         }
 
         // Update policies table
@@ -856,19 +911,45 @@ export async function loadRetentionPolicies(): Promise<void> {
             const tbody = document.getElementById('retention-policies-list') as HTMLElement | null;
             if (!tbody) return;
 
+            const fallbackAudio = policiesData.fallback_audio_days ?? 0;
+            const fallbackTranscript = policiesData.fallback_transcript_days ?? 0;
+
+            // A null period inherits the config fallback. Showing "0 days" there would read
+            // as "delete immediately", which is the opposite of what it means.
+            const period = (days: number | null, fallback: number): string =>
+                days === null
+                    ? `<em>inherits ${fallback}d</em>`
+                    : `${days} days`;
+
             if (policiesData.policies.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align: center;">No retention policies configured</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center;">No retention policies configured</td></tr>';
             } else {
                 tbody.innerHTML = policiesData.policies.map(policy => {
-                    const created = policy.created_at ? new Date(policy.created_at).toLocaleDateString() : 'N/A';
-                    const tags = policy.tags ? policy.tags.join(', ') : 'None';
+                    const rules = policy.match_rules || {};
+                    const parts: string[] = [];
+                    if (rules.media) parts.push(`media = ${rules.media}`);
+                    if (rules.extensions && rules.extensions.length) {
+                        parts.push(`ext in ${rules.extensions.join(', ')}`);
+                    }
+                    if (rules.min_duration_seconds !== undefined) {
+                        parts.push(`≥ ${rules.min_duration_seconds}s`);
+                    }
+                    if (rules.max_duration_seconds !== undefined) {
+                        parts.push(`≤ ${rules.max_duration_seconds}s`);
+                    }
+                    const applies = parts.length
+                        ? escapeHtml(parts.join(' and '))
+                        : '<strong>everything</strong> (catch-all)';
+
+                    const state = policy.enabled ? '' : ' <small>(disabled)</small>';
 
                     return `
                         <tr>
-                            <td><strong>${escapeHtml(policy.name)}</strong></td>
-                            <td>${policy.retention_days} days</td>
-                            <td><small>${escapeHtml(tags)}</small></td>
-                            <td><small>${created}</small></td>
+                            <td><strong>${escapeHtml(policy.name)}</strong>${state}<br><small>${escapeHtml(policy.policy_id)}</small></td>
+                            <td>${period(policy.audio_days, fallbackAudio)}</td>
+                            <td>${period(policy.transcript_days, fallbackTranscript)}</td>
+                            <td><small>${applies}</small></td>
+                            <td><small>${policy.priority}</small></td>
                             <td>
                                 <button class="btn-small btn-danger" onclick="deleteRetentionPolicy('${escapeHtml(policy.policy_id)}', '${escapeHtml(policy.name)}')">Delete</button>
                             </td>
@@ -899,8 +980,12 @@ export async function addRetentionPolicy(event: Event): Promise<void> {
     event.preventDefault();
 
     const name = (document.getElementById('retention-policy-name') as HTMLInputElement).value;
-    const retentionDays = parseInt((document.getElementById('retention-days') as HTMLInputElement).value);
-    const tagsInput = (document.getElementById('retention-tags') as HTMLInputElement).value;
+    const audioRaw = (document.getElementById('retention-audio-days') as HTMLInputElement).value.trim();
+    const transcriptRaw = (document.getElementById('retention-transcript-days') as HTMLInputElement).value.trim();
+    const media = (document.getElementById('retention-match-media') as HTMLSelectElement).value;
+    const extensionsInput = (document.getElementById('retention-match-extensions') as HTMLInputElement).value;
+    const maxDurationRaw = (document.getElementById('retention-match-max-duration') as HTMLInputElement).value.trim();
+    const priorityRaw = (document.getElementById('retention-priority') as HTMLInputElement).value.trim();
 
     // Validate input
     if (!name.match(/^[a-zA-Z0-9_\s-]+$/)) {
@@ -908,19 +993,52 @@ export async function addRetentionPolicy(event: Event): Promise<void> {
         return;
     }
 
-    if (retentionDays < 1 || retentionDays > 3650) {
-        showNotification('Retention days must be between 1 and 3650', 'error');
+    // Blank means "inherit the fallback" rather than zero, so blanks are sent as null and
+    // only non-blank values are range-checked.
+    const parsePeriod = (raw: string, label: string): number | null | false => {
+        if (!raw) return null;
+        const days = parseInt(raw, 10);
+        if (isNaN(days) || days < 1 || days > 3650) {
+            showNotification(`${label} must be between 1 and 3650 days`, 'error');
+            return false;
+        }
+        return days;
+    };
+
+    const audioDays = parsePeriod(audioRaw, 'Audio retention');
+    if (audioDays === false) return;
+    const transcriptDays = parsePeriod(transcriptRaw, 'Transcript retention');
+    if (transcriptDays === false) return;
+
+    if (audioDays === null && transcriptDays === null) {
+        showNotification('Set at least one of audio or transcript retention', 'error');
         return;
+    }
+
+    const matchRules: Record<string, unknown> = {};
+    if (media) matchRules.media = media;
+    if (extensionsInput.trim()) {
+        matchRules.extensions = extensionsInput.split(',').map(t => t.trim()).filter(t => t);
+    }
+    if (maxDurationRaw) {
+        const seconds = parseFloat(maxDurationRaw);
+        if (isNaN(seconds) || seconds < 0) {
+            showNotification('Maximum duration must be a positive number of seconds', 'error');
+            return;
+        }
+        matchRules.max_duration_seconds = seconds;
     }
 
     const policyData: Record<string, unknown> = {
         name: name,
-        retention_days: retentionDays
+        audio_days: audioDays,
+        transcript_days: transcriptDays,
+        match_rules: matchRules
     };
 
-    // Parse tags if provided
-    if (tagsInput.trim()) {
-        policyData.tags = tagsInput.split(',').map(t => t.trim()).filter(t => t);
+    if (priorityRaw) {
+        const priority = parseInt(priorityRaw, 10);
+        if (!isNaN(priority)) policyData.priority = priority;
     }
 
     try {
