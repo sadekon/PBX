@@ -162,7 +162,11 @@ class AudioTap:
         self.sink = sink
         self.logger = logger or get_logger()
 
-        self._queue: queue.Queue[tuple[str, bytes]] = queue.Queue(maxsize=max(1, queue_size))
+        # Carries either a raw packet awaiting parse, or a frame injected by something
+        # that never went near the socket (see feed_frame).
+        self._queue: queue.Queue[RtpFrame | tuple[str, bytes]] = queue.Queue(
+            maxsize=max(1, queue_size)
+        )
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -190,6 +194,27 @@ class AudioTap:
         except Exception:
             # Genuinely unreachable, and that is exactly why it is caught: the cost of being
             # wrong is a broken call, and the cost of the guard is nothing.
+            self._dropped += 1
+        else:
+            self._fed += 1
+
+    def feed_frame(self, frame: RtpFrame) -> None:
+        """
+        Hand the tap a frame that never travelled over the socket.
+
+        Injected audio -- a recording notice, hold music -- is written straight to the socket
+        by ``RTPPlayer`` and so never passes through ``_relay_loop``, where :meth:`feed` is
+        called. Without this it is absent from its own recording, which is how music-on-hold
+        has always been missing from recordings.
+
+        Takes a built frame rather than bytes because there is no packet to parse: the caller
+        already knows the source, codec and timing.
+        """
+        try:
+            self._queue.put_nowait(frame)
+        except queue.Full:
+            self._dropped += 1
+        except Exception:
             self._dropped += 1
         else:
             self._fed += 1
@@ -253,29 +278,34 @@ class AudioTap:
         """Pull packets and hand them to the sink until asked to stop."""
         while True:
             try:
-                source, data = self._queue.get(timeout=_POLL_INTERVAL)
+                item = self._queue.get(timeout=_POLL_INTERVAL)
             except queue.Empty:
                 if self._stop.is_set():
                     return
                 continue
 
-            self._deliver(source, data)
+            self._deliver(item)
 
     def _flush(self) -> None:
         """Deliver whatever is left in the queue. Called after the thread has stopped."""
         while True:
             try:
-                source, data = self._queue.get_nowait()
+                item = self._queue.get_nowait()
             except queue.Empty:
                 return
-            self._deliver(source, data)
+            self._deliver(item)
 
-    def _deliver(self, source: str, data: bytes) -> None:
-        """Parse one packet and give it to the sink. Never raises."""
-        frame = parse_rtp_packet(data, source)
-        if frame is None:
-            self._malformed += 1
-            return
+    def _deliver(self, item: RtpFrame | tuple[str, bytes]) -> None:
+        """Give one queued item to the sink, parsing it first if it is still a packet."""
+        if isinstance(item, RtpFrame):
+            frame = item
+        else:
+            source, data = item
+            parsed = parse_rtp_packet(data, source)
+            if parsed is None:
+                self._malformed += 1
+                return
+            frame = parsed
 
         try:
             self.sink.write(frame)

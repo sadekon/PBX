@@ -1883,9 +1883,7 @@ class TestRecordingRetentionRoutes:
         with self._auth():
             resp = api_client.post(
                 "/api/recording-retention/policy",
-                data=json.dumps(
-                    {"name": "<script>alert(1)</script>", "audio_days": 30}
-                ),
+                data=json.dumps({"name": "<script>alert(1)</script>", "audio_days": 30}),
                 content_type="application/json",
             )
         assert resp.status_code == 400
@@ -1927,9 +1925,7 @@ class TestRetentionHoldRoutes:
             return_value=(True, {"extension": "1001", "is_admin": True}),
         )
 
-    def test_place_hold_success(
-        self, api_client: FlaskClient, mock_pbx_core: MagicMock
-    ) -> None:
+    def test_place_hold_success(self, api_client: FlaskClient, mock_pbx_core: MagicMock) -> None:
         rr = MagicMock()
         rr.holds.place.return_value = True
         mock_pbx_core.recording_retention = rr
@@ -1975,9 +1971,7 @@ class TestRetentionHoldRoutes:
         assert resp.status_code == 400
         rr.holds.place.assert_not_called()
 
-    def test_release_hold_success(
-        self, api_client: FlaskClient, mock_pbx_core: MagicMock
-    ) -> None:
+    def test_release_hold_success(self, api_client: FlaskClient, mock_pbx_core: MagicMock) -> None:
         rr = MagicMock()
         rr.holds.release.return_value = True
         mock_pbx_core.recording_retention = rr

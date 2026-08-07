@@ -82,6 +82,9 @@ RTP_CLOCK_HZ = 8000
 PAYLOAD_ULAW = 0
 PAYLOAD_ALAW = 8
 PAYLOAD_G722 = 9
+#: L16 mono, 8 kHz. Nothing on the wire uses it -- it is how locally injected audio (the
+#: recording notice) reaches the tape without a needless encode/decode round trip.
+PAYLOAD_L16 = 11
 
 #: A jump larger than this is treated as a discontinuity to resync on, not a gap to fill.
 #: Hold-and-resume re-INVITEs restart the timestamp series, and filling that "gap" literally
@@ -107,19 +110,6 @@ LEAD_QUANTUM_SAMPLES = 160
 #: unexpectedly would otherwise open one per packet. Comfortably above `mixer.max_ports_per_
 #: bridge` (8) plus room for transfers.
 MAX_CHANNELS = 32
-
-#: Config key that must *also* be true before anything is recorded.
-#:
-#: ``features.call_recording`` has been true in config.yml for as long as it has existed, and
-#: was harmless the whole time because nothing fed the recorder. Wiring the RTP tap turned that
-#: dormant flag into "record every call from the next restart", which is not a change anybody
-#: opted into by leaving a config file alone.
-#:
-#: Recording a call without telling the participants is unlawful in two-party-consent
-#: jurisdictions. This PBX plays no announcement yet, so the second key is the thing that says
-#: an operator decided, rather than inherited, that recording is appropriate here. Remove it
-#: once a consent announcement exists and the decision has somewhere better to live.
-CONSENT_KEY = "recording.consent_acknowledged"
 
 
 class _Channel:
@@ -203,6 +193,9 @@ class _Channel:
             return alaw_to_pcm16(payload)
         if payload_type == PAYLOAD_G722:
             return self._decode_g722(payload)
+        if payload_type == PAYLOAD_L16:
+            # Already what a channel stores; only the byte order needs asserting.
+            return np.frombuffer(payload, dtype="<i2")
 
         self.undecodable_packets += 1
         return None
@@ -565,17 +558,12 @@ class CallRecordingSystem:
         self,
         recording_path: str = "recordings",
         requested: bool = False,
-        consent_acknowledged: bool = False,
     ) -> None:
         self.recording_path = recording_path
-        #: Requested by ``features.call_recording``.
-        #:
-        #: Named ``requested`` rather than ``auto_record`` because config.yml had a dead
-        #: ``recording.auto_record`` key that nothing read, and the two being spelled the same
-        #: made an inert setting look like the switch that works.
+        #: Requested by ``features.call_recording``. Named ``requested`` rather than
+        #: ``auto_record`` because config.yml had a dead ``recording.auto_record`` key that
+        #: nothing read, and the two spelled the same would be indistinguishable.
         self.requested = requested
-        #: Set by ``recording.consent_acknowledged``. See :data:`CONSENT_KEY`.
-        self.consent_acknowledged = consent_acknowledged
         self.active_recordings: dict[str, CallRecording] = {}
         self.recording_metadata: list[dict[str, Any]] = []
         self.logger = get_logger()
@@ -583,24 +571,23 @@ class CallRecordingSystem:
         #: started, without this module having to know that transcription exists.
         self.on_recording_finished: Callable[[Path], None] | None = None
 
-        if self.requested and not self.consent_acknowledged:
-            self.logger.warning(
-                "features.call_recording is enabled but %s is false, so no calls will be "
-                "recorded. Calls cannot be recorded without notifying the participants in "
-                "two-party-consent jurisdictions, and this PBX plays no announcement yet. "
-                "Set %s to true once you have decided that recording is appropriate here.",
-                CONSENT_KEY,
-                CONSENT_KEY,
-            )
-        elif self.requested:
+        if self.requested:
             self.logger.info("Call recording is enabled; every answered call will be recorded")
 
         Path(recording_path).mkdir(parents=True, exist_ok=True)
 
     @property
     def auto_record(self) -> bool:
-        """Whether calls actually get recorded. Both switches must be on."""
-        return self.requested and self.consent_acknowledged
+        """
+        Whether calls get recorded.
+
+        There used to be a second switch here, ``recording.consent_acknowledged``, standing in
+        for a notice this PBX could not yet play. It is gone: the recording notice is that
+        mechanism now, and it is a stronger guarantee than a boolean -- it fails closed against
+        real playback rather than against someone having ticked a box. See
+        ``pbx/features/recording_consent.py``.
+        """
+        return self.requested
 
     def start_recording(
         self,
@@ -699,6 +686,23 @@ class CallRecordingSystem:
 
         # stop() fires _reap, which removes it from active_recordings.
         return recording.stop()
+
+    def abandon(self, call_id: str, reason: str) -> bool:
+        """
+        Throw a recording away without writing anything. Returns whether one was discarded.
+
+        This is the fail-closed path for consent: audio captured before we established that
+        notice was given is audio we had no right to keep, so it is destroyed rather than
+        finished. Unlike stop_recording() nothing reaches disk -- no WAV, no manifest, no
+        transcription job, and the per-channel spools are unlinked.
+        """
+        recording = self.active_recordings.pop(call_id, None)
+        if recording is None:
+            return False
+
+        recording._discard()
+        self.logger.warning(f"Discarded recording for {call_id}: {reason}")
+        return True
 
     def stop_all(self) -> int:
         """Finish every recording in progress. Returns how many were closed."""

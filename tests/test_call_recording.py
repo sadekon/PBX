@@ -488,7 +488,7 @@ class TestRelayTriggersRecording:
     goes through the relay, so triggering there covers every path by construction.
     """
 
-    def _pbx(self, tmp_path, *, consent=True):
+    def _pbx(self, tmp_path, *, requested=True):
         from types import SimpleNamespace
 
         from pbx.core.feature_initializer import FeatureInitializer
@@ -497,9 +497,7 @@ class TestRelayTriggersRecording:
         call = SimpleNamespace(from_extension="1001", to_extension="1002", session_id="conv-1")
         pbx = SimpleNamespace(
             rtp_relay=RTPRelay(port_range_start=30000, port_range_end=30100),
-            recording_system=CallRecordingSystem(
-                str(tmp_path), requested=True, consent_acknowledged=consent
-            ),
+            recording_system=CallRecordingSystem(str(tmp_path), requested=requested),
             call_manager=SimpleNamespace(get_call=lambda _id: call),
         )
         FeatureInitializer._wire_call_recording(pbx)
@@ -542,8 +540,8 @@ class TestRelayTriggersRecording:
         assert not pbx.recording_system.is_recording("conv-1")
         assert handler.tap is None
 
-    def test_consent_off_records_nothing(self, tmp_path):
-        pbx = self._pbx(tmp_path, consent=False)
+    def test_the_feature_off_records_nothing(self, tmp_path):
+        pbx = self._pbx(tmp_path, requested=False)
         handler = self._handler(pbx)
 
         handler.set_endpoints(("1.1.1.1", 100), ("2.2.2.2", 200))
@@ -600,7 +598,7 @@ class TestTransferLabelling:
         handler = RTPRelayHandler(local_port=0, call_id="leg-1")
         handler.set_endpoints(("1.1.1.1", 100), ("2.2.2.2", 200))
 
-        system = CallRecordingSystem(str(tmp_path), requested=True, consent_acknowledged=True)
+        system = CallRecordingSystem(str(tmp_path), requested=True)
         tap = system.start_recording(
             "leg-1", "1001", "1002", session_id="conv-1", labels={"a0": "1001", "b0": "1002"}
         )
@@ -664,39 +662,38 @@ class TestTransferLabelling:
 
 
 @pytest.mark.unit
-class TestConsentGate:
+class TestRecordingGate:
     """
-    features.call_recording has been true in config.yml the whole time this feature did
-    nothing. Wiring the tap turned that dormant flag into "record every call", which nobody
-    opted into by leaving a config file alone -- so recording needs a second, deliberate key.
+    ``features.call_recording`` alone decides whether calls record.
+
+    There used to be a second key, ``recording.consent_acknowledged``, standing in for a notice
+    this PBX could not yet play. The recording notice replaced it -- a boolean asserting that
+    someone thought about consent is a much weaker guarantee than audio that must actually
+    reach the caller, and which discards the recording when it does not.
     """
 
-    def test_the_feature_flag_alone_does_not_record(self, tmp_path):
+    def test_the_feature_flag_records(self, tmp_path):
         system = CallRecordingSystem(str(tmp_path), requested=True)
 
         assert system.requested is True
-        assert system.auto_record is False, "recording without acknowledged consent"
-
-    def test_both_switches_on_records(self, tmp_path):
-        system = CallRecordingSystem(str(tmp_path), requested=True, consent_acknowledged=True)
-
         assert system.auto_record is True
-
-    def test_consent_alone_does_not_record(self, tmp_path):
-        system = CallRecordingSystem(str(tmp_path), consent_acknowledged=True)
-
-        assert system.auto_record is False
 
     def test_default_is_off(self, tmp_path):
         assert CallRecordingSystem(str(tmp_path)).auto_record is False
 
-    def test_the_gate_is_warned_about_at_startup(self, tmp_path):
-        """A silently disabled feature is worse than a noisy one; say why nothing records."""
+    def test_enabling_is_announced_at_startup(self, tmp_path):
+        """Recording every call is worth one line in the log, not silence."""
         from unittest.mock import MagicMock, patch
 
         logger = MagicMock()
         with patch("pbx.features.call_recording.get_logger", return_value=logger):
             CallRecordingSystem(str(tmp_path), requested=True)
 
-        warning = " ".join(str(c) for c in logger.warning.call_args_list)
-        assert "consent" in warning.lower()
+        assert (
+            "recording is enabled" in " ".join(str(c) for c in logger.info.call_args_list).lower()
+        )
+
+    def test_consent_is_no_longer_a_constructor_argument(self, tmp_path):
+        """The notice is the gate now; a leftover boolean would be a way to bypass it."""
+        with pytest.raises(TypeError):
+            CallRecordingSystem(str(tmp_path), requested=True, consent_acknowledged=True)

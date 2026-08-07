@@ -140,7 +140,7 @@ class TestFeatureInitializerInitialize:
         assert pbx_core.conference_system == mocks["ConferenceSystem"].return_value
 
         mocks["CallRecordingSystem"].assert_called_once_with(
-            recording_path="recordings", requested=False, consent_acknowledged=False
+            recording_path="recordings", requested=False
         )
         assert pbx_core.recording_system == mocks["CallRecordingSystem"].return_value
 
@@ -247,25 +247,20 @@ class TestFeatureInitializerInitialize:
         mocks = _run_initialize_with_all_patches(pbx_core)
 
         mocks["CallRecordingSystem"].assert_called_once_with(
-            recording_path="recordings", requested=True, consent_acknowledged=False
+            recording_path="recordings", requested=True
         )
 
-    def test_consent_acknowledgement_is_passed_through(self) -> None:
+    def test_recording_is_gated_by_the_feature_flag_alone(self) -> None:
         """
-        The feature flag alone must not record. config.yml has had
-        features.call_recording: true since before anything could record, so the second key
-        is what distinguishes a decision from an inherited default.
+        There is no second key any more. ``recording.consent_acknowledged`` stood in for a
+        notice this PBX could not play; the recording notice replaced it, and it fails closed
+        against real playback rather than against a boolean.
         """
-        pbx_core = _make_pbx_core(
-            config_overrides={
-                "features.call_recording": True,
-                "recording.consent_acknowledged": True,
-            }
-        )
+        pbx_core = _make_pbx_core(config_overrides={"features.call_recording": True})
         mocks = _run_initialize_with_all_patches(pbx_core)
 
         mocks["CallRecordingSystem"].assert_called_once_with(
-            recording_path="recordings", requested=True, consent_acknowledged=True
+            recording_path="recordings", requested=True
         )
 
     # ------------------------------------------------------------------ #

@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from pbx.features.recording_consent import SYSTEM_LABEL
 from pbx.speech.dialogue import format_dialogue
 from pbx.speech.store import SOURCE_RECORDING, TranscriptStore
 from pbx.speech.types import Segment, Transcript
@@ -206,11 +207,15 @@ class RecordingTranscriber:
         silence_floor: float = SILENCE_RMS_FLOOR,
         split_gap_seconds: float = DEFAULT_SPLIT_GAP_SECONDS,
         max_region_seconds: float = DEFAULT_MAX_REGION_SECONDS,
+        notice_text: str = "",
     ) -> None:
         self.worker = worker
         self.store = store or TranscriptStore()
         self.logger = logger or get_logger()
         self.min_speech_seconds = min_speech_seconds
+        #: What the recording notice said, injected verbatim rather than recognised. Empty
+        #: when consent announcements are off, in which case no notice channel exists.
+        self.notice_text = notice_text
         #: Silence that must elapse before a channel is cut into separate regions. Raising it
         #: cuts less and protects punctuation; lowering it risks splitting sentences.
         self.split_gap_seconds = split_gap_seconds
@@ -331,6 +336,23 @@ class RecordingTranscriber:
 
     # ---------------------------------------------------------------- splitting
 
+    def _prepend_notice(self, pending: _PendingTranscription, merged: Transcript) -> Transcript:
+        """
+        Put the recording notice at the front of the transcript, verbatim.
+
+        The notice was deliberately not transcribed -- see the skip in ``_measure`` -- so its
+        text comes from the manifest, which recorded what was actually played rather than what
+        a model thought it heard. A recording whose channels show no notice gets nothing added.
+        """
+        if not self.notice_text:
+            return merged
+        if SYSTEM_LABEL not in self._channel_labels(pending.media_path):
+            return merged
+
+        notice = Segment(text=self.notice_text, start=0.0, end=0.0, speaker=SYSTEM_LABEL)
+        segments = (notice, *merged.segments)
+        return replace(merged, segments=segments, text=format_dialogue(segments))
+
     def _channel_labels(self, media_path: Path) -> list[str]:
         """Speaker labels in channel order, from the sidecar the recorder wrote."""
         manifest_path = media_path.with_suffix(".json")
@@ -420,6 +442,15 @@ class RecordingTranscriber:
 
         for index, pieces in enumerate(per_channel):
             speaker = labels[index] if index < len(labels) else f"channel{index}"
+
+            # The recording notice is never recognised. We already have its exact wording --
+            # it is the configured string that generated the audio -- so running a model over
+            # it would spend a whole encoder window to recover a sentence we hold, and could
+            # return it paraphrased. That is the last sentence worth approximating if the
+            # recording is ever evidence. Its text is injected in _finish() instead.
+            if speaker == SYSTEM_LABEL:
+                continue
+
             rms = np.concatenate(pieces) if pieces else np.zeros(0)
 
             # Derived from the same frames rather than re-reading: a channel nobody spoke on
@@ -536,6 +567,7 @@ class RecordingTranscriber:
             speaker: combine_regions(entries) for speaker, entries in pending.results.items()
         }
         merged = merge_channels(per_speaker)
+        merged = self._prepend_notice(pending, merged)
         # The speakers are the participants: each region was cut from one participant's
         # channel, so the keys here are exactly the labels the recording manifest named.
         # Stored on the row because the manifest expires with the audio, long before the

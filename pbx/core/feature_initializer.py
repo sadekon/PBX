@@ -10,7 +10,7 @@ from typing import Any
 
 from pbx.features.call_parking import CallParkingSystem
 from pbx.features.call_queue import QueueSystem
-from pbx.features.call_recording import CONSENT_KEY, CallRecordingSystem
+from pbx.features.call_recording import CallRecordingSystem
 from pbx.features.cdr import CDRSystem
 from pbx.features.conference import ConferenceSystem
 from pbx.features.find_me_follow_me import FindMeFollowMe
@@ -107,8 +107,8 @@ class FeatureInitializer:
             # what recording.storage_path said.
             recording_path=config.get("recording.storage_path", "recordings"),
             requested=config.get("features.call_recording", False),
-            consent_acknowledged=config.get(CONSENT_KEY, False),
         )
+        FeatureInitializer._build_consent_announcer(pbx_core, config, logger)
         FeatureInitializer._wire_call_recording(pbx_core)
         pbx_core.queue_system = QueueSystem(
             database=database if database.enabled else None, config=config
@@ -377,6 +377,55 @@ class FeatureInitializer:
             pbx_core.skills_router = None
 
     @staticmethod
+    def _build_consent_announcer(pbx_core: Any, config: Any, logger: Any) -> None:
+        """
+        Build the recording-notice announcer.
+
+        "Internal" means "resolves to a provisioned extension" -- the same question the
+        recorder answers when it labels a channel, so the two cannot disagree about who was
+        on a call. Anything else is an outside party and gets the notice.
+        """
+        from pbx.features.recording_consent import ConsentAnnouncer, ConsentSettings
+
+        def is_internal(number: str) -> bool:
+            if not number or number == "unknown":
+                return False
+            try:
+                extension_db = getattr(pbx_core, "extension_db", None)
+                if extension_db is not None and extension_db.get_extension(number):
+                    return True
+                return bool(config.get_extension(number))
+            except Exception:
+                # An unresolvable number is treated as external, which announces more rather
+                # than less -- the safe direction for a consent gate.
+                return False
+
+        settings = ConsentSettings.from_dict(config.get("recording.consent", {}) or {})
+        for problem in settings.validate():
+            logger.warning("Recording consent config: %s", problem)
+
+        announcer = ConsentAnnouncer(settings, is_internal=is_internal, logger=logger)
+        pbx_core.consent_announcer = announcer
+
+        # Recording with no notice at all is legitimate in a one-party-consent jurisdiction,
+        # but it must never be a quiet state -- this is the config that used to require a
+        # separate consent_acknowledged key to reach.
+        if config.get("features.call_recording", False) and not announcer.enabled:
+            logger.warning(
+                "Call recording is on with %s.announce_for=off: calls are recorded and no "
+                "notice is played. This is unlawful in two-party-consent jurisdictions.",
+                "recording.consent",
+            )
+        # Synthesise the prompt now, so a missing one is a startup error rather than a silent
+        # loss of every external recording later.
+        ready = announcer.prepare()
+        logger.info(
+            "Recording consent: announce_for=%s, prompt ready=%s",
+            settings.announce_for,
+            ready,
+        )
+
+    @staticmethod
     def _wire_call_recording(pbx_core: Any) -> None:
         """
         Have every bridged call start recording itself.
@@ -416,8 +465,30 @@ class FeatureInitializer:
                 # arrives gets their own channel instead of the departed party's.
                 labels={"a0": caller, "b0": callee},
             )
-            if tap is not None:
-                handler.attach_tap(tap)
+            if tap is None:
+                return
+            handler.attach_tap(tap)
+
+            # Recording starts first so the notice lands on its own tape -- the recording is
+            # then the evidence that notice was given. If the notice does not play, the
+            # audio captured in the meantime is audio we had no right to keep, so it is
+            # destroyed rather than finished.
+            announcer = getattr(pbx_core, "consent_announcer", None)
+            session_id = getattr(call, "session_id", None) or handler.call_id
+            if announcer is None or not announcer.required_for(caller, callee):
+                return
+
+            def on_announced(delivered: bool) -> None:
+                if delivered:
+                    return
+                handler.detach_tap()
+                recording_system.abandon(
+                    session_id, "recording notice could not be played to the caller"
+                )
+
+            # Both legs hear it. The outside party is who the disclosure is for, but it is
+            # also what tells the employee why the line is quiet -- see recording_consent.
+            announcer.announce(handler, on_announced)
 
         relay.on_bridged = on_bridged
 
@@ -462,6 +533,13 @@ class FeatureInitializer:
             store=TranscriptStore(database if getattr(database, "enabled", False) else None),
             silence_floor=getattr(settings, "silence_rms_floor", SILENCE_RMS_FLOOR),
             max_region_seconds=max_region,
+            # Verbatim from config, so the transcript records what was played rather than
+            # what a model made of it.
+            notice_text=getattr(
+                getattr(getattr(pbx_core, "consent_announcer", None), "settings", None),
+                "text",
+                "",
+            ),
         )
         pbx_core.recording_transcriber = transcriber
         recording_system.on_recording_finished = transcriber.submit
