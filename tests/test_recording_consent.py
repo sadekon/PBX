@@ -494,3 +494,80 @@ class TestCodecConversion:
             out.writeframes(b"\x10\x02" * 1600)
 
         assert _announcer(audio_file=str(path))._ulaw_payload(path) is None
+
+
+@pytest.mark.unit
+class TestInternalLookupContract:
+    """
+    The lookup that decides who is external.
+
+    This got it wrong once in the worst possible way: the code called
+    ``extension_db.get_extension()``, which does not exist, a bare ``except Exception``
+    swallowed the AttributeError, and every party resolved as external -- so the notice played
+    on internal calls while looking like a deliberate policy. These tests pin the method name
+    and prove a failed lookup is loud.
+    """
+
+    def test_extension_db_exposes_the_method_we_call(self):
+        """A rename here silently changes who gets announced to."""
+        from pbx.utils.database import ExtensionDB
+
+        assert hasattr(ExtensionDB, "get")
+        assert not hasattr(ExtensionDB, "get_extension"), (
+            "if this appears, confirm which one feature_initializer.is_internal calls"
+        )
+
+    def test_config_exposes_the_fallback_we_call(self):
+        from pbx.utils.config import Config
+
+        assert hasattr(Config, "get_extension")
+
+    def _is_internal(self, pbx_core, config):
+        """Build the real closure the initializer installs."""
+        from pbx.core.feature_initializer import FeatureInitializer
+
+        FeatureInitializer._build_consent_announcer(pbx_core, config, MagicMock())
+        return pbx_core.consent_announcer._is_internal
+
+    def _pbx(self, extension_db=None):
+        pbx_core = MagicMock()
+        pbx_core.extension_db = extension_db
+        return pbx_core
+
+    def _config(self, extensions=()):
+        config = MagicMock()
+        config.get.return_value = {"announce_for": "external"}
+        config.get_extension.side_effect = lambda n: (
+            {"number": str(n)} if str(n) in extensions else None
+        )
+        return config
+
+    def test_a_database_extension_is_internal(self):
+        db = MagicMock()
+        db.get.side_effect = lambda n: {"number": n} if n == "1512" else None
+
+        is_internal = self._is_internal(self._pbx(db), self._config())
+
+        assert is_internal("1512")
+        assert not is_internal("+15551234567")
+
+    def test_a_config_only_extension_is_internal(self):
+        """Installs without a database still have extensions in config.yml."""
+        is_internal = self._is_internal(self._pbx(None), self._config(extensions={"1513"}))
+
+        assert is_internal("1513")
+
+    def test_a_broken_database_falls_through_to_config(self):
+        """The original bug: an exception here must not decide that everyone is external."""
+        db = MagicMock()
+        db.get.side_effect = AttributeError("no such method")
+
+        is_internal = self._is_internal(self._pbx(db), self._config(extensions={"1512"}))
+
+        assert is_internal("1512")
+
+    def test_unknown_is_external(self):
+        is_internal = self._is_internal(self._pbx(None), self._config())
+
+        assert not is_internal("unknown")
+        assert not is_internal("")

@@ -388,16 +388,32 @@ class FeatureInitializer:
         from pbx.features.recording_consent import ConsentAnnouncer, ConsentSettings
 
         def is_internal(number: str) -> bool:
+            """
+            Whether `number` is a provisioned extension.
+
+            Database first, then config.yml, matching how the rest of the codebase resolves
+            extensions. A lookup that *fails* is logged rather than swallowed: an earlier
+            version caught everything and returned False, so calling a method that did not
+            exist looked exactly like "this number is external" and announced on every
+            internal call. A wrong answer here is a policy change, so it has to be noisy.
+            """
             if not number or number == "unknown":
                 return False
+
+            extension_db = getattr(pbx_core, "extension_db", None)
+            if extension_db is not None:
+                try:
+                    if extension_db.get(number):
+                        return True
+                except Exception as e:
+                    logger.warning("Extension lookup failed for %s: %s", number, e)
+
             try:
-                extension_db = getattr(pbx_core, "extension_db", None)
-                if extension_db is not None and extension_db.get_extension(number):
-                    return True
                 return bool(config.get_extension(number))
-            except Exception:
-                # An unresolvable number is treated as external, which announces more rather
-                # than less -- the safe direction for a consent gate.
+            except Exception as e:
+                logger.warning("Config extension lookup failed for %s: %s", number, e)
+                # Unresolvable means treated as external, which announces rather than
+                # records silently -- the safe direction for a consent gate.
                 return False
 
         settings = ConsentSettings.from_dict(config.get("recording.consent", {}) or {})
