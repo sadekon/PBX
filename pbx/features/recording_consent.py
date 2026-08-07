@@ -34,6 +34,7 @@ you would want approximated if the recording is ever evidence.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,9 +78,15 @@ DEFAULT_TEXT = "This call is being recorded for quality assurance."
 #: 20 ms at 8 kHz -- the same framing everything else on the media path uses.
 FRAME_SAMPLES = 160
 
-#: L16 mono. The notice is already PCM, so this avoids an encode/decode round trip that
-#: would only lose fidelity on the one piece of audio that might be read out in court.
+#: L16 mono, used only to hand the notice to the recorder -- no encode/decode round trip
+#: on the one piece of audio that might be read out in court.
 PAYLOAD_L16 = 11
+
+#: What goes on the wire. PT 0 is the one codec every endpoint here negotiates.
+PAYLOAD_ULAW = 0
+
+SAMPLE_RATE = 8000
+FRAME_INTERVAL_SECONDS = 0.02
 
 #: Where a synthesised notice is cached. Generated once at startup, not per call: gTTS is a
 #: network round trip and this is on the path of every external call.
@@ -237,9 +244,20 @@ class ConsentAnnouncer:
                 self.logger.error(f"Recording notice callback for {handler.call_id} raised: {e}")
 
     def _play_to_sides(self, handler: Any, sides: list[str]) -> bool:
-        """Send the notice to each named side over the relay's own socket."""
-        from pbx.rtp.handler import RTPPlayer
+        """
+        Send the notice to every leg at once, with the relay muted while it plays.
 
+        Two things here were learned the hard way.
+
+        **The relay is paused first.** Injecting a second RTP stream into a live session means
+        two SSRCs arriving on one port, and phones lock onto whichever they saw first -- so the
+        notice reached one end, the other end, or neither, differing per call. Pausing leaves
+        exactly one stream on the wire. It also mutes both microphones for the duration, so
+        nobody talks over the notice.
+
+        **Both legs are driven from one loop.** Playing to them in turn meant the second party
+        heard the notice only after the first had finished it.
+        """
         path = self.audio_path()
         if not path.is_file():
             self.logger.error(f"Recording notice audio missing at {path}")
@@ -250,39 +268,89 @@ class ConsentAnnouncer:
             self.logger.warning(f"Recording notice for {handler.call_id}: relay is not running")
             return False
 
-        # Success means at least one leg heard it. Requiring both would discard a perfectly
-        # lawful recording whenever one endpoint had not been learned yet -- and the leg that
-        # matters legally is the outside one, which is always among these.
-        played = False
-        for target_side in sides:
-            target = handler.get_endpoint(target_side)
-            if target is None:
-                self.logger.warning(
-                    f"Recording notice for {handler.call_id}: side {target_side} has no endpoint"
-                )
-                continue
+        targets = [t for t in (handler.get_endpoint(side) for side in sides) if t is not None]
+        if not targets:
+            self.logger.warning(f"Recording notice for {handler.call_id}: no endpoints learned")
+            return False
 
-            # Reuse the relay's bound socket, exactly as music-on-hold does, so no second
-            # bind is needed on the same port.
-            player = RTPPlayer(
-                local_port=handler.local_port,
-                remote_host=target[0],
-                remote_port=target[1],
-                call_id=handler.call_id,
-                external_socket=sock,
-            )
-            player.start()
-            try:
-                # The tap lives on _relay_loop, which this bypasses, so the notice would
-                # otherwise be absent from its own recording. Feeding it here is what makes
-                # the tape self-evidencing.
-                self._feed_tap(handler, path)
-                player.play_file(path)
-                played = True
-            finally:
-                player.stop()
+        payload = self._ulaw_payload(path)
+        if payload is None:
+            return False
 
-        return played
+        handler.pause_relay()
+        try:
+            self._feed_tap(handler, path)
+            self._stream(sock, targets, payload)
+        finally:
+            handler.resume_relay()
+
+        return True
+
+    def _ulaw_payload(self, path: Path) -> bytes | None:
+        """
+        Read the notice as G.711 µ-law.
+
+        µ-law rather than whatever the file happens to hold: PT 0 is the one codec every
+        endpoint here negotiates. ``RTPPlayer.play_file`` re-encodes 16-bit PCM to G.722, which
+        a phone that agreed on µ-law cannot decode -- that alone made the notice inaudible.
+        """
+        import wave
+
+        from pbx.utils.audio import pcm16_to_ulaw, resample_pcm16
+
+        try:
+            with wave.open(str(path), "rb") as wav:
+                channels = wav.getnchannels()
+                width = wav.getsampwidth()
+                rate = wav.getframerate()
+                raw = wav.readframes(wav.getnframes())
+        except Exception as e:
+            self.logger.error(f"Recording notice audio is unreadable ({path}): {e}")
+            return None
+
+        if channels != 1:
+            self.logger.error(f"Recording notice audio must be mono ({path})")
+            return None
+        if width == 1:
+            # Already 8-bit; assume it is the µ-law a telephony prompt normally is.
+            return raw
+        if width != 2:
+            self.logger.error(f"Recording notice audio must be 8- or 16-bit ({path})")
+            return None
+
+        if rate != SAMPLE_RATE:
+            raw = resample_pcm16(raw, rate, SAMPLE_RATE)
+        return pcm16_to_ulaw(raw)
+
+    def _stream(self, sock: Any, targets: list[tuple[str, int]], payload: bytes) -> None:
+        """
+        Packetise once and send each packet to every target, paced at 20 ms.
+
+        One loop rather than one player per leg, so the legs stay sample-aligned instead of
+        drifting apart by however long the first one took.
+        """
+        import random
+        import struct
+        import time
+
+        ssrc = random.getrandbits(32)
+        sequence = random.getrandbits(16)
+        timestamp = 0
+        next_send = time.monotonic()
+
+        for start in range(0, len(payload), FRAME_SAMPLES):
+            chunk = payload[start : start + FRAME_SAMPLES]
+            header = struct.pack("!BBHII", 0x80, PAYLOAD_ULAW, sequence & 0xFFFF, timestamp, ssrc)
+            for target in targets:
+                with contextlib.suppress(OSError):
+                    sock.sendto(header + chunk, target)
+
+            sequence += 1
+            timestamp += FRAME_SAMPLES
+            next_send += FRAME_INTERVAL_SECONDS
+            delay = next_send - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
 
     def _feed_tap(self, handler: Any, path: Path) -> None:
         """

@@ -319,8 +319,178 @@ class TestInjectedAudioReachesTheRecorder:
         from pbx.features.call_recording import _Channel
 
         channel = _Channel(tmp_path / "spool.raw")
-        samples = channel.decode(b"\x00\x01" * 160, 11)
+        try:
+            samples = channel.decode(b"\x00\x01" * 160, 11)
 
-        assert samples is not None
-        assert len(samples) == 160
-        assert channel.undecodable_packets == 0
+            assert samples is not None
+            assert len(samples) == 160
+            assert channel.undecodable_packets == 0
+        finally:
+            # Holds an open spool; leaking it surfaces as an unraisable exception at GC.
+            channel.discard()
+
+
+@pytest.mark.unit
+class TestOneStreamOnTheWire:
+    """
+    Regressions from the first version, all of which showed up only on real calls.
+
+    Injecting a second RTP stream into a live session puts two SSRCs on one port, and phones
+    lock onto whichever they saw first -- so the notice reached one end, the other, or neither,
+    differing per call. And playing to the legs in turn meant the second party heard it only
+    once the first had finished.
+    """
+
+    def _handler(self, notice: Path) -> MagicMock:
+        handler = MagicMock()
+        handler.call_id = "call-1"
+        handler.running = True
+        handler.local_port = 10000
+        handler.tap = None
+        handler.get_endpoint.side_effect = lambda side: {
+            "a": ("10.0.0.1", 4000),
+            "b": ("10.0.0.2", 5000),
+        }[side]
+        handler.sent = []
+        handler.socket.sendto.side_effect = lambda data, target: handler.sent.append((target, data))
+        return handler
+
+    def _notice(self, path: Path, seconds: float = 0.2) -> Path:
+        import wave
+
+        with wave.open(str(path), "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(8000)
+            out.writeframes(b"\x10\x02" * int(8000 * seconds))
+        return path
+
+    def _play(self, tmp_path: Path):
+        notice = self._notice(tmp_path / "notice.wav")
+        handler = self._handler(notice)
+        announcer = _announcer(audio_file=str(notice))
+        assert announcer._play_to_sides(handler, ["a", "b"]) is True
+        return handler
+
+    def test_the_relay_is_muted_while_it_plays(self, tmp_path):
+        """Otherwise two SSRCs share the port, and both parties can talk over the notice."""
+        handler = self._play(tmp_path)
+
+        handler.pause_relay.assert_called_once()
+        handler.resume_relay.assert_called_once()
+
+    def test_the_relay_resumes_even_if_sending_fails(self, tmp_path):
+        """A paused relay left paused is a call with no audio for the rest of its life."""
+        notice = self._notice(tmp_path / "notice.wav")
+        handler = self._handler(notice)
+        handler.socket.sendto.side_effect = RuntimeError("network gone")
+
+        with pytest.raises(RuntimeError):
+            _announcer(audio_file=str(notice))._play_to_sides(handler, ["a", "b"])
+
+        handler.resume_relay.assert_called_once()
+
+    def test_one_ssrc_for_the_whole_notice(self, tmp_path):
+        handler = self._play(tmp_path)
+
+        assert len({data[8:12] for _, data in handler.sent}) == 1
+
+    def test_both_legs_receive_the_same_packets_in_lockstep(self, tmp_path):
+        """Sequential playback meant the second party heard it after the first had finished."""
+        handler = self._play(tmp_path)
+
+        by_leg = {}
+        for target, data in handler.sent:
+            by_leg.setdefault(target[0], []).append(data)
+
+        assert set(by_leg) == {"10.0.0.1", "10.0.0.2"}
+        assert by_leg["10.0.0.1"] == by_leg["10.0.0.2"]
+
+    def test_it_goes_out_as_ulaw(self, tmp_path):
+        """
+        PT 0 is the one codec every endpoint here negotiates. RTPPlayer.play_file re-encodes
+        16-bit PCM to G.722, which a phone that agreed on µ-law cannot decode -- that alone
+        made the notice inaudible.
+        """
+        handler = self._play(tmp_path)
+
+        payload_types = {data[1] for _, data in handler.sent}
+        assert payload_types == {0}
+        assert all(len(data) - 12 == 160 for _, data in handler.sent)
+
+    def test_timestamps_advance_one_frame_per_packet(self, tmp_path):
+        import struct
+
+        handler = self._play(tmp_path)
+        stamps = [
+            struct.unpack("!I", data[4:8])[0] for t, data in handler.sent if t[0] == "10.0.0.1"
+        ]
+
+        assert stamps == [i * 160 for i in range(len(stamps))]
+
+    def test_no_endpoints_means_no_playback_and_no_mute(self, tmp_path):
+        """Pausing a relay we are not about to play into would just be dead air."""
+        notice = self._notice(tmp_path / "notice.wav")
+        handler = self._handler(notice)
+        handler.get_endpoint.side_effect = lambda side: None
+
+        assert _announcer(audio_file=str(notice))._play_to_sides(handler, ["a", "b"]) is False
+        handler.pause_relay.assert_not_called()
+
+
+@pytest.mark.unit
+class TestCodecConversion:
+    def test_sixteen_bit_pcm_is_converted(self, tmp_path):
+        import wave
+
+        path = tmp_path / "pcm.wav"
+        with wave.open(str(path), "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(8000)
+            out.writeframes(b"\x10\x02" * 800)
+
+        payload = _announcer(audio_file=str(path))._ulaw_payload(path)
+
+        assert payload is not None
+        assert len(payload) == 800, "one byte per sample once µ-law encoded"
+
+    def test_eight_bit_audio_is_passed_through(self, tmp_path):
+        """A telephony prompt that is already 8-bit is already µ-law."""
+        import wave
+
+        path = tmp_path / "ulaw.wav"
+        with wave.open(str(path), "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(1)
+            out.setframerate(8000)
+            out.writeframes(b"\xff" * 800)
+
+        assert _announcer(audio_file=str(path))._ulaw_payload(path) == b"\xff" * 800
+
+    def test_wideband_audio_is_resampled(self, tmp_path):
+        import wave
+
+        path = tmp_path / "wide.wav"
+        with wave.open(str(path), "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(16000)
+            out.writeframes(b"\x10\x02" * 1600)
+
+        payload = _announcer(audio_file=str(path))._ulaw_payload(path)
+
+        assert payload is not None
+        assert len(payload) == 800, "16 kHz halves to 8 kHz"
+
+    def test_stereo_is_refused(self, tmp_path):
+        import wave
+
+        path = tmp_path / "stereo.wav"
+        with wave.open(str(path), "wb") as out:
+            out.setnchannels(2)
+            out.setsampwidth(2)
+            out.setframerate(8000)
+            out.writeframes(b"\x10\x02" * 1600)
+
+        assert _announcer(audio_file=str(path))._ulaw_payload(path) is None
