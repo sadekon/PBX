@@ -19,7 +19,11 @@ from pbx.api.utils import (
     send_json,
     verify_authentication,
 )
-from pbx.features.retention_policies import RetentionPolicy, validate_match_rules
+from pbx.features.retention_policies import (
+    SEED_POLICY_ID,
+    RetentionPolicy,
+    validate_match_rules,
+)
 from pbx.utils.audit_logger import get_audit_logger
 from pbx.utils.logger import get_logger
 
@@ -1734,8 +1738,13 @@ def add_retention_policy() -> tuple[Response, int]:
         if not re.match(r"^[a-zA-Z0-9_\-]+$", policy_id.replace(" ", "_")):
             return send_json({"error": "policy_id contains invalid characters"}, 400), 400
 
+        policy_id = policy_id.replace(" ", "_").lower()
+        # Editing keeps whatever origin the row already had, so the seeded catch-all stays
+        # marked as config-seeded rather than being relabelled user-created on first edit.
+        existing = pbx_core.recording_retention.policies.get(policy_id)
+
         policy = RetentionPolicy(
-            policy_id=policy_id.replace(" ", "_").lower(),
+            policy_id=policy_id,
             name=str(data["name"]),
             description=str(data.get("description") or ""),
             audio_days=periods["audio_days"],
@@ -1743,7 +1752,7 @@ def add_retention_policy() -> tuple[Response, int]:
             priority=int(data.get("priority", 100)),
             match_rules=rules,
             enabled=bool(data.get("enabled", True)),
-            origin="api",
+            origin=existing.origin if existing else "api",
         )
 
         if not pbx_core.recording_retention.policies.save(policy):
@@ -1771,6 +1780,13 @@ def delete_retention_policy(policy_id: str) -> tuple[Response, int]:
     pbx_core = get_pbx_core()
     if not (pbx_core and hasattr(pbx_core, "recording_retention")):
         return send_json({"error": "Recording retention not initialized"}, 500), 500
+
+    if policy_id == SEED_POLICY_ID:
+        # It governs everything no other policy matches. Deleting it would silently hand that
+        # job back to config.yml, which this page never shows -- edit it instead.
+        return send_json(
+            {"error": "The default policy cannot be deleted. Edit its periods instead."}, 403
+        ), 403
 
     try:
         if pbx_core.recording_retention.policies.delete(policy_id):

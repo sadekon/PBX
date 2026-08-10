@@ -422,6 +422,35 @@ forwarding across supported phone models before merge to `DEV`.
 Backend post-call transcription is **complete**: tap → per-participant recording → per-region
 transcription → one speaker-attributed transcript in `call_transcripts`. Nothing reads it yet.
 
+### Recording consent — complete 2026-08-07, verified on real calls
+
+`recording.consent.announce_for` (`external` | `all` | `off`) decides which calls get a spoken
+notice; both legs always hear it. Recording starts first so the notice is on its own tape, and
+**the recording is discarded if the notice did not play** — `CallRecordingSystem.abandon()`.
+The notice is never transcribed: its text is injected verbatim from config, because we already
+have the exact wording and a paraphrase is the last thing wanted in evidence.
+
+`recording.consent_acknowledged` is **gone**. It stood in for a notice that did not exist yet;
+the announcement is a stronger guarantee than a boolean. Upgrade note: an install with
+`features.call_recording: true` and no `recording.consent:` block will now record internal
+calls silently — external calls still get a notice or fail closed.
+
+Three bugs here were invisible to unit tests and only appeared on real handsets. Worth knowing
+before touching this code:
+
+- **Codec.** `RTPPlayer.play_file` re-encodes 16-bit PCM to G.722, which a phone that
+  negotiated µ-law cannot decode. The notice converts to µ-law (PT 0) itself.
+- **SSRC collision.** Injecting a second RTP stream into a live session puts two SSRCs on one
+  port; phones lock onto whichever arrived first, so the notice reached one end, the other, or
+  neither, differing per call. The relay is paused while it plays, which also mutes both
+  microphones. **Any future injected audio has the same problem** — see MoH below.
+- **Sequential legs.** Playing to each leg in turn meant the second party heard it only after
+  the first had finished. Both legs are now driven from one loop.
+
+Also fixed: `is_internal()` called `ExtensionDB.get_extension()`, which does not exist, and a
+bare `except Exception` turned the `AttributeError` into "everyone is external" — so
+`announce_for: external` announced on internal calls while looking like working policy.
+
 ### Retention — reconciled 2026-08-07 (was: two systems, one of them inert)
 
 There were two retention systems and only one of them deleted anything.
@@ -471,8 +500,19 @@ the table is authoritative and the UI owns it; editing that policy survives rest
 changing config.yml afterwards does **not** move it.
 
 `RecordingTranscriber` now writes `session_id` and `participants` on every transcript it
-stores, so transcript policies match on participants from the day this lands. Voicemail
-transcripts still store neither, so those match on `source` and duration only.
+stores, so transcript policies match on participants from the day this lands.
+
+**Voicemail has three artifacts and now three consistent outcomes.** The `.wav` goes on the
+audio clock, and the sweep stamps `audio_deleted_at` on its row when it does — without that
+the mailbox kept listing expired messages, counting them toward MWI, with `file_path` pointing
+at nothing. That phantom was created by the sweep itself and would have appeared the first
+time `dry_run` went off.
+
+The row goes on the transcript clock, deleted outright. A row holding neither audio nor text
+is not a voicemail, it is metadata CDR already keeps, and leaving it made
+`voicemail_messages` the one tier with no expiry at all. Deleting it takes both copies of the
+transcript with it — the `transcription_*` columns the email path reads, and (swept
+separately) the `call_transcripts` row.
 
 Remaining gaps: `dry_run` is still on in config.yml, so nothing is deleted yet — read a dry-run
 log before turning it off, because the first real sweep on a system that has never expired

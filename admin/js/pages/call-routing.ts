@@ -840,6 +840,9 @@ export async function logoutHotDesk(extension: string): Promise<void> {
 // Recording Retention
 // ---------------------------------------------------------------------------
 
+// Last load, kept so the edit modal can prefill without refetching.
+let retentionPolicies: RetentionPolicy[] = [];
+
 export async function loadRetentionPolicies(): Promise<void> {
     try {
         const API_BASE = getApiBaseUrl();
@@ -908,6 +911,7 @@ export async function loadRetentionPolicies(): Promise<void> {
 
         // Update policies table
         if (policiesData && policiesData.policies) {
+            retentionPolicies = policiesData.policies;
             const tbody = document.getElementById('retention-policies-list') as HTMLElement | null;
             if (!tbody) return;
 
@@ -943,6 +947,14 @@ export async function loadRetentionPolicies(): Promise<void> {
 
                     const state = policy.enabled ? '' : ' <small>(disabled)</small>';
 
+                    // The seeded catch-all governs everything no other policy matches.
+                    // Deleting it would hand that job back to config.yml, which this page
+                    // never shows, so it is editable but not removable.
+                    const isDefault = policy.policy_id === 'default';
+                    const remove = isDefault
+                        ? '<small>default</small>'
+                        : `<button class="btn-small btn-danger" onclick="deleteRetentionPolicy('${escapeHtml(policy.policy_id)}', '${escapeHtml(policy.name)}')">Delete</button>`;
+
                     return `
                         <tr>
                             <td><strong>${escapeHtml(policy.name)}</strong>${state}<br><small>${escapeHtml(policy.policy_id)}</small></td>
@@ -951,7 +963,8 @@ export async function loadRetentionPolicies(): Promise<void> {
                             <td><small>${applies}</small></td>
                             <td><small>${policy.priority}</small></td>
                             <td>
-                                <button class="btn-small btn-danger" onclick="deleteRetentionPolicy('${escapeHtml(policy.policy_id)}', '${escapeHtml(policy.name)}')">Delete</button>
+                                <button class="btn-small" onclick="editRetentionPolicy('${escapeHtml(policy.policy_id)}')">Edit</button>
+                                ${remove}
                             </td>
                         </tr>
                     `;
@@ -964,7 +977,68 @@ export async function loadRetentionPolicies(): Promise<void> {
     }
 }
 
+function retentionField(id: string): HTMLInputElement | HTMLSelectElement | null {
+    return document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
+}
+
+/** Which policy the modal is editing, or '' when it is creating a new one. */
+let editingRetentionPolicy = '';
+
 export function showAddRetentionPolicyModal(): void {
+    editingRetentionPolicy = '';
+    const form = document.getElementById('add-retention-policy-form') as HTMLFormElement | null;
+    if (form) form.reset();
+
+    const name = retentionField('retention-policy-name') as HTMLInputElement | null;
+    if (name) name.readOnly = false;
+
+    const title = document.getElementById('retention-modal-title') as HTMLElement | null;
+    if (title) title.textContent = 'Add Retention Policy';
+
+    const modal = document.getElementById('add-retention-policy-modal') as HTMLElement | null;
+    if (modal) modal.style.display = 'block';
+}
+
+export function editRetentionPolicy(policyId: string): void {
+    const policy = retentionPolicies.find(p => p.policy_id === policyId);
+    if (!policy) {
+        showNotification('Policy not found; refresh and try again', 'error');
+        return;
+    }
+
+    editingRetentionPolicy = policy.policy_id;
+
+    const set = (id: string, value: string): void => {
+        const field = retentionField(id);
+        if (field) field.value = value;
+    };
+
+    set('retention-policy-name', policy.name);
+    // Null means "inherit the fallback", so it must come back as an empty field rather
+    // than as a zero, which would be read as "delete immediately".
+    set('retention-audio-days', policy.audio_days === null ? '' : String(policy.audio_days));
+    set(
+        'retention-transcript-days',
+        policy.transcript_days === null ? '' : String(policy.transcript_days)
+    );
+    set('retention-priority', String(policy.priority));
+
+    const rules = policy.match_rules || {};
+    set('retention-match-media', rules.media || '');
+    set('retention-match-extensions', (rules.extensions || []).join(', '));
+    set(
+        'retention-match-max-duration',
+        rules.max_duration_seconds === undefined ? '' : String(rules.max_duration_seconds)
+    );
+
+    // The id is derived from the name, so renaming would create a second policy rather than
+    // rename this one.
+    const name = retentionField('retention-policy-name') as HTMLInputElement | null;
+    if (name) name.readOnly = true;
+
+    const title = document.getElementById('retention-modal-title') as HTMLElement | null;
+    if (title) title.textContent = `Edit Policy: ${policy.name}`;
+
     const modal = document.getElementById('add-retention-policy-modal') as HTMLElement | null;
     if (modal) modal.style.display = 'block';
 }
@@ -974,6 +1048,7 @@ export function closeAddRetentionPolicyModal(): void {
     if (modal) modal.style.display = 'none';
     const form = document.getElementById('add-retention-policy-form') as HTMLFormElement | null;
     if (form) form.reset();
+    editingRetentionPolicy = '';
 }
 
 export async function addRetentionPolicy(event: Event): Promise<void> {
@@ -1036,6 +1111,10 @@ export async function addRetentionPolicy(event: Event): Promise<void> {
         match_rules: matchRules
     };
 
+    // Without this the server derives an id from the name, so an edit would insert a
+    // near-duplicate instead of updating the row.
+    if (editingRetentionPolicy) policyData.policy_id = editingRetentionPolicy;
+
     if (priorityRaw) {
         const priority = parseInt(priorityRaw, 10);
         if (!isNaN(priority)) policyData.priority = priority;
@@ -1051,7 +1130,10 @@ export async function addRetentionPolicy(event: Event): Promise<void> {
 
         const data: ApiSuccessResponse = await response.json();
         if (data.success) {
-            showNotification(`Retention policy "${name}" added successfully`, 'success');
+            showNotification(
+                `Retention policy "${name}" ${editingRetentionPolicy ? 'updated' : 'added'}`,
+                'success'
+            );
             closeAddRetentionPolicyModal();
             loadRetentionPolicies();
         } else {
@@ -1390,6 +1472,7 @@ export async function cancelCallback(callbackId: string): Promise<void> {
 (window as any).closeAddRetentionPolicyModal = closeAddRetentionPolicyModal;
 (window as any).addRetentionPolicy = addRetentionPolicy;
 (window as any).deleteRetentionPolicy = deleteRetentionPolicy;
+(window as any).editRetentionPolicy = editRetentionPolicy;
 (window as any).loadCallbackQueue = loadCallbackQueue;
 (window as any).showRequestCallbackModal = showRequestCallbackModal;
 (window as any).closeRequestCallbackModal = closeRequestCallbackModal;

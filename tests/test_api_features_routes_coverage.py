@@ -1644,6 +1644,9 @@ class TestRecordingRetentionRoutes:
         rr.settings.audio_days = 90
         rr.settings.transcript_days = 365
         rr.policies.all.return_value = []
+        # Default: nothing exists yet, so a POST is a create. A MagicMock would otherwise
+        # return a truthy policy and make every save look like an edit.
+        rr.policies.get.return_value = None
         mock_pbx_core.recording_retention = rr
         return rr
 
@@ -1907,6 +1910,124 @@ class TestRecordingRetentionRoutes:
         with self._auth():
             resp = api_client.delete("/api/recording-retention/policy/nonexistent")
         assert resp.status_code == 404
+
+
+@pytest.mark.unit
+class TestDefaultPolicyProtection:
+    """
+    The seeded catch-all is editable but not removable.
+
+    It governs everything no other policy matches, so deleting it silently hands that job back
+    to the ``retention:`` block in config.yml -- which this page never shows. That is the same
+    "the UI says one thing, deletion follows another" trap the two retention systems created.
+    """
+
+    @staticmethod
+    def _auth():
+        return patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        )
+
+    def test_the_default_policy_cannot_be_deleted(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        rr = MagicMock()
+        mock_pbx_core.recording_retention = rr
+
+        with self._auth():
+            resp = api_client.delete("/api/recording-retention/policy/default")
+
+        assert resp.status_code == 403
+        rr.policies.delete.assert_not_called()
+
+    def test_other_policies_are_still_deletable(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        rr = MagicMock()
+        rr.policies.delete.return_value = True
+        mock_pbx_core.recording_retention = rr
+
+        with self._auth():
+            resp = api_client.delete("/api/recording-retention/policy/vip")
+
+        assert resp.status_code == 200
+
+    def test_editing_the_default_keeps_its_config_origin(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        """
+        An edit must not relabel the seeded row as user-created.
+
+        Origin is what tells seed() the table has been provisioned; flipping it on first edit
+        would be a lie about where the policy came from.
+        """
+        rr = MagicMock()
+        rr.settings.audio_days = 90
+        rr.settings.transcript_days = 365
+        rr.policies.save.return_value = True
+        rr.policies.get.return_value = RetentionPolicy(
+            policy_id="default", name="Default retention", audio_days=90, origin="config"
+        )
+        mock_pbx_core.recording_retention = rr
+
+        with self._auth():
+            resp = api_client.post(
+                "/api/recording-retention/policy",
+                data=json.dumps(
+                    {"policy_id": "default", "name": "Default retention", "audio_days": 180}
+                ),
+                content_type="application/json",
+            )
+
+        assert resp.status_code == 200
+        saved = rr.policies.save.call_args[0][0]
+        assert saved.policy_id == "default"
+        assert saved.audio_days == 180
+        assert saved.origin == "config"
+
+    def test_a_new_policy_is_marked_api_created(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        rr = MagicMock()
+        rr.settings.audio_days = 90
+        rr.settings.transcript_days = 365
+        rr.policies.save.return_value = True
+        rr.policies.get.return_value = None
+        mock_pbx_core.recording_retention = rr
+
+        with self._auth():
+            resp = api_client.post(
+                "/api/recording-retention/policy",
+                data=json.dumps({"name": "Support", "audio_days": 30}),
+                content_type="application/json",
+            )
+
+        assert resp.status_code == 200
+        assert rr.policies.save.call_args[0][0].origin == "api"
+
+    def test_posting_an_existing_id_updates_rather_than_duplicates(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        """The edit path: same policy_id in, same policy_id saved."""
+        rr = MagicMock()
+        rr.settings.audio_days = 90
+        rr.settings.transcript_days = 365
+        rr.policies.save.return_value = True
+        rr.policies.get.return_value = RetentionPolicy(
+            policy_id="support", name="Support", audio_days=30
+        )
+        mock_pbx_core.recording_retention = rr
+
+        with self._auth():
+            resp = api_client.post(
+                "/api/recording-retention/policy",
+                data=json.dumps({"policy_id": "support", "name": "Renamed", "audio_days": 45}),
+                content_type="application/json",
+            )
+
+        assert resp.status_code == 200
+        assert rr.policies.save.call_args[0][0].policy_id == "support"
 
 
 @pytest.mark.unit

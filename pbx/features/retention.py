@@ -151,6 +151,9 @@ class SweepResult:
     #: own. Counted separately so the audio figure stays a count of recordings.
     sidecars: int = 0
     transcripts: int = 0
+    #: Voicemail rows removed once their last content expired. Counted apart from
+    #: transcripts because one is a row and the other is text on it.
+    voicemail_messages: int = 0
     #: Items left alone because their session is under an unreleased legal hold. Reported
     #: because "nothing expired this week" and "nothing expired because 400 calls are frozen
     #: for a lawsuit" need to look different in the log.
@@ -165,9 +168,10 @@ class SweepResult:
         verb = "would delete" if self.dry_run else "deleted"
         sidecars = f", {self.sidecars} manifest(s)" if self.sidecars else ""
         held = f", {self.held} held" if self.held else ""
+        mailbox = f", {self.voicemail_messages} voicemail row(s)" if self.voicemail_messages else ""
         return (
             f"{verb} {self.audio_files} audio file(s) ({self.audio_megabytes:,.1f} MB)"
-            f"{sidecars} and {self.transcripts} transcript(s){held}"
+            f"{sidecars} and {self.transcripts} transcript(s){mailbox}{held}"
         )
 
 
@@ -254,13 +258,25 @@ class RetentionSweeper:
         self.holds.refresh()
 
         now = datetime.now(UTC)
+        #: Voicemail recordings this sweep expired. Their rows have to be tombstoned to match,
+        #: or the mailbox keeps listing messages whose audio is gone.
+        expired_voicemail: list[str] = []
         for root, media in (
             (self.settings.voicemail_path, MEDIA_VOICEMAIL),
             (self.settings.recording_path, MEDIA_RECORDING),
         ):
-            self._sweep_audio(Path(root), media, now, result)
+            self._sweep_audio(
+                Path(root),
+                media,
+                now,
+                result,
+                expired_voicemail if media == MEDIA_VOICEMAIL else None,
+            )
+
+        self._tombstone_voicemail_audio(expired_voicemail, result)
 
         self._sweep_transcripts(now, result)
+        self._sweep_voicemail_transcripts(now, result)
 
         self.last_sweep = now
         self.last_result = result
@@ -310,7 +326,14 @@ class RetentionSweeper:
             "last_sweep_summary": self.last_result.summary() if self.last_result else None,
         }
 
-    def _sweep_audio(self, root: Path, media: str, now: datetime, result: SweepResult) -> None:
+    def _sweep_audio(
+        self,
+        root: Path,
+        media: str,
+        now: datetime,
+        result: SweepResult,
+        expired: list[str] | None = None,
+    ) -> None:
         """
         Delete recordings under `root` that are past whatever period governs each of them.
 
@@ -355,6 +378,8 @@ class RetentionSweeper:
 
                 result.audio_files += 1
                 result.audio_bytes += stat.st_size
+                if expired is not None:
+                    expired.append(str(path))
                 if self.settings.dry_run:
                     self.logger.debug(
                         f"  would delete {path} ({modified:%Y-%m-%d}, "
@@ -370,6 +395,38 @@ class RetentionSweeper:
                 result.errors.append(f"{path}: {e}")
 
         self._sweep_orphan_sidecars(root, now - fallback, result)
+
+    def _tombstone_voicemail_audio(self, paths: list[str], result: SweepResult) -> None:
+        """
+        Mark the rows whose recording this sweep just removed.
+
+        Without this the sweep creates phantom voicemails. The mailbox lists messages with
+        ``audio_deleted_at IS NULL`` and only ``delete_message`` ever set that column, so an
+        expired voicemail kept appearing in the mailbox, kept counting toward the message
+        waiting indicator, and pointed ``file_path`` at a recording that was no longer on
+        disk. It is the exact failure the comment on that query warns about, reached by a
+        different route.
+        """
+        if not paths or self.settings.dry_run:
+            return
+        if not (self.database and getattr(self.database, "enabled", False)):
+            return
+
+        try:
+            for start in range(0, len(paths), TRANSCRIPT_DELETE_CHUNK):
+                chunk = paths[start : start + TRANSCRIPT_DELETE_CHUNK]
+                placeholders = ", ".join(["%s"] * len(chunk))
+                self.database.execute(
+                    f"""
+                    UPDATE voicemail_messages
+                       SET audio_deleted_at = CURRENT_TIMESTAMP
+                     WHERE file_path IN ({placeholders})
+                       AND audio_deleted_at IS NULL
+                    """,
+                    tuple(chunk),
+                )
+        except Exception as e:
+            result.errors.append(f"voicemail tombstone failed: {e}")
 
     def _shortest_audio_period(self) -> timedelta:
         """
@@ -504,6 +561,87 @@ class RetentionSweeper:
                 )
         except Exception as e:
             result.errors.append(f"transcript delete failed: {e}")
+
+    def _sweep_voicemail_transcripts(self, now: datetime, result: SweepResult) -> None:
+        """
+        Remove voicemail rows once their last content has expired.
+
+        A voicemail's audio goes on the audio clock and its text on the transcript clock; the
+        row goes with the longer of the two, because a row holding neither is not a voicemail.
+        It is metadata that CDR already records about the same call, and leaving it was the one
+        tier of this design with no expiry at all.
+
+        Deleting the row takes both copies of the transcript with it -- the columns on this
+        table, which the email path reads, and (separately swept) the ``call_transcripts`` row.
+        """
+        if not (self.database and getattr(self.database, "enabled", False)):
+            return
+
+        horizon = now - self._shortest_transcript_period()
+        try:
+            rows = self.database.fetch_all(
+                """
+                SELECT id, extension_number, caller_id, duration, created_at
+                  FROM voicemail_messages
+                 WHERE created_at < %s
+                """,
+                (horizon,),
+            )
+        except Exception as e:
+            result.errors.append(f"voicemail transcript sweep failed: {e}")
+            return
+
+        fallback = timedelta(days=self.settings.transcript_days)
+        expired: list[Any] = []
+
+        for row in rows or []:
+            created = row.get("created_at")
+            if not isinstance(created, datetime):
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+
+            policy = self.policies.resolve(self._voicemail_facts(row))
+            period = fallback
+            if policy is not None and policy.transcript_days is not None:
+                period = timedelta(days=policy.transcript_days)
+
+            if created < now - period:
+                expired.append(row["id"])
+
+        result.voicemail_messages = len(expired)
+        if not expired or self.settings.dry_run:
+            return
+
+        try:
+            for start in range(0, len(expired), TRANSCRIPT_DELETE_CHUNK):
+                chunk = expired[start : start + TRANSCRIPT_DELETE_CHUNK]
+                placeholders = ", ".join(["%s"] * len(chunk))
+                self.database.execute(
+                    f"DELETE FROM voicemail_messages WHERE id IN ({placeholders})",
+                    tuple(chunk),
+                )
+        except Exception as e:
+            result.errors.append(f"voicemail row delete failed: {e}")
+
+    def _voicemail_facts(self, row: dict) -> RecordingFacts:
+        """
+        Match facts for a voicemail message row.
+
+        Participants are the mailbox owner and the caller -- the same pair
+        ``retention_policies.facts_for`` derives from a voicemail's path, so a policy written
+        against an extension governs the audio and the text identically.
+        """
+        participants = tuple(
+            str(v) for v in (row.get("extension_number"), row.get("caller_id")) if v
+        )
+        duration = row.get("duration")
+        return RecordingFacts(
+            path=Path(),
+            media=MEDIA_VOICEMAIL,
+            participants=participants,
+            duration_seconds=float(duration) if isinstance(duration, int | float) else None,
+        )
 
     def _shortest_transcript_period(self) -> timedelta:
         """Shortest transcript period any policy could impose. See `_shortest_audio_period`."""

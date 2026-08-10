@@ -762,3 +762,194 @@ class TestLegalHolds:
         holds.refresh()
 
         assert holds.held("case-1")
+
+
+@pytest.mark.unit
+class TestVoicemailTranscriptSweep:
+    """
+    The second copy of a voicemail transcript.
+
+    Voicemail writes its transcript to ``voicemail_messages`` (read by the email path) as well
+    as ``call_transcripts``. Sweeping only the latter left the same text on the message row
+    forever, with the caller id beside it -- and it survived the user deleting the voicemail,
+    because ``delete_message`` tombstones rather than removes. That made "transcripts expire
+    after N days" false for every voicemail on the system.
+    """
+
+    def _db(self, rows, policies=()):
+        """
+        The sweep reads policies, holds and both transcript stores, so the fake dispatches.
+
+        A single return_value would hand voicemail rows to the policy query -- and, worse,
+        return nothing for it, which makes load() wipe any policy the test just saved.
+        """
+        import json as _json
+
+        policy_rows = [
+            {
+                "policy_id": p.policy_id,
+                "name": p.name,
+                "description": p.description,
+                "audio_days": p.audio_days,
+                "transcript_days": p.transcript_days,
+                "priority": p.priority,
+                "match_rules": _json.dumps(p.match_rules),
+                "enabled": p.enabled,
+                "origin": p.origin,
+            }
+            for p in policies
+        ]
+
+        def fetch_all(query, params=None):
+            if "retention_policies" in query:
+                return policy_rows
+            if "voicemail_messages" in query:
+                return rows
+            return []
+
+        db = MagicMock()
+        db.enabled = True
+        db.execute.return_value = True
+        db.fetch_all.side_effect = fetch_all
+        return db
+
+    def _row(self, days_old, **overrides):
+        row = {
+            "id": 1,
+            "extension_number": "1500",
+            "caller_id": "5551234",
+            "duration": 12,
+            "created_at": datetime.now(UTC) - timedelta(days=days_old),
+        }
+        row.update(overrides)
+        return row
+
+    def test_an_expired_row_is_deleted(self, tmp_path):
+        """A row holding neither audio nor text is not a voicemail, just metadata."""
+        db = self._db([self._row(900)])
+
+        result = RetentionSweeper(
+            _settings(tmp_path, dry_run=False, transcript_days=365), database=db
+        ).sweep()
+
+        assert result.voicemail_messages == 1
+        statements = " ".join(str(c[0][0]) for c in db.execute.call_args_list)
+        assert "DELETE FROM voicemail_messages" in statements
+
+    def test_a_recent_transcript_is_left_alone(self, tmp_path):
+        db = self._db([self._row(10)])
+
+        result = RetentionSweeper(
+            _settings(tmp_path, dry_run=False, transcript_days=365), database=db
+        ).sweep()
+
+        assert result.transcripts == 0
+        assert "voicemail_messages" not in " ".join(str(c[0][0]) for c in db.execute.call_args_list)
+
+    def test_dry_run_counts_but_clears_nothing(self, tmp_path):
+        db = self._db([self._row(900)])
+
+        result = RetentionSweeper(
+            _settings(tmp_path, dry_run=True, transcript_days=365), database=db
+        ).sweep()
+
+        assert result.voicemail_messages == 1
+        db.execute.assert_not_called()
+
+    def test_a_policy_can_extend_a_mailbox(self, tmp_path):
+        """Participants are the mailbox and the caller, so extension policies govern both."""
+        vip = RetentionPolicy(
+            "vip",
+            "VIP mailbox",
+            transcript_days=3650,
+            priority=5,
+            match_rules={"extensions": ["1500"]},
+        )
+        db = self._db([self._row(900)], policies=[vip])
+        sweeper = RetentionSweeper(
+            _settings(tmp_path, dry_run=False, transcript_days=365), database=db
+        )
+
+        result = sweeper.sweep()
+
+        assert result.voicemail_messages == 0
+
+    def test_a_query_failure_does_not_end_the_sweep(self, tmp_path):
+        db = MagicMock()
+        db.enabled = True
+        db.fetch_all.side_effect = RuntimeError("connection reset")
+
+        result = RetentionSweeper(_settings(tmp_path), database=db).sweep()
+
+        assert any("voicemail transcript sweep failed" in e for e in result.errors)
+
+
+@pytest.mark.unit
+class TestVoicemailTombstoning:
+    """
+    Expiring a voicemail's audio has to mark its row.
+
+    The mailbox lists messages with ``audio_deleted_at IS NULL`` and only ``delete_message``
+    ever set that column, so a swept voicemail kept appearing in the mailbox, kept counting
+    toward the message waiting indicator, and pointed ``file_path`` at a recording no longer
+    on disk. The sweep was creating exactly the phantom the query's own comment warns about.
+    """
+
+    def _db(self):
+        db = MagicMock()
+        db.enabled = True
+        db.execute.return_value = True
+        db.fetch_all.side_effect = lambda q, p=None: []
+        return db
+
+    def _expired_voicemail(self, tmp_path: Path) -> Path:
+        return _aged(tmp_path / "voicemail" / "1500" / "5551234_20250101_101010.wav", days=200)
+
+    def test_the_row_is_stamped_when_the_audio_goes(self, tmp_path):
+        db = self._db()
+        path = self._expired_voicemail(tmp_path)
+
+        RetentionSweeper(_settings(tmp_path, dry_run=False, audio_days=90), database=db).sweep()
+
+        updates = [c for c in db.execute.call_args_list if "audio_deleted_at" in str(c[0][0])]
+        assert updates, "expired voicemail audio must tombstone its row"
+        assert str(path) in updates[0][0][1]
+
+    def test_a_dry_run_stamps_nothing(self, tmp_path):
+        """The file is still there, so claiming its audio is gone would be a lie."""
+        db = self._db()
+        self._expired_voicemail(tmp_path)
+
+        RetentionSweeper(_settings(tmp_path, dry_run=True, audio_days=90), database=db).sweep()
+
+        db.execute.assert_not_called()
+
+    def test_recordings_are_not_tombstoned(self, tmp_path):
+        """Only voicemail has a mailbox row; a call recording has no equivalent."""
+        db = self._db()
+        _aged(tmp_path / "recordings" / "call.wav", days=200)
+
+        RetentionSweeper(_settings(tmp_path, dry_run=False, audio_days=90), database=db).sweep()
+
+        assert not [c for c in db.execute.call_args_list if "audio_deleted_at" in str(c[0][0])]
+
+    def test_only_untombstoned_rows_are_touched(self, tmp_path):
+        """Re-stamping a row the user already deleted would move its deletion time."""
+        db = self._db()
+        self._expired_voicemail(tmp_path)
+
+        RetentionSweeper(_settings(tmp_path, dry_run=False, audio_days=90), database=db).sweep()
+
+        update = next(c for c in db.execute.call_args_list if "audio_deleted_at" in str(c[0][0]))
+        assert "audio_deleted_at IS NULL" in str(update[0][0])
+
+    def test_a_failure_is_reported_not_raised(self, tmp_path):
+        db = self._db()
+        db.execute.side_effect = RuntimeError("connection reset")
+        self._expired_voicemail(tmp_path)
+
+        result = RetentionSweeper(
+            _settings(tmp_path, dry_run=False, audio_days=90), database=db
+        ).sweep()
+
+        assert any("voicemail tombstone failed" in e for e in result.errors)
