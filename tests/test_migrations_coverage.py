@@ -627,20 +627,20 @@ class TestRegisterAllMigrations:
 
     @patch("pbx.utils.migrations.get_logger")
     def test_registers_every_migration(self, mock_get_logger: MagicMock) -> None:
-        """Must register exactly 21 migrations (1000-1020)."""
+        """Must register exactly 22 migrations (1000-1021)."""
         db = _make_db_backend("sqlite")
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
-        assert len(mgr.migrations) == 21
+        assert len(mgr.migrations) == 22
 
     @patch("pbx.utils.migrations.get_logger")
     def test_migration_versions_are_sequential(self, mock_get_logger: MagicMock) -> None:
-        """Migration versions must be 1000 through 1020, with no gaps."""
+        """Migration versions must be 1000 through 1021, with no gaps."""
         db = _make_db_backend("sqlite")
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
         versions = sorted(m["version"] for m in mgr.migrations)
-        assert versions == list(range(1000, 1021))
+        assert versions == list(range(1000, 1022))
 
     @patch("pbx.utils.migrations.get_logger")
     def test_migration_names(self, mock_get_logger: MagicMock) -> None:
@@ -825,18 +825,18 @@ class TestRegisterAllMigrationsCanApply:
         register_all_migrations(mgr)
         result = mgr.apply_migrations()
         assert result is True
-        assert db.execute_script.call_count == 21
+        assert db.execute_script.call_count == 22
 
     @patch("pbx.utils.migrations.get_logger")
     def test_apply_partial_from_midpoint(self, mock_get_logger: MagicMock) -> None:
-        """Applying migrations from version 1005 should apply 1006-1020 (15 migrations)."""
+        """Applying migrations from version 1005 should apply 1006-1021 (16 migrations)."""
         db = _make_db_backend("sqlite")
         db.fetch_one.return_value = {"max_version": 1005}
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
         result = mgr.apply_migrations()
         assert result is True
-        assert db.execute_script.call_count == 15
+        assert db.execute_script.call_count == 16
 
     @patch("pbx.utils.migrations.get_logger")
     def test_apply_with_target_version(self, mock_get_logger: MagicMock) -> None:
@@ -853,7 +853,7 @@ class TestRegisterAllMigrationsCanApply:
     def test_already_up_to_date(self, mock_get_logger: MagicMock) -> None:
         """Applying when already at latest version should be a no-op."""
         db = _make_db_backend("sqlite")
-        db.fetch_one.return_value = {"max_version": 1020}
+        db.fetch_one.return_value = {"max_version": 1021}
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
         result = mgr.apply_migrations()
@@ -979,3 +979,38 @@ class TestUnifiedStorage:
         )
 
         assert conn.execute("SELECT count(*) FROM transcripts").fetchone()[0] == 1
+
+
+@pytest.mark.unit
+class TestNoticeParticipantsRepair:
+    """
+    1021 exists because 1020 was edited after it had already been applied.
+
+    Versions only move forward and there is no checksum, so the edit was silently a no-op on
+    every install that already had 1020 -- producing a recording_notices table with no
+    participants column while the INSERT named one. The rule is add a migration, never edit one.
+    """
+
+    def _sql(self, version: int) -> str:
+        from pbx.utils.migrations import register_all_migrations
+
+        mgr = MigrationManager(_make_db_backend())
+        mgr.migrations = []
+        register_all_migrations(mgr)
+        return next(m["sql"] for m in mgr.migrations if m["version"] == version)
+
+    def test_1021_adds_the_column(self) -> None:
+        sql = self._sql(1021)
+        assert "ALTER TABLE recording_notices" in sql
+        assert "participants" in sql
+
+    def test_it_is_idempotent(self) -> None:
+        """It has to be harmless on a fresh install and on one that already ran it."""
+        assert "IF NOT EXISTS" in self._sql(1021)
+
+    def test_1020_stays_as_it_was_applied(self) -> None:
+        """
+        Reverted deliberately. A migration already applied somewhere must keep matching what
+        actually ran there, or the code and the deployed schema tell different stories.
+        """
+        assert "participants" not in self._sql(1020)

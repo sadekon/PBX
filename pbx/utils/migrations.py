@@ -1078,12 +1078,6 @@ def register_all_migrations(manager: MigrationManager) -> None:
             -- Stored verbatim rather than referenced. The configured wording changes; what a
             -- given caller was actually told does not, and that is the whole point of this row.
             notice_text {TEXT},
-            -- Who was told. Denormalised on purpose, and deliberately NOT a foreign key to
-            -- recordings: the recording expires at 90 days while this row is kept, so a
-            -- cascade would delete the evidence along with the thing it justifies, and a plain
-            -- reference would dangle. For an external call this is the caller's number, which
-            -- is exactly what "we informed this person at this time" needs to name.
-            participants {TEXT},
             -- How many legs heard it. Both, normally.
             legs INTEGER,
             -- Why it did not play, when it did not.
@@ -1093,5 +1087,25 @@ def register_all_migrations(manager: MigrationManager) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_notices_session ON recording_notices(session_id);
         CREATE INDEX IF NOT EXISTS idx_notices_played ON recording_notices(played, played_at);
+    """),
+    )
+
+    # Migration 1021: who the notice was given to
+    #
+    # Belongs in 1020 and is here instead because 1020 had already been applied by the time
+    # the column was added. Editing an applied migration does nothing -- versions only move
+    # forward and there is no checksum -- so the edit silently produced installs whose
+    # recording_notices had no participants column while INSERTs named one.
+    #
+    # Denormalised, and deliberately NOT a foreign key to recordings: this log is kept
+    # indefinitely while the recording it justifies expires at 90 days, so a cascade would
+    # delete the evidence along with the thing it proves, and a plain reference would dangle.
+    # For an external call this holds the caller's number -- exactly what "we informed this
+    # person at this time" has to be able to name.
+    manager.register_migration(
+        1021,
+        "Recording Notice Participants",
+        manager._build_migration_sql("""
+        ALTER TABLE recording_notices ADD COLUMN IF NOT EXISTS participants {TEXT};
     """),
     )
