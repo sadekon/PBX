@@ -190,11 +190,39 @@ class RecordingStore:
     def for_session(self, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
         return self._select(f"WHERE session_id = {_PH}", (session_id,), limit)
 
-    def recent(self, limit: int = 50, kind: str | None = None) -> list[dict[str, Any]]:
-        """The latest recordings, for the admin view that has never had one."""
-        if kind:
-            return self._select(f"WHERE kind = {_PH}", (kind,), limit)
-        return self._select("", (), limit)
+    def recent(
+        self,
+        limit: int = 50,
+        kind: str | None = None,
+        kinds: Sequence[str] | None = None,
+        participant: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        The latest recordings, for the admin view that has never had one.
+
+        `kinds` filters on several at once, which `kind` cannot -- the admin list shows calls
+        by default and calls plus voicemail when asked, and running that as two queries would
+        interleave them wrongly once a limit is applied.
+
+        `participant` matches one extension against the denormalised participant list. That
+        column is a JSON array of strings, so the match is on the quoted form: searching for
+        `"100"` inside `["1001"]` would otherwise hit, and every extension would match its own
+        prefixes.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        selected = list(kinds) if kinds else ([kind] if kind else [])
+        if selected:
+            clauses.append(f"kind IN ({', '.join([_PH] * len(selected))})")
+            params.extend(selected)
+
+        if participant:
+            clauses.append(f"participants LIKE {_PH}")
+            params.append(f'%"{participant}"%')
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._select(where, tuple(params), limit)
 
     def expiring_before(self, cutoff: Any, kind: str | None = None) -> list[dict[str, Any]]:
         """

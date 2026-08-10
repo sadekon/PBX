@@ -803,6 +803,168 @@ header h1 {
     background: rgba(59, 157, 214, 0.08);
 }
 
+/* ==========================================================================
+   Call recordings
+
+   Deliberately built on the queue card above rather than beside it: a recording
+   card is the same shape as a queue card -- identity and labelled stats in a
+   one-line header, detail in a body that collapses as a unit -- so it reuses
+   .queue-card, .queue-card-head, .qch-*, .en-pill and .qbtn unchanged. Only what
+   is genuinely new to recordings (the player, the transcript, the filter bar)
+   is defined here.
+   ========================================================================== */
+
+.rec-filters {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+}
+
+.rec-filters label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-secondary);
+    font-weight: 600;
+}
+
+.rec-filters input[type="text"] {
+    min-width: 240px;
+    padding: 6px 10px;
+    border: 1px solid var(--color-border);
+    border-radius: 7px;
+    background: var(--color-bg-card);
+    color: var(--color-text);
+    font-size: 0.86rem;
+}
+
+/* The checkbox reads as a sentence, so it keeps sentence case and normal weight
+   rather than the uppercase treatment the filter labels use. */
+.rec-checkbox {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 6px;
+    cursor: pointer;
+    text-transform: none !important;
+    letter-spacing: normal !important;
+    font-size: 0.86rem !important;
+    font-weight: 400 !important;
+    color: var(--color-text) !important;
+}
+
+.rec-body {
+    padding: 10px 16px 4px;
+}
+
+.rec-player {
+    width: 100%;
+    margin-bottom: 12px;
+}
+
+.rec-transcript-run {
+    border-top: 1px solid var(--color-border);
+    padding-top: 10px;
+    margin-top: 4px;
+}
+
+.rec-transcript-run:first-child {
+    border-top: none;
+    padding-top: 0;
+}
+
+.rec-transcript-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
+.rec-transcript-head .k {
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-secondary);
+    font-weight: 600;
+}
+
+.rec-transcript-meta {
+    font-size: 0.76rem;
+    color: var(--color-text-secondary);
+}
+
+/* Clamped on rendered lines rather than a character count, so the preview never
+   cuts mid-word and adapts to however wide the card is. */
+.rec-transcript-preview {
+    margin: 0 0 10px;
+    font-size: 0.88rem;
+    line-height: 1.65;
+    color: var(--color-text-secondary);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.rec-transcript-flat {
+    margin: 0 0 10px;
+    font-size: 0.88rem;
+    line-height: 1.7;
+}
+
+.rec-transcript-none {
+    font-size: 0.86rem;
+    color: var(--color-text-secondary);
+    padding: 4px 0 10px;
+}
+
+.rec-lines {
+    margin-bottom: 10px;
+}
+
+/* One row per speaker turn. Fixed-width time and speaker columns so the text
+   edge stays straight down the whole transcript. */
+.rec-line {
+    display: flex;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--color-border-light);
+}
+
+.rec-line:last-child {
+    border-bottom: none;
+}
+
+.rec-line-time {
+    flex-shrink: 0;
+    width: 38px;
+    font-size: 0.74rem;
+    color: var(--color-text-muted);
+    font-variant-numeric: tabular-nums;
+    padding-top: 2px;
+}
+
+.rec-line-speaker {
+    flex-shrink: 0;
+    width: 82px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--color-text-secondary);
+    padding-top: 1px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.rec-line-text {
+    font-size: 0.88rem;
+    line-height: 1.6;
+}
+
 /* Status pill for agent state (Available / Paused / Logged out) */
 .status-pill {
     display: inline-flex;

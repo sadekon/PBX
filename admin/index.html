@@ -2775,44 +2775,37 @@ G.726-32</textarea>
 
         <!-- Recording Retention Tab -->
         <div id="call-recordings" class="tab-content">
-            <h2>⏺️ Call Recordings</h2>
+            <div class="section-header">
+                <h2>⏺️ Call Recordings</h2>
+                <button class="btn btn-primary" onclick="loadCallRecordings()">🔄 Refresh</button>
+            </div>
 
             <!-- Recordings are admin-only out of the box. Said here rather than only in an
                  error, because a non-admin seeing an empty list would otherwise read it as
                  "nothing was recorded". -->
-            <div class="info-box" style="margin-bottom: 20px;">
-                Call audio and transcripts are restricted to administrators. Users can be given
-                access to calls they were part of by enabling
-                <code>recording.participant_access</code>. Every playback and
-                transcript read is written to the audit log.
+            <div class="info-box">
+                <h3>ℹ️ About Call Recordings</h3>
+                <p>Call audio and transcripts are restricted to administrators. Users can be given
+                access to calls they took part in by enabling
+                <code>recording.participant_access</code>.</p>
+                <p><strong>Every playback and transcript read is written to the audit log</strong>,
+                including refused ones.</p>
             </div>
 
-            <div class="action-buttons" style="margin-bottom: 20px;">
-                <button class="btn btn-primary" onclick="loadCallRecordings()">🔄 Refresh</button>
-                <label for="recordings-kind-filter" style="margin-left: 12px;">Kind:</label>
-                <select id="recordings-kind-filter">
-                    <option value="">All</option>
-                    <option value="call">Call</option>
-                    <option value="voicemail">Voicemail</option>
-                    <option value="conference">Conference</option>
-                </select>
-            </div>
+            <div class="config-section">
+                <div class="rec-filters">
+                    <label for="recordings-participant-filter">Participant</label>
+                    <input type="text" id="recordings-participant-filter"
+                           placeholder="Extension or caller number" autocomplete="off">
+                    <label class="rec-checkbox" for="recordings-include-voicemail">
+                        <input type="checkbox" id="recordings-include-voicemail">
+                        Include voicemail
+                    </label>
+                </div>
 
-            <!-- Hidden until something is played. Audio arrives as a blob fetched with the
-                 bearer token, so this element's src is an object URL, never the API path. -->
-            <div id="recording-player-section" style="display: none; margin-bottom: 20px;">
-                <audio id="recording-audio-player" controls style="width: 100%;"></audio>
-                <button class="btn btn-secondary btn-sm" onclick="closeRecordingPlayer()"
-                        style="margin-top: 8px;">Close Player</button>
-            </div>
-
-            <div id="recording-transcript-section" style="display: none; margin-bottom: 20px;">
-                <h3>Transcript</h3>
-                <div id="recording-transcript-body"></div>
-            </div>
-
-            <div id="call-recordings-list">
-                <div class="info-box">Loading recordings&hellip;</div>
+                <div id="call-recordings-list">
+                    <div class="queues-cards"><div class="loading">Loading recordings...</div></div>
+                </div>
             </div>
         </div>
 

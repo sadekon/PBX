@@ -78,7 +78,6 @@ declare global {
         // pages/call-recordings.ts
         initCallRecordings: () => void;
         loadCallRecordings: () => Promise<void>;
-        closeRecordingPlayer: () => void;
 
         // pages/calls.ts
         loadCalls: () => Promise<void>;

@@ -221,6 +221,116 @@ def alaw_to_pcm16(payload: bytes) -> "np.ndarray":
     return _ALAW_DECODE_TABLE[np.frombuffer(payload, dtype=np.uint8)]
 
 
+def read_wav_format(path: "str | Path") -> tuple[int, int, int] | None:
+    """
+    Read a WAV file's ``fmt`` chunk without decoding the audio.
+
+    Returns:
+        ``(audio_format, sample_rate, channels)``, or None when the file is not a readable
+        RIFF/WAVE. ``audio_format`` is the raw code -- compare against ``WAV_FORMAT_*``.
+    """
+    try:
+        with Path(path).open("rb") as f:
+            if f.read(4) != b"RIFF":
+                return None
+            f.read(4)
+            if f.read(4) != b"WAVE":
+                return None
+
+            while True:
+                chunk_id = f.read(4)
+                if not chunk_id or len(chunk_id) < 4:
+                    return None
+                size_bytes = f.read(4)
+                if len(size_bytes) < 4:
+                    return None
+                chunk_size = struct.unpack("<I", size_bytes)[0]
+
+                if chunk_id == b"fmt ":
+                    fmt = f.read(chunk_size)
+                    if len(fmt) < 16:
+                        return None
+                    return (
+                        struct.unpack("<H", fmt[0:2])[0],
+                        struct.unpack("<I", fmt[4:8])[0],
+                        struct.unpack("<H", fmt[2:4])[0],
+                    )
+                # Chunks are word-aligned; an odd size carries a pad byte.
+                f.seek(chunk_size + (chunk_size & 1), 1)
+    except (OSError, struct.error):
+        return None
+
+
+def wav_as_pcm16_wav(path: "str | Path") -> tuple[bytes | None, int | None]:
+    """
+    Read a WAV file as one a browser will actually play.
+
+    Telephony audio is routinely stored as G.711, which every mainstream browser refuses --
+    an ``<audio>`` element given µ-law reports "no supported source was found" rather than any
+    decode error, so the failure looks like a broken URL. Decoding to linear PCM here is what
+    makes voicemail and call audio playable from the admin UI at all.
+
+    Returns:
+        ``(data, audio_format)``. ``data`` is None when the file needs no conversion (already
+        linear PCM -- serve the file directly so range requests keep working) **or** when the
+        format cannot be decoded; the two cases are told apart by ``audio_format``, which is
+        None only when the file could not be parsed. Callers should refuse to serve a format
+        that is neither PCM nor G.711 rather than send bytes that will not play.
+    """
+    header = read_wav_format(path)
+    if header is None:
+        return None, None
+
+    audio_format, sample_rate, channels = header
+    if audio_format == WAV_FORMAT_PCM:
+        return None, audio_format
+    if audio_format not in (WAV_FORMAT_ULAW, WAV_FORMAT_ALAW):
+        return None, audio_format
+
+    # Read the data chunk directly rather than through the stdlib: wave.open refuses G.711
+    # outright with "unknown format: 7", which is the whole reason this function exists.
+    payload = _read_wav_data_chunk(path)
+    if payload is None:
+        return None, audio_format
+
+    decode = ulaw_to_pcm16 if audio_format == WAV_FORMAT_ULAW else alaw_to_pcm16
+    try:
+        samples = decode(payload).astype("<i2").tobytes()
+    except (ValueError, TypeError):
+        return None, audio_format
+
+    header_bytes = build_wav_header(
+        len(samples), sample_rate=sample_rate, channels=channels, bits_per_sample=16
+    )
+    return header_bytes + samples, audio_format
+
+
+def _read_wav_data_chunk(path: "str | Path") -> bytes | None:
+    """The raw contents of a WAV's ``data`` chunk, whatever the encoding."""
+    try:
+        with Path(path).open("rb") as f:
+            if f.read(4) != b"RIFF":
+                return None
+            f.read(4)
+            if f.read(4) != b"WAVE":
+                return None
+
+            while True:
+                chunk_id = f.read(4)
+                if not chunk_id or len(chunk_id) < 4:
+                    return None
+                size_bytes = f.read(4)
+                if len(size_bytes) < 4:
+                    return None
+                chunk_size = struct.unpack("<I", size_bytes)[0]
+
+                if chunk_id == b"data":
+                    return f.read(chunk_size)
+                f.seek(chunk_size + (chunk_size & 1), 1)
+    except (OSError, struct.error):
+        return None
+
+
 def _encode_index(samples: "np.ndarray") -> "np.ndarray":
     """Shift int16 samples into the 0..65535 range the encode tables use."""
     return np.asarray(samples, dtype=np.int16).astype(np.int32) + 32768

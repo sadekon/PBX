@@ -24,7 +24,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
-from flask import Blueprint, request, send_file
+from flask import Blueprint, current_app, request, send_file
 
 from pbx.api.utils import (
     check_recording_access,
@@ -34,6 +34,8 @@ from pbx.api.utils import (
     send_json,
     validate_limit_param,
 )
+from pbx.features.recording_store import KIND_CALL, KIND_VOICEMAIL
+from pbx.utils.audio import WAV_FORMAT_PCM, wav_as_pcm16_wav
 from pbx.utils.audit_logger import get_audit_logger
 from pbx.utils.logger import get_logger
 
@@ -60,10 +62,6 @@ _LIST_FIELDS: Final[tuple[str, ...]] = (
     "audio_deleted_at",
     "created_at",
 )
-
-#: Recording kinds accepted as a filter. An unknown value is rejected rather than passed to
-#: the store, so the parameter cannot be used to probe the column.
-_KINDS: Final[frozenset[str]] = frozenset({"call", "voicemail", "conference"})
 
 
 def _stores() -> tuple[Any, Any]:
@@ -196,18 +194,27 @@ def list_recordings() -> Response:
     if not is_admin and not participant_access_enabled():
         return send_json({"error": "Not authorized to access recordings"}, 403)
 
-    kind = request.args.get("kind")
-    if kind and kind not in _KINDS:
-        return send_json(
-            {"error": f"Unknown kind. Expected one of: {', '.join(sorted(_KINDS))}"}, 400
-        )
+    # Calls unless voicemail is asked for. Voicemail rows live in the same table but have
+    # their own page, so surfacing them here by default would show every mailbox message
+    # twice over and bury the call recordings this page exists for.
+    #
+    # These are the only two kinds anything writes: CallRecordingSystem registers KIND_CALL
+    # and the mailbox registers KIND_VOICEMAIL. There is deliberately no conference option --
+    # RTPMixer is constructed on PBXCore but bridges nothing, so it has no writer.
+    kinds = [KIND_CALL]
+    if request.args.get("include_voicemail", "0") in {"1", "true"}:
+        kinds.append(KIND_VOICEMAIL)
+
+    participant = (request.args.get("participant") or "").strip() or None
+    if participant and len(participant) > 50:
+        return send_json({"error": "Participant filter is too long"}, 400)
 
     limit = validate_limit_param(default=50, max_value=500)
     if limit is None:
         return send_json({"error": "Invalid limit parameter"}, 400)
 
     try:
-        rows = store.recent(limit=limit, kind=kind)
+        rows = store.recent(limit=limit, kinds=kinds, participant=participant)
     except Exception as e:
         logger.error(f"Could not list recordings: {e}")
         return send_json({"error": "Could not list recordings"}, 500)
@@ -289,12 +296,49 @@ def get_recording_audio(recording_id: str) -> Response:
         user=user, recording_id=recording_id, kind="audio", ip_address=ip, granted=True
     )
 
+    download = request.args.get("download", "0") in {"1", "true"}
+    filename = f"recording_{recording_id}.wav"
+
+    # Telephony audio is often stored as G.711, which no mainstream browser will decode -- an
+    # <audio> element reports "no supported source was found", which reads as a broken URL
+    # rather than an unsupported codec. Convert to linear PCM on the way out.
+    converted, audio_format = wav_as_pcm16_wav(media)
+
+    if audio_format is None:
+        logger.error("Recording %s is not a readable WAV: %s", recording_id, media.name)
+        return send_json({"error": "Audio file is not a readable WAV"}, 422)
+
+    if converted is not None:
+        response = current_app.response_class(converted, mimetype="audio/wav")
+        response.headers["Content-Length"] = str(len(converted))
+        if download:
+            response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return _no_store(response)
+
+    if audio_format != WAV_FORMAT_PCM:
+        # Serving it anyway would produce the same silent failure this function exists to
+        # avoid. G.722 is the likely one here -- it has no decoder in this codebase yet.
+        logger.error(
+            "Recording %s is WAV format %s, which the browser cannot play and we cannot convert",
+            recording_id,
+            audio_format,
+        )
+        return send_json(
+            {
+                "error": "Audio is in a format this browser cannot play",
+                "wav_format": audio_format,
+            },
+            415,
+        )
+
+    # Already linear PCM: serve the file itself so range requests keep working, which is what
+    # lets a player seek in a long call without pulling the whole recording first.
     response = send_file(
         media,
         mimetype="audio/wav",
         conditional=True,
-        as_attachment=request.args.get("download", "0") in {"1", "true"},
-        download_name=f"recording_{recording_id}.wav",
+        as_attachment=download,
+        download_name=filename,
     )
     return _no_store(response)
 
@@ -325,4 +369,55 @@ def get_recording_transcript(recording_id: str) -> Response:
         user=user, recording_id=recording_id, kind="transcript", ip_address=ip, granted=True
     )
 
-    return _no_store(send_json({"recording_id": recording.get("id"), "transcripts": runs}))
+    # `lines` replaces `segments` rather than joining it: they carry the same content, and
+    # sending both would ship the per-word timing this strips out in the first place.
+    shaped = [
+        {
+            **{k: v for k, v in run.items() if k != "segments"},
+            "lines": _speaker_lines(run.get("segments")),
+        }
+        for run in runs
+    ]
+    return _no_store(send_json({"recording_id": recording.get("id"), "transcripts": shaped}))
+
+
+def _speaker_lines(segments: Any) -> list[dict[str, Any]]:
+    """Collapse raw segments into one line per turn.
+
+    Whisper emits a segment per decoded window rather than per utterance, so a single spoken
+    sentence routinely arrives as three fragments with the same speaker. Rendered one-per-line
+    that reads as stuttering rather than conversation, so consecutive segments from the same
+    speaker are joined and keep the first one's start time.
+
+    Per-word timing is dropped: nothing in the UI seeks to a word, and `words` is by far the
+    largest part of a segment -- carrying it would multiply the response size for no reader.
+
+    Returns an empty list when timing was never recorded, which is the signal to fall back to
+    the flat ``text`` field rather than render an empty transcript.
+    """
+    if not isinstance(segments, list):
+        return []
+
+    lines: list[dict[str, Any]] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            continue
+
+        speaker = str(segment.get("speaker") or "")
+        if lines and lines[-1]["speaker"] == speaker:
+            lines[-1]["text"] = f"{lines[-1]['text']} {text}"
+            lines[-1]["end"] = segment.get("end")
+        else:
+            lines.append(
+                {
+                    "speaker": speaker,
+                    "text": text,
+                    "start": segment.get("start"),
+                    "end": segment.get("end"),
+                }
+            )
+
+    return lines

@@ -478,8 +478,50 @@ authenticates against the user's **voicemail PIN**. Any extension with a PIN cou
 retention policy, search recording analyses, and `POST`/`DELETE` policies and legal holds.
 Deleting a retention policy is a data-destruction primitive. All 14 are now `@require_admin`.
 
+### G.711 had to be decoded before a browser would play anything
+
+Playback failed with "no supported source was found" — which reads as a broken URL, not as a
+codec problem, because that is the *only* thing an `<audio>` element reports. Telephony audio
+is routinely stored as G.711, and no mainstream browser decodes it.
+
+`pbx/utils/audio.wav_as_pcm16_wav` now reads the `fmt` chunk and decides:
+
+| Stored format | Behaviour |
+|---|---|
+| Linear PCM | Served untouched via `send_file`, so range requests and seeking still work |
+| µ-law / A-law | Decoded to PCM16 and rebuilt, using the existing `ulaw_to_pcm16` tables |
+| Anything else (G.722) | **415, not served** — sending it reproduces the same silent failure |
+| Not a RIFF/WAVE | 422 |
+
+The refusal matters as much as the conversion: serving a format the browser cannot decode is
+indistinguishable, from the UI, from the bug this replaced.
+
+### Page layout follows the call queues page
+
+One card per recording reusing `.queue-card` / `.queue-card-head` / `.qch-*` / `.en-pill` /
+`.qbtn` unchanged — same one-line header, same collapse-as-a-unit body. Only the player,
+transcript and filter bar are new CSS.
+
+The transcript shows as a two-line preview (clamped on rendered lines, not characters) and
+expands to one row per speaker turn. `/transcript` returns `lines` instead of raw `segments`:
+consecutive segments from the same speaker are merged — Whisper emits one segment per decoded
+window, so an unmerged sentence renders as three stuttering fragments — and per-word timing is
+dropped, since nothing seeks to a word and `words` dominates the payload. Voicemail has no
+speaker column at all rather than an empty one, and a transcript with no timing falls back to
+prose.
+
+**There is no conference filter, and the kind dropdown is gone.** `RecordingStore` exports only
+`KIND_CALL` (`"recording"`) and `KIND_VOICEMAIL`; nothing writes a conference kind, since
+`RTPMixer` bridges nothing. Note `KIND_CALL` is the string `"recording"`, not `"call"` — an
+earlier filter used the literal and silently matched no rows. The page shows calls, with an
+"Include voicemail" checkbox for cross-cutting review, and a debounced participant filter
+matching `recordings.participants` on the quoted JSON form (`%"1001"%`) so `100` cannot match
+`1001`.
+
 ### Not done
 
+- Click-to-seek from a transcript line. `start` is carried on every line and the player is in
+  the same card, so the wiring is short; it just is not done.
 - Bulk export of recordings (voicemail has a ZIP export path; recordings have none).
 - Live-transcript view. `transcripts.recording_id` is nullable and `source="live"` is reserved
   for it, but nothing streams yet.

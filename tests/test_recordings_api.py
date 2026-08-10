@@ -11,7 +11,23 @@ from unittest.mock import MagicMock
 import pytest
 from flask.testing import FlaskClient
 
+from pbx.features.recording_store import KIND_CALL, KIND_VOICEMAIL
+from pbx.utils.audio import WAV_FORMAT_PCM, build_wav_header
 from pbx.utils.session_token import get_session_token_manager
+
+
+def _wav(path: Path, audio_format: int = WAV_FORMAT_PCM, payload: bytes = b"\x00\x01" * 64) -> Path:
+    """Write a minimal but genuinely parseable WAV. The endpoint rejects anything else."""
+    bits = 16 if audio_format == WAV_FORMAT_PCM else 8
+    header = build_wav_header(
+        len(payload),
+        sample_rate=8000,
+        channels=1,
+        bits_per_sample=bits,
+        audio_format=audio_format,
+    )
+    path.write_bytes(header + payload)
+    return path
 
 
 def _token(extension: str, is_admin: bool) -> dict[str, str]:
@@ -28,7 +44,7 @@ def _recording(**overrides: object) -> dict:
         "id": 7,
         "session_id": "sess-1",
         "call_id": "call-1",
-        "kind": "call",
+        "kind": KIND_CALL,
         "path": None,
         "bytes": 1024,
         "duration_seconds": 12.5,
@@ -165,11 +181,33 @@ class TestListResponseShape:
         resp = api_client.get("/api/recordings", headers=_token("9000", is_admin=True))
         assert "secret-layout" not in resp.get_data(as_text=True)
 
-    def test_unknown_kind_is_rejected(
+    def test_voicemail_is_excluded_unless_asked_for(
+        self, api_client: FlaskClient, recording_core: MagicMock
+    ) -> None:
+        """Voicemail has its own page; this one is for calls."""
+        api_client.get("/api/recordings", headers=_token("9000", is_admin=True))
+        kwargs = recording_core.recording_system.store.recent.call_args.kwargs
+        assert kwargs["kinds"] == [KIND_CALL]
+
+    def test_include_voicemail_widens_the_query(
+        self, api_client: FlaskClient, recording_core: MagicMock
+    ) -> None:
+        api_client.get("/api/recordings?include_voicemail=1", headers=_token("9000", is_admin=True))
+        kwargs = recording_core.recording_system.store.recent.call_args.kwargs
+        assert kwargs["kinds"] == [KIND_CALL, KIND_VOICEMAIL]
+
+    def test_participant_filter_is_passed_to_the_store(
+        self, api_client: FlaskClient, recording_core: MagicMock
+    ) -> None:
+        api_client.get("/api/recordings?participant=1001", headers=_token("9000", is_admin=True))
+        kwargs = recording_core.recording_system.store.recent.call_args.kwargs
+        assert kwargs["participant"] == "1001"
+
+    def test_overlong_participant_filter_is_rejected(
         self, api_client: FlaskClient, recording_core: MagicMock
     ) -> None:
         resp = api_client.get(
-            "/api/recordings?kind=../etc", headers=_token("9000", is_admin=True)
+            f"/api/recordings?participant={'9' * 80}", headers=_token("9000", is_admin=True)
         )
         assert resp.status_code == 400
 
@@ -211,8 +249,7 @@ class TestAudioRetrieval:
     ) -> None:
         root = tmp_path / "recordings"
         root.mkdir()
-        media = root / "7.wav"
-        media.write_bytes(b"RIFF....WAVE")
+        media = _wav(root / "7.wav")
 
         recording_core.config.get.side_effect = lambda key, default=None: {
             "recording.storage_path": str(root),
@@ -222,7 +259,7 @@ class TestAudioRetrieval:
 
         resp = api_client.get("/api/recordings/7/audio", headers=_token("9000", is_admin=True))
         assert resp.status_code == 200
-        assert resp.get_data() == b"RIFF....WAVE"
+        assert resp.get_data() == media.read_bytes()
 
     def test_media_response_is_not_cacheable(
         self, api_client: FlaskClient, recording_core: MagicMock, tmp_path: Path
@@ -230,8 +267,7 @@ class TestAudioRetrieval:
         """Audio must not settle into a browser cache that outlives the retention policy."""
         root = tmp_path / "recordings"
         root.mkdir()
-        media = root / "7.wav"
-        media.write_bytes(b"RIFF")
+        media = _wav(root / "7.wav")
 
         recording_core.config.get.side_effect = lambda key, default=None: {
             "recording.storage_path": str(root),
@@ -249,9 +285,7 @@ class TestTranscriptRetrieval:
     def test_admin_gets_transcript_text(
         self, api_client: FlaskClient, recording_core: MagicMock
     ) -> None:
-        resp = api_client.get(
-            "/api/recordings/7/transcript", headers=_token("9000", is_admin=True)
-        )
+        resp = api_client.get("/api/recordings/7/transcript", headers=_token("9000", is_admin=True))
         assert resp.status_code == 200
         assert resp.get_json()["transcripts"][0]["text"] == "hello there"
 
@@ -259,9 +293,7 @@ class TestTranscriptRetrieval:
         self, api_client: FlaskClient, recording_core: MagicMock
     ) -> None:
         recording_core.transcript_store.for_recording.return_value = []
-        resp = api_client.get(
-            "/api/recordings/7/transcript", headers=_token("9000", is_admin=True)
-        )
+        resp = api_client.get("/api/recordings/7/transcript", headers=_token("9000", is_admin=True))
         assert resp.status_code == 404
 
     def test_non_admin_refused_by_default(
@@ -291,3 +323,86 @@ class TestRetentionRoutesAreAdminOnly:
     ) -> None:
         resp = api_client.get(path, headers=_token("1001", is_admin=False))
         assert resp.status_code == 403
+
+
+@pytest.mark.unit
+class TestAudioFormatConversion:
+    """G.711 is the format a browser silently refuses, and the one telephony stores."""
+
+    @staticmethod
+    def _write_wav(path: Path, audio_format: int, payload: bytes) -> None:
+        """A minimal single-chunk WAV with the given format code."""
+        from pbx.utils.audio import build_wav_header
+
+        bits = 16 if audio_format == 1 else 8
+        header = build_wav_header(
+            len(payload),
+            sample_rate=8000,
+            channels=1,
+            bits_per_sample=bits,
+            audio_format=audio_format,
+        )
+        path.write_bytes(header + payload)
+
+    def test_ulaw_is_decoded_to_pcm(self, tmp_path: Path) -> None:
+        """Served as-is, this is exactly the 'no supported source was found' failure."""
+        from pbx.utils.audio import (
+            WAV_FORMAT_PCM,
+            WAV_FORMAT_ULAW,
+            read_wav_format,
+            wav_as_pcm16_wav,
+        )
+
+        src = tmp_path / "vm.wav"
+        self._write_wav(src, WAV_FORMAT_ULAW, bytes(range(256)))
+
+        assert read_wav_format(src)[0] == WAV_FORMAT_ULAW
+
+        converted, detected = wav_as_pcm16_wav(src)
+        assert detected == WAV_FORMAT_ULAW
+        assert converted is not None
+
+        out = tmp_path / "out.wav"
+        out.write_bytes(converted)
+        assert read_wav_format(out)[0] == WAV_FORMAT_PCM
+        # 8-bit in, 16-bit out.
+        assert len(converted) > len(src.read_bytes())
+
+    def test_pcm_is_left_alone(self, tmp_path: Path) -> None:
+        """Untouched so send_file keeps serving range requests."""
+        from pbx.utils.audio import WAV_FORMAT_PCM, wav_as_pcm16_wav
+
+        src = tmp_path / "call.wav"
+        self._write_wav(src, WAV_FORMAT_PCM, b"\x00\x01" * 64)
+
+        converted, detected = wav_as_pcm16_wav(src)
+        assert detected == WAV_FORMAT_PCM
+        assert converted is None
+
+    def test_unreadable_file_reports_no_format(self, tmp_path: Path) -> None:
+        junk = tmp_path / "not.wav"
+        junk.write_bytes(b"this is not a RIFF file")
+
+        from pbx.utils.audio import wav_as_pcm16_wav
+
+        assert wav_as_pcm16_wav(junk) == (None, None)
+
+    def test_undecodable_format_is_refused_not_served(
+        self, api_client: FlaskClient, recording_core: MagicMock, tmp_path: Path
+    ) -> None:
+        """G.722 has no decoder here; serving it would reproduce the silent failure."""
+        from pbx.utils.audio import WAV_FORMAT_G722
+
+        root = tmp_path / "recordings"
+        root.mkdir()
+        media = root / "7.wav"
+        self._write_wav(media, WAV_FORMAT_G722, b"\x00" * 32)
+
+        recording_core.config.get.side_effect = lambda key, default=None: {
+            "recording.storage_path": str(root),
+        }.get(key, default)
+        recording_core.recording_system.store.get.return_value = _recording(path=str(media))
+
+        resp = api_client.get("/api/recordings/7/audio", headers=_token("9000", is_admin=True))
+        assert resp.status_code == 415
+        assert resp.get_json()["wav_format"] == WAV_FORMAT_G722
