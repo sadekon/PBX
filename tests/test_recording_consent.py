@@ -571,3 +571,96 @@ class TestInternalLookupContract:
 
         assert not is_internal("unknown")
         assert not is_internal("")
+
+
+@pytest.mark.unit
+class TestNoticeLog:
+    """
+    The record that a caller was told.
+
+    Counters live in memory and the audio expires, so without this there is no durable proof
+    that notice was given -- for the one feature whose entire purpose is being able to show it.
+    Deliberately not swept by retention: a call expiring at 90 days must not take the evidence
+    justifying it along too.
+    """
+
+    def _db(self):
+        db = MagicMock()
+        db.enabled = True
+        db.execute.return_value = True
+        db.fetch_all.return_value = []
+        return db
+
+    def _handler(self):
+        handler = MagicMock()
+        handler.call_id = "call-1"
+        return handler
+
+    def test_a_played_notice_is_recorded(self, tmp_path):
+        db = self._db()
+        announcer = _announcer(audio_file=str(tmp_path / "x.wav"))
+        announcer.database = db
+
+        announcer._record(self._handler(), played=True)
+
+        query, params = db.execute.call_args[0]
+        assert "INSERT INTO recording_notices" in query
+        assert params[2] is True
+
+    def test_the_wording_is_stored_verbatim(self, tmp_path):
+        """The configured text changes; what this caller heard does not."""
+        db = self._db()
+        announcer = _announcer(audio_file=str(tmp_path / "x.wav"), text="Specific wording")
+        announcer.database = db
+
+        announcer._record(self._handler(), played=True)
+
+        assert "Specific wording" in db.execute.call_args[0][1]
+
+    def test_a_failure_is_recorded_with_its_reason(self, tmp_path):
+        """The rows that matter most: each one is a recording that was discarded."""
+        db = self._db()
+        announcer = _announcer(audio_file=str(tmp_path / "x.wav"))
+        announcer.database = db
+
+        announcer._record(self._handler(), played=False)
+
+        params = db.execute.call_args[0][1]
+        assert params[2] is False
+        assert "discarded" in params[5]
+
+    def test_no_database_is_survivable(self, tmp_path):
+        _announcer(audio_file=str(tmp_path / "x.wav"))._record(self._handler(), played=True)
+
+    def test_a_logging_failure_never_costs_the_call(self, tmp_path):
+        """Failing to log a notice is not a reason to fail the call it protected."""
+        db = self._db()
+        db.execute.side_effect = RuntimeError("connection reset")
+        announcer = _announcer(audio_file=str(tmp_path / "x.wav"))
+        announcer.database = db
+
+        announcer._record(self._handler(), played=True)
+
+    def test_playback_records_its_outcome(self, tmp_path):
+        """_play must log whatever happened, including the failure path."""
+        db = self._db()
+        announcer = _announcer(audio_file=str(tmp_path / "absent.wav"))
+        announcer.database = db
+        handler = MagicMock()
+        handler.call_id = "call-1"
+        handler.running = True
+        handler.tap = None
+
+        announcer._play(handler, lambda _ok: None)
+
+        assert db.execute.called
+        assert db.execute.call_args[0][1][2] is False
+
+    def test_recent_reads_newest_first(self, tmp_path):
+        db = self._db()
+        announcer = _announcer(audio_file=str(tmp_path / "x.wav"))
+        announcer.database = db
+
+        announcer.recent(10)
+
+        assert "ORDER BY played_at DESC" in db.fetch_all.call_args[0][0]

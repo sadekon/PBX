@@ -894,66 +894,118 @@ export async function sendTestNotification(userId: string): Promise<void> {
     }
 }
 
-// --- Recording Announcements ---
+// --- Recording Notice (consent) ---
+
+interface NoticeStats {
+    enabled?: boolean;
+    announce_for?: string;
+    announcements_played?: number;
+    announcements_failed?: number;
+    audio_file?: string;
+    audio_present?: boolean;
+    text?: string;
+}
+
+interface NoticeRow {
+    session_id?: string;
+    played?: boolean;
+    notice_text?: string;
+    legs?: number;
+    failure_reason?: string;
+    played_at?: string;
+}
+
+interface NoticeLogResponse {
+    notices?: NoticeRow[];
+}
 
 export async function loadRecordingAnnouncementsStats(): Promise<void> {
     try {
         const API_BASE = getApiBaseUrl();
-        const [statsRes, configRes] = await Promise.all([
+        const [statsRes, logRes] = await Promise.all([
             fetchWithTimeout(`${API_BASE}/api/recording-announcements/statistics`, {
                 headers: getAuthHeaders()
             }),
-            fetchWithTimeout(`${API_BASE}/api/recording-announcements/config`, {
+            fetchWithTimeout(`${API_BASE}/api/recording-announcements/log`, {
                 headers: getAuthHeaders()
             })
         ]);
-        const [statsData, configData]: [RecordingAnnouncementsStats, RecordingAnnouncementsConfig] =
-            await Promise.all([statsRes.json(), configRes.json()]);
 
-        // Update statistics
-        if (statsData) {
-            const el = (id: string): HTMLElement | null => document.getElementById(id);
-            if (el('announcements-enabled')) {
-                (el('announcements-enabled') as HTMLElement).textContent =
-                    statsData.enabled ? 'Enabled' : 'Disabled';
-            }
-            if (el('announcements-played')) {
-                (el('announcements-played') as HTMLElement).textContent =
-                    String(statsData.announcements_played ?? 0);
-            }
-            if (el('consent-accepted')) {
-                (el('consent-accepted') as HTMLElement).textContent =
-                    String(statsData.consent_accepted ?? 0);
-            }
-            if (el('consent-declined')) {
-                (el('consent-declined') as HTMLElement).textContent =
-                    String(statsData.consent_declined ?? 0);
-            }
-            if (el('announcement-type')) {
-                (el('announcement-type') as HTMLElement).textContent =
-                    statsData.announcement_type ?? 'N/A';
-            }
-            if (el('require-consent')) {
-                (el('require-consent') as HTMLElement).textContent =
-                    statsData.require_consent ? 'Yes' : 'No';
+        const [stats, log]: [NoticeStats, NoticeLogResponse] = await Promise.all([
+            statsRes.json(),
+            logRes.json()
+        ]);
+
+        const set = (id: string, value: string): void => {
+            const node = document.getElementById(id);
+            if (node) node.textContent = value;
+        };
+
+        if (stats) {
+            const mode = stats.announce_for ?? 'external';
+            set('announcements-enabled', stats.enabled === false ? 'Off' : mode);
+            set('announcements-played', String(stats.announcements_played ?? 0));
+            // Each failure discarded a recording: notice is what makes keeping one lawful.
+            set('announcements-failed', String(stats.announcements_failed ?? 0));
+            set('announcement-mode', mode);
+            set('announcement-text', stats.text ?? 'N/A');
+            set(
+                'audio-file-path',
+                stats.audio_present === false
+                    ? `${stats.audio_file ?? 'N/A'} — MISSING`
+                    : (stats.audio_file ?? 'N/A')
+            );
+
+            // The prompt failing to exist stops external calls recording at all, silently
+            // except for this line and the log.
+            const banner = document.getElementById('announcement-banner');
+            if (banner) {
+                if (stats.enabled === false) {
+                    banner.className = 'alert-box warning';
+                    banner.textContent =
+                        'Recording notices are OFF. Calls still record, with no notice played. '
+                        + 'This is unlawful in two-party-consent jurisdictions.';
+                } else if (stats.audio_present === false) {
+                    banner.className = 'alert-box error';
+                    banner.textContent =
+                        'The notice audio is MISSING. Calls that require a notice are NOT being '
+                        + 'recorded — the recording is discarded when the notice cannot play.';
+                } else {
+                    banner.className = 'alert-box';
+                    banner.textContent =
+                        `Notices play on ${mode === 'all' ? 'every call' : 'calls with an outside party'}`
+                        + ', to both legs. A recording whose notice fails to play is discarded.';
+                }
             }
         }
 
-        // Update configuration
-        if (configData) {
-            const el = (id: string): HTMLElement | null => document.getElementById(id);
-            if (el('audio-file-path')) {
-                (el('audio-file-path') as HTMLElement).textContent =
-                    configData.audio_path ?? 'N/A';
-            }
-            if (el('announcement-text')) {
-                (el('announcement-text') as HTMLElement).textContent =
-                    configData.announcement_text ?? 'N/A';
-            }
+        const tbody = document.getElementById('announcement-log-table');
+        if (tbody) {
+            const rows = log?.notices ?? [];
+            tbody.innerHTML = rows.length
+                ? rows
+                      .map(row => {
+                          const when = row.played_at
+                              ? new Date(row.played_at).toLocaleString()
+                              : 'N/A';
+                          const outcome = row.played
+                              ? 'played'
+                              : `<strong>not played</strong> — recording discarded`;
+                          return `
+                        <tr>
+                            <td><small>${when}</small></td>
+                            <td><small>${escapeHtml(row.session_id ?? '')}</small></td>
+                            <td>${outcome}</td>
+                            <td><small>${escapeHtml(row.notice_text ?? row.failure_reason ?? '')}</small></td>
+                        </tr>
+                    `;
+                      })
+                      .join('')
+                : '<tr><td colspan="4" style="text-align: center;">No notices recorded yet</td></tr>';
         }
     } catch (error: unknown) {
-        console.error('Error loading recording announcements data:', error);
-        showNotification('Error loading recording announcements data', 'error');
+        console.error('Error loading recording notice data:', error);
+        showNotification('Error loading recording notice data', 'error');
     }
 }
 

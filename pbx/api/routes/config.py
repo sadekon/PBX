@@ -283,9 +283,12 @@ def get_features_config() -> tuple[Response, int]:
             ),
             "description": "Speech-to-text voicemail transcription",
         },
-        "call_recording_announcements": {
-            "enabled": pbx_core.config.get("features.call_recording_announcements.enabled", False),
-            "description": "Play recording announcements to callers",
+        "recording_notice": {
+            # Not a features.* flag: which calls get a notice is recording.consent.announce_for,
+            # and "off" is the only way to disable it. The old key never existed in config.yml,
+            # so this always reported False while notices were in fact playing.
+            "enabled": pbx_core.config.get("recording.consent.announce_for", "external") != "off",
+            "description": "Play a recording notice to call participants",
         },
         "fraud_detection": {
             "enabled": pbx_core.config.get("features.fraud_detection.enabled", True),

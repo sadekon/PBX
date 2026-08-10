@@ -299,11 +299,6 @@ class FeatureInitializer:
             logger.info("Mobile push notifications initialized")
 
         # Initialize Recording Announcements
-        from pbx.features.recording_announcements import RecordingAnnouncements
-
-        pbx_core.recording_announcements = RecordingAnnouncements(config=config, database=database)
-        if pbx_core.recording_announcements.enabled:
-            logger.info("Recording announcements initialized")
 
         # Initialize MFA if enabled
         if config.get("security.mfa.enabled", False):
@@ -424,8 +419,16 @@ class FeatureInitializer:
         for problem in settings.validate():
             logger.warning("Recording consent config: %s", problem)
 
-        announcer = ConsentAnnouncer(settings, is_internal=is_internal, logger=logger)
+        announcer = ConsentAnnouncer(
+            settings,
+            is_internal=is_internal,
+            logger=logger,
+            database=getattr(pbx_core, "database", None),
+        )
         pbx_core.consent_announcer = announcer
+        # The admin page and the announcement API address it under this name. It used to be
+        # a separate module that never played anything; both are the same object now.
+        pbx_core.recording_announcements = announcer
 
         # Recording with no notice at all is legitimate in a one-party-consent jurisdiction,
         # but it must never be a quiet state -- this is the config that used to require a

@@ -17,6 +17,7 @@ from pbx.api.utils import (
     get_request_body,
     require_auth,
     send_json,
+    validate_limit_param,
     verify_authentication,
 )
 from pbx.features.retention_policies import (
@@ -2478,40 +2479,56 @@ def test_push_notification() -> tuple[Response, int]:
 @features_bp.route("/api/recording-announcements/statistics", methods=["GET"])
 @require_auth
 def get_announcement_statistics() -> tuple[Response, int]:
-    """Get recording announcements statistics."""
+    """
+    Statistics for the recording notice.
+
+    These used to come from a module whose playback path was unreachable, so the page showed
+    zeroes while a different system played the notices correctly. Both are the same object now.
+    """
     pbx_core = get_pbx_core()
-    if pbx_core and hasattr(pbx_core, "recording_announcements"):
-        try:
-            stats = {
-                "enabled": pbx_core.recording_announcements.enabled,
-                "announcements_played": pbx_core.recording_announcements.announcements_played,
-                "consent_accepted": pbx_core.recording_announcements.consent_accepted,
-                "consent_declined": pbx_core.recording_announcements.consent_declined,
-                "announcement_type": pbx_core.recording_announcements.announcement_type,
-                "require_consent": pbx_core.recording_announcements.require_consent,
+    if not (pbx_core and hasattr(pbx_core, "recording_announcements")):
+        return send_json({"error": "Recording announcements not initialized"}, 500), 500
+
+    try:
+        stats = pbx_core.recording_announcements.stats()
+        return send_json(
+            {
+                "enabled": stats["enabled"],
+                "announce_for": stats["announce_for"],
+                "announcements_played": stats["announced"],
+                # The number that matters: each failure discarded a recording, because notice
+                # is what makes keeping it lawful.
+                "announcements_failed": stats["failed"],
+                "audio_file": stats["audio_file"],
+                "audio_present": stats["audio_present"],
+                "text": stats["text"],
             }
-            return send_json(stats), 200
-        except Exception as e:
-            logger.error(f"Error getting announcement statistics: {e}")
-            return send_json({"error": "Error getting announcement statistics"}, 500), 500
-    else:
-        return send_json({"error": "Recording announcements not initialized"}, 500), 500
+        ), 200
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error getting announcement statistics: {e}")
+        return send_json({"error": "Error getting announcement statistics"}, 500), 500
 
 
-@features_bp.route("/api/recording-announcements/config", methods=["GET"])
+@features_bp.route("/api/recording-announcements/log", methods=["GET"])
 @require_auth
-def get_announcement_config() -> tuple[Response, int]:
-    """Get recording announcements configuration."""
+def get_announcement_log() -> tuple[Response, int]:
+    """
+    The record that callers were told, newest first.
+
+    Kept indefinitely and not swept by retention: it is the evidence justifying a recording,
+    and a call expiring at 90 days must not take that with it.
+    """
     pbx_core = get_pbx_core()
-    if pbx_core and hasattr(pbx_core, "recording_announcements"):
-        try:
-            config = pbx_core.recording_announcements.get_announcement_config()
-            return send_json(config), 200
-        except Exception as e:
-            logger.error(f"Error getting announcement config: {e}")
-            return send_json({"error": "Error getting announcement config"}, 500), 500
-    else:
+    if not (pbx_core and hasattr(pbx_core, "recording_announcements")):
         return send_json({"error": "Recording announcements not initialized"}, 500), 500
+
+    try:
+        limit = validate_limit_param(default=50, max_value=500) or 50
+        notices = pbx_core.recording_announcements.recent(limit)
+        return send_json({"notices": notices, "count": len(notices)}), 200
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error getting announcement log: {e}")
+        return send_json({"error": "Error getting announcement log"}, 500), 500
 
 
 # ==========================================================================

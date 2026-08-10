@@ -627,20 +627,20 @@ class TestRegisterAllMigrations:
 
     @patch("pbx.utils.migrations.get_logger")
     def test_registers_every_migration(self, mock_get_logger: MagicMock) -> None:
-        """Must register exactly 20 migrations (1000-1019)."""
+        """Must register exactly 21 migrations (1000-1020)."""
         db = _make_db_backend("sqlite")
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
-        assert len(mgr.migrations) == 20
+        assert len(mgr.migrations) == 21
 
     @patch("pbx.utils.migrations.get_logger")
     def test_migration_versions_are_sequential(self, mock_get_logger: MagicMock) -> None:
-        """Migration versions must be 1000 through 1019, with no gaps."""
+        """Migration versions must be 1000 through 1020, with no gaps."""
         db = _make_db_backend("sqlite")
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
         versions = sorted(m["version"] for m in mgr.migrations)
-        assert versions == list(range(1000, 1020))
+        assert versions == list(range(1000, 1021))
 
     @patch("pbx.utils.migrations.get_logger")
     def test_migration_names(self, mock_get_logger: MagicMock) -> None:
@@ -825,18 +825,18 @@ class TestRegisterAllMigrationsCanApply:
         register_all_migrations(mgr)
         result = mgr.apply_migrations()
         assert result is True
-        assert db.execute_script.call_count == 20
+        assert db.execute_script.call_count == 21
 
     @patch("pbx.utils.migrations.get_logger")
     def test_apply_partial_from_midpoint(self, mock_get_logger: MagicMock) -> None:
-        """Applying migrations from version 1005 should apply 1006-1019 (14 migrations)."""
+        """Applying migrations from version 1005 should apply 1006-1020 (15 migrations)."""
         db = _make_db_backend("sqlite")
         db.fetch_one.return_value = {"max_version": 1005}
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
         result = mgr.apply_migrations()
         assert result is True
-        assert db.execute_script.call_count == 14
+        assert db.execute_script.call_count == 15
 
     @patch("pbx.utils.migrations.get_logger")
     def test_apply_with_target_version(self, mock_get_logger: MagicMock) -> None:
@@ -853,7 +853,7 @@ class TestRegisterAllMigrationsCanApply:
     def test_already_up_to_date(self, mock_get_logger: MagicMock) -> None:
         """Applying when already at latest version should be a no-op."""
         db = _make_db_backend("sqlite")
-        db.fetch_one.return_value = {"max_version": 1019}
+        db.fetch_one.return_value = {"max_version": 1020}
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
         result = mgr.apply_migrations()

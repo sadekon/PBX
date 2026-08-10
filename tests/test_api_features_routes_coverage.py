@@ -2897,12 +2897,15 @@ class TestRecordingAnnouncementsRoutes:
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
     ) -> None:
         ra = MagicMock()
-        ra.enabled = True
-        ra.announcements_played = 100
-        ra.consent_accepted = 80
-        ra.consent_declined = 20
-        ra.announcement_type = "beep"
-        ra.require_consent = True
+        ra.stats.return_value = {
+            "enabled": True,
+            "announce_for": "external",
+            "announced": 100,
+            "failed": 2,
+            "audio_file": "auto_attendant/recording_notice.wav",
+            "audio_present": True,
+            "text": "This call is being recorded.",
+        }
         mock_pbx_core.recording_announcements = ra
 
         with patch(
@@ -2910,10 +2913,41 @@ class TestRecordingAnnouncementsRoutes:
             return_value=(True, {"extension": "1001", "is_admin": True}),
         ):
             resp = api_client.get("/api/recording-announcements/statistics")
+
         assert resp.status_code == 200
         data = json.loads(resp.data)
         assert data["enabled"] is True
         assert data["announcements_played"] == 100
+        # Each failure discarded a recording, so this is the number worth surfacing.
+        assert data["announcements_failed"] == 2
+        assert data["announce_for"] == "external"
+
+    def test_statistics_report_a_missing_prompt(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        """
+        Without the prompt no notice can play, so external calls stop recording entirely.
+        Nothing else on the page would say so.
+        """
+        ra = MagicMock()
+        ra.stats.return_value = {
+            "enabled": True,
+            "announce_for": "external",
+            "announced": 0,
+            "failed": 12,
+            "audio_file": "missing.wav",
+            "audio_present": False,
+            "text": "x",
+        }
+        mock_pbx_core.recording_announcements = ra
+
+        with patch(
+            "pbx.api.utils.verify_authentication",
+            return_value=(True, {"extension": "1001", "is_admin": True}),
+        ):
+            resp = api_client.get("/api/recording-announcements/statistics")
+
+        assert json.loads(resp.data)["audio_present"] is False
 
     def test_get_announcement_statistics_not_initialized(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
@@ -2928,32 +2962,24 @@ class TestRecordingAnnouncementsRoutes:
             resp = api_client.get("/api/recording-announcements/statistics")
         assert resp.status_code == 500
 
-    def test_get_announcement_config_success(
+    def test_the_notice_log_is_readable(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
     ) -> None:
+        """The durable proof that a caller was told; counters are memory-only."""
         ra = MagicMock()
-        ra.get_announcement_config.return_value = {"type": "beep", "consent": True}
+        ra.recent.return_value = [
+            {"session_id": "s-1", "played": True, "notice_text": "recorded", "legs": 2}
+        ]
         mock_pbx_core.recording_announcements = ra
 
         with patch(
             "pbx.api.utils.verify_authentication",
             return_value=(True, {"extension": "1001", "is_admin": True}),
         ):
-            resp = api_client.get("/api/recording-announcements/config")
+            resp = api_client.get("/api/recording-announcements/log")
+
         assert resp.status_code == 200
-
-    def test_get_announcement_config_not_initialized(
-        self, api_client: FlaskClient, mock_pbx_core: MagicMock
-    ) -> None:
-        if hasattr(mock_pbx_core, "recording_announcements"):
-            del mock_pbx_core.recording_announcements
-
-        with patch(
-            "pbx.api.utils.verify_authentication",
-            return_value=(True, {"extension": "1001", "is_admin": True}),
-        ):
-            resp = api_client.get("/api/recording-announcements/config")
-        assert resp.status_code == 500
+        assert json.loads(resp.data)["count"] == 1
 
 
 @pytest.mark.unit

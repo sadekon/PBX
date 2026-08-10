@@ -83,7 +83,6 @@ _LAZY_PATCHES = {
     "get_security_monitor": "pbx.utils.security_monitor.get_security_monitor",
     "CallbackQueue": "pbx.features.callback_queue.CallbackQueue",
     "MobilePushNotifications": "pbx.features.mobile_push.MobilePushNotifications",
-    "RecordingAnnouncements": "pbx.features.recording_announcements.RecordingAnnouncements",
 }
 
 
@@ -707,15 +706,20 @@ class TestFeatureInitializerInitialize:
         )
         assert pbx_core.mobile_push == mocks["MobilePushNotifications"].return_value
 
-    def test_recording_announcements_always_initialized(self) -> None:
-        """RecordingAnnouncements is always created."""
-        pbx_core = _make_pbx_core()
-        mocks = _run_initialize_with_all_patches(pbx_core)
+    def test_the_notice_announcer_is_always_built(self) -> None:
+        """
+        One announcer under both names.
 
-        mocks["RecordingAnnouncements"].assert_called_once_with(
-            config=pbx_core.config, database=pbx_core.database
-        )
-        assert pbx_core.recording_announcements == mocks["RecordingAnnouncements"].return_value
+        recording_announcements used to be a separate module whose playback path was
+        unreachable -- it guarded on a pbx_core attribute nothing set, then called a method the
+        relay handler does not have. The admin page reported its zeroes while a different
+        system played the notices. They are the same object now.
+        """
+        pbx_core = _make_pbx_core()
+        _run_initialize_with_all_patches(pbx_core)
+
+        assert pbx_core.consent_announcer is not None
+        assert pbx_core.recording_announcements is pbx_core.consent_announcer
 
     # ------------------------------------------------------------------ #
     # All optional features disabled at once

@@ -3119,81 +3119,103 @@ G.726-32</textarea>
 
         <!-- Recording Announcements Tab -->
         <div id="recording-announcements" class="tab-content">
-            <h2>📢 Recording Announcements</h2>
+            <h2>📢 Recording Notice</h2>
+
+            <!-- Whether notices are actually playing. A missing prompt stops external calls
+                 recording entirely, and nothing else on this page would say so. -->
+            <div id="announcement-banner" class="alert-box" style="margin-bottom: 20px;">
+                Loading notice status&hellip;
+            </div>
 
             <div class="action-buttons" style="margin-bottom: 20px;">
                 <button class="btn btn-primary" onclick="loadRecordingAnnouncementsStats()">🔄 Refresh</button>
             </div>
 
-            <!-- Announcement Statistics -->
             <div class="stats-grid" style="margin-bottom: 20px;">
                 <div class="stat-card">
                     <div class="stat-value" id="announcements-enabled">-</div>
-                    <div class="stat-label">Status</div>
+                    <div class="stat-label">Announce For</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-value" id="announcements-played">-</div>
-                    <div class="stat-label">Announcements Played</div>
+                    <div class="stat-label">Notices Played</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-value" id="consent-accepted">-</div>
-                    <div class="stat-label">Consent Accepted</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="consent-declined">-</div>
-                    <div class="stat-label">Consent Declined</div>
+                    <div class="stat-value" id="announcements-failed">-</div>
+                    <div class="stat-label">Failed (recording discarded)</div>
                 </div>
             </div>
 
-            <!-- Current Configuration -->
             <div class="config-section">
-                <h3>⚙️ Current Configuration</h3>
+                <h3>⚙️ Configuration</h3>
+                <p><small>Set in <code>recording.consent</code> in config.yml. Changes need a restart.</small></p>
                 <div class="config-grid">
                     <div class="config-item">
-                        <strong>Announcement Type:</strong>
-                        <span id="announcement-type">-</span>
-                    </div>
-                    <div class="config-item">
-                        <strong>Require Consent:</strong>
-                        <span id="require-consent">-</span>
+                        <strong>Announce For:</strong>
+                        <span id="announcement-mode">-</span>
                     </div>
                     <div class="config-item">
                         <strong>Audio File:</strong>
                         <span id="audio-file-path">-</span>
                     </div>
                     <div class="config-item">
-                        <strong>Announcement Text:</strong>
+                        <strong>Notice Text:</strong>
                         <span id="announcement-text">-</span>
                     </div>
                 </div>
             </div>
 
+            <div class="config-section">
+                <h3>📋 Notice Log</h3>
+                <p><small>The record that callers were told. Kept indefinitely and never swept by
+                    retention &mdash; it is the evidence justifying a recording, so it must outlive it.</small></p>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>When</th>
+                                <th>Session</th>
+                                <th>Outcome</th>
+                                <th>Notice</th>
+                            </tr>
+                        </thead>
+                        <tbody id="announcement-log-table">
+                            <tr><td colspan="4" style="text-align: center;">Loading&hellip;</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
             <!-- Info Box -->
             <div class="info-box">
-                <h3>ℹ️ About Recording Announcements</h3>
-                <p><strong>Recording Announcements</strong> automatically inform call participants that the call may be recorded, ensuring legal compliance.</p>
+                <h3>ℹ️ About the Recording Notice</h3>
+                <p>A spoken notice plays at the moment a call is bridged, telling participants the
+                    call is being recorded. Recording someone without notice is unlawful in
+                    two-party-consent jurisdictions.</p>
                 <ul>
-                    <li><strong>Legal Compliance:</strong> Meets requirements for recording disclosure in various jurisdictions</li>
-                    <li><strong>Announcement Types:</strong>
+                    <li><strong>Fail-closed:</strong> if the notice does not play, the recording is
+                        <em>discarded</em>. No notice, no lawful recording, so there is nothing worth
+                        keeping. A missing prompt file therefore stops external calls recording.</li>
+                    <li><strong>Both legs always hear it.</strong> Only the outside party needs the
+                        disclosure, but the notice is also what tells the employee why the line is
+                        quiet &mdash; playing it to one side alone means muting the other, and dead
+                        air just makes people talk into a muted channel.</li>
+                    <li><strong>Announce for:</strong>
                         <ul>
-                            <li><code>caller</code> - Play to incoming callers only</li>
-                            <li><code>callee</code> - Play to outbound call recipients only</li>
-                            <li><code>both</code> - Play to all parties</li>
+                            <li><code>external</code> &mdash; calls where a party is not a provisioned extension</li>
+                            <li><code>all</code> &mdash; every bridged call, internal included (for testing)</li>
+                            <li><code>off</code> &mdash; no notice; calls still record</li>
                         </ul>
                     </li>
-                    <li><strong>Consent Management:</strong> Optional consent requirement with DTMF response capture</li>
-                    <li><strong>Audio Options:</strong> Use pre-recorded WAV file or text-to-speech</li>
+                    <li><strong>On the tape:</strong> the notice is recorded onto its own channel, so
+                        the recording is itself the evidence that notice was given. Its text is copied
+                        into the transcript verbatim rather than transcribed, because we already know
+                        exactly what was said.</li>
+                    <li><strong>Audio:</strong> a WAV file, or text-to-speech generated once at startup.</li>
                 </ul>
-                <p><strong>Configuration:</strong></p>
-                <p>Edit <code>config.yml</code> under <code>features.recording_announcements</code> to customize:</p>
-                <ul>
-                    <li><code>enabled</code> - Enable/disable announcements</li>
-                    <li><code>type</code> - Announcement type (caller/callee/both)</li>
-                    <li><code>audio_path</code> - Path to audio file</li>
-                    <li><code>text</code> - TTS text (if no audio file)</li>
-                    <li><code>require_consent</code> - Enable consent requirement</li>
-                    <li><code>consent_timeout_seconds</code> - Timeout for consent response</li>
-                </ul>
+                <p><strong>Configuration:</strong> edit <code>recording.consent</code> in
+                    <code>config.yml</code> (<code>announce_for</code>, <code>text</code>,
+                    <code>audio_file</code>) and restart.</p>
             </div>
         </div>
 

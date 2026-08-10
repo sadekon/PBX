@@ -142,9 +142,13 @@ class ConsentAnnouncer:
         settings: ConsentSettings,
         is_internal: Callable[[str], bool] | None = None,
         logger: Any | None = None,
+        database: Any | None = None,
     ) -> None:
         self.settings = settings
         self.logger = logger or get_logger()
+        #: Where each notice is recorded. Optional, like every other database dependency
+        #: here -- a install without one still plays notices, it just cannot prove it.
+        self.database = database
         # Injected rather than reached for, so this module never imports PBXCore. Defaults to
         # "everyone is external", which is the cautious direction: it announces more, not less.
         self._is_internal = is_internal or (lambda _number: False)
@@ -238,6 +242,7 @@ class ConsentAnnouncer:
                 self.announced += 1
             else:
                 self.failed += 1
+            self._record(handler, ok)
             try:
                 on_complete(ok)
             except Exception as e:
@@ -395,6 +400,55 @@ class ConsentAnnouncer:
                 )
         except Exception as e:
             self.logger.debug(f"Recording notice not added to the tape: {e}")
+
+    def _record(self, handler: Any, played: bool, legs: int = 2) -> None:
+        """
+        Write the row that says this caller was told.
+
+        The only durable proof notice was given -- the counters above are in memory and the
+        audio expires. Deliberately not swept by retention: a recording expiring at 90 days
+        must not take the evidence justifying it along too.
+
+        Never raises: failing to log a notice is not a reason to fail the call it protected.
+        """
+        if not (self.database and getattr(self.database, "enabled", False)):
+            return
+
+        try:
+            self.database.execute(
+                """
+                INSERT INTO recording_notices
+                    (session_id, call_id, played, notice_text, legs, failure_reason)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    getattr(handler, "call_id", None),
+                    getattr(handler, "call_id", None),
+                    played,
+                    # Verbatim: the configured wording changes, what this caller heard does not.
+                    self.settings.text if played else None,
+                    legs if played else 0,
+                    None if played else "notice did not play; recording discarded",
+                ),
+            )
+        except Exception as e:
+            self.logger.error(f"Could not record recording notice: {e}")
+
+    def recent(self, limit: int = 50) -> list[dict[str, Any]]:
+        """The latest notices, for the admin view. Empty on any failure."""
+        if not (self.database and getattr(self.database, "enabled", False)):
+            return []
+        try:
+            return (
+                self.database.fetch_all(
+                    "SELECT session_id, call_id, played, notice_text, legs, failure_reason, "
+                    f"played_at FROM recording_notices ORDER BY played_at DESC LIMIT {int(limit)}"
+                )
+                or []
+            )
+        except Exception as e:
+            self.logger.error(f"Could not read recording notices: {e}")
+            return []
 
     def stats(self) -> dict[str, Any]:
         return {

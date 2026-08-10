@@ -1049,3 +1049,43 @@ def register_all_migrations(manager: MigrationManager) -> None:
         CREATE INDEX IF NOT EXISTS idx_vm_recording ON voicemail_messages(recording_id);
     """),
     )
+
+    # Migration 1020: the record that notice was given
+    #
+    # Replaces recording_announcements_log, which belonged to a module that never played
+    # anything -- its playback path guarded on a pbx_core attribute nothing ever set, and then
+    # called a method the relay handler does not have. Dropping it here is only half the job:
+    # that module recreated the table at startup, *after* migrations run, which is why a
+    # DROP in 1019 did not stick.
+    #
+    # Deliberately NOT swept by retention. This is the evidence that a caller was told, and it
+    # has to outlive the recording it justifies -- a call expiring at 90 days must not take the
+    # proof with it. Rows are ~100 bytes, so growth is not a concern.
+    manager.register_migration(
+        1020,
+        "Recording Notice Log",
+        manager._build_migration_sql("""
+        DROP TABLE IF EXISTS recording_announcements_log;
+
+        CREATE TABLE IF NOT EXISTS recording_notices (
+            id {SERIAL},
+            -- The conversation, so a notice can be tied to its recording and to a legal hold.
+            session_id VARCHAR(100),
+            call_id VARCHAR(100),
+            -- False rows are the ones that matter: the notice did not reach anyone, so the
+            -- recording was discarded.
+            played BOOLEAN NOT NULL DEFAULT {BOOLEAN_FALSE},
+            -- Stored verbatim rather than referenced. The configured wording changes; what a
+            -- given caller was actually told does not, and that is the whole point of this row.
+            notice_text {TEXT},
+            -- How many legs heard it. Both, normally.
+            legs INTEGER,
+            -- Why it did not play, when it did not.
+            failure_reason {TEXT},
+            played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_notices_session ON recording_notices(session_id);
+        CREATE INDEX IF NOT EXISTS idx_notices_played ON recording_notices(played, played_at);
+    """),
+    )
