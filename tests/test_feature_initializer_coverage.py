@@ -139,9 +139,12 @@ class TestFeatureInitializerInitialize:
         mocks["ConferenceSystem"].assert_called_once()
         assert pbx_core.conference_system == mocks["ConferenceSystem"].return_value
 
-        mocks["CallRecordingSystem"].assert_called_once_with(
-            recording_path="recordings", requested=False
-        )
+        mocks["CallRecordingSystem"].assert_called_once()
+        kwargs = mocks["CallRecordingSystem"].call_args.kwargs
+        assert kwargs["recording_path"] == "recordings"
+        assert kwargs["requested"] is False
+        # Registering finished recordings is what makes them visible to retention.
+        assert kwargs["store"] is not None
         assert pbx_core.recording_system == mocks["CallRecordingSystem"].return_value
 
         mocks["QueueSystem"].assert_called_once()
@@ -246,9 +249,8 @@ class TestFeatureInitializerInitialize:
         pbx_core = _make_pbx_core(config_overrides={"features.call_recording": True})
         mocks = _run_initialize_with_all_patches(pbx_core)
 
-        mocks["CallRecordingSystem"].assert_called_once_with(
-            recording_path="recordings", requested=True
-        )
+        mocks["CallRecordingSystem"].assert_called_once()
+        assert mocks["CallRecordingSystem"].call_args.kwargs["requested"] is True
 
     def test_recording_is_gated_by_the_feature_flag_alone(self) -> None:
         """
@@ -259,9 +261,8 @@ class TestFeatureInitializerInitialize:
         pbx_core = _make_pbx_core(config_overrides={"features.call_recording": True})
         mocks = _run_initialize_with_all_patches(pbx_core)
 
-        mocks["CallRecordingSystem"].assert_called_once_with(
-            recording_path="recordings", requested=True
-        )
+        mocks["CallRecordingSystem"].assert_called_once()
+        assert mocks["CallRecordingSystem"].call_args.kwargs["requested"] is True
 
     # ------------------------------------------------------------------ #
     # Optional features: auto_attendant

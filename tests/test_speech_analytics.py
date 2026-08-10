@@ -23,6 +23,10 @@ class TestSpeechAnalytics:
                 self.enabled = True
 
             def execute(self, query: str, params: Any = None) -> list[Any]:
+                # NOTE: the real DatabaseBackend.execute returns *bool*, not rows. This mock
+                # returning rows is what let get_call_summary read through execute() and pass
+                # its tests, while returning None on every real install. Read through
+                # fetch_one/fetch_all; do not lean on this return value.
                 query = query.replace("%s", "?")
                 cursor = self.conn.cursor()
                 if params:
@@ -31,6 +35,20 @@ class TestSpeechAnalytics:
                     cursor.execute(query)
                 self.conn.commit()
                 return cursor.fetchall()
+
+            def _rows(self, query: str, params: Any = None) -> list[dict]:
+                query = query.replace("%s", "?")
+                cursor = self.conn.cursor()
+                cursor.execute(query, params or ())
+                columns = [c[0] for c in cursor.description or []]
+                return [dict(zip(columns, row, strict=False)) for row in cursor.fetchall()]
+
+            def fetch_one(self, query: str, params: Any = None) -> dict | None:
+                rows = self._rows(query, params)
+                return rows[0] if rows else None
+
+            def fetch_all(self, query: str, params: Any = None) -> list[dict]:
+                return self._rows(query, params)
 
             def disconnect(self) -> None:
                 self.conn.close()

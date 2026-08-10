@@ -516,21 +516,24 @@ class SpeechAnalyticsEngine:
             Summary dict or None
         """
         try:
-            result = self.db.execute(
+            # fetch_one, not execute. execute() returns a bool whatever the statement, so the
+            # SELECT came back as True and the row lookup below raised into the handler --
+            # meaning this returned None for every call, on every install, always.
+            row = self.db.fetch_one(
                 "SELECT call_id, transcript, summary, sentiment, sentiment_score, "
-                "created_at FROM call_summaries WHERE call_id = %s",
+                "created_at FROM call_summaries WHERE call_id = %s ORDER BY created_at DESC",
                 (call_id,),
             )
 
-            if result and result[0]:
-                row = result[0]
+            if row:
+                score = row.get("sentiment_score")
                 return {
-                    "call_id": row[0],
-                    "transcript": row[1],
-                    "summary": row[2],
-                    "sentiment": row[3],
-                    "sentiment_score": float(row[4]) if row[4] else 0.0,
-                    "created_at": row[5],
+                    "call_id": row.get("call_id"),
+                    "transcript": row.get("transcript"),
+                    "summary": row.get("summary"),
+                    "sentiment": row.get("sentiment"),
+                    "sentiment_score": float(score) if score is not None else 0.0,
+                    "created_at": row.get("created_at"),
                 }
             return None
         except (KeyError, TypeError, ValueError) as e:

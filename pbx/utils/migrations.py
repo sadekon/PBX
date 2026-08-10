@@ -125,8 +125,20 @@ class MigrationManager:
             for migration in pending:
                 self.logger.info(f"Applying migration {migration['version']}: {migration['name']}")
 
-                # Execute migration SQL using execute_script for multi-statement support
-                self.db.execute_script(migration["sql"])
+                # Execute migration SQL using execute_script for multi-statement support.
+                #
+                # The result is checked. It used to be ignored, so a migration that failed
+                # halfway was still recorded as applied -- and because versions only move
+                # forward, it was never retried. execute_script stops at the first failing
+                # statement, so the tables after that point simply never existed, on an
+                # install that believed itself up to date.
+                if not self.db.execute_script(migration["sql"]):
+                    self.logger.error(
+                        f"✗ Migration {migration['version']} ({migration['name']}) failed; "
+                        "not recording it, and stopping here so later migrations do not run "
+                        "against a schema that never got this one"
+                    )
+                    return False
 
                 # Record migration
                 self.db.execute(
@@ -909,5 +921,131 @@ def register_all_migrations(manager: MigrationManager) -> None:
         ALTER TABLE call_transcripts ADD COLUMN IF NOT EXISTS session_id VARCHAR(100);
 
         CREATE INDEX IF NOT EXISTS idx_transcripts_session ON call_transcripts(session_id);
+    """),
+    )
+
+    # Migration 1019: one home for recorded media
+    #
+    # DESTRUCTIVE. It drops call_transcripts, call_summaries and voicemail_messages and
+    # rebuilds them. There is no backfill: every stored voicemail and transcript is discarded,
+    # deliberately, because the alternative was carrying a compatibility shim through a schema
+    # that was wrong in four separate ways.
+    #
+    # What was wrong. Transcript text lived in three tables (call_transcripts,
+    # voicemail_messages.transcription_text, call_summaries.transcript), each needing its own
+    # retention treatment, and each one that got missed was a leak found weeks apart. Recordings
+    # had no row at all -- only a file and a .json sidecar -- so a transcript's only link to its
+    # audio was a path string that dangled the moment retention expired the file. And voicemail
+    # was modelled as a separate universe from call recording, though a voicemail is exactly a
+    # recording with a mailbox attached, which meant every retention bug had to be fixed twice.
+    #
+    # The shape here says what belongs to what, and lets the database enforce it: deleting a
+    # recording takes its transcripts, and their summaries, by cascade rather than by anyone
+    # remembering to. Every retention hole this replaces was a missed second place.
+    manager.register_migration(
+        1019,
+        "Unified Recording and Transcript Storage",
+        manager._build_migration_sql("""
+        -- Superseded by the tables below.
+        DROP TABLE IF EXISTS call_summaries;
+        DROP TABLE IF EXISTS call_transcripts;
+        DROP TABLE IF EXISTS voicemail_messages;
+
+        -- Never had a writer or a reader. call_records duplicated the file-based CDR in
+        -- features/cdr.py; call_recording_analytics was written by nothing; and
+        -- recording_announcements_log was written by a module the call path never invokes.
+        -- Left in place they invite someone to wire the wrong one.
+        DROP TABLE IF EXISTS call_records;
+        DROP TABLE IF EXISTS call_recording_analytics;
+        DROP TABLE IF EXISTS recording_announcements_log;
+
+        -- One row per captured media file, whatever produced it. A voicemail and a call
+        -- recording differ in metadata, not in kind.
+        CREATE TABLE IF NOT EXISTS recordings (
+            id {SERIAL},
+            -- The conversation, which survives transfers and re-INVITEs. call_id names a
+            -- single SIP dialog and is kept only for tracing back to signalling.
+            session_id VARCHAR(100),
+            call_id VARCHAR(100),
+            kind VARCHAR(20) NOT NULL DEFAULT 'call',
+            -- Null once retention has expired the audio. The row outlives the file: audio and
+            -- text run on separate clocks, and this is what marks the gap between them.
+            path VARCHAR(255),
+            bytes BIGINT,
+            duration_seconds FLOAT,
+            sample_rate INTEGER,
+            -- The channel map: which track holds whom. Previously a .json sidecar that had to
+            -- be swept in lockstep with the audio and could orphan when it was not.
+            channels {TEXT},
+            -- Extension labels, indexed for "was I on this call?" and matched by retention
+            -- policy. Derivable from channels, denormalised so neither has to parse JSON.
+            participants {TEXT},
+            started_at TIMESTAMP,
+            ended_at TIMESTAMP,
+            audio_deleted_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_recordings_session ON recordings(session_id);
+        CREATE INDEX IF NOT EXISTS idx_recordings_call ON recordings(call_id);
+        CREATE INDEX IF NOT EXISTS idx_recordings_created ON recordings(kind, created_at);
+
+        -- One row per transcription run, not per recording: re-transcribing with a better
+        -- model appends rather than overwriting what somebody already read.
+        --
+        -- recording_id is nullable because a live transcript has no file. Those expire on
+        -- their own created_at instead of by cascade.
+        CREATE TABLE IF NOT EXISTS transcripts (
+            id {SERIAL},
+            recording_id INTEGER REFERENCES recordings(id) ON DELETE CASCADE,
+            session_id VARCHAR(100),
+            source VARCHAR(20) NOT NULL DEFAULT 'recording',
+            provider VARCHAR(30),
+            model VARCHAR(255),
+            language VARCHAR(20),
+            text {TEXT},
+            -- JSON: per-segment timing and speaker. Nullable because word timing is opt-in.
+            segments {TEXT},
+            -- Null when the engine cannot report one. Whisper genuinely cannot, and a 0.0
+            -- default renders to a user as "Estimated accuracy 0%".
+            confidence FLOAT,
+            processing_duration FLOAT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_transcripts_recording ON transcripts(recording_id);
+        CREATE INDEX IF NOT EXISTS idx_transcripts_session ON transcripts(session_id);
+        CREATE INDEX IF NOT EXISTS idx_transcripts_created ON transcripts(created_at);
+
+        -- Analysis derived from one transcript. No transcript column this time: it keyed on
+        -- call_id and carried a third full copy of the text, which is what made it a retention
+        -- hole rather than a cache.
+        CREATE TABLE IF NOT EXISTS call_summaries (
+            id {SERIAL},
+            transcript_id INTEGER REFERENCES transcripts(id) ON DELETE CASCADE,
+            summary {TEXT},
+            sentiment VARCHAR(20),
+            sentiment_score FLOAT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_summaries_transcript ON call_summaries(transcript_id);
+
+        -- Mailbox facts only. The audio, duration, channel map and transcript all live on the
+        -- recording now; this says whose mailbox it landed in and whether they have heard it.
+        CREATE TABLE IF NOT EXISTS voicemail_messages (
+            id {SERIAL},
+            message_id VARCHAR(100) UNIQUE NOT NULL,
+            recording_id INTEGER REFERENCES recordings(id) ON DELETE CASCADE,
+            extension_number VARCHAR(20) NOT NULL,
+            caller_id VARCHAR(50),
+            listened BOOLEAN DEFAULT {BOOLEAN_FALSE},
+            notified_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_vm_extension ON voicemail_messages(extension_number);
+        CREATE INDEX IF NOT EXISTS idx_vm_listened ON voicemail_messages(listened);
+        CREATE INDEX IF NOT EXISTS idx_vm_recording ON voicemail_messages(recording_id);
     """),
     )

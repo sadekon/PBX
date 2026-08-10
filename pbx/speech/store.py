@@ -1,21 +1,21 @@
 """
 Where transcripts are kept.
 
-One module owns reading and writing ``call_transcripts`` so that nothing else has to know the
-column names. Voicemail already denormalises its transcript onto ``voicemail_messages`` and
-keeps doing so -- the email path reads it there -- but every transcript also lands here, which
-gives retention one table to sweep and the admin UI one place to query.
+One module owns reading and writing ``transcripts`` so nothing else has to know the column
+names. A transcript belongs to a *recording* -- ``recording_id`` with ``ON DELETE CASCADE`` --
+so expiring the audio's row takes its text with it, and anything derived from that text
+(``call_summaries``) goes too. That relationship used to be a ``media_path`` string, which
+dangled the moment retention deleted the file, while duplicated copies of the same text sat on
+``voicemail_messages`` and ``call_summaries`` and each had to be swept by hand.
 
 Takes and returns the same :class:`~pbx.speech.types.Transcript` the backends produce, so a
 caller never assembles a row by hand. Nothing here raises: losing a stored transcript is
 survivable, and it must never cost a voicemail or a call.
 
-**This is shaped for live transcription as much as for files.** A live session has no file on
-disk and no duration until it ends, so ``media_path`` and both durations are optional and
-``call_id`` is not unique -- one call can hold several transcripts, whether that is one per leg
-or a live pass plus a better post-call re-run. ``StreamSession.close()`` already returns a
-``Transcript``, so a finished live session stores through this same method with
-``source="live"`` and no schema change.
+**Shaped for live transcription as much as for files.** A live session has no recording, so
+``recording_id`` is nullable and those rows expire on their own ``created_at`` rather than by
+cascade. ``StreamSession.close()`` already returns a ``Transcript``, so a finished live session
+stores through this same method with ``source="live"`` and no schema change.
 """
 
 from __future__ import annotations
@@ -39,16 +39,18 @@ SOURCE_VOICEMAIL: Final[str] = "voicemail"
 SOURCE_RECORDING: Final[str] = "recording"
 SOURCE_LIVE: Final[str] = "live"
 
-#: Parameter placeholder. PostgreSQL only -- DatabaseBackend hardcodes db_type to
-#: "postgresql" and there is no SQLite path in the codebase, whatever CLAUDE.md says. Matches
-#: VoicemailBox._get_db_placeholder, which also returns this unconditionally.
+#: PostgreSQL only -- DatabaseBackend hardcodes db_type and there is no SQLite path.
 _PH: Final[str] = "%s"
 
-#: Columns read back, in order. Named rather than SELECT * because the row is unpacked
-#: positionally and a column added in the middle would otherwise shift every field silently.
+#: Ids per DELETE. Bounds the IN list on a first sweep, which on a long-neglected install can
+#: expire everything at once.
+_DELETE_CHUNK: Final[int] = 500
+
+#: Columns read back. Named rather than SELECT * because a column added in the middle would
+#: otherwise shift every field silently.
 _COLUMNS: Final[str] = (
-    "id, call_id, source, media_path, provider, model, language, transcript_text, "
-    "segments, confidence, audio_duration, processing_duration, created_at"
+    "id, recording_id, session_id, source, provider, model, language, text, "
+    "segments, confidence, processing_duration, created_at"
 )
 
 
@@ -69,26 +71,21 @@ class TranscriptStore:
         transcript: Transcript,
         *,
         source: str,
-        call_id: str | None = None,
-        media_path: str | None = None,
+        recording_id: Any = None,
         session_id: str | None = None,
-        participants: Sequence[str] | None = None,
-    ) -> bool:
+    ) -> int | None:
         """
-        Store one transcript. Returns whether it was written.
+        Store one transcript, returning its id.
 
         A failed transcript is not stored: there is no text to keep, and a row recording that
         an engine errored belongs in the log, not in the table the admin UI reads.
 
-        `session_id` and `participants` are denormalised onto the row on purpose. Both are
-        derivable from the recording's sidecar manifest today, but audio expires on a far
-        shorter clock than text -- by the time a transcript comes up for retention its manifest
-        is long gone, and these are the only surviving record of whose call it was. Retention
-        matching and the review surface's "was I on this call?" both read them here.
+        `session_id` is kept alongside `recording_id` because a live transcript has no
+        recording, and a legal hold is placed on a session rather than on a file.
         """
         database = self.database
         if database is None or not self.enabled or not transcript.success:
-            return False
+            return None
 
         segments = None
         if transcript.segments:
@@ -98,59 +95,90 @@ class TranscriptStore:
                 # Timing is a nice-to-have; the text is not. Keep the row, drop the segments.
                 self.logger.warning(f"Could not serialise transcript segments: {e}")
 
-        # Fall back to the speakers the transcript itself names, so a caller that knows nothing
-        # about the recording still stores something matchable.
-        speakers = list(participants) if participants else self._speakers(transcript)
-
         try:
-            database.execute(
-                f"INSERT INTO call_transcripts (call_id, source, media_path, provider, model, "
-                f"language, transcript_text, segments, confidence, audio_duration, "
-                f"processing_duration, session_id, participants) "
-                f"VALUES ({', '.join([_PH] * 13)})",
+            row = database.fetch_one(
+                f"""
+                INSERT INTO transcripts (
+                    recording_id, session_id, source, provider, model, language,
+                    text, segments, confidence, processing_duration
+                ) VALUES ({", ".join([_PH] * 10)})
+                RETURNING id
+                """,
                 (
-                    call_id,
+                    recording_id,
+                    session_id,
                     source,
-                    media_path,
                     transcript.provider,
                     transcript.model,
                     transcript.language,
                     transcript.text,
                     segments,
                     transcript.confidence,
-                    transcript.audio_duration,
                     transcript.processing_duration,
-                    session_id,
-                    json.dumps(speakers) if speakers else None,
                 ),
             )
         except Exception as e:
             # Broad on purpose: every driver raises its own type, and none of them are worth
             # losing a voicemail or dropping a call over.
-            self.logger.error(f"Could not store transcript for {call_id or media_path}: {e}")
-            return False
+            self.logger.error(f"Could not store transcript for recording {recording_id}: {e}")
+            return None
 
-        return True
+        # Defensive: a driver that does not honour RETURNING, or a mock, can hand back
+        # something unusable here, and this runs at the end of a call.
+        try:
+            return int(row["id"]) if row else None
+        except (KeyError, TypeError, ValueError):
+            self.logger.warning("Transcript stored but its id could not be read")
+            return None
 
-    @staticmethod
-    def _speakers(transcript: Transcript) -> list[str]:
-        """Distinct speaker labels named by the transcript, in first-heard order."""
-        seen: list[str] = []
-        for segment in transcript.segments or ():
-            speaker = getattr(segment, "speaker", "")
-            if speaker and speaker not in seen:
-                seen.append(speaker)
-        return seen
+    def delete(self, ids: Sequence[Any]) -> int:
+        """
+        Delete transcripts by id. Summaries follow by cascade, not by this method remembering.
 
-    def for_call(self, call_id: str, limit: int = 50) -> list[dict[str, Any]]:
-        """Every transcript for one call, newest first."""
-        return self._select(f"WHERE call_id = {_PH}", (call_id,), limit)
+        Only needed for transcripts with no recording -- a live pass. Anything attached to a
+        recording is expired by deleting the recording, which is the single deletion path the
+        schema was reshaped to give us.
+        """
+        database = self.database
+        if database is None or not self.enabled or not ids:
+            return 0
+
+        removed = 0
+        for start in range(0, len(ids), _DELETE_CHUNK):
+            chunk = list(ids[start : start + _DELETE_CHUNK])
+            marks = ", ".join([_PH] * len(chunk))
+            try:
+                if database.execute(f"DELETE FROM transcripts WHERE id IN ({marks})", tuple(chunk)):
+                    removed += len(chunk)
+            except Exception as e:
+                self.logger.error(f"Could not delete transcripts: {e}")
+
+        return removed
+
+    def for_recording(self, recording_id: Any, limit: int = 50) -> list[dict[str, Any]]:
+        """Every transcript of one recording, newest first."""
+        return self._select(f"WHERE recording_id = {_PH}", (recording_id,), limit)
+
+    def for_session(self, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Every transcript of one conversation, across its legs."""
+        return self._select(f"WHERE session_id = {_PH}", (session_id,), limit)
 
     def recent(self, limit: int = 50, source: str | None = None) -> list[dict[str, Any]]:
         """The latest transcripts, for the admin monitoring view."""
         if source:
             return self._select(f"WHERE source = {_PH}", (source,), limit)
         return self._select("", (), limit)
+
+    def orphans_before(self, cutoff: Any) -> list[dict[str, Any]]:
+        """
+        Transcripts with no recording, older than `cutoff`.
+
+        Live transcripts have nothing to cascade from, so they are the only ones retention has
+        to expire directly.
+        """
+        return self._select(
+            f"WHERE recording_id IS NULL AND created_at < {_PH}", (cutoff,), limit=100000
+        )
 
     def _select(self, where: str, params: tuple, limit: int) -> list[dict[str, Any]]:
         """Run a read and shape the rows. Returns empty on any failure."""
@@ -162,7 +190,7 @@ class TranscriptStore:
             # fetch_all, not execute: execute() returns a bool no matter the statement, so a
             # SELECT run through it yields True rather than rows.
             rows = database.fetch_all(
-                f"SELECT {_COLUMNS} FROM call_transcripts {where} "
+                f"SELECT {_COLUMNS} FROM transcripts {where} "
                 f"ORDER BY created_at DESC LIMIT {int(limit)}",
                 params,
             )
@@ -174,14 +202,13 @@ class TranscriptStore:
 
     @staticmethod
     def _row_to_dict(row: Any) -> dict[str, Any]:
-        """One row as a dict, with segments decoded back from JSON."""
-        record = dict(row)
-
-        raw = record.get("segments")
-        if raw:
+        """Shape a row, decoding the segments JSON."""
+        data = dict(row)
+        raw = data.get("segments")
+        if isinstance(raw, str):
             try:
-                record["segments"] = json.loads(raw)
+                data["segments"] = json.loads(raw)
             except (TypeError, ValueError):
-                # A malformed blob should not cost the caller the text next to it.
-                record["segments"] = None
-        return record
+                # Malformed timing must not cost the text, which is the part anyone reads.
+                data["segments"] = None
+        return data

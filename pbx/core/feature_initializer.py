@@ -19,6 +19,7 @@ from pbx.features.inbound_routing import InboundRoutingSystem
 from pbx.features.music_on_hold import MusicOnHold
 from pbx.features.phone_provisioning import PhoneProvisioning
 from pbx.features.presence import PresenceSystem
+from pbx.features.recording_store import RecordingStore
 from pbx.features.retention import (
     CONFIG_SECTION as RETENTION_CONFIG_SECTION,
     RetentionSettings,
@@ -107,6 +108,9 @@ class FeatureInitializer:
             # what recording.storage_path said.
             recording_path=config.get("recording.storage_path", "recordings"),
             requested=config.get("features.call_recording", False),
+            # Registers each finished recording, which is what makes it visible to retention,
+            # to the admin view, and to the transcript that references it.
+            store=RecordingStore(database if getattr(database, "enabled", False) else None),
         )
         FeatureInitializer._build_consent_announcer(pbx_core, config, logger)
         FeatureInitializer._wire_call_recording(pbx_core)
@@ -547,6 +551,7 @@ class FeatureInitializer:
         transcriber = RecordingTranscriber(
             worker=worker,
             store=TranscriptStore(database if getattr(database, "enabled", False) else None),
+            recordings=RecordingStore(database if getattr(database, "enabled", False) else None),
             silence_floor=getattr(settings, "silence_rms_floor", SILENCE_RMS_FLOOR),
             max_region_seconds=max_region,
             # Verbatim from config, so the transcript records what was played rather than

@@ -168,9 +168,18 @@ class _PendingTranscription:
     the worker refused never reports back, and waiting for it would strand the transcript.
     """
 
-    def __init__(self, session_id: str, media_path: Path, workspace: Path) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        media_path: Path,
+        workspace: Path,
+        recording_id: Any = None,
+    ) -> None:
         self.session_id = session_id
         self.media_path = media_path
+        #: The row this recording was registered as. What ties the transcript to its audio
+        #: so retention can expire both by deleting one.
+        self.recording_id = recording_id
         self.workspace = workspace
         self.expected = 0
         #: Per speaker, one entry per region: (offset, transcript).
@@ -202,6 +211,7 @@ class RecordingTranscriber:
         self,
         worker: TranscriptionWorker | None = None,
         store: TranscriptStore | None = None,
+        recordings: Any = None,
         logger: Any | None = None,
         min_speech_seconds: float = MIN_SPEECH_SECONDS,
         silence_floor: float = SILENCE_RMS_FLOOR,
@@ -211,6 +221,9 @@ class RecordingTranscriber:
     ) -> None:
         self.worker = worker
         self.store = store or TranscriptStore()
+        #: Reads the channel map back from the recording row. Optional: without it the
+        #: sidecar is used, which is what a database-less install has anyway.
+        self.recordings = recordings
         self.logger = logger or get_logger()
         self.min_speech_seconds = min_speech_seconds
         #: What the recording notice said, injected verbatim rather than recognised. Empty
@@ -261,7 +274,7 @@ class RecordingTranscriber:
 
     # ---------------------------------------------------------------- submission
 
-    def submit(self, media_path: Path) -> bool:
+    def submit(self, media_path: Path, recording_id: Any = None) -> bool:
         """
         Queue a finished recording for transcription. Returns whether anything was accepted.
 
@@ -273,13 +286,13 @@ class RecordingTranscriber:
             return False
 
         try:
-            return self._submit(media_path)
+            return self._submit(media_path, recording_id)
         except Exception as e:
             self.logger.error(f"Could not transcribe recording {media_path}: {e}")
             return False
 
-    def _submit(self, media_path: Path) -> bool:
-        channels = self._channel_labels(media_path)
+    def _submit(self, media_path: Path, recording_id: Any = None) -> bool:
+        channels = self._channel_labels(media_path, recording_id)
         if not channels:
             self.logger.debug(f"No channel manifest for {media_path}; not transcribing")
             return False
@@ -288,7 +301,10 @@ class RecordingTranscriber:
         scratch.mkdir(parents=True, exist_ok=True)
         workspace = Path(tempfile.mkdtemp(prefix="job-", dir=str(scratch)))
         pending = _PendingTranscription(
-            session_id=self._session_id(media_path), media_path=media_path, workspace=workspace
+            session_id=self._session_id(media_path),
+            media_path=media_path,
+            workspace=workspace,
+            recording_id=recording_id,
         )
 
         regions = self._split(media_path, channels, workspace)
@@ -346,15 +362,28 @@ class RecordingTranscriber:
         """
         if not self.notice_text:
             return merged
-        if SYSTEM_LABEL not in self._channel_labels(pending.media_path):
+        if SYSTEM_LABEL not in self._channel_labels(pending.media_path, pending.recording_id):
             return merged
 
         notice = Segment(text=self.notice_text, start=0.0, end=0.0, speaker=SYSTEM_LABEL)
         segments = (notice, *merged.segments)
         return replace(merged, segments=segments, text=format_dialogue(segments))
 
-    def _channel_labels(self, media_path: Path) -> list[str]:
-        """Speaker labels in channel order, from the sidecar the recorder wrote."""
+    def _channel_labels(self, media_path: Path, recording_id: Any = None) -> list[str]:
+        """
+        Speaker labels in channel order.
+
+        The recording row is authoritative -- the sidecar is a disposable convenience artifact
+        now, kept so a ``.wav`` moved to another machine is still attributable. Falling back to
+        it means a database hiccup costs accuracy of attribution, not the whole transcript.
+        """
+        if recording_id is not None and self.recordings is not None:
+            row = self.recordings.get(recording_id)
+            channels = (row or {}).get("channels") or []
+            labels = [str(c.get("label", "")) for c in channels if isinstance(c, dict)]
+            if labels:
+                return labels
+
         manifest_path = media_path.with_suffix(".json")
         try:
             manifest = json.loads(manifest_path.read_text())
@@ -575,10 +604,8 @@ class RecordingTranscriber:
         self.store.save(
             merged,
             source=SOURCE_RECORDING,
-            call_id=pending.session_id,
-            media_path=str(pending.media_path),
+            recording_id=pending.recording_id,
             session_id=pending.session_id,
-            participants=sorted(pending.results),
         )
         self.logger.info(
             f"Transcribed {pending.media_path.name}: "

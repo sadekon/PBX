@@ -58,6 +58,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from pbx.features.recording_store import KIND_CALL, RecordingStore
 from pbx.utils.audio import alaw_to_pcm16, resample_pcm16, ulaw_to_pcm16
 from pbx.utils.logger import get_logger
 
@@ -558,8 +559,13 @@ class CallRecordingSystem:
         self,
         recording_path: str = "recordings",
         requested: bool = False,
+        store: RecordingStore | None = None,
     ) -> None:
         self.recording_path = recording_path
+        #: Where finished recordings are registered. Constructed rather than required so a
+        #: database-less caller still gets a working recorder -- it simply records nothing
+        #: to the table.
+        self.store = store or RecordingStore()
         #: Requested by ``features.call_recording``. Named ``requested`` rather than
         #: ``auto_record`` because config.yml had a dead ``recording.auto_record`` key that
         #: nothing read, and the two spelled the same would be indistinguishable.
@@ -567,9 +573,9 @@ class CallRecordingSystem:
         self.active_recordings: dict[str, CallRecording] = {}
         self.recording_metadata: list[dict[str, Any]] = []
         self.logger = get_logger()
-        #: Called with the finished file whenever a recording completes. How transcription is
-        #: started, without this module having to know that transcription exists.
-        self.on_recording_finished: Callable[[Path], None] | None = None
+        #: Called with the finished file and its row id whenever a recording completes. How
+        #: transcription is started, without this module having to know it exists.
+        self.on_recording_finished: Callable[[Path, Any], None] | None = None
 
         if self.requested:
             self.logger.info("Call recording is enabled; every answered call will be recorded")
@@ -652,26 +658,56 @@ class CallRecordingSystem:
         call that ended normally.
         """
         self.active_recordings.pop(recording.session_id, None)
+        if not file_path:
+            return
 
-        if file_path and self.on_recording_finished is not None:
+        # Register the file before anything downstream runs. A recording with no row is
+        # invisible to retention, to the admin view and to the transcript that is about to
+        # reference it -- and until this existed, the only durable record of a recording was
+        # the file itself plus a sidecar that could orphan.
+        recording_id = None
+        try:
+            recording_id = self.store.register(
+                path=file_path,
+                kind=KIND_CALL,
+                session_id=recording.session_id,
+                call_id=recording.call_id,
+                duration_seconds=recording.get_duration(),
+                sample_rate=SAMPLE_RATE,
+                channels=recording.channel_map(),
+                started_at=recording.start_time,
+                ended_at=recording.end_time,
+                bytes_written=self._size(file_path),
+            )
+        except Exception as e:
+            self.logger.error(f"Could not register recording {file_path}: {e}")
+
+        if self.on_recording_finished is not None:
             # Runs on the tap's drain thread, at the end of a call. Guarded because a
             # transcription problem must not lose the recording that just succeeded.
             try:
-                self.on_recording_finished(file_path)
+                self.on_recording_finished(file_path, recording_id)
             except Exception as e:
                 self.logger.error(f"Recording follow-up for {recording.session_id} failed: {e}")
 
-        if file_path:
-            self.recording_metadata.append(
-                {
-                    "session_id": recording.session_id,
-                    "call_id": recording.call_id,
-                    "file_path": file_path,
-                    "duration": recording.get_duration(),
-                    "timestamp": recording.start_time,
-                    "channels": recording.channel_map(),
-                }
-            )
+        self.recording_metadata.append(
+            {
+                "recording_id": recording_id,
+                "session_id": recording.session_id,
+                "call_id": recording.call_id,
+                "file_path": file_path,
+                "duration": recording.get_duration(),
+                "timestamp": recording.start_time,
+                "channels": recording.channel_map(),
+            }
+        )
+
+    @staticmethod
+    def _size(path: Path) -> int | None:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return None
 
     def stop_recording(self, call_id: str) -> Path | None:
         """

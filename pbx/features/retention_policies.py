@@ -20,8 +20,9 @@ suspend expiry entirely until released. They replace the old tag vocabulary, whi
 still lost the audio and one settled in a month held the recording for another seven years
 with no way to let it go.
 
-**Facts** are what we know about a recording at sweep time, read from the sidecar manifest the
-recorder already writes. Policies match against facts.
+**Facts** are what we know about a recording at sweep time, read straight off its row. They
+used to be parsed from a ``.json`` sidecar and from the voicemail path layout, which meant a
+manifest that expired with its audio took a policy's ability to match with it.
 
 Two clocks throughout. Audio is where the bytes and the privacy weight are; transcripts are
 ~2% of the size and carry most of the value, so they outlive the audio they came from.
@@ -44,7 +45,6 @@ __all__ = [
     "PolicyStore",
     "RecordingFacts",
     "RetentionPolicy",
-    "facts_for",
 ]
 
 #: The complete match vocabulary. Closed on purpose: an open expression language would mean
@@ -79,66 +79,6 @@ class RecordingFacts:
     session_id: str = ""
     participants: tuple[str, ...] = ()
     duration_seconds: float | None = None
-
-
-def facts_for(path: Path, media: str) -> RecordingFacts:
-    """
-    Read what we know about `path`.
-
-    Never raises: a sweep that dies on one malformed sidecar leaves every later file to grow
-    forever. An unreadable manifest yields facts with no participants, which simply means
-    participant rules cannot match it.
-    """
-    if media == MEDIA_VOICEMAIL:
-        return _voicemail_facts(path)
-    return _recording_facts(path)
-
-
-def _recording_facts(path: Path) -> RecordingFacts:
-    """Facts from the JSON manifest written beside every recording."""
-    sidecar = path.with_suffix(".json")
-    try:
-        manifest = json.loads(sidecar.read_text())
-    except (OSError, ValueError):
-        return RecordingFacts(path=path, media=MEDIA_RECORDING)
-
-    if not isinstance(manifest, dict):
-        return RecordingFacts(path=path, media=MEDIA_RECORDING)
-
-    participants = []
-    for channel in manifest.get("channels") or []:
-        if isinstance(channel, dict):
-            label = str(channel.get("label", "")).strip()
-            if label and label not in participants:
-                participants.append(label)
-
-    duration = manifest.get("duration_seconds")
-    return RecordingFacts(
-        path=path,
-        media=MEDIA_RECORDING,
-        session_id=str(manifest.get("session_id") or ""),
-        participants=tuple(participants),
-        duration_seconds=float(duration) if isinstance(duration, int | float) else None,
-    )
-
-
-def _voicemail_facts(path: Path) -> RecordingFacts:
-    """
-    Facts from the voicemail path layout: ``voicemail/<mailbox>/<caller>_<timestamp>.wav``.
-
-    There is no manifest here, so the mailbox owner comes from the parent directory and the
-    caller from the filename prefix. Duration is unavailable without opening the file, and
-    opening every voicemail during a sweep is not worth a duration rule.
-    """
-    mailbox = path.parent.name
-    caller = path.stem.rsplit("_", 2)[0] if "_" in path.stem else ""
-
-    participants = [p for p in (mailbox, caller) if p]
-    return RecordingFacts(
-        path=path,
-        media=MEDIA_VOICEMAIL,
-        participants=tuple(dict.fromkeys(participants)),
-    )
 
 
 # --------------------------------------------------------------------------- policy

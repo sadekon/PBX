@@ -104,15 +104,16 @@ class FakeStore:
     def __init__(self):
         self.saved: list[dict] = []
 
-    def save(self, transcript, *, source, call_id=None, media_path=None):
+    def save(self, transcript, *, source, recording_id=None, session_id=None):
         self.saved.append(
             {
                 "transcript": transcript,
                 "source": source,
-                "call_id": call_id,
-                "media_path": media_path,
+                "recording_id": recording_id,
+                "session_id": session_id,
             }
         )
+        return len(self.saved)
         return True
 
 
@@ -453,7 +454,7 @@ class TestRecordingTranscriber:
         assert len(store.saved) == 1
         saved = store.saved[0]
         assert saved["source"] == "recording"
-        assert saved["call_id"] == "conv-1", "stored against the session, not the file"
+        assert saved["session_id"] == "conv-1", "stored against the session, not the file"
         assert {s.speaker for s in saved["transcript"].segments} == {"1001", "1002"}
 
     def test_a_silent_channel_never_reaches_a_model(self, tmp_path):

@@ -28,21 +28,21 @@ before flipping it.
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pbx.features.recording_store import RecordingStore
 from pbx.features.retention_policies import (
     MEDIA_RECORDING,
     MEDIA_VOICEMAIL,
     HoldStore,
     PolicyStore,
     RecordingFacts,
-    facts_for,
 )
+from pbx.speech.store import TranscriptStore
 from pbx.utils.logger import get_logger
 from pbx.utils.periodic import PeriodicTask
 
@@ -82,6 +82,26 @@ KEEP_FOREVER = frozenset({"greeting.wav"})
 #:
 #: Must match ``pbx.speech.recording.SCRATCH_DIRNAME``; a test asserts they do.
 SKIP_DIR_NAMES = frozenset({".transcribe"})
+
+
+def _as_utc(value: Any) -> datetime | None:
+    """
+    Normalise a timestamp column to an aware UTC datetime, or None if it cannot be read.
+
+    Strings are parsed as well as datetimes. psycopg2 hands back datetimes, but the codebase
+    has already been bitten by string timestamps elsewhere (``VoicemailBox._load_messages``
+    parses them defensively), and here a value that failed to convert would silently mean
+    "skip this row" -- a row that never expires rather than a visible error.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +219,11 @@ class RetentionSweeper:
         # gets a working sweeper -- an empty policy store resolves to the fallback every time.
         self.policies = policies if policies is not None else PolicyStore(database, self.logger)
         self.holds = holds if holds is not None else HoldStore(database, self.logger)
+        #: The sweep reads recordings and deletes them; the cascade in migration 1019
+        #: takes transcripts and summaries. Live transcripts have no recording, so the
+        #: transcript store is still needed for those.
+        self.recordings = RecordingStore(database, self.logger)
+        self._transcripts = TranscriptStore(database, self.logger)
 
         # Reported to the admin UI. Lifetime counters advance only on real deletions, never on
         # dry runs -- a "Deleted (All Time)" figure that counts things still sitting on disk is
@@ -246,8 +271,13 @@ class RetentionSweeper:
         """
         Run one full pass. Safe to call directly, which is what makes it testable.
 
-        Audio first, transcripts second. The order matters only for the log: seeing the files
-        go before the rows makes a dry-run log read the way the deletion actually happens.
+        Driven by the ``recordings`` table rather than by walking directories. A row knows its
+        participants, duration and session, so a policy can be resolved without opening a
+        sidecar; and deleting a row takes its transcripts and their summaries by cascade. The
+        filesystem walk that remains is only a safety net for files no row points at.
+
+        Audio first, rows second. The order matters only for the log: seeing the files go
+        before the rows makes a dry-run read the way deletion actually happens.
         """
         result = SweepResult(dry_run=self.settings.dry_run)
         started = time.monotonic()
@@ -258,25 +288,10 @@ class RetentionSweeper:
         self.holds.refresh()
 
         now = datetime.now(UTC)
-        #: Voicemail recordings this sweep expired. Their rows have to be tombstoned to match,
-        #: or the mailbox keeps listing messages whose audio is gone.
-        expired_voicemail: list[str] = []
-        for root, media in (
-            (self.settings.voicemail_path, MEDIA_VOICEMAIL),
-            (self.settings.recording_path, MEDIA_RECORDING),
-        ):
-            self._sweep_audio(
-                Path(root),
-                media,
-                now,
-                result,
-                expired_voicemail if media == MEDIA_VOICEMAIL else None,
-            )
-
-        self._tombstone_voicemail_audio(expired_voicemail, result)
-
-        self._sweep_transcripts(now, result)
-        self._sweep_voicemail_transcripts(now, result)
+        self._sweep_audio(now, result)
+        self._sweep_rows(now, result)
+        self._sweep_live_transcripts(now, result)
+        self._sweep_unregistered_files(now, result)
 
         self.last_sweep = now
         self.last_result = result
@@ -290,6 +305,255 @@ class RetentionSweeper:
         for error in result.errors:
             self.logger.warning(f"Retention: {error}")
         return result
+
+    # ------------------------------------------------------------------ audio
+
+    def _sweep_audio(self, now: datetime, result: SweepResult) -> None:
+        """
+        Expire media whose recording row is past its audio period.
+
+        The row outlives the file: the path is cleared and ``audio_deleted_at`` stamped, so a
+        mailbox stops listing a message whose audio is gone. Skipping that step is what used
+        to leave phantom voicemails pointing at nothing.
+        """
+        horizon = now - self._shortest_audio_period()
+        rows = self.recordings.expiring_before(horizon)
+        expired: list[Any] = []
+
+        for row in rows:
+            facts = self._facts(row)
+            if self.holds.held(facts.session_id):
+                result.held += 1
+                continue
+
+            created = _as_utc(row.get("created_at"))
+            if created is None:
+                continue
+
+            policy = self.policies.resolve(facts)
+            period = timedelta(days=self.settings.audio_days)
+            if policy is not None and policy.audio_days is not None:
+                period = timedelta(days=policy.audio_days)
+            if created >= now - period:
+                continue
+
+            result.audio_files += 1
+            result.audio_bytes += int(row.get("bytes") or 0)
+            expired.append(row["id"])
+
+            if not self.settings.dry_run:
+                self._unlink(row.get("path"), result)
+
+        if expired and not self.settings.dry_run:
+            self.recordings.mark_audio_deleted(expired)
+
+    def _unlink(self, path: Any, result: SweepResult) -> None:
+        """Remove a recording and the sidecar beside it. Neither is fatal."""
+        if not path:
+            return
+        media = Path(str(path))
+        for target in (media, media.with_suffix(SIDECAR_SUFFIX)):
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                result.errors.append(f"{target}: {e}")
+            else:
+                if target is not media:
+                    result.sidecars += 1
+
+    # ------------------------------------------------------------------ rows
+
+    def _sweep_rows(self, now: datetime, result: SweepResult) -> None:
+        """
+        Delete recording rows past their transcript period.
+
+        This is the whole retention story in one statement: the cascade declared in migration
+        1020 takes each row's transcripts, their summaries, and the voicemail row that points
+        at it. Every hole this design replaced -- the duplicate voicemail transcript, the
+        summary nobody swept, the row nothing deleted -- was a second place somebody forgot.
+        """
+        horizon = now - self._shortest_transcript_period()
+        rows = self.recordings.expiring_before(horizon) + self._rows_without_media(horizon)
+        seen: set[Any] = set()
+        expired: list[Any] = []
+
+        for row in rows:
+            if row["id"] in seen:
+                continue
+            seen.add(row["id"])
+
+            facts = self._facts(row)
+            if self.holds.held(facts.session_id):
+                result.held += 1
+                continue
+
+            created = _as_utc(row.get("created_at"))
+            if created is None:
+                continue
+
+            policy = self.policies.resolve(facts)
+            period = timedelta(days=self.settings.transcript_days)
+            if policy is not None and policy.transcript_days is not None:
+                period = timedelta(days=policy.transcript_days)
+            if created >= now - period:
+                continue
+
+            expired.append(row["id"])
+            if row.get("kind") == MEDIA_VOICEMAIL:
+                result.voicemail_messages += 1
+
+        result.transcripts += len(expired)
+        if expired and not self.settings.dry_run:
+            for row_id in expired:
+                self._unlink_by_id(row_id, result)
+            self.recordings.delete(expired)
+
+    def _rows_without_media(self, horizon: Any) -> list[dict[str, Any]]:
+        """
+        Rows the audio sweep will not return: media already expired, or never present.
+
+        ``expiring_before`` only yields rows that still have a file, since that is what an
+        audio sweep acts on. Everything else has to be caught here or it never expires at all
+        -- both the row whose audio went months ago and still holds its transcript, and the
+        row that never had a file (a registration whose media was never written).
+        """
+        try:
+            rows = self.recordings.database.fetch_all(  # type: ignore[union-attr]
+                "SELECT id, session_id, kind, participants, duration_seconds, created_at, "
+                "path, bytes FROM recordings "
+                "WHERE (audio_deleted_at IS NOT NULL OR path IS NULL) AND created_at < %s",
+                (horizon,),
+            )
+        except Exception as e:
+            self.logger.error(f"Could not read expired-audio recordings: {e}")
+            return []
+        return [self.recordings._decode(r) for r in rows or []]
+
+    def _unlink_by_id(self, row_id: Any, result: SweepResult) -> None:
+        """Remove any media still on disk for a row that is about to be deleted."""
+        row = self.recordings.get(row_id)
+        if row:
+            self._unlink(row.get("path"), result)
+
+    # ------------------------------------------------------------------ transcripts
+
+    def _sweep_live_transcripts(self, now: datetime, result: SweepResult) -> None:
+        """
+        Expire transcripts that have no recording to cascade from.
+
+        Only live transcription produces these: there is no file, so nothing owns the row.
+        Everything else is expired by deleting its recording.
+        """
+        cutoff = now - timedelta(days=self.settings.transcript_days)
+        rows = self._transcripts.orphans_before(cutoff)
+        if not rows:
+            return
+
+        expired = []
+        for row in rows:
+            if self.holds.held(str(row.get("session_id") or "")):
+                result.held += 1
+                continue
+            expired.append(row["id"])
+
+        result.transcripts += len(expired)
+        if expired and not self.settings.dry_run:
+            self._transcripts.delete(expired)
+
+    # ------------------------------------------------------------------ orphans
+
+    def _sweep_unregistered_files(self, now: datetime, result: SweepResult) -> None:
+        """
+        Delete audio on disk that no recording row points at.
+
+        A safety net, not the main path. Registration can fail -- a database blip at the end
+        of a call -- and a file nothing knows about would otherwise sit there forever, outside
+        every policy and every clock. Judged on mtime against the fallback period, because
+        there is no row to resolve a policy from.
+        """
+        cutoff = now - timedelta(days=self.settings.audio_days)
+        known = self._known_paths()
+
+        for root_name in (self.settings.voicemail_path, self.settings.recording_path):
+            root = Path(root_name)
+            if not root.is_dir():
+                continue
+
+            for path in root.rglob(AUDIO_SUFFIX):
+                if path.name in KEEP_FOREVER:
+                    continue
+                if SKIP_DIR_NAMES.intersection(path.relative_to(root).parts[:-1]):
+                    continue
+                if str(path) in known:
+                    continue
+                try:
+                    stat = path.stat()
+                    if datetime.fromtimestamp(stat.st_mtime, tz=UTC) >= cutoff:
+                        continue
+
+                    result.audio_files += 1
+                    result.audio_bytes += stat.st_size
+                    if self.settings.dry_run:
+                        self.logger.debug(f"  would delete unregistered {path}")
+                    else:
+                        self._unlink(path, result)
+                except OSError as e:
+                    result.errors.append(f"{path}: {e}")
+
+    def _known_paths(self) -> set[str]:
+        """Every path a recording row still claims."""
+        try:
+            rows = self.recordings.database.fetch_all(  # type: ignore[union-attr]
+                "SELECT path FROM recordings WHERE path IS NOT NULL"
+            )
+        except Exception as e:
+            # Failing open here would delete every registered recording as though it were an
+            # orphan, so an unreadable table means the safety net simply does not fire.
+            self.logger.error(f"Could not list known recording paths ({e}); skipping orphans")
+            raise
+        return {str(r["path"]) for r in rows or [] if r.get("path")}
+
+    # ------------------------------------------------------------------ helpers
+
+    def _facts(self, row: dict[str, Any]) -> RecordingFacts:
+        """Match facts straight off a recording row -- no sidecar, no path parsing."""
+        participants = row.get("participants") or []
+        if not isinstance(participants, list):
+            participants = []
+
+        duration = row.get("duration_seconds")
+        return RecordingFacts(
+            path=Path(str(row.get("path") or "")),
+            media=str(row.get("kind") or MEDIA_RECORDING),
+            session_id=str(row.get("session_id") or ""),
+            participants=tuple(str(p) for p in participants),
+            duration_seconds=float(duration) if isinstance(duration, int | float) else None,
+        )
+
+    def _shortest_audio_period(self) -> timedelta:
+        """
+        The shortest audio period any policy could impose.
+
+        A pre-filter only, so it must never be *longer* than a real period or rows would be
+        skipped before their policy was ever consulted.
+        """
+        days = [self.settings.audio_days]
+        days.extend(
+            p.audio_days for p in self.policies.all() if p.enabled and p.audio_days is not None
+        )
+        return timedelta(days=max(1, min(days)))
+
+    def _shortest_transcript_period(self) -> timedelta:
+        """Shortest transcript period any policy could impose. See `_shortest_audio_period`."""
+        days = [self.settings.transcript_days]
+        days.extend(
+            p.transcript_days
+            for p in self.policies.all()
+            if p.enabled and p.transcript_days is not None
+        )
+        return timedelta(days=max(1, min(days)))
 
     def statistics(self) -> dict[str, Any]:
         """
@@ -325,356 +589,3 @@ class RetentionSweeper:
             "lifetime_transcripts_deleted": self.lifetime_transcripts_deleted,
             "last_sweep_summary": self.last_result.summary() if self.last_result else None,
         }
-
-    def _sweep_audio(
-        self,
-        root: Path,
-        media: str,
-        now: datetime,
-        result: SweepResult,
-        expired: list[str] | None = None,
-    ) -> None:
-        """
-        Delete recordings under `root` that are past whatever period governs each of them.
-
-        The cutoff is per file, not per sweep: two recordings in the same directory can be
-        governed by different policies, so each one's age is compared against its own period.
-        """
-        if not root.is_dir():
-            return
-
-        fallback = timedelta(days=self.settings.audio_days)
-
-        for path in root.rglob(AUDIO_SUFFIX):
-            if path.name in KEEP_FOREVER:
-                continue
-            # relative_to(root) so a skip name appearing above the sweep root -- someone's
-            # recordings living under a path that happens to contain it -- does not exempt
-            # everything below it.
-            if SKIP_DIR_NAMES.intersection(path.relative_to(root).parts[:-1]):
-                continue
-            try:
-                stat = path.stat()
-                modified = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
-
-                # Cheapest test first: nothing younger than the shortest possible period can
-                # expire under any policy, and that skips almost every file on a daily sweep
-                # without reading a single sidecar.
-                if modified >= now - self._shortest_audio_period():
-                    continue
-
-                facts = facts_for(path, media)
-                if self.holds.held(facts.session_id):
-                    result.held += 1
-                    self.logger.debug(f"  holding {path} (session {facts.session_id})")
-                    continue
-
-                policy = self.policies.resolve(facts)
-                period = fallback
-                if policy is not None and policy.audio_days is not None:
-                    period = timedelta(days=policy.audio_days)
-                if modified >= now - period:
-                    continue
-
-                result.audio_files += 1
-                result.audio_bytes += stat.st_size
-                if expired is not None:
-                    expired.append(str(path))
-                if self.settings.dry_run:
-                    self.logger.debug(
-                        f"  would delete {path} ({modified:%Y-%m-%d}, "
-                        f"policy {policy.policy_id if policy else 'fallback'})"
-                    )
-                else:
-                    path.unlink()
-                    self.logger.debug(f"  deleted {path}")
-
-                self._sweep_sidecar(path, result)
-            except OSError as e:
-                # One unreadable file must not end the sweep; the rest still expire.
-                result.errors.append(f"{path}: {e}")
-
-        self._sweep_orphan_sidecars(root, now - fallback, result)
-
-    def _tombstone_voicemail_audio(self, paths: list[str], result: SweepResult) -> None:
-        """
-        Mark the rows whose recording this sweep just removed.
-
-        Without this the sweep creates phantom voicemails. The mailbox lists messages with
-        ``audio_deleted_at IS NULL`` and only ``delete_message`` ever set that column, so an
-        expired voicemail kept appearing in the mailbox, kept counting toward the message
-        waiting indicator, and pointed ``file_path`` at a recording that was no longer on
-        disk. It is the exact failure the comment on that query warns about, reached by a
-        different route.
-        """
-        if not paths or self.settings.dry_run:
-            return
-        if not (self.database and getattr(self.database, "enabled", False)):
-            return
-
-        try:
-            for start in range(0, len(paths), TRANSCRIPT_DELETE_CHUNK):
-                chunk = paths[start : start + TRANSCRIPT_DELETE_CHUNK]
-                placeholders = ", ".join(["%s"] * len(chunk))
-                self.database.execute(
-                    f"""
-                    UPDATE voicemail_messages
-                       SET audio_deleted_at = CURRENT_TIMESTAMP
-                     WHERE file_path IN ({placeholders})
-                       AND audio_deleted_at IS NULL
-                    """,
-                    tuple(chunk),
-                )
-        except Exception as e:
-            result.errors.append(f"voicemail tombstone failed: {e}")
-
-    def _shortest_audio_period(self) -> timedelta:
-        """
-        The shortest audio period any policy could impose.
-
-        Used only as a pre-filter, so it must never be *longer* than a real period or files
-        would be skipped before their policy was ever consulted.
-        """
-        days = [self.settings.audio_days]
-        days.extend(
-            p.audio_days for p in self.policies.all() if p.enabled and p.audio_days is not None
-        )
-        return timedelta(days=max(1, min(days)))
-
-    def _sweep_sidecar(self, audio: Path, result: SweepResult) -> None:
-        """
-        Remove the manifest written beside a recording, when the recording goes.
-
-        The sidecar names every participant on every channel. Leaving it once the audio is
-        gone keeps a record of who spoke to whom, indefinitely, on a system whose whole
-        retention design is that things provably expire. It is a few hundred bytes, so this
-        was easy to miss and is not about disk.
-        """
-        sidecar = audio.with_suffix(SIDECAR_SUFFIX)
-        if not sidecar.is_file():
-            return
-
-        try:
-            result.sidecars += 1
-            result.audio_bytes += sidecar.stat().st_size
-            if not self.settings.dry_run:
-                sidecar.unlink()
-                self.logger.debug(f"  deleted {sidecar}")
-        except OSError as e:
-            result.errors.append(f"{sidecar}: {e}")
-
-    def _sweep_orphan_sidecars(self, root: Path, cutoff: datetime, result: SweepResult) -> None:
-        """
-        Expire manifests whose recording is already gone.
-
-        Catches the ones deleted before this existed, and any whose audio was removed by hand.
-        Only manifests that sit beside a recording are considered -- an unrelated .json under
-        the same root is somebody else's file.
-        """
-        for sidecar in root.rglob(f"*{SIDECAR_SUFFIX}"):
-            if SKIP_DIR_NAMES.intersection(sidecar.relative_to(root).parts[:-1]):
-                continue
-            if sidecar.with_suffix(AUDIO_SUFFIX.removeprefix("*")).exists():
-                continue
-            try:
-                stat = sidecar.stat()
-                if datetime.fromtimestamp(stat.st_mtime, tz=UTC) >= cutoff:
-                    continue
-
-                result.sidecars += 1
-                result.audio_bytes += stat.st_size
-                if self.settings.dry_run:
-                    self.logger.debug(f"  would delete orphaned {sidecar}")
-                else:
-                    sidecar.unlink()
-                    self.logger.debug(f"  deleted orphaned {sidecar}")
-            except OSError as e:
-                result.errors.append(f"{sidecar}: {e}")
-
-    def _sweep_transcripts(self, now: datetime, result: SweepResult) -> None:
-        """
-        Delete transcripts past their own, longer period.
-
-        Policy is resolved per row from columns rather than from the sidecar, because by the
-        time a transcript expires its recording is long gone -- audio runs on the short clock
-        and the manifest goes with it. That is why migration 1018 puts ``participants`` and
-        ``session_id`` on the row: they are the only surviving record of who was on the call.
-        """
-        if not (self.database and getattr(self.database, "enabled", False)):
-            return
-
-        # Widest net first, then decide per row. Fetching by the shortest period keeps the scan
-        # bounded without letting a short policy's rows escape the query.
-        horizon = now - self._shortest_transcript_period()
-        try:
-            rows = self.database.fetch_all(
-                """
-                SELECT id, session_id, source, participants, audio_duration, created_at
-                  FROM call_transcripts
-                 WHERE created_at < %s
-                """,
-                (horizon,),
-            )
-        except Exception as e:
-            # Broad: every driver raises its own type, and a failed sweep must not take the
-            # background thread -- or the PBX -- down with it.
-            result.errors.append(f"transcript sweep failed: {e}")
-            return
-
-        fallback = timedelta(days=self.settings.transcript_days)
-        expired: list[Any] = []
-
-        for row in rows or []:
-            created = row.get("created_at")
-            if not isinstance(created, datetime):
-                continue
-            if created.tzinfo is None:
-                # The column is a naive TIMESTAMP; every writer stores UTC.
-                created = created.replace(tzinfo=UTC)
-
-            session_id = str(row.get("session_id") or "")
-            if self.holds.held(session_id):
-                result.held += 1
-                continue
-
-            policy = self.policies.resolve(self._transcript_facts(row))
-            period = fallback
-            if policy is not None and policy.transcript_days is not None:
-                period = timedelta(days=policy.transcript_days)
-
-            if created < now - period:
-                expired.append(row["id"])
-
-        result.transcripts = len(expired)
-        if not expired or self.settings.dry_run:
-            return
-
-        try:
-            # Chunked: a first sweep on a long-neglected install can expire tens of thousands
-            # of rows, and one IN list that size is a statement no driver enjoys.
-            for start in range(0, len(expired), TRANSCRIPT_DELETE_CHUNK):
-                chunk = expired[start : start + TRANSCRIPT_DELETE_CHUNK]
-                placeholders = ", ".join(["%s"] * len(chunk))
-                self.database.execute(
-                    f"DELETE FROM call_transcripts WHERE id IN ({placeholders})",
-                    tuple(chunk),
-                )
-        except Exception as e:
-            result.errors.append(f"transcript delete failed: {e}")
-
-    def _sweep_voicemail_transcripts(self, now: datetime, result: SweepResult) -> None:
-        """
-        Remove voicemail rows once their last content has expired.
-
-        A voicemail's audio goes on the audio clock and its text on the transcript clock; the
-        row goes with the longer of the two, because a row holding neither is not a voicemail.
-        It is metadata that CDR already records about the same call, and leaving it was the one
-        tier of this design with no expiry at all.
-
-        Deleting the row takes both copies of the transcript with it -- the columns on this
-        table, which the email path reads, and (separately swept) the ``call_transcripts`` row.
-        """
-        if not (self.database and getattr(self.database, "enabled", False)):
-            return
-
-        horizon = now - self._shortest_transcript_period()
-        try:
-            rows = self.database.fetch_all(
-                """
-                SELECT id, extension_number, caller_id, duration, created_at
-                  FROM voicemail_messages
-                 WHERE created_at < %s
-                """,
-                (horizon,),
-            )
-        except Exception as e:
-            result.errors.append(f"voicemail transcript sweep failed: {e}")
-            return
-
-        fallback = timedelta(days=self.settings.transcript_days)
-        expired: list[Any] = []
-
-        for row in rows or []:
-            created = row.get("created_at")
-            if not isinstance(created, datetime):
-                continue
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=UTC)
-
-            policy = self.policies.resolve(self._voicemail_facts(row))
-            period = fallback
-            if policy is not None and policy.transcript_days is not None:
-                period = timedelta(days=policy.transcript_days)
-
-            if created < now - period:
-                expired.append(row["id"])
-
-        result.voicemail_messages = len(expired)
-        if not expired or self.settings.dry_run:
-            return
-
-        try:
-            for start in range(0, len(expired), TRANSCRIPT_DELETE_CHUNK):
-                chunk = expired[start : start + TRANSCRIPT_DELETE_CHUNK]
-                placeholders = ", ".join(["%s"] * len(chunk))
-                self.database.execute(
-                    f"DELETE FROM voicemail_messages WHERE id IN ({placeholders})",
-                    tuple(chunk),
-                )
-        except Exception as e:
-            result.errors.append(f"voicemail row delete failed: {e}")
-
-    def _voicemail_facts(self, row: dict) -> RecordingFacts:
-        """
-        Match facts for a voicemail message row.
-
-        Participants are the mailbox owner and the caller -- the same pair
-        ``retention_policies.facts_for`` derives from a voicemail's path, so a policy written
-        against an extension governs the audio and the text identically.
-        """
-        participants = tuple(
-            str(v) for v in (row.get("extension_number"), row.get("caller_id")) if v
-        )
-        duration = row.get("duration")
-        return RecordingFacts(
-            path=Path(),
-            media=MEDIA_VOICEMAIL,
-            participants=participants,
-            duration_seconds=float(duration) if isinstance(duration, int | float) else None,
-        )
-
-    def _shortest_transcript_period(self) -> timedelta:
-        """Shortest transcript period any policy could impose. See `_shortest_audio_period`."""
-        days = [self.settings.transcript_days]
-        days.extend(
-            p.transcript_days
-            for p in self.policies.all()
-            if p.enabled and p.transcript_days is not None
-        )
-        return timedelta(days=max(1, min(days)))
-
-    def _transcript_facts(self, row: dict) -> RecordingFacts:
-        """
-        Rebuild match facts from a transcript row.
-
-        ``source`` is 'recording', 'voicemail' or 'live'; the first two line up with the media
-        vocabulary, and a live transcript simply matches no media rule.
-        """
-        raw = row.get("participants")
-        participants: tuple[str, ...] = ()
-        if raw:
-            try:
-                parsed = json.loads(raw) if isinstance(raw, str) else raw
-                if isinstance(parsed, list):
-                    participants = tuple(str(p) for p in parsed)
-            except (TypeError, ValueError):
-                participants = ()
-
-        duration = row.get("audio_duration")
-        return RecordingFacts(
-            path=Path(),
-            media=str(row.get("source") or ""),
-            session_id=str(row.get("session_id") or ""),
-            participants=participants,
-            duration_seconds=float(duration) if isinstance(duration, int | float) else None,
-        )

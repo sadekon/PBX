@@ -238,10 +238,10 @@ class TestVoicemailBoxInit:
                 "duration": 30.0,
                 "listened": True,
                 "created_at": datetime.now(UTC),
-                "transcription_text": "Hello world",
-                "transcription_confidence": 0.95,
-                "transcription_language": "en",
-                "transcription_provider": "whisper",
+                "text": "Hello world",
+                "confidence": 0.95,
+                "language": "en",
+                "provider": "whisper",
                 "transcribed_at": "2025-01-01T12:00:05",
             }
         ]
@@ -423,13 +423,20 @@ class TestVoicemailBoxSaveMessage:
         voicemail_box.transcription_service = self._inline_worker(text="Hello", confidence=0.9)
         voicemail_box.save_message("5551234", b"audio data")
 
-        # Three writes: the message row, the transcription columns on it, and the row in
-        # call_transcripts. The last is the dual-write -- voicemail_messages stays because the
-        # email reads it, while call_transcripts is the one table retention and the admin view
-        # have to know about.
-        assert mock_database.execute.call_count == 3
-        statements = " ".join(str(call[0][0]) for call in mock_database.execute.call_args_list)
-        assert "INSERT INTO call_transcripts" in statements
+        # The mailbox row goes through execute(); the recording and the transcript use
+        # fetch_one, because both need the id RETURNING gives back. What matters is that the
+        # transcript is written exactly once -- it used to be written twice, and only one of
+        # the two copies was ever swept.
+        statements = " ".join(
+            str(call[0][0])
+            for call in (
+                *mock_database.execute.call_args_list,
+                *mock_database.fetch_one.call_args_list,
+            )
+        )
+        assert "INSERT INTO voicemail_messages" in statements
+        assert "INSERT INTO recordings" in statements
+        assert statements.count("INSERT INTO transcripts") == 1
 
     def test_save_message_without_a_mailer_skips_transcription(self, voicemail_box) -> None:
         """No mailer means no notification, so there is nothing a transcript would serve."""
@@ -635,7 +642,11 @@ class TestVoicemailBoxDeleteMessage:
         voicemail_box.delete_message(msg_id)
 
         query = str(mock_database.execute.call_args[0][0])
-        assert "UPDATE voicemail_messages" in query
+        # Tombstoned on the recording, which is where the audio lives now. The mailbox row
+        # and the transcript stay until retention expires them.
+        assert "UPDATE recordings" in query
+        assert "audio_deleted_at" in query
+        assert "path = NULL" in query, "a row naming a missing file is the phantom bug"
         assert "audio_deleted_at" in query
         # "DELETE FROM", not "DELETE": audio_deleted_at contains the word.
         assert "DELETE FROM" not in query.upper()
