@@ -75,6 +75,11 @@ declare global {
         closeVoicemailPlayer: () => void;
         toggleVoicemailView: () => void;
 
+        // pages/call-recordings.ts
+        initCallRecordings: () => void;
+        loadCallRecordings: () => Promise<void>;
+        closeRecordingPlayer: () => void;
+
         // pages/calls.ts
         loadCalls: () => Promise<void>;
         loadCodecStatus: () => Promise<void>;

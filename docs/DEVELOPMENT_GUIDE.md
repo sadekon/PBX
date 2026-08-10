@@ -417,10 +417,74 @@ forwarding across supported phone models before merge to `DEV`.
 
 ---
 
-## Next up — call transcript review (design agreed 2026-08-06, not built)
+## Call transcript review — read path built 2026-08-10
 
-Backend post-call transcription is **complete**: tap → per-participant recording → per-region
-transcription → one speaker-attributed transcript in `call_transcripts`. Nothing reads it yet.
+Backend post-call transcription was already **complete**: tap → per-participant recording →
+per-region transcription → one speaker-attributed transcript. What was missing was anything
+that read it. `recordings` had rows since the recorder started registering them and no view
+onto them; `admin/js/pages/recordings.ts` is fraud alerts and callback queues despite the name.
+
+Now there is a read API (`pbx/api/routes/recordings.py`) and a **Call Recordings** admin tab
+(`admin/js/pages/call-recordings.ts`): list, play, download, read transcript.
+
+### Who may read a recording
+
+Binary, because the token is binary — the session token carries an `is_admin` bool and there
+are no roles. Two tiers, no more:
+
+| Tier | Reach |
+|---|---|
+| Admin | Every recording and transcript |
+| Participant | Only calls they were a party to, matched against `recordings.participants` |
+
+Participant access is gated on **`recording.participant_access`, default `false`** — a fresh
+install is admin-only. Note the key lives under `recording:`, **not**
+`features.call_recording.participant_access`: `features.call_recording` is a bool, and
+`Config.get` returns the default the moment a dotted lookup hits a non-dict, so that key could
+never have been switched on and would have read as "the flag does nothing".
+
+There is deliberately **no supervisor tier**. Nothing in the schema models teams or reporting
+lines, so it would have to be inferred from extension numbers, which is a guess.
+
+`check_recording_access()` in `pbx/api/utils.py` owns the rule; no route re-implements it.
+
+### How the path is kept secure
+
+- **Reads are audited, not just writes** — `AuditLogger.log_recording_access` fires on every
+  playback and transcript fetch, and on every denial. Who listened to which call is the
+  question asked months later, and only a record made at the time can answer it.
+- **Text never appears in a list response.** Listing is metadata only; text comes from a
+  per-recording fetch that audits. Otherwise one paginated call drains every transcript and
+  lands in the log as a single event.
+- **Media resolves from the row, never the caller** — there is no path in any URL. The stored
+  path is still confined to `recording.storage_path` / `voicemail.storage_path` before serving,
+  so a bad `storage_path` or a future writer cannot turn this into an arbitrary file read.
+- **Expired audio returns 410, not 404.** The row outlives the file by design; 404 reads as
+  "no such recording" when the recording plainly exists and its transcript usually remains.
+- **`no-store` on media and transcripts**, so neither settles into a cache that outlives the
+  retention policy.
+- **403 is flat.** The body never distinguishes "not yours" from "does not exist", or a caller
+  could enumerate which calls a colleague was on.
+
+Audio reaches the browser as a blob fetched with the bearer token, never an `<audio src>`
+pointed at the API — the browser's own request carries no `Authorization` header. Same reason
+`playVoicemail` already did it that way.
+
+### Retention and analytics endpoints were open to any extension
+
+`/api/recording-retention/*` (policies, statistics, holds), `/api/recording-announcements/*`
+and `/recording-analytics/*` were all `@require_auth`, not `@require_admin` — and login
+authenticates against the user's **voicemail PIN**. Any extension with a PIN could read
+retention policy, search recording analyses, and `POST`/`DELETE` policies and legal holds.
+Deleting a retention policy is a data-destruction primitive. All 14 are now `@require_admin`.
+
+### Not done
+
+- Bulk export of recordings (voicemail has a ZIP export path; recordings have none).
+- Live-transcript view. `transcripts.recording_id` is nullable and `source="live"` is reserved
+  for it, but nothing streams yet.
+- The token bakes `is_admin` in at login, so **demoting a user leaves them admin until their
+  token expires**. That limits how much admin-only can be leaned on as a primary control.
 
 ### Recording consent — complete 2026-08-07, verified on real calls
 

@@ -2360,7 +2360,7 @@ def delete_mobile_mapping(business_number: str) -> tuple[Response, int]:
 
 
 @framework_bp.route("/recording-analytics/analyses", methods=["GET"])
-@require_auth
+@require_admin
 def get_recording_analyses() -> tuple[Response, int]:
     """Get all recording analyses."""
     try:
@@ -2376,7 +2376,7 @@ def get_recording_analyses() -> tuple[Response, int]:
 
 
 @framework_bp.route("/recording-analytics/statistics", methods=["GET"])
-@require_auth
+@require_admin
 def get_recording_statistics() -> tuple[Response, int]:
     """Get recording analytics statistics."""
     try:
@@ -2392,7 +2392,7 @@ def get_recording_statistics() -> tuple[Response, int]:
 
 
 @framework_bp.route("/recording-analytics/analysis/<recording_id>", methods=["GET"])
-@require_auth
+@require_admin
 def get_recording_analysis(recording_id: str) -> tuple[Response, int]:
     """Get specific recording analysis."""
     try:
@@ -2410,7 +2410,7 @@ def get_recording_analysis(recording_id: str) -> tuple[Response, int]:
 
 
 @framework_bp.route("/recording-analytics/analyze", methods=["POST"])
-@require_auth
+@require_admin
 def analyze_recording() -> tuple[Response, int]:
     """Analyze a recording."""
     try:
@@ -2436,7 +2436,7 @@ def analyze_recording() -> tuple[Response, int]:
 
 
 @framework_bp.route("/recording-analytics/search", methods=["POST"])
-@require_auth
+@require_admin
 def search_recordings() -> tuple[Response, int]:
     """Search recordings."""
     try:

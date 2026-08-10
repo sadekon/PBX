@@ -436,6 +436,21 @@ recording:
   # negotiate different codecs, so there is no single wire format to preserve.
   storage_path: recordings
 
+  # Who may play a recording or read its transcript through the admin API.
+  #
+  # false (default) = administrators only.
+  # true            = an extension may also reach recordings of calls it was a party to,
+  #                   matched against the participant list the recorder stores per call.
+  #
+  # Off by default deliberately. A recording is the most sensitive thing this system keeps,
+  # the admin login authenticates against the user's voicemail PIN, and many deployments are
+  # required to keep call audio to compliance staff. Turning this on is a decision to make
+  # on purpose, not one to have to remember to undo.
+  #
+  # Independent of this setting, every playback and transcript read -- allowed or refused --
+  # is written to the audit log.
+  participant_access: false
+
   # Spoken notice played at bridge. If it does not play, the recording is discarded --
   # recording without notice is unlawful in two-party-consent jurisdictions.
   consent:

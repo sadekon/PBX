@@ -145,6 +145,7 @@ export function showTab(tabName: string): void {
         'webhooks':            window.loadWebhooks,
         'hot-desking':         window.loadHotDeskSessions,
         'recording-retention': window.loadRetentionPolicies,
+        'call-recordings':     window.initCallRecordings,
         'jitsi-integration':   window.loadJitsiConfig,
         'matrix-integration':  window.loadMatrixConfig,
         'espocrm-integration': window.loadEspoCRMConfig,

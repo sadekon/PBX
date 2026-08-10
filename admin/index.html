@@ -174,6 +174,10 @@
                         <span class="tab-icon">🔔</span>
                         <span class="tab-text">Webhooks</span>
                     </button>
+                    <button class="tab-button" data-tab="call-recordings">
+                        <span class="tab-icon">⏺️</span>
+                        <span class="tab-text">Call Recordings</span>
+                    </button>
                     <button class="tab-button" data-tab="recording-retention">
                         <span class="tab-icon">📁</span>
                         <span class="tab-text">Recording Retention</span>
@@ -2770,6 +2774,48 @@ G.726-32</textarea>
         </div>
 
         <!-- Recording Retention Tab -->
+        <div id="call-recordings" class="tab-content">
+            <h2>⏺️ Call Recordings</h2>
+
+            <!-- Recordings are admin-only out of the box. Said here rather than only in an
+                 error, because a non-admin seeing an empty list would otherwise read it as
+                 "nothing was recorded". -->
+            <div class="info-box" style="margin-bottom: 20px;">
+                Call audio and transcripts are restricted to administrators. Users can be given
+                access to calls they were part of by enabling
+                <code>recording.participant_access</code>. Every playback and
+                transcript read is written to the audit log.
+            </div>
+
+            <div class="action-buttons" style="margin-bottom: 20px;">
+                <button class="btn btn-primary" onclick="loadCallRecordings()">🔄 Refresh</button>
+                <label for="recordings-kind-filter" style="margin-left: 12px;">Kind:</label>
+                <select id="recordings-kind-filter">
+                    <option value="">All</option>
+                    <option value="call">Call</option>
+                    <option value="voicemail">Voicemail</option>
+                    <option value="conference">Conference</option>
+                </select>
+            </div>
+
+            <!-- Hidden until something is played. Audio arrives as a blob fetched with the
+                 bearer token, so this element's src is an object URL, never the API path. -->
+            <div id="recording-player-section" style="display: none; margin-bottom: 20px;">
+                <audio id="recording-audio-player" controls style="width: 100%;"></audio>
+                <button class="btn btn-secondary btn-sm" onclick="closeRecordingPlayer()"
+                        style="margin-top: 8px;">Close Player</button>
+            </div>
+
+            <div id="recording-transcript-section" style="display: none; margin-bottom: 20px;">
+                <h3>Transcript</h3>
+                <div id="recording-transcript-body"></div>
+            </div>
+
+            <div id="call-recordings-list">
+                <div class="info-box">Loading recordings&hellip;</div>
+            </div>
+        </div>
+
         <div id="recording-retention" class="tab-content">
             <h2>📁 Recording Retention Policies</h2>
 

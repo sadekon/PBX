@@ -15,6 +15,7 @@ from flask import Blueprint, Response, request
 from pbx.api.utils import (
     get_pbx_core,
     get_request_body,
+    require_admin,
     require_auth,
     send_json,
     validate_limit_param,
@@ -1619,7 +1620,7 @@ def _audit_hold(action: str, user: str, session_id: str, details: dict) -> None:
 
 
 @features_bp.route("/api/recording-retention/policies", methods=["GET"])
-@require_auth
+@require_admin
 def get_retention_policies() -> tuple[Response, int]:
     """Get all retention policies, in the order the sweeper resolves them."""
     pbx_core = get_pbx_core()
@@ -1659,7 +1660,7 @@ def get_retention_policies() -> tuple[Response, int]:
 
 
 @features_bp.route("/api/recording-retention/statistics", methods=["GET"])
-@require_auth
+@require_admin
 def get_retention_statistics() -> tuple[Response, int]:
     """Get retention statistics."""
     pbx_core = get_pbx_core()
@@ -1692,7 +1693,7 @@ def get_retention_statistics() -> tuple[Response, int]:
 
 
 @features_bp.route("/api/recording-retention/policy", methods=["POST"])
-@require_auth
+@require_admin
 def add_retention_policy() -> tuple[Response, int]:
     """Create or update a retention policy."""
     pbx_core = get_pbx_core()
@@ -1775,7 +1776,7 @@ def add_retention_policy() -> tuple[Response, int]:
 
 
 @features_bp.route("/api/recording-retention/policy/<policy_id>", methods=["DELETE"])
-@require_auth
+@require_admin
 def delete_retention_policy(policy_id: str) -> tuple[Response, int]:
     """Delete a retention policy."""
     pbx_core = get_pbx_core()
@@ -1801,7 +1802,7 @@ def delete_retention_policy(policy_id: str) -> tuple[Response, int]:
 
 
 @features_bp.route("/api/recording-retention/holds", methods=["GET"])
-@require_auth
+@require_admin
 def get_retention_holds() -> tuple[Response, int]:
     """List legal holds. Released ones are included only on request."""
     pbx_core = get_pbx_core()
@@ -1818,7 +1819,7 @@ def get_retention_holds() -> tuple[Response, int]:
 
 
 @features_bp.route("/api/recording-retention/hold", methods=["POST"])
-@require_auth
+@require_admin
 def place_retention_hold() -> tuple[Response, int]:
     """
     Put a call session beyond the reach of the sweeper until it is released.
@@ -1856,7 +1857,7 @@ def place_retention_hold() -> tuple[Response, int]:
 
 
 @features_bp.route("/api/recording-retention/hold/<session_id>", methods=["DELETE"])
-@require_auth
+@require_admin
 def release_retention_hold(session_id: str) -> tuple[Response, int]:
     """Release every active hold on a session. The rows are stamped, not deleted."""
     pbx_core = get_pbx_core()
@@ -2477,7 +2478,7 @@ def test_push_notification() -> tuple[Response, int]:
 
 
 @features_bp.route("/api/recording-announcements/statistics", methods=["GET"])
-@require_auth
+@require_admin
 def get_announcement_statistics() -> tuple[Response, int]:
     """
     Statistics for the recording notice.
@@ -2510,7 +2511,7 @@ def get_announcement_statistics() -> tuple[Response, int]:
 
 
 @features_bp.route("/api/recording-announcements/log", methods=["GET"])
-@require_auth
+@require_admin
 def get_announcement_log() -> tuple[Response, int]:
     """
     The record that callers were told, newest first.

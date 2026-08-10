@@ -245,6 +245,43 @@ class AuditLogger:
             ip_address=ip_address,
         )
 
+    def log_recording_access(
+        self,
+        user: str,
+        recording_id: str,
+        kind: str,
+        ip_address: str | None = None,
+        granted: bool = True,
+        reason: str | None = None,
+    ) -> None:
+        """Log a read of recorded media or its transcript.
+
+        Reads are audited here, not just writes: retrieving a recording is the event that
+        matters after the fact, and a denial is worth keeping too -- a run of them against
+        recordings someone was not party to is what an attempt looks like.
+
+        Args:
+            user: Extension or identifier of the caller
+            recording_id: The recording row being read
+            kind: What was read -- "audio" or "transcript"
+            ip_address: Client IP address
+            granted: Whether access was allowed
+            reason: Why access was denied, when it was
+        """
+        details: dict[str, Any] = {"kind": kind}
+        if reason:
+            details["reason"] = reason
+
+        self.log_action(
+            action="access",
+            user=user,
+            resource="recording",
+            resource_id=str(recording_id),
+            details=details,
+            success=granted,
+            ip_address=ip_address,
+        )
+
     def log_backup_operation(self, user: str, operation: str, details: dict) -> None:
         """Log backup operation."""
         self.log_action(

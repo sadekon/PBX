@@ -18,11 +18,22 @@ interface VoicemailMessage {
     timestamp: string;
     duration?: number;
     listened?: boolean;
+    transcription?: string | null;
+    transcription_confidence?: number | null;
+    transcription_provider?: string | null;
 }
 
 interface VoicemailResponse {
     messages?: VoicemailMessage[];
 }
+
+/**
+ * The messages currently on screen, by id.
+ *
+ * The transcript arrives with the listing, so playback does not re-fetch it -- the mailbox
+ * response is already authorised for this extension and there is nothing further to ask for.
+ */
+const loadedMessages = new Map<string, VoicemailMessage>();
 
 export async function loadVoicemailTab(): Promise<void> {
     try {
@@ -97,6 +108,9 @@ function updateVoicemailView(messages: VoicemailMessage[] | undefined, extension
     const container = document.getElementById('voicemail-cards-view') as HTMLElement | null;
     if (!container) return;
 
+    loadedMessages.clear();
+    for (const msg of messages ?? []) loadedMessages.set(msg.id, msg);
+
     if (!messages || messages.length === 0) {
         container.innerHTML = '<div class="info-box">No voicemail messages</div>';
         return;
@@ -118,6 +132,7 @@ function updateVoicemailView(messages: VoicemailMessage[] | undefined, extension
                 <div class="voicemail-card-body">
                     <div>Time: ${timestamp}</div>
                     <div>Duration: ${duration}</div>
+                    ${renderTranscriptPreview(msg)}
                 </div>
                 <div class="voicemail-card-actions">
                     <button class="btn btn-primary btn-sm" onclick="playVoicemail('${extension}', '${msg.id}')">Play</button>
@@ -127,6 +142,60 @@ function updateVoicemailView(messages: VoicemailMessage[] | undefined, extension
             </div>
         `;
     }).join('');
+}
+
+/** How much transcript a card shows before it needs the player to read the rest. */
+const PREVIEW_CHARS = 180;
+
+function renderTranscriptPreview(msg: VoicemailMessage): string {
+    const text = (msg.transcription ?? '').trim();
+    if (!text) return '';
+
+    const truncated = text.length > PREVIEW_CHARS;
+    const preview = truncated ? `${text.slice(0, PREVIEW_CHARS).trimEnd()}…` : text;
+    return `<div class="voicemail-transcript-preview" style="margin-top: 8px; color: #4b5563;">
+        <em>${escapeHtml(preview)}</em>
+    </div>`;
+}
+
+/**
+ * Show the transcript of the message being played, or hide the panel when there is none.
+ *
+ * Absent is the normal case, not a failure: transcription is optional, the engine may have
+ * declined a message that was too short, and a message recorded before it was switched on
+ * will never have one.
+ */
+function showTranscription(messageId: string): void {
+    const display = document.getElementById('vm-transcription-display') as HTMLElement | null;
+    const textEl = document.getElementById('vm-transcription-text');
+    const confidenceEl = document.getElementById('vm-transcription-confidence');
+    if (!display || !textEl) return;
+
+    const msg = loadedMessages.get(messageId);
+    const text = (msg?.transcription ?? '').trim();
+
+    if (!text) {
+        display.style.display = 'none';
+        return;
+    }
+
+    textEl.textContent = text;
+
+    if (confidenceEl) {
+        // Whisper cannot report a confidence at all. Showing null as 0% claims the transcript
+        // is worthless, which is a different statement from "not measured".
+        const confidence = msg?.transcription_confidence;
+        const provider = msg?.transcription_provider;
+        const parts = [
+            provider ? `Provider: ${provider}` : null,
+            confidence === null || confidence === undefined
+                ? 'Estimated accuracy: not reported'
+                : `Estimated accuracy: ${Math.round(confidence * 100)}%`
+        ].filter(Boolean);
+        confidenceEl.textContent = parts.join(' · ');
+    }
+
+    display.style.display = 'block';
 }
 
 /**
@@ -172,6 +241,13 @@ export async function playVoicemail(extension: string, messageId: string): Promi
         if (player.dataset.objectUrl) URL.revokeObjectURL(player.dataset.objectUrl);
         player.src = objectUrl;
         player.dataset.objectUrl = objectUrl;
+
+        // closeVoicemailPlayer() hides this section and nothing used to bring it back, so
+        // once a user closed the player every later Play was silent with no visible player.
+        const playerSection = document.getElementById('voicemail-player-section') as HTMLElement | null;
+        if (playerSection) playerSection.style.display = 'block';
+
+        showTranscription(messageId);
 
         // Awaited so a playback failure is caught here rather than surfacing as an
         // unhandled rejection -- and so the message is only marked read once it has
