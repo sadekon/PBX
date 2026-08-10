@@ -1078,6 +1078,12 @@ def register_all_migrations(manager: MigrationManager) -> None:
             -- Stored verbatim rather than referenced. The configured wording changes; what a
             -- given caller was actually told does not, and that is the whole point of this row.
             notice_text {TEXT},
+            -- Who was told. Denormalised on purpose, and deliberately NOT a foreign key to
+            -- recordings: the recording expires at 90 days while this row is kept, so a
+            -- cascade would delete the evidence along with the thing it justifies, and a plain
+            -- reference would dangle. For an external call this is the caller's number, which
+            -- is exactly what "we informed this person at this time" needs to name.
+            participants {TEXT},
             -- How many legs heard it. Both, normally.
             legs INTEGER,
             -- Why it did not play, when it did not.

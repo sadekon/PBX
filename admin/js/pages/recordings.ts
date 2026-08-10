@@ -910,6 +910,7 @@ interface NoticeRow {
     session_id?: string;
     played?: boolean;
     notice_text?: string;
+    participants?: string | string[];
     legs?: number;
     failure_reason?: string;
     played_at?: string;
@@ -991,9 +992,22 @@ export async function loadRecordingAnnouncementsStats(): Promise<void> {
                           const outcome = row.played
                               ? 'played'
                               : `<strong>not played</strong> — recording discarded`;
+                          // Stored as JSON text; naming who was told is what makes the row
+                          // evidence rather than a timestamp.
+                          let told = '';
+                          if (Array.isArray(row.participants)) {
+                              told = row.participants.join(', ');
+                          } else if (row.participants) {
+                              try {
+                                  told = (JSON.parse(row.participants) as string[]).join(', ');
+                              } catch {
+                                  told = row.participants;
+                              }
+                          }
                           return `
                         <tr>
                             <td><small>${when}</small></td>
+                            <td><small>${escapeHtml(told)}</small></td>
                             <td><small>${escapeHtml(row.session_id ?? '')}</small></td>
                             <td>${outcome}</td>
                             <td><small>${escapeHtml(row.notice_text ?? row.failure_reason ?? '')}</small></td>
@@ -1001,7 +1015,7 @@ export async function loadRecordingAnnouncementsStats(): Promise<void> {
                     `;
                       })
                       .join('')
-                : '<tr><td colspan="4" style="text-align: center;">No notices recorded yet</td></tr>';
+                : '<tr><td colspan="5" style="text-align: center;">No notices recorded yet</td></tr>';
         }
     } catch (error: unknown) {
         console.error('Error loading recording notice data:', error);

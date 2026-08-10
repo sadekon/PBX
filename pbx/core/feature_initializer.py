@@ -511,7 +511,16 @@ class FeatureInitializer:
 
             # Both legs hear it. The outside party is who the disclosure is for, but it is
             # also what tells the employee why the line is quiet -- see recording_consent.
-            announcer.announce(handler, on_announced)
+            #
+            # The parties are passed through so the notice log can name who was told. It is
+            # kept indefinitely while the recording expires, so there is nothing to join to
+            # later -- a row that cannot identify anyone proves nothing.
+            announcer.announce(
+                handler,
+                on_announced,
+                session_id=session_id,
+                participants=[p for p in (caller, callee) if p and p != "unknown"],
+            )
 
         relay.on_bridged = on_bridged
 

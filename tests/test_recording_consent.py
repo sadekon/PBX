@@ -7,6 +7,7 @@ prevent, and it is the case that fails silently -- a broken prompt file still pr
 perfectly good audio, which is exactly why it must not be kept.
 """
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -627,7 +628,7 @@ class TestNoticeLog:
 
         params = db.execute.call_args[0][1]
         assert params[2] is False
-        assert "discarded" in params[5]
+        assert "discarded" in params[6]
 
     def test_no_database_is_survivable(self, tmp_path):
         _announcer(audio_file=str(tmp_path / "x.wav"))._record(self._handler(), played=True)
@@ -664,3 +665,90 @@ class TestNoticeLog:
         announcer.recent(10)
 
         assert "ORDER BY played_at DESC" in db.fetch_all.call_args[0][0]
+
+
+@pytest.mark.unit
+class TestNoticeNamesWhoWasTold:
+    """
+    A notice row has to identify the people it covers.
+
+    The log is kept indefinitely while the recording it justifies expires at 90 days, so there
+    is nothing left to join to by the time anyone needs it. Participants are denormalised for
+    the same reason transcripts carry theirs -- and deliberately not a foreign key, since a
+    cascade would delete the evidence along with the recording.
+    """
+
+    def _db(self):
+        db = MagicMock()
+        db.enabled = True
+        db.execute.return_value = True
+        db.fetch_all.return_value = []
+        return db
+
+    def _announcer_with(self, db, tmp_path):
+        announcer = _announcer(audio_file=str(tmp_path / "x.wav"))
+        announcer.database = db
+        return announcer
+
+    def _handler(self):
+        handler = MagicMock()
+        handler.call_id = "call-1"
+        return handler
+
+    def test_participants_are_stored(self, tmp_path):
+        db = self._db()
+
+        self._announcer_with(db, tmp_path)._record(
+            self._handler(),
+            played=True,
+            session_id="sess-1",
+            participants=["1512", "+15551234567"],
+        )
+
+        params = db.execute.call_args[0][1]
+        assert json.loads(params[4]) == ["1512", "+15551234567"]
+
+    def test_the_session_is_not_just_the_call_id(self, tmp_path):
+        """A session survives transfers; call_id names one dialog. They were the same value."""
+        db = self._db()
+
+        self._announcer_with(db, tmp_path)._record(
+            self._handler(), played=True, session_id="sess-1", participants=["1512"]
+        )
+
+        params = db.execute.call_args[0][1]
+        assert params[0] == "sess-1"
+        assert params[1] == "call-1"
+
+    def test_the_session_falls_back_to_the_call_id(self, tmp_path):
+        db = self._db()
+
+        self._announcer_with(db, tmp_path)._record(self._handler(), played=True)
+
+        assert db.execute.call_args[0][1][0] == "call-1"
+
+    def test_a_failed_notice_still_names_the_participants(self, tmp_path):
+        """Especially then: it records who was NOT told, and so was not recorded."""
+        db = self._db()
+
+        self._announcer_with(db, tmp_path)._record(
+            self._handler(), played=False, session_id="s", participants=["1512"]
+        )
+
+        params = db.execute.call_args[0][1]
+        assert params[2] is False
+        assert json.loads(params[4]) == ["1512"]
+
+    def test_announce_passes_them_through(self, tmp_path):
+        db = self._db()
+        announcer = self._announcer_with(db, tmp_path)
+        handler = MagicMock()
+        handler.call_id = "call-1"
+        handler.running = True
+        handler.tap = None
+
+        announcer._play(handler, lambda _ok: None, "sess-1", ["1512", "1513"])
+
+        params = db.execute.call_args[0][1]
+        assert params[0] == "sess-1"
+        assert json.loads(params[4]) == ["1512", "1513"]

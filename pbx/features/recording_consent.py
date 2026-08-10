@@ -35,6 +35,7 @@ you would want approximated if the recording is ever evidence.
 from __future__ import annotations
 
 import contextlib
+import json
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,7 +44,7 @@ from typing import TYPE_CHECKING, Any
 from pbx.utils.logger import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 __all__ = [
     "ANNOUNCE_ALL",
@@ -215,7 +216,13 @@ class ConsentAnnouncer:
         )
         return False
 
-    def announce(self, handler: Any, on_complete: Callable[[bool], None]) -> None:
+    def announce(
+        self,
+        handler: Any,
+        on_complete: Callable[[bool], None],
+        session_id: str | None = None,
+        participants: Sequence[str] | None = None,
+    ) -> None:
         """
         Play the notice to both legs, then report success through `on_complete`.
 
@@ -224,13 +231,19 @@ class ConsentAnnouncer:
         """
         thread = threading.Thread(
             target=self._play,
-            args=(handler, on_complete),
+            args=(handler, on_complete, session_id, participants),
             name=f"ConsentNotice-{getattr(handler, 'call_id', '?')}",
             daemon=True,
         )
         thread.start()
 
-    def _play(self, handler: Any, on_complete: Callable[[bool], None]) -> None:
+    def _play(
+        self,
+        handler: Any,
+        on_complete: Callable[[bool], None],
+        session_id: str | None = None,
+        participants: Sequence[str] | None = None,
+    ) -> None:
         """Play to both legs. Never raises -- it owns a thread of its own."""
         ok = False
         try:
@@ -242,7 +255,7 @@ class ConsentAnnouncer:
                 self.announced += 1
             else:
                 self.failed += 1
-            self._record(handler, ok)
+            self._record(handler, ok, session_id, participants)
             try:
                 on_complete(ok)
             except Exception as e:
@@ -401,32 +414,45 @@ class ConsentAnnouncer:
         except Exception as e:
             self.logger.debug(f"Recording notice not added to the tape: {e}")
 
-    def _record(self, handler: Any, played: bool, legs: int = 2) -> None:
+    def _record(
+        self,
+        handler: Any,
+        played: bool,
+        session_id: str | None = None,
+        participants: Sequence[str] | None = None,
+        legs: int = 2,
+    ) -> None:
         """
-        Write the row that says this caller was told.
+        Write the row that says these people were told.
 
-        The only durable proof notice was given -- the counters above are in memory and the
-        audio expires. Deliberately not swept by retention: a recording expiring at 90 days
-        must not take the evidence justifying it along too.
+        The only durable proof notice was given -- the counters are in memory and the audio
+        expires. Participants are stored on the row rather than looked up later: this log is
+        kept indefinitely while the recording it justifies expires at 90 days, so by the time
+        anyone needs it there is nothing left to join to. Naming who was told is the whole
+        difference between an audit record and a timestamp.
 
         Never raises: failing to log a notice is not a reason to fail the call it protected.
         """
         if not (self.database and getattr(self.database, "enabled", False)):
             return
 
+        call_id = getattr(handler, "call_id", None)
         try:
             self.database.execute(
                 """
                 INSERT INTO recording_notices
-                    (session_id, call_id, played, notice_text, legs, failure_reason)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                    (session_id, call_id, played, notice_text, participants, legs,
+                     failure_reason)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    getattr(handler, "call_id", None),
-                    getattr(handler, "call_id", None),
+                    # The conversation, which survives transfers; call_id names one dialog.
+                    session_id or call_id,
+                    call_id,
                     played,
                     # Verbatim: the configured wording changes, what this caller heard does not.
                     self.settings.text if played else None,
+                    json.dumps(list(participants)) if participants else None,
                     legs if played else 0,
                     None if played else "notice did not play; recording discarded",
                 ),
@@ -441,7 +467,8 @@ class ConsentAnnouncer:
         try:
             return (
                 self.database.fetch_all(
-                    "SELECT session_id, call_id, played, notice_text, legs, failure_reason, "
+                    "SELECT session_id, call_id, played, notice_text, participants, legs, "
+                    "failure_reason, "
                     f"played_at FROM recording_notices ORDER BY played_at DESC LIMIT {int(limit)}"
                 )
                 or []

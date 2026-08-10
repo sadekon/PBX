@@ -3174,13 +3174,14 @@ G.726-32</textarea>
                         <thead>
                             <tr>
                                 <th>When</th>
+                                <th>Who Was Told</th>
                                 <th>Session</th>
                                 <th>Outcome</th>
                                 <th>Notice</th>
                             </tr>
                         </thead>
                         <tbody id="announcement-log-table">
-                            <tr><td colspan="4" style="text-align: center;">Loading&hellip;</td></tr>
+                            <tr><td colspan="5" style="text-align: center;">Loading&hellip;</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -3213,9 +3214,33 @@ G.726-32</textarea>
                         exactly what was said.</li>
                     <li><strong>Audio:</strong> a WAV file, or text-to-speech generated once at startup.</li>
                 </ul>
-                <p><strong>Configuration:</strong> edit <code>recording.consent</code> in
-                    <code>config.yml</code> (<code>announce_for</code>, <code>text</code>,
-                    <code>audio_file</code>) and restart.</p>
+
+                <h4>About the notice log</h4>
+                <p>Every notice is recorded above &mdash; who was told, on which call, whether it
+                    actually played, and the exact wording they heard.</p>
+                <ul>
+                    <li><strong>Kept indefinitely.</strong> Retention never sweeps it. This log is the
+                        evidence justifying a recording, so it has to outlive the recording itself
+                        &mdash; a call expiring at 90 days must not take the proof with it.</li>
+                    <li><strong>Who was told is stored on the row</strong>, not looked up later. By the
+                        time anyone needs this, the recording and everything linked to it may be long
+                        gone; a row that cannot name a person proves nothing.</li>
+                    <li><strong>The wording is stored verbatim.</strong> The configured text below can
+                        change at any time, but what a given caller actually heard cannot, and that is
+                        the part that matters if it is ever questioned.</li>
+                    <li><strong>Failed rows are the important ones.</strong> Each represents a call that
+                        was <em>not</em> recorded, because the notice could not be played &mdash; usually
+                        a missing or unreadable prompt file.</li>
+                </ul>
+                <p><strong>Configuration:</strong></p>
+                <p>Edit <code>config.yml</code> under <code>recording.consent</code> to customize:</p>
+                <ul>
+                    <li><code>announce_for</code> - Which calls get a notice: <code>external</code>, <code>all</code>, or <code>off</code></li>
+                    <li><code>text</code> - What callers hear, and what the transcript records verbatim</li>
+                    <li><code>audio_file</code> - Prompt file; generated from <code>text</code> via TTS at startup if missing</li>
+                </ul>
+                <p>Changes take effect on restart. Recording must be enabled
+                    (<code>features.call_recording</code>) for a notice to play at all.</p>
             </div>
         </div>
 
