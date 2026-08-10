@@ -370,7 +370,8 @@ class TestOneStreamOnTheWire:
         notice = self._notice(tmp_path / "notice.wav")
         handler = self._handler(notice)
         announcer = _announcer(audio_file=str(notice))
-        assert announcer._play_to_sides(handler, ["a", "b"]) is True
+        ok, _ = announcer._play_to_sides(handler, ["a", "b"])
+        assert ok is True
         return handler
 
     def test_the_relay_is_muted_while_it_plays(self, tmp_path):
@@ -435,7 +436,8 @@ class TestOneStreamOnTheWire:
         handler = self._handler(notice)
         handler.get_endpoint.side_effect = lambda side: None
 
-        assert _announcer(audio_file=str(notice))._play_to_sides(handler, ["a", "b"]) is False
+        ok, _ = _announcer(audio_file=str(notice))._play_to_sides(handler, ["a", "b"])
+        assert ok is False
         handler.pause_relay.assert_not_called()
 
 
@@ -628,7 +630,7 @@ class TestNoticeLog:
 
         params = db.execute.call_args[0][1]
         assert params[2] is False
-        assert "discarded" in params[6]
+        assert params[6], "a failed notice must record why"
 
     def test_no_database_is_survivable(self, tmp_path):
         _announcer(audio_file=str(tmp_path / "x.wav"))._record(self._handler(), played=True)
@@ -752,3 +754,116 @@ class TestNoticeNamesWhoWasTold:
         params = db.execute.call_args[0][1]
         assert params[0] == "sess-1"
         assert json.loads(params[4]) == ["1512", "1513"]
+
+
+@pytest.mark.unit
+class TestAnInterruptedNoticeIsNotGiven:
+    """
+    A caller who heard two seconds of a four-second disclosure was not told.
+
+    Reporting a truncated notice as played keeps a recording nobody was fully informed about,
+    which is precisely what this gate exists to prevent. The relay stops when the call ends,
+    so that is the signal.
+    """
+
+    def _notice(self, path: Path, seconds: float = 1.0) -> Path:
+        import wave
+
+        with wave.open(str(path), "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(8000)
+            out.writeframes(b"\x10\x02" * int(8000 * seconds))
+        return path
+
+    def _handler(self, running_for: int | None = None) -> MagicMock:
+        """A handler whose relay stops after `running_for` frames."""
+        handler = MagicMock()
+        handler.call_id = "call-1"
+        handler.local_port = 10000
+        handler.tap = None
+        handler.get_endpoint.side_effect = lambda side: {
+            "a": ("10.0.0.1", 4000),
+            "b": ("10.0.0.2", 5000),
+        }[side]
+
+        if running_for is None:
+            handler.running = True
+        else:
+            frames = iter([True] * running_for + [False] * 10000)
+            type(handler).running = property(lambda _self: next(frames))
+        return handler
+
+    def test_a_completed_notice_reports_played(self, tmp_path):
+        notice = self._notice(tmp_path / "n.wav", seconds=0.2)
+        announcer = _announcer(audio_file=str(notice))
+
+        ok, reason = announcer._play_to_sides(self._handler(), ["a", "b"])
+
+        assert ok is True
+        assert reason == ""
+
+    def test_a_call_ending_mid_notice_reports_not_given(self, tmp_path):
+        notice = self._notice(tmp_path / "n.wav", seconds=1.0)
+        announcer = _announcer(audio_file=str(notice))
+
+        ok, reason = announcer._play_to_sides(self._handler(running_for=5), ["a", "b"])
+
+        assert ok is False
+        assert "ended before" in reason
+
+    def test_it_stops_sending_once_the_call_is_gone(self, tmp_path):
+        """Continuing would spend the rest of the notice talking to a closed socket."""
+        notice = self._notice(tmp_path / "n.wav", seconds=1.0)
+        handler = self._handler(running_for=5)
+        sent = []
+        handler.socket.sendto.side_effect = lambda data, target: sent.append(target)
+
+        _announcer(audio_file=str(notice))._play_to_sides(handler, ["a", "b"])
+
+        # Stopped early: a fraction of the 100 packets a full one-second notice would send.
+        # Not an exact count -- the pre-flight check consumes a reading of `running` too.
+        assert 0 < len(sent) < 20
+
+    def test_the_relay_is_resumed_even_when_cut_short(self, tmp_path):
+        notice = self._notice(tmp_path / "n.wav", seconds=1.0)
+        handler = self._handler(running_for=5)
+
+        _announcer(audio_file=str(notice))._play_to_sides(handler, ["a", "b"])
+
+        handler.resume_relay.assert_called_once()
+
+    def test_an_interrupted_notice_discards_the_recording(self, tmp_path):
+        """The callback carries False, which is what abandons the recording."""
+        notice = self._notice(tmp_path / "n.wav", seconds=1.0)
+        announcer = _announcer(audio_file=str(notice))
+        results = []
+
+        announcer._play(self._handler(running_for=5), results.append)
+
+        assert results == [False]
+
+    def test_the_reason_distinguishes_a_hangup_from_a_missing_prompt(self, tmp_path):
+        """Both discard the recording; only the reason says whether anything needs fixing."""
+        announcer = _announcer(audio_file=str(tmp_path / "absent.wav"))
+
+        _, missing = announcer._play_to_sides(self._handler(), ["a", "b"])
+
+        notice = self._notice(tmp_path / "n.wav", seconds=1.0)
+        _, hangup = _announcer(audio_file=str(notice))._play_to_sides(
+            self._handler(running_for=5), ["a", "b"]
+        )
+
+        assert "missing" in missing
+        assert "ended before" in hangup
+
+    def test_the_reason_reaches_the_log(self, tmp_path):
+        db = MagicMock()
+        db.enabled = True
+        db.execute.return_value = True
+        announcer = _announcer(audio_file=str(tmp_path / "absent.wav"))
+        announcer.database = db
+
+        announcer._play(self._handler(), lambda _ok: None)
+
+        assert "missing" in db.execute.call_args[0][1][6]

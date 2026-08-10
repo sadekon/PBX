@@ -246,22 +246,24 @@ class ConsentAnnouncer:
     ) -> None:
         """Play to both legs. Never raises -- it owns a thread of its own."""
         ok = False
+        reason = "notice did not run"
         try:
-            ok = self._play_to_sides(handler, ["a", "b"])
+            ok, reason = self._play_to_sides(handler, ["a", "b"])
         except Exception as e:
+            reason = f"notice raised: {e}"
             self.logger.error(f"Recording notice for {handler.call_id} failed: {e}")
         finally:
             if ok:
                 self.announced += 1
             else:
                 self.failed += 1
-            self._record(handler, ok, session_id, participants)
+            self._record(handler, ok, session_id, participants, reason=reason)
             try:
                 on_complete(ok)
             except Exception as e:
                 self.logger.error(f"Recording notice callback for {handler.call_id} raised: {e}")
 
-    def _play_to_sides(self, handler: Any, sides: list[str]) -> bool:
+    def _play_to_sides(self, handler: Any, sides: list[str]) -> tuple[bool, str]:
         """
         Send the notice to every leg at once, with the relay muted while it plays.
 
@@ -279,30 +281,38 @@ class ConsentAnnouncer:
         path = self.audio_path()
         if not path.is_file():
             self.logger.error(f"Recording notice audio missing at {path}")
-            return False
+            return False, f"prompt file missing: {path}"
 
         sock = getattr(handler, "socket", None)
         if sock is None or not getattr(handler, "running", False):
             self.logger.warning(f"Recording notice for {handler.call_id}: relay is not running")
-            return False
+            return False, "call was no longer up when the notice was due"
 
         targets = [t for t in (handler.get_endpoint(side) for side in sides) if t is not None]
         if not targets:
             self.logger.warning(f"Recording notice for {handler.call_id}: no endpoints learned")
-            return False
+            return False, "no media endpoint had been learned"
 
         payload = self._ulaw_payload(path)
         if payload is None:
-            return False
+            return False, "prompt audio could not be read"
 
         handler.pause_relay()
         try:
             self._feed_tap(handler, path)
-            self._stream(sock, targets, payload)
+            completed = self._stream(handler, sock, targets, payload)
         finally:
             handler.resume_relay()
 
-        return True
+        if not completed:
+            # A notice the caller only heard half of is not notice. Reporting it as played
+            # would keep a recording nobody was fully told about -- the precise case this
+            # gate exists to prevent.
+            self.logger.warning(
+                f"Recording notice for {handler.call_id} was cut short; treating as not given"
+            )
+            return False, "call ended before the notice finished"
+        return True, ""
 
     def _ulaw_payload(self, path: Path) -> bytes | None:
         """
@@ -340,12 +350,18 @@ class ConsentAnnouncer:
             raw = resample_pcm16(raw, rate, SAMPLE_RATE)
         return pcm16_to_ulaw(raw)
 
-    def _stream(self, sock: Any, targets: list[tuple[str, int]], payload: bytes) -> None:
+    def _stream(
+        self, handler: Any, sock: Any, targets: list[tuple[str, int]], payload: bytes
+    ) -> bool:
         """
         Packetise once and send each packet to every target, paced at 20 ms.
 
         One loop rather than one player per leg, so the legs stay sample-aligned instead of
         drifting apart by however long the first one took.
+
+        Returns whether the whole notice was delivered. A call that hangs up mid-notice stops
+        the loop and reports False: the recording is then discarded, because somebody who heard
+        two seconds of a four-second disclosure was not told.
         """
         import random
         import struct
@@ -357,6 +373,11 @@ class ConsentAnnouncer:
         next_send = time.monotonic()
 
         for start in range(0, len(payload), FRAME_SAMPLES):
+            # Checked every frame. The relay stops when the call ends, and continuing would
+            # spend the rest of the notice talking to a closed socket before declaring success.
+            if not getattr(handler, "running", False):
+                return False
+
             chunk = payload[start : start + FRAME_SAMPLES]
             header = struct.pack("!BBHII", 0x80, PAYLOAD_ULAW, sequence & 0xFFFF, timestamp, ssrc)
             for target in targets:
@@ -369,6 +390,8 @@ class ConsentAnnouncer:
             delay = next_send - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
+
+        return True
 
     def _feed_tap(self, handler: Any, path: Path) -> None:
         """
@@ -421,6 +444,7 @@ class ConsentAnnouncer:
         session_id: str | None = None,
         participants: Sequence[str] | None = None,
         legs: int = 2,
+        reason: str = "",
     ) -> None:
         """
         Write the row that says these people were told.
@@ -454,7 +478,9 @@ class ConsentAnnouncer:
                     self.settings.text if played else None,
                     json.dumps(list(participants)) if participants else None,
                     legs if played else 0,
-                    None if played else "notice did not play; recording discarded",
+                    # Why it was not given. "Prompt file missing" needs a fix; "caller hung
+                    # up" is ordinary. Both discard the recording, so only this tells them apart.
+                    None if played else (reason or "notice did not play"),
                 ),
             )
         except Exception as e:
