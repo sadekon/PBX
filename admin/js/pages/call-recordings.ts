@@ -213,9 +213,15 @@ function renderRecordingCard(rec: Recording): string {
 
 /** Built only while expanded, so a long list does not carry every player and transcript. */
 function renderCardBody(rec: Recording): string {
+    // A slot, not an <audio> element. Rendering `<audio controls>` before its source exists
+    // shows a fully working-looking player whose own play button reports "no supported source
+    // was found" -- the browser's message for an empty element, indistinguishable from a
+    // codec failure. The player is inserted by attachAudio() once it has something to play.
     const player = rec.audio_deleted_at
-        ? ''
-        : `<audio class="rec-player" data-rec-audio="${rec.id}" controls preload="none"></audio>`;
+        ? '<div class="rec-transcript-none">Audio was removed by the retention policy.</div>'
+        : `<div class="rec-player-slot" data-rec-player="${rec.id}">
+               <div class="rec-transcript-none">Loading audio...</div>
+           </div>`;
 
     return `
         <div class="rec-body">
@@ -308,7 +314,7 @@ function renderLine(line: TranscriptLine): string {
 
 // --- Actions ---------------------------------------------------------------
 
-function toggleCard(recordingId: number): void {
+async function toggleCard(recordingId: number): Promise<void> {
     const rec = recordings.get(recordingId);
     if (!rec) return;
 
@@ -318,6 +324,11 @@ function toggleCard(recordingId: number): void {
 
     const body = document.querySelector(`[data-rec-body="${recordingId}"]`) as HTMLElement | null;
     if (body) {
+        if (!open) {
+            // Release the blob before the element goes; otherwise it is held until reload.
+            const player = body.querySelector('audio') as HTMLAudioElement | null;
+            if (player?.dataset.objectUrl) URL.revokeObjectURL(player.dataset.objectUrl);
+        }
         body.innerHTML = open ? renderCardBody(rec) : '';
         body.classList.toggle('collapsed', !open);
     }
@@ -326,6 +337,10 @@ function toggleCard(recordingId: number): void {
         toggle.setAttribute('aria-expanded', String(open));
         toggle.querySelector('.queue-chevron')?.classList.toggle('open', open);
     }
+
+    // Loaded on expand rather than on a Play click, so the controls the user is now looking
+    // at are backed by a source the moment they appear.
+    if (open && !rec.audio_deleted_at) await attachAudio(recordingId);
 }
 
 /**
@@ -346,27 +361,59 @@ async function fetchRecordingAudio(recordingId: number): Promise<string> {
     return URL.createObjectURL(await response.blob());
 }
 
-async function playRecording(recordingId: number): Promise<void> {
-    if (!expanded.has(recordingId)) toggleCard(recordingId);
+/**
+ * Fetch the audio and put a real player in the slot.
+ *
+ * On failure the slot gets the server's reason -- 415 for a codec we cannot convert, 410 for
+ * expired audio -- rather than an empty player. An `<audio>` with no source reports only "no
+ * supported source was found" whatever went wrong, which hides the actual cause.
+ *
+ * Returns the player once it has a source, or null when there is nothing to play.
+ */
+async function attachAudio(recordingId: number): Promise<HTMLAudioElement | null> {
+    const slot = document.querySelector(`[data-rec-player="${recordingId}"]`) as HTMLElement | null;
+    if (!slot) return null;
 
-    const player = document.querySelector(`[data-rec-audio="${recordingId}"]`) as HTMLAudioElement | null;
+    const existing = slot.querySelector('audio') as HTMLAudioElement | null;
+    if (existing?.dataset.objectUrl) return existing;
+
+    try {
+        const objectUrl = await fetchRecordingAudio(recordingId);
+        const player = document.createElement('audio');
+        player.className = 'rec-player';
+        player.controls = true;
+        player.src = objectUrl;
+        player.dataset.objectUrl = objectUrl;
+
+        // The element is only inserted once it has a source, so the controls the user sees
+        // are always backed by something playable.
+        slot.replaceChildren(player);
+        return player;
+    } catch (error: unknown) {
+        console.error('Error loading recording audio:', error);
+        const message = error instanceof Error ? error.message : 'Failed to load audio';
+        slot.replaceChildren();
+        const note = document.createElement('div');
+        note.className = 'rec-transcript-none';
+        note.textContent = message;
+        slot.appendChild(note);
+        return null;
+    }
+}
+
+async function playRecording(recordingId: number): Promise<void> {
+    if (!expanded.has(recordingId)) {
+        // Expanding kicks off attachAudio itself; await it so the player exists below.
+        await toggleCard(recordingId);
+    }
+
+    const player = await attachAudio(recordingId);
     if (!player) return;
 
-    let objectUrl: string | null = null;
     try {
-        if (!player.dataset.objectUrl) {
-            objectUrl = await fetchRecordingAudio(recordingId);
-            player.src = objectUrl;
-            player.dataset.objectUrl = objectUrl;
-        }
         // Awaited so a decode failure surfaces here rather than as an unhandled rejection.
         await player.play();
     } catch (error: unknown) {
-        if (objectUrl) {
-            URL.revokeObjectURL(objectUrl);
-            delete player.dataset.objectUrl;
-            player.removeAttribute('src');
-        }
         console.error('Error playing recording:', error);
         showNotification(error instanceof Error ? error.message : 'Failed to play recording', 'error');
     }
@@ -448,7 +495,7 @@ function bindActions(): void {
         if (!el) return;
         const data = (el as HTMLElement).dataset;
 
-        if (data.recToggle) toggleCard(Number(data.recToggle));
+        if (data.recToggle) void toggleCard(Number(data.recToggle));
         else if (data.recPlay) void playRecording(Number(data.recPlay));
         else if (data.recDownload) void downloadRecording(Number(data.recDownload));
         else if (data.recFetchTranscript) void fetchTranscript(Number(data.recFetchTranscript));

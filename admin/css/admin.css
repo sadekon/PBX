@@ -859,9 +859,12 @@ header h1 {
     padding: 10px 16px 4px;
 }
 
+.rec-player-slot {
+    margin-bottom: 12px;
+}
+
 .rec-player {
     width: 100%;
-    margin-bottom: 12px;
 }
 
 .rec-transcript-run {

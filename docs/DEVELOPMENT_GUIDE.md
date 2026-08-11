@@ -478,6 +478,25 @@ authenticates against the user's **voicemail PIN**. Any extension with a PIN cou
 retention policy, search recording analyses, and `POST`/`DELETE` policies and legal holds.
 Deleting a retention policy is a data-destruction primitive. All 14 are now `@require_admin`.
 
+### The player was empty, not broken
+
+The first cause of "no supported source was found" was not a codec at all. The card rendered
+
+```html
+<audio class="rec-player" controls preload="none"></audio>
+```
+
+with **no `src`** — the blob was attached only by a separate Play button in the card header.
+So the user saw a fully rendered player, pressed its own play button, and got the browser's
+message for an element with no source, which is the same message it gives for an unsupported
+codec. That ambiguity is what made this look like a media problem.
+
+The player is now inserted by `attachAudio()` only once it has a source, and the expand
+handler loads it, so the controls on screen are always backed by something playable. When the
+fetch fails the slot shows the server's reason (415, 410) instead of an empty player.
+`admin/tests/call-recordings.test.js` guards the invariant: no `<audio>` element without a
+`src`, ever.
+
 ### G.711 had to be decoded before a browser would play anything
 
 Playback failed with "no supported source was found" — which reads as a broken URL, not as a
