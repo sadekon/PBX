@@ -464,3 +464,57 @@ class TestMalformedWavRepair:
         converted, fmt = wav_as_pcm16_wav(_wav(tmp_path / "fine.wav"))
         assert fmt == WAV_FORMAT_PCM
         assert converted is None
+
+
+@pytest.mark.unit
+class TestPagination:
+    """Cursor paging, so a call ending mid-browse cannot shift a page boundary."""
+
+    def test_first_page_sends_no_cursor(
+        self, api_client: FlaskClient, recording_core: MagicMock
+    ) -> None:
+        api_client.get("/api/recordings", headers=_token("9000", is_admin=True))
+        assert recording_core.recording_system.store.recent.call_args.kwargs["before_id"] is None
+
+    def test_cursor_is_passed_through(
+        self, api_client: FlaskClient, recording_core: MagicMock
+    ) -> None:
+        api_client.get("/api/recordings?before=42", headers=_token("9000", is_admin=True))
+        assert recording_core.recording_system.store.recent.call_args.kwargs["before_id"] == 42
+
+    def test_non_numeric_cursor_is_rejected(
+        self, api_client: FlaskClient, recording_core: MagicMock
+    ) -> None:
+        resp = api_client.get("/api/recordings?before=abc", headers=_token("9000", is_admin=True))
+        assert resp.status_code == 400
+
+    def test_asks_for_one_more_than_the_limit(
+        self, api_client: FlaskClient, recording_core: MagicMock
+    ) -> None:
+        """The extra row answers 'is there another page?' without a second COUNT query."""
+        api_client.get("/api/recordings?limit=10", headers=_token("9000", is_admin=True))
+        assert recording_core.recording_system.store.recent.call_args.kwargs["limit"] == 11
+
+    def test_extra_row_is_trimmed_and_reported_as_more(
+        self, api_client: FlaskClient, recording_core: MagicMock
+    ) -> None:
+        recording_core.recording_system.store.recent.return_value = [
+            _recording(id=i) for i in range(1, 5)
+        ]
+        resp = api_client.get("/api/recordings?limit=3", headers=_token("9000", is_admin=True))
+        body = resp.get_json()
+
+        assert len(body["recordings"]) == 3, "the probe row must not be sent to the client"
+        assert body["has_more"] is True
+        assert body["next_before"] == 3, "the cursor is the last row actually returned"
+
+    def test_last_page_reports_no_more(
+        self, api_client: FlaskClient, recording_core: MagicMock
+    ) -> None:
+        recording_core.recording_system.store.recent.return_value = [_recording(id=1)]
+        body = api_client.get(
+            "/api/recordings?limit=3", headers=_token("9000", is_admin=True)
+        ).get_json()
+
+        assert body["has_more"] is False
+        assert body["next_before"] is None

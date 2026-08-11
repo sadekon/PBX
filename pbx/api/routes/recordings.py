@@ -213,19 +213,59 @@ def list_recordings() -> Response:
     if limit is None:
         return send_json({"error": "Invalid limit parameter"}, 400)
 
+    # Cursor: the id of the last row the caller already has. Everything older follows.
+    before = request.args.get("before")
+    if before is not None:
+        try:
+            before_id: int | None = int(before)
+        except ValueError:
+            return send_json({"error": "before must be a recording id"}, 400)
+    else:
+        before_id = None
+
     try:
-        rows = store.recent(limit=limit, kinds=kinds, participant=participant)
+        # One more than asked for, purely to answer "is there another page?" without a second
+        # COUNT query over a table that only grows. The extra row is trimmed before sending.
+        rows = store.recent(
+            limit=limit + 1, kinds=kinds, participant=participant, before_id=before_id
+        )
     except Exception as e:
         logger.error(f"Could not list recordings: {e}")
         return send_json({"error": "Could not list recordings"}, 500)
 
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
     if not is_admin:
-        # Filtered here rather than in SQL because participants is a JSON column and the
-        # store has no predicate for it. Bounded by `limit`, so this stays cheap -- but it
-        # does mean a non-admin's page can come back shorter than the limit they asked for.
+        # Filtered here rather than in SQL because participants is a JSON column and the store
+        # has no predicate for it. Note this can return fewer than `limit` rows while
+        # `has_more` is still true -- the cursor is what drives paging, not the count, so the
+        # next page still starts in the right place.
         rows = [row for row in rows if check_recording_access(row)[0]]
 
-    return send_json({"recordings": [_visible(row) for row in rows], "count": len(rows)})
+    # Whether a transcript exists, not what it says. One query for the page, so the list can
+    # show a badge without the reader expanding every card to find out -- and without this
+    # becoming an unaudited way to read transcript text, which still needs the single fetch.
+    _, transcripts = _stores()
+    with_text: set[Any] = set()
+    if transcripts is not None and transcripts.enabled:
+        with_text = transcripts.recordings_with_transcripts([row.get("id") for row in rows])
+
+    listed = []
+    for row in rows:
+        item = _visible(row)
+        item["has_transcript"] = row.get("id") in with_text
+        listed.append(item)
+
+    return send_json(
+        {
+            "recordings": listed,
+            "count": len(listed),
+            "has_more": has_more,
+            # Fed straight back as `before` for the next page. Null when this is the end.
+            "next_before": listed[-1]["id"] if has_more and listed else None,
+        }
+    )
 
 
 @recordings_bp.route("/<recording_id>", methods=["GET"])

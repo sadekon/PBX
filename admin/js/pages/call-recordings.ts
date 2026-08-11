@@ -31,11 +31,14 @@ interface Recording {
     ended_at: string | null;
     audio_deleted_at: string | null;
     created_at: string | null;
+    has_transcript?: boolean;
 }
 
 interface RecordingListResponse {
     recordings?: Recording[];
     count?: number;
+    has_more?: boolean;
+    next_before?: number | null;
 }
 
 /** One speaker turn. `speaker` is empty for single-source audio such as voicemail. */
@@ -61,6 +64,12 @@ interface TranscriptResponse {
     recording_id?: number;
     transcripts?: TranscriptRun[];
 }
+
+/** Rows per request. Small enough that the first paint is quick; "Load more" fetches the next. */
+const PAGE_SIZE = 50;
+
+/** Cursor for the next page: id of the oldest row on screen. Null once the list is complete. */
+let nextBefore: number | null = null;
 
 /** Recordings currently rendered, by id, so actions do not re-fetch the list. */
 const recordings = new Map<number, Recording>();
@@ -98,10 +107,41 @@ function formatOffset(seconds: number | null): string {
     return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
 }
 
-function formatTimestamp(value: string | null): string {
-    if (!value) return 'Unknown';
+function parseDate(value: string | null): Date | null {
+    if (!value) return null;
     const parsed = new Date(value);
-    return Number.isNaN(parsed.getTime()) ? 'Unknown' : parsed.toLocaleString();
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/** Time of day only. The date is carried by the group heading above the card. */
+function formatTimeOfDay(value: string | null): string {
+    const parsed = parseDate(value);
+    if (!parsed) return 'Unknown';
+    return parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+/**
+ * The heading a recording sits under.
+ *
+ * Relative for the two days people actually talk about, absolute after that. The year is only
+ * shown once it stops being obvious, so a list of this week's calls is not a wall of 2026.
+ */
+function groupHeading(value: string | null): string {
+    const parsed = parseDate(value);
+    if (!parsed) return 'Unknown date';
+
+    const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const days = Math.round((startOfDay(new Date()) - startOfDay(parsed)) / 86_400_000);
+
+    if (days === 0) return 'Today';
+    if (days === 1) return 'Yesterday';
+
+    const sameYear = parsed.getFullYear() === new Date().getFullYear();
+    return parsed.toLocaleDateString([], {
+        day: 'numeric',
+        month: 'short',
+        ...(sameYear ? {} : { year: 'numeric' })
+    });
 }
 
 function participantLabel(rec: Recording): string {
@@ -113,17 +153,32 @@ function participantLabel(rec: Recording): string {
 // --- Loading ---------------------------------------------------------------
 
 export async function loadCallRecordings(): Promise<void> {
+    await fetchPage({ append: false });
+}
+
+/** Fetch the next page and append it, leaving what is on screen in place. */
+async function loadMoreRecordings(): Promise<void> {
+    await fetchPage({ append: true });
+}
+
+async function fetchPage({ append }: { append: boolean }): Promise<void> {
     const container = document.getElementById('call-recordings-list');
     if (!container) return;
+    if (append && nextBefore === null) return;
 
     const includeVoicemail = (document.getElementById('recordings-include-voicemail') as HTMLInputElement | null)?.checked;
     const participant = (document.getElementById('recordings-participant-filter') as HTMLInputElement | null)?.value.trim();
 
-    const params = new URLSearchParams({ limit: '200' });
+    const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
     if (includeVoicemail) params.set('include_voicemail', '1');
     if (participant) params.set('participant', participant);
+    if (append && nextBefore !== null) params.set('before', String(nextBefore));
 
-    container.innerHTML = '<div class="queues-cards"><div class="loading">Loading recordings...</div></div>';
+    if (append) {
+        setLoadMoreBusy(true);
+    } else {
+        container.innerHTML = '<div class="list-loading">Loading recordings...</div>';
+    }
 
     try {
         const API_BASE = getApiBaseUrl();
@@ -134,23 +189,48 @@ export async function loadCallRecordings(): Promise<void> {
         if (!response.ok) {
             // A 403 here is the participant_access default, not a fault. Say which, or an
             // admin goes looking for a broken feature that is actually a setting.
-            container.innerHTML = `<div class="queues-empty">${escapeHtml(
-                response.status === 403
-                    ? 'You do not have access to call recordings. Recordings are admin-only unless participant access is enabled.'
-                    : failureMessage(response, 'load recordings')
-            )}</div>`;
+            const message = response.status === 403
+                ? 'You do not have access to call recordings. Recordings are admin-only unless participant access is enabled.'
+                : failureMessage(response, 'load recordings');
+
+            if (append) {
+                setLoadMoreBusy(false);
+                showNotification(message, 'error');
+            } else {
+                container.innerHTML = `<div class="list-empty">${escapeHtml(message)}</div>`;
+            }
             return;
         }
 
         const data: RecordingListResponse = await response.json();
-        recordings.clear();
+
+        // Starting over drops what is on screen; paging keeps it and adds below. Expanded
+        // cards and fetched transcripts key off the id, so they survive an append.
+        if (!append) {
+            recordings.clear();
+            expanded.clear();
+        }
         for (const rec of data.recordings ?? []) recordings.set(rec.id, rec);
+
+        nextBefore = data.has_more ? (data.next_before ?? null) : null;
         renderRecordings();
     } catch (error: unknown) {
         console.error('Error loading recordings:', error);
-        container.innerHTML = '<div class="queues-empty">Failed to load recordings</div>';
-        showNotification('Failed to load recordings', 'error');
+        if (append) {
+            setLoadMoreBusy(false);
+            showNotification('Failed to load more recordings', 'error');
+        } else {
+            container.innerHTML = '<div class="list-empty">Failed to load recordings</div>';
+            showNotification('Failed to load recordings', 'error');
+        }
     }
+}
+
+function setLoadMoreBusy(busy: boolean): void {
+    const button = document.getElementById('recordings-load-more') as HTMLButtonElement | null;
+    if (!button) return;
+    button.disabled = busy;
+    button.textContent = busy ? 'Loading...' : 'Load more';
 }
 
 // --- Rendering -------------------------------------------------------------
@@ -159,52 +239,106 @@ function renderRecordings(): void {
     const container = document.getElementById('call-recordings-list');
     if (!container) return;
 
-    if (recordings.size === 0) {
+    const all = [...recordings.values()];
+    updateSummary(all);
+
+    if (all.length === 0) {
         const filtered = (document.getElementById('recordings-participant-filter') as HTMLInputElement | null)?.value.trim();
-        container.innerHTML = `<div class="queues-empty">${
+        container.innerHTML = `<div class="list-empty">${
             filtered ? `No recordings involving ${escapeHtml(filtered)}` : 'No recordings'
         }</div>`;
         return;
     }
 
-    container.innerHTML = `<div class="queues-cards">${
-        [...recordings.values()].map(renderRecordingCard).join('')
-    }</div>`;
+    // Grouped by day, in the order the server returned (newest first), so the heading for a
+    // day appears once above its run of cards rather than as a date on every row.
+    const sections: string[] = [];
+    let currentHeading: string | null = null;
+
+    for (const rec of all) {
+        const heading = groupHeading(rec.started_at ?? rec.created_at);
+        if (heading !== currentHeading) {
+            sections.push(`<div class="group-label">${escapeHtml(heading)}</div>`);
+            currentHeading = heading;
+        }
+        sections.push(renderRecordingCard(rec));
+    }
+
+    // The button lives inside the list container so a re-render replaces it along with the
+    // cards, rather than leaving a stale "Load more" under a list that has none.
+    const more = nextBefore === null
+        ? ''
+        : `<div class="list-more">
+               <button type="button" class="btn-ghost" id="recordings-load-more">Load more</button>
+           </div>`;
+
+    container.innerHTML = `<div class="card-stack">${sections.join('')}</div>${more}`;
+}
+
+/**
+ * How many rows are loaded, and whether that is all of them.
+ *
+ * A total run time across an arbitrary filtered set was the first thing here and is not a
+ * number anyone acts on. How much of the list you are looking at is.
+ */
+function updateSummary(all: Recording[]): void {
+    const summary = document.getElementById('recordings-summary');
+    if (!summary) return;
+
+    if (all.length === 0) {
+        summary.textContent = '';
+        return;
+    }
+
+    const count = `${all.length} recording${all.length === 1 ? '' : 's'}`;
+    summary.textContent = nextBefore === null ? count : `${count} loaded`;
 }
 
 function renderRecordingCard(rec: Recording): string {
     const open = expanded.has(rec.id);
     const audioGone = Boolean(rec.audio_deleted_at);
 
-    const statePill = audioGone
-        ? `<span class="en-pill off" title="Removed by the retention policy"><span class="en-dot"></span>Audio expired</span>`
-        : `<span class="en-pill on"><span class="en-dot"></span>Audio available</span>`;
+    // Only exceptional states get a pill. "Audio available" on every row is the norm restated
+    // once per card, which is exactly the noise a scan has to read past to find the one row
+    // that differs.
+    const pills: string[] = [];
+    if (rec.has_transcript) {
+        pills.push('<span class="pill pill-info">Transcript</span>');
+    }
+    if (audioGone) {
+        pills.push(
+            '<span class="pill pill-muted" title="Removed by the retention policy">Audio expired</span>'
+        );
+    }
+    // Kind is only worth the space when it is not the one this page is about.
+    if (rec.kind && rec.kind !== 'recording') {
+        pills.push(`<span class="pill pill-muted">${escapeHtml(rec.kind)}</span>`);
+    }
 
-    const mediaActions = audioGone
+    const actions = audioGone
         ? ''
-        : `<button type="button" class="qbtn" data-rec-play="${rec.id}">Play</button>
-           <button type="button" class="qbtn" data-rec-download="${rec.id}">Download</button>`;
+        : `<button type="button" class="btn-ghost" data-rec-play="${rec.id}">Play</button>
+           <button type="button" class="btn-ghost" data-rec-download="${rec.id}">Download</button>`;
 
     const head = `
-        <div class="queue-card-head">
-            <span class="qch-title" role="button" aria-expanded="${open}" data-rec-toggle="${rec.id}">
-                <span class="queue-chevron${open ? ' open' : ''}" aria-hidden="true">&#9654;</span>
+        <div class="card-head">
+            <span class="card-title" role="button" tabindex="0" aria-expanded="${open}" data-rec-toggle="${rec.id}">
+                <span class="card-chevron${open ? ' open' : ''}" aria-hidden="true">&#9654;</span>
                 <strong>${participantLabel(rec)}</strong>
             </span>
-            ${statePill}
-            <span class="qch-stats">
-                <span class="qch-stat"><span class="k">Kind</span><span class="v">${escapeHtml(rec.kind)}</span></span>
-                <span class="qch-stat"><span class="k">Duration</span><span class="v">${formatDuration(rec.duration_seconds)}</span></span>
-                <span class="qch-stat"><span class="k">Started</span><span class="v">${formatTimestamp(rec.started_at ?? rec.created_at)}</span></span>
+            ${pills.join('')}
+            <span class="meta-stats">
+                <span class="meta-stat"><span class="k">Duration</span><span class="v">${formatDuration(rec.duration_seconds)}</span></span>
+                <span class="meta-stat"><span class="k">Started</span><span class="v">${formatTimeOfDay(rec.started_at ?? rec.created_at)}</span></span>
             </span>
-            <span class="qch-actions">${mediaActions}</span>
+            <span class="card-actions">${actions}</span>
         </div>
     `;
 
     return `
-        <div class="queue-card">
+        <div class="card-shell">
             ${head}
-            <div class="queue-card-body${open ? '' : ' collapsed'}" data-rec-body="${rec.id}">
+            <div class="card-body${open ? '' : ' collapsed'}" data-rec-body="${rec.id}">
                 ${open ? renderCardBody(rec) : ''}
             </div>
         </div>
@@ -218,9 +352,9 @@ function renderCardBody(rec: Recording): string {
     // was found" -- the browser's message for an empty element, indistinguishable from a
     // codec failure. The player is inserted by attachAudio() once it has something to play.
     const player = rec.audio_deleted_at
-        ? '<div class="rec-transcript-none">Audio was removed by the retention policy.</div>'
+        ? '<div class="muted-note">Audio was removed by the retention policy.</div>'
         : `<div class="rec-player-slot" data-rec-player="${rec.id}">
-               <div class="rec-transcript-none">Loading audio...</div>
+               <div class="muted-note">Loading audio...</div>
            </div>`;
 
     return `
@@ -237,10 +371,10 @@ function renderTranscript(recordingId: number): string {
     const runs = transcripts.get(recordingId);
 
     if (runs === undefined) {
-        return `<button type="button" class="qbtn" data-rec-fetch-transcript="${recordingId}">Show transcript</button>`;
+        return `<button type="button" class="btn-ghost" data-rec-fetch-transcript="${recordingId}">Show transcript</button>`;
     }
     if (runs.length === 0) {
-        return `<div class="rec-transcript-none">No transcript for this recording.</div>`;
+        return `<div class="muted-note">No transcript for this recording.</div>`;
     }
 
     const showFull = fullTranscript.has(recordingId);
@@ -269,7 +403,7 @@ function renderTranscriptRun(recordingId: number, run: TranscriptRun, showFull: 
         // Timing was never recorded, so there are no turns to lay out -- show the prose.
         content = flat
             ? `<p class="rec-transcript-flat">${escapeHtml(flat)}</p>`
-            : `<div class="rec-transcript-none">Transcript is empty.</div>`;
+            : `<div class="muted-note">Transcript is empty.</div>`;
     } else if (showFull) {
         content = `<div class="rec-lines">${lines.map(renderLine).join('')}</div>`;
     } else {
@@ -278,7 +412,7 @@ function renderTranscriptRun(recordingId: number, run: TranscriptRun, showFull: 
     }
 
     const toggle = lines.length > 0
-        ? `<button type="button" class="qbtn" data-rec-expand-transcript="${recordingId}">
+        ? `<button type="button" class="btn-ghost" data-rec-expand-transcript="${recordingId}">
                ${showFull ? 'Show less' : 'Show full transcript'}
            </button>`
         : '';
@@ -335,7 +469,7 @@ async function toggleCard(recordingId: number): Promise<void> {
     const toggle = document.querySelector(`[data-rec-toggle="${recordingId}"]`);
     if (toggle) {
         toggle.setAttribute('aria-expanded', String(open));
-        toggle.querySelector('.queue-chevron')?.classList.toggle('open', open);
+        toggle.querySelector('.card-chevron')?.classList.toggle('open', open);
     }
 
     // Loaded on expand rather than on a Play click, so the controls the user is now looking
@@ -394,7 +528,7 @@ async function attachAudio(recordingId: number): Promise<HTMLAudioElement | null
         const message = error instanceof Error ? error.message : 'Failed to load audio';
         slot.replaceChildren();
         const note = document.createElement('div');
-        note.className = 'rec-transcript-none';
+        note.className = 'muted-note';
         note.textContent = message;
         slot.appendChild(note);
         return null;
@@ -440,7 +574,7 @@ async function downloadRecording(recordingId: number): Promise<void> {
 
 async function fetchTranscript(recordingId: number): Promise<void> {
     const target = document.querySelector(`[data-rec-transcript="${recordingId}"]`);
-    if (target) target.innerHTML = '<div class="rec-transcript-none">Loading transcript...</div>';
+    if (target) target.innerHTML = '<div class="muted-note">Loading transcript...</div>';
 
     try {
         const API_BASE = getApiBaseUrl();
@@ -452,7 +586,7 @@ async function fetchTranscript(recordingId: number): Promise<void> {
             transcripts.set(recordingId, []);
         } else if (!response.ok) {
             if (target) {
-                target.innerHTML = `<div class="rec-transcript-none">${escapeHtml(failureMessage(response, 'load this transcript'))}</div>`;
+                target.innerHTML = `<div class="muted-note">${escapeHtml(failureMessage(response, 'load this transcript'))}</div>`;
             }
             return;
         } else {
@@ -461,7 +595,7 @@ async function fetchTranscript(recordingId: number): Promise<void> {
         }
     } catch (error: unknown) {
         console.error('Error loading transcript:', error);
-        if (target) target.innerHTML = '<div class="rec-transcript-none">Failed to load transcript</div>';
+        if (target) target.innerHTML = '<div class="muted-note">Failed to load transcript</div>';
         return;
     }
 
@@ -495,11 +629,22 @@ function bindActions(): void {
         if (!el) return;
         const data = (el as HTMLElement).dataset;
 
-        if (data.recToggle) void toggleCard(Number(data.recToggle));
+        if (el.id === 'recordings-load-more') void loadMoreRecordings();
+        else if (data.recToggle) void toggleCard(Number(data.recToggle));
         else if (data.recPlay) void playRecording(Number(data.recPlay));
         else if (data.recDownload) void downloadRecording(Number(data.recDownload));
         else if (data.recFetchTranscript) void fetchTranscript(Number(data.recFetchTranscript));
         else if (data.recExpandTranscript) toggleTranscriptLength(Number(data.recExpandTranscript));
+    });
+
+    // The card title is a span with role="button", so it gets no key handling for free.
+    // Without this the whole list is unreachable by keyboard.
+    container.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        const el = (event.target as HTMLElement | null)?.closest('[data-rec-toggle]');
+        if (!el) return;
+        event.preventDefault();
+        void toggleCard(Number((el as HTMLElement).dataset.recToggle));
     });
 }
 
@@ -514,14 +659,27 @@ export function initCallRecordings(): void {
         voicemail.addEventListener('change', () => void loadCallRecordings());
     }
 
-    const participant = document.getElementById('recordings-participant-filter');
+    const participant = document.getElementById('recordings-participant-filter') as HTMLInputElement | null;
+    const clear = document.getElementById('recordings-clear-filter');
+
     if (participant && participant.dataset.bound !== 'true') {
         participant.dataset.bound = 'true';
         // Debounced: the filter runs server-side, and a query per keystroke would be one
         // audited list request per character typed.
         participant.addEventListener('input', () => {
+            if (clear) clear.hidden = participant.value.trim() === '';
             clearTimeout(filterTimer);
+            // loadCallRecordings() starts a fresh query, which resets the cursor.
             filterTimer = setTimeout(() => void loadCallRecordings(), 300);
+        });
+    }
+
+    if (clear && clear.dataset.bound !== 'true') {
+        clear.dataset.bound = 'true';
+        clear.addEventListener('click', () => {
+            if (participant) participant.value = '';
+            clear.hidden = true;
+            void loadCallRecordings();
         });
     }
 

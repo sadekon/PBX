@@ -47,7 +47,9 @@ function blobResponse() {
 function setupDom() {
   document.body.innerHTML = `
     <input type="text" id="recordings-participant-filter">
+    <button id="recordings-clear-filter" hidden>Clear</button>
     <input type="checkbox" id="recordings-include-voicemail">
+    <span id="recordings-summary"></span>
     <div id="call-recordings-list"></div>
   `;
 }
@@ -82,9 +84,88 @@ describe('Call recordings page', () => {
     await load({ recordings: [RECORDING], count: 1 });
 
     const list = document.getElementById('call-recordings-list');
-    expect(list.querySelectorAll('.queue-card')).toHaveLength(1);
+    expect(list.querySelectorAll('.card-shell')).toHaveLength(1);
     expect(list.textContent).toContain('1001');
     expect(list.textContent).toContain('4m 12s');
+  });
+
+  it('groups cards under a day heading and drops the date from the row', async () => {
+    await load({ recordings: [RECORDING], count: 1 });
+
+    const list = document.getElementById('call-recordings-list');
+    expect(list.querySelectorAll('.group-label')).toHaveLength(1);
+    // The full date belongs to the heading; the row carries time of day only.
+    expect(list.querySelector('.card-head').textContent).not.toMatch(/2026/);
+  });
+
+  it('shows no pill for the ordinary case', async () => {
+    // "Audio available" on every row is the norm restated once per card.
+    await load({ recordings: [RECORDING], count: 1 });
+    expect(document.querySelectorAll('.pill')).toHaveLength(0);
+  });
+
+  it('pills expired audio and an available transcript', async () => {
+    await load({
+      recordings: [{ ...RECORDING, audio_deleted_at: '2026-01-01T00:00:00Z', has_transcript: true }]
+    });
+
+    const text = document.querySelector('.card-head').textContent;
+    expect(text).toContain('Audio expired');
+    expect(text).toContain('Transcript');
+  });
+
+  it('reports the result count when the list is complete', async () => {
+    await load({ recordings: [RECORDING, { ...RECORDING, id: 8 }], count: 2, has_more: false });
+    expect(document.getElementById('recordings-summary').textContent).toBe('2 recordings');
+    expect(document.getElementById('recordings-load-more')).toBeNull();
+  });
+
+  it('offers Load more only while pages remain', async () => {
+    await load({ recordings: [RECORDING], count: 1, has_more: true, next_before: 7 });
+
+    expect(document.getElementById('recordings-load-more')).not.toBeNull();
+    expect(document.getElementById('recordings-summary').textContent).toBe('1 recording loaded');
+  });
+
+  it('appends the next page rather than replacing what is on screen', async () => {
+    await load({ recordings: [RECORDING], count: 1, has_more: true, next_before: 7 });
+
+    fetch.mockResolvedValueOnce(jsonResponse({
+      recordings: [{ ...RECORDING, id: 8 }], count: 1, has_more: false
+    }));
+    document.getElementById('recordings-load-more').click();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Both pages are on screen, and the cursor was sent so the server knows where to resume.
+    expect(document.querySelectorAll('.card-shell')).toHaveLength(2);
+    expect(fetch.mock.calls[1][0]).toContain('before=7');
+    expect(document.getElementById('recordings-load-more')).toBeNull();
+  });
+
+  it('reveals Clear only while the filter has a value', async () => {
+    await load({ recordings: [], count: 0 });
+
+    const input = document.getElementById('recordings-participant-filter');
+    const clear = document.getElementById('recordings-clear-filter');
+    expect(clear.hidden).toBe(true);
+
+    input.value = '1001';
+    input.dispatchEvent(new Event('input'));
+    expect(clear.hidden).toBe(false);
+
+    fetch.mockResolvedValueOnce(jsonResponse({ recordings: [], count: 0 }));
+    clear.click();
+    await Promise.resolve();
+
+    expect(input.value).toBe('');
+    expect(clear.hidden).toBe(true);
+  });
+
+  it('does not send a cursor on the first page', async () => {
+    await load({ recordings: [RECORDING], count: 1, has_more: true, next_before: 7 });
+    expect(fetch.mock.calls[0][0]).not.toContain('before=');
   });
 
   it('requests calls only, without voicemail, by default', async () => {

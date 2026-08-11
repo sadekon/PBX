@@ -196,6 +196,7 @@ class RecordingStore:
         kind: str | None = None,
         kinds: Sequence[str] | None = None,
         participant: str | None = None,
+        before_id: Any = None,
     ) -> list[dict[str, Any]]:
         """
         The latest recordings, for the admin view that has never had one.
@@ -208,6 +209,13 @@ class RecordingStore:
         column is a JSON array of strings, so the match is on the quoted form: searching for
         `"100"` inside `["1001"]` would otherwise hit, and every extension would match its own
         prefixes.
+
+        `before_id` pages backwards from a row the caller already has: everything older than
+        it, by the same ``(created_at, id)`` order the list is sorted in. A cursor rather than
+        an OFFSET because rows are inserted at the *top* of this ordering as calls end -- with
+        an offset, one call finishing between pages shifts everything down and the next page
+        silently skips a recording. The comparison is on the pair, not on ``created_at`` alone,
+        because two recordings can share a timestamp.
         """
         clauses: list[str] = []
         params: list[Any] = []
@@ -220,6 +228,13 @@ class RecordingStore:
         if participant:
             clauses.append(f"participants LIKE {_PH}")
             params.append(f'%"{participant}"%')
+
+        if before_id is not None:
+            # Row-value comparison: PostgreSQL-only, which this backend already is.
+            clauses.append(
+                f"(created_at, id) < (SELECT created_at, id FROM recordings WHERE id = {_PH})"
+            )
+            params.append(before_id)
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         return self._select(where, tuple(params), limit)
@@ -246,9 +261,12 @@ class RecordingStore:
         try:
             # fetch_all, not execute: execute() returns a bool no matter the statement, so a
             # SELECT run through it comes back as True and then fails on subscripting.
+            # Ordered on the pair, not on created_at alone: two recordings can share a
+            # timestamp, and an ambiguous order makes the `before_id` cursor skip or repeat
+            # rows at the page boundary.
             rows = database.fetch_all(
                 f"SELECT {_COLUMNS} FROM recordings {where} "
-                f"ORDER BY created_at DESC LIMIT {int(limit)}",
+                f"ORDER BY created_at DESC, id DESC LIMIT {int(limit)}",
                 params,
             )
         except Exception as e:

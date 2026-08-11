@@ -2780,31 +2780,24 @@ G.726-32</textarea>
                 <button class="btn btn-primary" onclick="loadCallRecordings()">🔄 Refresh</button>
             </div>
 
-            <!-- Recordings are admin-only out of the box. Said here rather than only in an
-                 error, because a non-admin seeing an empty list would otherwise read it as
-                 "nothing was recorded". -->
-            <div class="info-box">
-                <h3>ℹ️ About Call Recordings</h3>
-                <p>Call audio and transcripts are restricted to administrators. Users can be given
-                access to calls they took part in by enabling
-                <code>recording.participant_access</code>.</p>
-                <p><strong>Every playback and transcript read is written to the audit log</strong>,
-                including refused ones.</p>
-            </div>
-
             <div class="config-section">
-                <div class="rec-filters">
-                    <label for="recordings-participant-filter">Participant</label>
-                    <input type="text" id="recordings-participant-filter"
-                           placeholder="Extension or caller number" autocomplete="off">
-                    <label class="rec-checkbox" for="recordings-include-voicemail">
+                <div class="filter-bar">
+                    <span class="filter-field">
+                        <label class="filter-label" for="recordings-participant-filter">Participant</label>
+                        <input type="text" id="recordings-participant-filter"
+                               placeholder="Extension or number" autocomplete="off">
+                        <button type="button" class="btn-ghost" id="recordings-clear-filter"
+                                aria-label="Clear participant filter" hidden>Clear</button>
+                    </span>
+                    <label class="filter-check" for="recordings-include-voicemail">
                         <input type="checkbox" id="recordings-include-voicemail">
                         Include voicemail
                     </label>
+                    <span class="filter-summary" id="recordings-summary"></span>
                 </div>
 
                 <div id="call-recordings-list">
-                    <div class="queues-cards"><div class="loading">Loading recordings...</div></div>
+                    <div class="list-loading">Loading recordings...</div>
                 </div>
             </div>
         </div>

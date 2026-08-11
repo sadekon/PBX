@@ -169,6 +169,32 @@ class TranscriptStore:
             return self._select(f"WHERE source = {_PH}", (source,), limit)
         return self._select("", (), limit)
 
+    def recordings_with_transcripts(self, recording_ids: Sequence[Any]) -> set[Any]:
+        """
+        Which of these recordings have at least one transcript.
+
+        One query for the whole page rather than one per row: the admin list shows a badge so
+        a reader can tell before expanding, and asking per card would be an N+1 against a
+        table that is only going to grow.
+
+        Returns an empty set on any failure -- a missing badge is not worth failing a list for.
+        """
+        ids = [i for i in recording_ids if i is not None]
+        if not ids or self.database is None or not self.enabled:
+            return set()
+
+        try:
+            rows = self.database.fetch_all(
+                f"SELECT DISTINCT recording_id FROM transcripts "
+                f"WHERE recording_id IN ({', '.join([_PH] * len(ids))})",
+                tuple(ids),
+            )
+        except Exception as e:
+            self.logger.error(f"Could not check which recordings have transcripts: {e}")
+            return set()
+
+        return {row["recording_id"] for row in rows or [] if row.get("recording_id") is not None}
+
     def orphans_before(self, cutoff: Any) -> list[dict[str, Any]]:
         """
         Transcripts with no recording, older than `cutoff`.

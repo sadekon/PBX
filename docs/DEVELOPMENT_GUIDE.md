@@ -515,6 +515,30 @@ is routinely stored as G.711, and no mainstream browser decodes it.
 The refusal matters as much as the conversion: serving a format the browser cannot decode is
 indistinguishable, from the UI, from the bug this replaced.
 
+### `admin/css/patterns.css` — the shared UI vocabulary
+
+New file, and the intended base for remodelling the other pages. The recordings page was first
+built by borrowing the queues page's classes (`.queue-card`, `.qch-stat`, `.en-pill`, `.qbtn`),
+which left two pages sharing selectors named after only one of them. `patterns.css` is the same
+rules under names that do not presuppose the caller:
+
+| Shared | Replaces (queue-named) |
+|---|---|
+| `.card-stack`, `.card-shell`, `.card-head`, `.card-body`, `.card-title`, `.card-chevron`, `.card-actions` | `.queues-cards`, `.queue-card*`, `.qch-title` |
+| `.meta-stats`, `.meta-stat` + `.k` / `.v` | `.qch-stats`, `.qch-stat` |
+| `.pill` + `.pill-ok` / `-warn` / `-danger` / `-muted` / `-info` | `.en-pill.on` / `.off` |
+| `.btn-ghost`, `.btn-ghost-danger` | `.qbtn`, `.qbtn-danger` |
+| `.filter-bar`, `.filter-label`, `.filter-check`, `.filter-summary` | — |
+| `.list-empty`, `.list-loading`, `.group-label`, `.muted-note` | `.queues-empty` |
+
+**Deliberately additive.** The queue-named originals are untouched and the queues page still
+uses them, so a handful of rules are duplicated on purpose. Migrating the other pages and
+deleting the originals is a separate change. Until then: new pages use the shared names, existing
+pages stay on the old ones.
+
+Only genuinely page-specific CSS stays in `admin.css` under the recordings heading — the
+transcript layout, which nothing else has.
+
 ### Page layout follows the call queues page
 
 One card per recording reusing `.queue-card` / `.queue-card-head` / `.qch-*` / `.en-pill` /
@@ -536,6 +560,25 @@ earlier filter used the literal and silently matched no rows. The page shows cal
 "Include voicemail" checkbox for cross-cutting review, and a debounced participant filter
 matching `recordings.participants` on the quoted JSON form (`%"1001"%`) so `100` cannot match
 `1001`.
+
+### Paging is a cursor, not an offset
+
+`GET /api/recordings` takes `?before=<id>` and returns `has_more` / `next_before`; the page
+loads 50 at a time and appends with "Load more".
+
+`OFFSET` would have been simpler and wrong here. Rows are inserted at the *top* of this
+ordering as calls end, so one call finishing between page one and page two shifts everything
+down by one and the next page silently skips a recording. The cursor compares on the pair
+`(created_at, id)` rather than `created_at` alone, because two recordings can share a
+timestamp — and `_select` now orders by both for the same reason, since an ambiguous sort makes
+a cursor skip or repeat rows at the boundary.
+
+`has_more` comes from asking for `limit + 1` rows and trimming, rather than a second `COUNT`
+over a table that only grows.
+
+One wrinkle: for a non-admin, participant filtering happens in Python after the query, so a
+page can return fewer than `limit` rows while `has_more` is still true. That is harmless — the
+cursor drives paging, not the count — but it means the count is "loaded so far", not "matching".
 
 ### Not done
 
