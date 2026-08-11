@@ -282,14 +282,30 @@ def wav_as_pcm16_wav(path: "str | Path") -> tuple[bytes | None, int | None]:
         return None, None
 
     audio_format, sample_rate, channels = header
+
     if audio_format == WAV_FORMAT_PCM:
-        return None, audio_format
+        # Already playable *if* the header is truthful. `wave.open(..., "wb")` patches the RIFF
+        # and data sizes in on close(), so a recording whose writer was killed -- or one still
+        # being written -- carries size 0 while otherwise looking like a valid WAV. A browser
+        # decodes that to zero samples and reports "no supported sources", identical to a codec
+        # failure. Rebuilding the header from the bytes actually present makes it playable.
+        payload, declared_ok = _read_wav_data_chunk(path)
+        if payload is None:
+            return None, audio_format
+        if declared_ok:
+            return None, audio_format
+
+        repaired = build_wav_header(
+            len(payload), sample_rate=sample_rate, channels=channels, bits_per_sample=16
+        )
+        return repaired + payload, audio_format
+
     if audio_format not in (WAV_FORMAT_ULAW, WAV_FORMAT_ALAW):
         return None, audio_format
 
     # Read the data chunk directly rather than through the stdlib: wave.open refuses G.711
     # outright with "unknown format: 7", which is the whole reason this function exists.
-    payload = _read_wav_data_chunk(path)
+    payload, _ = _read_wav_data_chunk(path)
     if payload is None:
         return None, audio_format
 
@@ -305,30 +321,53 @@ def wav_as_pcm16_wav(path: "str | Path") -> tuple[bytes | None, int | None]:
     return header_bytes + samples, audio_format
 
 
-def _read_wav_data_chunk(path: "str | Path") -> bytes | None:
-    """The raw contents of a WAV's ``data`` chunk, whatever the encoding."""
+def _read_wav_data_chunk(path: str | Path) -> tuple[bytes | None, bool]:
+    """
+    The raw contents of a WAV's ``data`` chunk, whatever the encoding.
+
+    The declared chunk size is treated as a hint, not a fact. A file whose writer never closed
+    reports 0, and a truncated one reports more than it holds; in both cases the audio that is
+    actually present is still perfectly decodable, so the bytes from here to end-of-file are
+    returned instead.
+
+    Returns:
+        ``(payload, declared_size_was_correct)``. The payload is None when the file is not a
+        readable RIFF/WAVE.
+    """
+    payload: bytes | None = None
+    declared_ok = True
+
     try:
         with Path(path).open("rb") as f:
             if f.read(4) != b"RIFF":
-                return None
+                return None, False
             f.read(4)
             if f.read(4) != b"WAVE":
-                return None
+                return None, False
 
             while True:
                 chunk_id = f.read(4)
                 if not chunk_id or len(chunk_id) < 4:
-                    return None
+                    break
                 size_bytes = f.read(4)
                 if len(size_bytes) < 4:
-                    return None
+                    break
                 chunk_size = struct.unpack("<I", size_bytes)[0]
 
                 if chunk_id == b"data":
-                    return f.read(chunk_size)
+                    rest = f.read()
+                    if chunk_size == 0 or chunk_size > len(rest):
+                        # Unfinalised or truncated: keep everything that is really there.
+                        payload, declared_ok = rest, False
+                    else:
+                        payload, declared_ok = rest[:chunk_size], True
+                    break
+
                 f.seek(chunk_size + (chunk_size & 1), 1)
     except (OSError, struct.error):
-        return None
+        return None, False
+
+    return payload, declared_ok
 
 
 def _encode_index(samples: "np.ndarray") -> "np.ndarray":

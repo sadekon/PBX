@@ -406,3 +406,61 @@ class TestAudioFormatConversion:
         resp = api_client.get("/api/recordings/7/audio", headers=_token("9000", is_admin=True))
         assert resp.status_code == 415
         assert resp.get_json()["wav_format"] == WAV_FORMAT_G722
+
+
+@pytest.mark.unit
+class TestMalformedWavRepair:
+    """A WAV whose header lies about its size still holds playable audio."""
+
+    @staticmethod
+    def _unfinalised(path: Path, payload: bytes) -> Path:
+        """A PCM WAV as `wave.open(..., 'wb')` leaves it when close() never runs.
+
+        The sizes are patched in on close, so a writer that was killed mid-call leaves both
+        at zero. The file parses as a valid WAV and decodes to silence.
+        """
+        import struct
+
+        from pbx.utils.audio import build_wav_header
+
+        header = bytearray(build_wav_header(len(payload)))
+        struct.pack_into("<I", header, 40, 0)  # data chunk size
+        struct.pack_into("<I", header, 4, 36)  # RIFF size
+        path.write_bytes(bytes(header) + payload)
+        return path
+
+    def test_zero_size_header_is_repaired(self, tmp_path: Path) -> None:
+        import struct
+
+        from pbx.utils.audio import wav_as_pcm16_wav
+
+        payload = b"\x01\x02" * 100
+        src = self._unfinalised(tmp_path / "cut-short.wav", payload)
+
+        converted, fmt = wav_as_pcm16_wav(src)
+        assert fmt == WAV_FORMAT_PCM
+        assert converted is not None, "an unfinalised WAV must be repaired, not passed through"
+        assert struct.unpack_from("<I", converted, 40)[0] == len(payload)
+        assert converted[44:] == payload
+
+    def test_truncated_file_keeps_what_is_there(self, tmp_path: Path) -> None:
+        """Declared size larger than the file: serve the audio that survived."""
+        from pbx.utils.audio import build_wav_header, wav_as_pcm16_wav
+
+        payload = b"\x01\x02" * 100
+        src = tmp_path / "truncated.wav"
+        # Header promises twice the payload that follows.
+        src.write_bytes(build_wav_header(len(payload) * 2) + payload)
+
+        converted, fmt = wav_as_pcm16_wav(src)
+        assert fmt == WAV_FORMAT_PCM
+        assert converted is not None
+        assert converted[44:] == payload
+
+    def test_well_formed_pcm_is_still_passed_through(self, tmp_path: Path) -> None:
+        """Untouched, so send_file keeps serving range requests for long calls."""
+        from pbx.utils.audio import wav_as_pcm16_wav
+
+        converted, fmt = wav_as_pcm16_wav(_wav(tmp_path / "fine.wav"))
+        assert fmt == WAV_FORMAT_PCM
+        assert converted is None

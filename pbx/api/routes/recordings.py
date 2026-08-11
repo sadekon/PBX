@@ -35,7 +35,7 @@ from pbx.api.utils import (
     validate_limit_param,
 )
 from pbx.features.recording_store import KIND_CALL, KIND_VOICEMAIL
-from pbx.utils.audio import WAV_FORMAT_PCM, wav_as_pcm16_wav
+from pbx.utils.audio import WAV_FORMAT_PCM, read_wav_format, wav_as_pcm16_wav
 from pbx.utils.audit_logger import get_audit_logger
 from pbx.utils.logger import get_logger
 
@@ -303,6 +303,20 @@ def get_recording_audio(recording_id: str) -> Response:
     # <audio> element reports "no supported source was found", which reads as a broken URL
     # rather than an unsupported codec. Convert to linear PCM on the way out.
     converted, audio_format = wav_as_pcm16_wav(media)
+
+    # Logged on every serve, not only on failure. When a player refuses audio the browser
+    # says only "no supported sources" whatever the reason, so the server log is the one
+    # place the actual shape of the file is recoverable.
+    header = read_wav_format(media)
+    logger.info(
+        "Serving recording %s: format=%s rate=%s channels=%s bytes=%s converted=%s",
+        recording_id,
+        header[0] if header else "unreadable",
+        header[1] if header else "?",
+        header[2] if header else "?",
+        media.stat().st_size if media.exists() else "?",
+        converted is not None,
+    )
 
     if audio_format is None:
         logger.error("Recording %s is not a readable WAV: %s", recording_id, media.name)
