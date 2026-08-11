@@ -4,6 +4,7 @@ AI analysis of recorded calls using FREE open-source libraries
 """
 
 import json
+import re
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
@@ -28,6 +29,29 @@ class AnalysisType(Enum):
     QUALITY = "quality"
     SUMMARY = "summary"
     TRANSCRIPT = "transcript"
+
+
+#: A dialogue line: ``[04:12] 1512 (overlapping): the words``.
+#:
+#: Both the timestamp and the speaker label are optional in the pattern but the timestamp
+#: anchors it, so a plain sentence that happens to contain a colon is never touched. The label
+#: is bounded because a long line with a mid-sentence colon should keep its first clause.
+_DIALOGUE_PREFIX = re.compile(r"^\[\d{1,2}:\d{2}(?::\d{2})?\]\s*(?:[^:\n]{0,40}:\s*)?")
+
+
+def spoken_text(transcript: str) -> str:
+    """
+    Strip the speaker and timestamp prefixes, leaving only what was said.
+
+    Transcripts are stored as formatted dialogue -- ``[04:12] 1512: ...`` -- because that is
+    what a person reads. Handing that to the analysers feeds them the furniture: the summary
+    picks sentences and can return "[04:12] 1512" as though it were content, sentiment counts
+    extension numbers toward its totals, and keyword matching scans timestamps.
+
+    Speaker labels are not lost information here. Nothing consults them -- ``agent_sentiment``
+    is hardcoded -- so there is nothing to preserve by keeping them in the text.
+    """
+    return "\n".join(_DIALOGUE_PREFIX.sub("", line) for line in transcript.splitlines()).strip()
 
 
 class RecordingAnalytics:
@@ -129,7 +153,10 @@ class RecordingAnalytics:
         }
 
         row = self._transcript_row(recording_id)
-        transcript = None if row is None else str(row.get("text") or "")
+        stored = None if row is None else str(row.get("text") or "")
+        # The analysers get the words; the transcript analysis returns the
+        # dialogue as stored, which is the form a person wants to read.
+        transcript = None if stored is None else spoken_text(stored)
         if transcript is None:
             # Transcription runs after the call and is queued, so a recording that has just
             # finished legitimately has no transcript yet. Saying so beats transcribing it
@@ -140,7 +167,7 @@ class RecordingAnalytics:
 
         for analysis_type in analysis_types:
             if analysis_type == "transcript":
-                results["analyses"]["transcript"] = {"transcript": transcript}
+                results["analyses"]["transcript"] = {"transcript": stored}
             elif analysis_type == "sentiment":
                 results["analyses"]["sentiment"] = self._analyze_sentiment(transcript)
             elif analysis_type == "keywords":

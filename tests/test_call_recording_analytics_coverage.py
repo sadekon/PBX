@@ -1434,3 +1434,71 @@ class TestResultsArePersisted:
         result = self._analytics(db).analyze_recording("rec-1", ["sentiment"])
 
         assert "sentiment" in result["analyses"]
+
+
+@pytest.mark.unit
+class TestSpokenText:
+    """
+    Analysers see the words, not the furniture around them.
+
+    Transcripts are stored as formatted dialogue because that is what a person reads. Handing
+    that straight to the analysers means the summary can pick "[04:12] 1512" as though it were
+    content, sentiment counts extension numbers toward its totals, and keyword matching scans
+    timestamps.
+    """
+
+    def test_timestamp_and_speaker_are_stripped(self) -> None:
+        from pbx.features.call_recording_analytics import spoken_text
+
+        assert spoken_text("[00:04] 1512: I have a problem") == "I have a problem"
+
+    def test_the_overlap_marker_goes_too(self) -> None:
+        from pbx.features.call_recording_analytics import spoken_text
+
+        assert spoken_text("[00:04] 1512 (overlapping): hello") == "hello"
+
+    def test_hour_long_calls_are_handled(self) -> None:
+        """clock() grows to h:mm:ss once a call runs past an hour."""
+        from pbx.features.call_recording_analytics import spoken_text
+
+        assert spoken_text("[1:04:12] 1512: still here") == "still here"
+
+    def test_a_colon_inside_speech_survives(self) -> None:
+        """The timestamp anchors the pattern, so ordinary punctuation is not eaten."""
+        from pbx.features.call_recording_analytics import spoken_text
+
+        assert (
+            spoken_text("[00:04] 1512: here is the thing: it broke")
+            == "here is the thing: it broke"
+        )
+
+    def test_a_line_without_a_prefix_is_untouched(self) -> None:
+        from pbx.features.call_recording_analytics import spoken_text
+
+        assert spoken_text("So: that happened") == "So: that happened"
+
+    def test_every_line_is_stripped(self) -> None:
+        from pbx.features.call_recording_analytics import spoken_text
+
+        text = "[00:00] 1513: one\n[00:04] 1512: two"
+
+        assert spoken_text(text) == "one\ntwo"
+
+    def test_the_analysers_get_stripped_text(self) -> None:
+        db = _with_transcript("[00:00] 1513: thank you excellent wonderful great appreciate")
+        analytics = _build_analytics()
+        analytics.database = db
+
+        result = analytics.analyze_recording("rec-1", ["sentiment"])
+
+        assert result["analyses"]["sentiment"]["overall_sentiment"] == "positive"
+
+    def test_the_transcript_analysis_returns_the_dialogue_as_stored(self) -> None:
+        """A person reading it wants to know who said what and when."""
+        stored = "[00:00] 1513: hello there"
+        analytics = _build_analytics()
+        analytics.database = _with_transcript(stored)
+
+        result = analytics.analyze_recording("rec-1", ["transcript"])
+
+        assert result["analyses"]["transcript"]["transcript"] == stored
