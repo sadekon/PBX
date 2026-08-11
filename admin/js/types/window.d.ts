@@ -154,7 +154,6 @@ declare global {
 
         // pages/phone_book.ts
         loadPhoneBook: () => Promise<void>;
-        deletePhoneBookEntry: (entryId: string) => Promise<void>;
 
         // pages/paging.ts
         loadPagingData: () => Promise<void>;

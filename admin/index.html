@@ -70,6 +70,10 @@
                         <span class="tab-icon">📞</span>
                         <span class="tab-text">Phone</span>
                     </button>
+                    <button class="tab-button" data-tab="phone-book" title="Company directory">
+                        <span class="tab-icon">📇</span>
+                        <span class="tab-text">Directory</span>
+                    </button>
                     <button class="tab-button" data-tab="calls">
                         <span class="tab-icon">📱</span>
                         <span class="tab-text">Active Calls</span>
@@ -453,6 +457,70 @@
                         <li><strong>Echo or feedback:</strong> Use headphones to prevent audio feedback</li>
                     </ul>
                 </div>
+            </div>
+        </div>
+
+        <!-- Company Directory Tab -->
+        <div id="phone-book" class="tab-content">
+            <h2>📇 Company Directory</h2>
+
+            <div class="table-toolbar">
+                <div class="table-search">
+                    <label for="directory-search" class="sr-only">Search the directory</label>
+                    <input type="search" id="directory-search" autocomplete="off"
+                           placeholder="Search by name, extension, email, or department">
+                </div>
+                <span class="table-result-count" id="directory-count" aria-live="polite"></span>
+                <button class="btn btn-primary" id="directory-refresh">🔄 Refresh</button>
+            </div>
+
+            <div class="stats-grid" style="margin-bottom: 20px;">
+                <div class="stat-card">
+                    <div class="stat-value" id="directory-total">-</div>
+                    <div class="stat-label">People</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="directory-online">-</div>
+                    <div class="stat-label">Online Now</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="directory-with-did">-</div>
+                    <div class="stat-label">Direct Dial Numbers</div>
+                </div>
+            </div>
+
+            <div class="config-section">
+                <h3>📋 Directory</h3>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th scope="col">Name</th>
+                                <th scope="col">Extension</th>
+                                <th scope="col">Direct Dial</th>
+                                <th scope="col">Email</th>
+                                <th scope="col">Department</th>
+                                <th scope="col">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="phone-book-body">
+                            <tr>
+                                <td colspan="6" class="loading">Loading directory...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="info-box">
+                <h3>ℹ️ About the Directory</h3>
+                <p>The directory lists every extension on the system and is visible to all signed-in users. Searching filters the list as you type across name, extension, direct dial, email, and department.</p>
+                <ul>
+                    <li><strong>Click an extension</strong> to place a call from your desk phone.</li>
+                    <li><strong>Click an email address</strong> to open a new message.</li>
+                    <li><strong>Status</strong> reflects live SIP registration at the moment the page loaded — press Refresh to update it.</li>
+                </ul>
+                <p>Name, extension, and email come from Active Directory. Department is maintained in the PBX and appears only where an administrator has filled it in.</p>
             </div>
         </div>
 

@@ -13,6 +13,21 @@
 
 @import 'variables.css';
 
+/* Visually hidden, still read by screen readers. For labels that would be
+   redundant next to a placeholder but are required for the input to be
+   announced at all. */
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
 /* Skip Navigation Link (Accessibility) */
 .skip-nav {
     position: absolute;
@@ -515,6 +530,120 @@ header h1 {
     margin-bottom: 10px;
     font-size: 1.5rem;
     font-weight: 600;
+}
+
+/* Table Search
+   Reusable filter bar for any .data-table. Pairs a search box with a live
+   result count so a filtered table never looks like an empty one. */
+.table-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-md);
+    margin-bottom: 20px;
+}
+
+.table-search {
+    position: relative;
+    flex: 1 1 320px;
+    max-width: 480px;
+}
+
+.table-search::before {
+    content: '🔍';
+    position: absolute;
+    left: 13px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.85rem;
+    opacity: 0.55;
+    pointer-events: none;
+}
+
+.table-search input {
+    width: 100%;
+    padding: 12px 38px 12px 38px;
+    font-family: inherit;
+    font-size: 0.95rem;
+    color: var(--color-text);
+    background: var(--color-bg-input);
+    border: 1px solid var(--color-border-medium);
+    border-radius: var(--radius-md);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.table-search input::placeholder {
+    color: var(--color-text-muted);
+}
+
+.table-search input:focus {
+    outline: none;
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.15);
+}
+
+.table-result-count {
+    font-size: 0.85rem;
+    color: var(--color-text-secondary);
+    white-space: nowrap;
+}
+
+/* Presence indicator
+   A coloured dot plus a text label — the label carries the meaning so the
+   status is not communicated by colour alone. */
+.presence {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+
+.presence::before {
+    content: '';
+    flex-shrink: 0;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--color-text-muted);
+}
+
+.presence-online::before {
+    background: var(--color-success);
+}
+
+.presence-dnd::before {
+    background: var(--color-warning);
+}
+
+/* Placeholder for a directory field the record simply does not carry. */
+.field-empty {
+    color: var(--color-text-muted);
+    font-style: italic;
+}
+
+/* A button that reads as a link. Used where the action is inline in a table
+   cell and a full .btn would dominate the row. */
+.btn-link {
+    padding: 0;
+    font: inherit;
+    font-weight: 600;
+    color: var(--color-accent);
+    background: none;
+    border: none;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.btn-link:hover {
+    color: var(--color-accent-hover);
+}
+
+.btn-link:focus-visible {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 2px;
+    border-radius: 2px;
 }
 
 /* Table */

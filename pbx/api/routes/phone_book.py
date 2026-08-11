@@ -2,6 +2,20 @@
 
 Handles phone book CRUD operations, search, sync with Active Directory,
 and export in multiple formats (Yealink XML, Cisco XML, JSON).
+
+Two data sources meet here, deliberately:
+
+* The **extension registry** decides who appears in the directory and carries
+  the live fields (presence, DID). GET and /search read it directly, so an
+  entry shows up the moment the extension exists, with no sync step in
+  between and with presence that is accurate at request time.
+* The **phone_book table** supplies optional enrichment (department, mobile,
+  office location) that Active Directory has no source for and that an admin
+  maintains by hand via POST. It also backs the desk-phone XML exports, which
+  provisioning templates reach through remote_phonebook.url.
+
+Enrichment is best-effort: when the phone_book feature is disabled the
+directory still serves, just without those columns.
 """
 
 from typing import Any
@@ -33,19 +47,81 @@ def _get_phone_book() -> tuple[Any, Response | None]:
     return pbx_core.phone_book, None
 
 
+# Fields a directory entry may expose. This list is the security boundary for
+# the endpoint: everything the registry holds but does not appear here
+# (is_admin, sip_password, voicemail_pin_hash, allow_external,
+# forward_destination) stays out of a payload every authenticated user reads.
+_SEARCHABLE_FIELDS = ("name", "extension", "email", "did_number", "department")
+
+
+def _enrichment_by_extension() -> dict[str, dict[str, Any]]:
+    """Optional per-extension detail from the phone_book table, keyed by extension.
+
+    Returns an empty mapping when the feature is off or the lookup fails, so
+    the directory degrades to registry-only fields instead of erroring.
+    """
+    pbx_core = get_pbx_core()
+    phone_book = getattr(pbx_core, "phone_book", None) if pbx_core else None
+    if not phone_book or not phone_book.enabled:
+        return {}
+
+    try:
+        return {entry["extension"]: entry for entry in phone_book.get_all_entries()}
+    except (AttributeError, KeyError, TypeError) as e:
+        logger.warning(f"Phone book enrichment unavailable, serving registry only: {e}")
+        return {}
+
+
+def _build_directory() -> list[dict[str, Any]]:
+    """Build the company directory from the live extension registry."""
+    pbx_core = get_pbx_core()
+    if not pbx_core or not hasattr(pbx_core, "extension_registry"):
+        return []
+
+    enrichment = _enrichment_by_extension()
+
+    entries = [
+        {
+            "extension": ext.number,
+            "name": ext.name,
+            "email": ext.config.get("email"),
+            "did_number": ext.config.get("did_number"),
+            # Read at request time rather than from a cached table, so the
+            # presence indicator reflects the current SIP registration.
+            "registered": bool(ext.registered),
+            "dnd_enabled": bool(ext.config.get("dnd_enabled", False)),
+            "department": enrichment.get(ext.number, {}).get("department"),
+            "mobile": enrichment.get(ext.number, {}).get("mobile"),
+            "office_location": enrichment.get(ext.number, {}).get("office_location"),
+        }
+        for ext in pbx_core.extension_registry.get_all()
+    ]
+
+    entries.sort(key=lambda entry: (entry["name"] or "").casefold())
+    return entries
+
+
+def _matches(entry: dict[str, Any], needle: str) -> bool:
+    """Case-insensitive substring match across the searchable directory fields."""
+    return any(needle in str(entry.get(field) or "").casefold() for field in _SEARCHABLE_FIELDS)
+
+
 @phone_book_bp.route("", methods=["GET"])
 @require_auth
 def handle_get_phone_book() -> Response:
-    """Get all phone book entries."""
-    phone_book, error = _get_phone_book()
-    if error:
-        return error
+    """Get the company directory.
 
+    Served to every authenticated user, not only admins: a directory that
+    shows you nobody but yourself is not a directory. This is why it does not
+    reuse GET /api/extensions, which filters non-admins down to their own row
+    because it carries administrative fields this payload deliberately omits.
+    """
     try:
-        entries = phone_book.get_all_entries()
-        return send_json(entries)
-    except Exception as e:
-        return send_json({"error": str(e)}, 500)
+        entries = _build_directory()
+        return send_json({"entries": entries, "count": len(entries)})
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error building directory: {e}")
+        return send_json({"error": "Failed to build directory"}, 500)
 
 
 @phone_book_bp.route("", methods=["POST"])
@@ -234,18 +310,20 @@ def handle_export_phone_book_json() -> Response:
 @phone_book_bp.route("/search", methods=["GET"])
 @require_auth
 def handle_search_phone_book() -> Response:
-    """Search phone book entries."""
-    phone_book, error = _get_phone_book()
-    if error:
-        return error
+    """Search the company directory.
+
+    Reads the same source as GET so the two cannot disagree. The admin UI
+    filters client-side over the full list; this exists for callers that would
+    rather not hold the directory in memory.
+    """
+    query = request.args.get("q", "").strip()
+    if not query:
+        return send_json({"error": 'Query parameter "q" is required'}, 400)
 
     try:
-        query = request.args.get("q", "")
-
-        if not query:
-            return send_json({"error": 'Query parameter "q" is required'}, 400)
-
-        results = phone_book.search(query)
-        return send_json(results)
-    except (KeyError, TypeError, ValueError) as e:
-        return send_json({"error": str(e)}, 500)
+        needle = query.casefold()
+        results = [entry for entry in _build_directory() if _matches(entry, needle)]
+        return send_json({"entries": results, "count": len(results)})
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error searching directory: {e}")
+        return send_json({"error": "Failed to search directory"}, 500)

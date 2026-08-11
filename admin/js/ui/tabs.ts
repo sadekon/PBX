@@ -149,6 +149,7 @@ export function showTab(tabName: string): void {
         'matrix-integration':  window.loadMatrixConfig,
         'espocrm-integration': window.loadEspoCRMConfig,
         'click-to-dial':       window.loadClickToDialTab,
+        'phone-book':          window.loadPhoneBook,
         'fraud-detection':     window.loadFraudDetectionData,
         'nomadic-e911':        window.loadNomadicE911Data,
         'callback-queue':      window.loadCallbackQueue,
