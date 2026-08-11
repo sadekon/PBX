@@ -1,0 +1,515 @@
+"""
+Telling people the call is being recorded.
+
+Recording someone without notice is unlawful in two-party-consent jurisdictions, so this is
+the gate the recorder was always supposed to sit behind. It plays a spoken notice on a
+bridged call, and **the recording is discarded if the notice did not play** -- no notice,
+no lawful recording, so there is nothing worth keeping.
+
+*Which calls* get a notice is a policy question (``announce_for``), but *who hears it* is
+not: it plays to both legs, always. Only the outside party needs the disclosure -- staff
+have signed a phone agreement -- but the notice is also the thing that tells the employee
+why the line is quiet. Playing it to the outside party alone means muting the employee so
+they cannot talk over it, which leaves them listening to dead air and saying "hello?"
+into a muted channel. Letting them hear it costs four seconds of a message they do not
+strictly need and removes that problem entirely.
+
+Three things make this less obvious than it sounds:
+
+**It runs on its own thread.** The bridge hook fires from the relay's own loop, and blocking
+there for four seconds would stall live media for every call on the box. The announcement is
+started and the hook returns immediately; the fail-closed decision happens on the announcement
+thread when playback finishes.
+
+**Injected audio is invisible to the recorder.** ``RTPPlayer`` writes straight to the socket,
+while the tap is fed inside ``_relay_loop`` -- two different code paths. Music-on-hold has
+always been absent from recordings for this reason. So the notice is fed to the tap explicitly,
+on its own source, which is what puts it on the tape as evidence that it was given.
+
+**The text is not transcribed, it is injected.** We already know what the notice says; it is
+the configured string that generated the audio. Recognising it would cost a full whisper window
+to recover a sentence we have, and could come back paraphrased -- which is the last sentence
+you would want approximated if the recording is ever evidence.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from pbx.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+__all__ = [
+    "ANNOUNCE_ALL",
+    "ANNOUNCE_EXTERNAL",
+    "ANNOUNCE_OFF",
+    "SYSTEM_LABEL",
+    "SYSTEM_SOURCE",
+    "ConsentAnnouncer",
+    "ConsentSettings",
+]
+
+CONFIG_SECTION = "recording.consent"
+
+#: Announce on calls with a party that is not a provisioned extension. The production setting.
+ANNOUNCE_EXTERNAL = "external"
+#: Announce on every bridged call, internal ones included. The testing setting.
+ANNOUNCE_ALL = "all"
+#: Announce on nothing. Recording still happens -- this says an operator decided notice is not
+#: required here (a one-party-consent jurisdiction, or internal-only recording), out loud,
+#: rather than by leaving a switch off somewhere.
+ANNOUNCE_OFF = "off"
+
+VALID_MODES = frozenset({ANNOUNCE_EXTERNAL, ANNOUNCE_ALL, ANNOUNCE_OFF})
+
+#: The notice's own channel in the recording. Not a participant, so it gets a source id that
+#: cannot collide with the relay's ("a0"/"b0", bumped per transfer).
+SYSTEM_SOURCE = "sys0"
+SYSTEM_LABEL = "system"
+
+DEFAULT_TEXT = "This call is being recorded for quality assurance."
+
+#: 20 ms at 8 kHz -- the same framing everything else on the media path uses.
+FRAME_SAMPLES = 160
+
+#: L16 mono, used only to hand the notice to the recorder -- no encode/decode round trip
+#: on the one piece of audio that might be read out in court.
+PAYLOAD_L16 = 11
+
+#: What goes on the wire. PT 0 is the one codec every endpoint here negotiates.
+PAYLOAD_ULAW = 0
+
+SAMPLE_RATE = 8000
+FRAME_INTERVAL_SECONDS = 0.02
+
+#: Where a synthesised notice is cached. Generated once at startup, not per call: gTTS is a
+#: network round trip and this is on the path of every external call.
+DEFAULT_AUDIO_FILE = "auto_attendant/recording_notice.wav"
+
+#: Give up on playback after this. A notice that never finishes would otherwise hold the
+#: recording in limbo for the length of the call.
+PLAYBACK_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass(frozen=True, slots=True)
+class ConsentSettings:
+    """Read once at construction, like every other settings object here."""
+
+    announce_for: str = ANNOUNCE_EXTERNAL
+    text: str = DEFAULT_TEXT
+    audio_file: str = DEFAULT_AUDIO_FILE
+
+    @classmethod
+    def from_dict(cls, section: dict[str, Any]) -> ConsentSettings:
+        return cls(
+            announce_for=str(section.get("announce_for", ANNOUNCE_EXTERNAL) or "").lower()
+            or ANNOUNCE_EXTERNAL,
+            text=str(section.get("text") or DEFAULT_TEXT),
+            audio_file=str(section.get("audio_file") or DEFAULT_AUDIO_FILE),
+        )
+
+    def validate(self) -> list[str]:
+        problems: list[str] = []
+        if self.announce_for not in VALID_MODES:
+            problems.append(
+                f"{CONFIG_SECTION}.announce_for must be one of {sorted(VALID_MODES)}, "
+                f"got {self.announce_for!r}"
+            )
+        if self.announce_for != ANNOUNCE_OFF and not self.text.strip():
+            problems.append(
+                f"{CONFIG_SECTION}.text is empty; it is both what callers hear and what the "
+                "transcript records as having been said"
+            )
+        return problems
+
+
+class ConsentAnnouncer:
+    """
+    Decides whether a call needs a notice, plays it, and reports whether it was given.
+
+    Constructed unconditionally so callers get a real object rather than something to guard
+    with hasattr -- a disabled announcer simply says no call needs a notice.
+    """
+
+    def __init__(
+        self,
+        settings: ConsentSettings,
+        is_internal: Callable[[str], bool] | None = None,
+        logger: Any | None = None,
+        database: Any | None = None,
+    ) -> None:
+        self.settings = settings
+        self.logger = logger or get_logger()
+        #: Where each notice is recorded. Optional, like every other database dependency
+        #: here -- a install without one still plays notices, it just cannot prove it.
+        self.database = database
+        # Injected rather than reached for, so this module never imports PBXCore. Defaults to
+        # "everyone is external", which is the cautious direction: it announces more, not less.
+        self._is_internal = is_internal or (lambda _number: False)
+        self.announced = 0
+        self.failed = 0
+
+    # ------------------------------------------------------------------ policy
+
+    @property
+    def enabled(self) -> bool:
+        return self.settings.announce_for != ANNOUNCE_OFF
+
+    def audio_path(self) -> Path:
+        return Path(self.settings.audio_file)
+
+    def required_for(self, caller: str, callee: str) -> bool:
+        """Whether this call may not be recorded without a notice first."""
+        if not self.enabled:
+            return False
+        if self.settings.announce_for == ANNOUNCE_ALL:
+            return True
+        return self.is_external_call(caller, callee)
+
+    def is_external_call(self, caller: str, callee: str) -> bool:
+        """
+        True when either party is not a provisioned extension.
+
+        Identity by extension lookup rather than by a flag on the call: it is the same
+        question the recorder already answers when it labels a channel, so the two cannot
+        disagree about who was on the call.
+        """
+        return not (self._is_internal(caller) and self._is_internal(callee))
+
+    # ------------------------------------------------------------------ playback
+
+    def prepare(self) -> bool:
+        """
+        Make sure there is something to play, synthesising it once if needed.
+
+        Called at startup so a missing prompt is a loud line in the boot log rather than a
+        silent loss of every external recording later.
+        """
+        if not self.enabled:
+            return True
+
+        path = self.audio_path()
+        if path.is_file():
+            self.logger.info(f"Recording notice: using {path}")
+            return True
+
+        try:
+            from pbx.utils.tts import text_to_wav_telephony
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if text_to_wav_telephony(self.settings.text, path):
+                self.logger.info(f"Recording notice: synthesised {path}")
+                return True
+        except Exception as e:
+            self.logger.error(f"Recording notice could not be synthesised: {e}")
+
+        self.logger.error(
+            f"Recording notice audio is missing ({path}) and could not be generated. "
+            "External calls will NOT be recorded until this is fixed."
+        )
+        return False
+
+    def announce(
+        self,
+        handler: Any,
+        on_complete: Callable[[bool], None],
+        session_id: str | None = None,
+        participants: Sequence[str] | None = None,
+    ) -> None:
+        """
+        Play the notice to both legs, then report success through `on_complete`.
+
+        Returns immediately. The caller is the relay's bridge hook, which runs on the media
+        loop -- four seconds of playback there would stall audio for the call.
+        """
+        thread = threading.Thread(
+            target=self._play,
+            args=(handler, on_complete, session_id, participants),
+            name=f"ConsentNotice-{getattr(handler, 'call_id', '?')}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _play(
+        self,
+        handler: Any,
+        on_complete: Callable[[bool], None],
+        session_id: str | None = None,
+        participants: Sequence[str] | None = None,
+    ) -> None:
+        """Play to both legs. Never raises -- it owns a thread of its own."""
+        ok = False
+        reason = "notice did not run"
+        try:
+            ok, reason = self._play_to_sides(handler, ["a", "b"])
+        except Exception as e:
+            reason = f"notice raised: {e}"
+            self.logger.error(f"Recording notice for {handler.call_id} failed: {e}")
+        finally:
+            if ok:
+                self.announced += 1
+            else:
+                self.failed += 1
+            self._record(handler, ok, session_id, participants, reason=reason)
+            try:
+                on_complete(ok)
+            except Exception as e:
+                self.logger.error(f"Recording notice callback for {handler.call_id} raised: {e}")
+
+    def _play_to_sides(self, handler: Any, sides: list[str]) -> tuple[bool, str]:
+        """
+        Send the notice to every leg at once, with the relay muted while it plays.
+
+        Two things here were learned the hard way.
+
+        **The relay is paused first.** Injecting a second RTP stream into a live session means
+        two SSRCs arriving on one port, and phones lock onto whichever they saw first -- so the
+        notice reached one end, the other end, or neither, differing per call. Pausing leaves
+        exactly one stream on the wire. It also mutes both microphones for the duration, so
+        nobody talks over the notice.
+
+        **Both legs are driven from one loop.** Playing to them in turn meant the second party
+        heard the notice only after the first had finished it.
+        """
+        path = self.audio_path()
+        if not path.is_file():
+            self.logger.error(f"Recording notice audio missing at {path}")
+            return False, f"prompt file missing: {path}"
+
+        sock = getattr(handler, "socket", None)
+        if sock is None or not getattr(handler, "running", False):
+            self.logger.warning(f"Recording notice for {handler.call_id}: relay is not running")
+            return False, "call was no longer up when the notice was due"
+
+        targets = [t for t in (handler.get_endpoint(side) for side in sides) if t is not None]
+        if not targets:
+            self.logger.warning(f"Recording notice for {handler.call_id}: no endpoints learned")
+            return False, "no media endpoint had been learned"
+
+        payload = self._ulaw_payload(path)
+        if payload is None:
+            return False, "prompt audio could not be read"
+
+        handler.pause_relay()
+        try:
+            self._feed_tap(handler, path)
+            completed = self._stream(handler, sock, targets, payload)
+        finally:
+            handler.resume_relay()
+
+        if not completed:
+            # A notice the caller only heard half of is not notice. Reporting it as played
+            # would keep a recording nobody was fully told about -- the precise case this
+            # gate exists to prevent.
+            self.logger.warning(
+                f"Recording notice for {handler.call_id} was cut short; treating as not given"
+            )
+            return False, "call ended before the notice finished"
+        return True, ""
+
+    def _ulaw_payload(self, path: Path) -> bytes | None:
+        """
+        Read the notice as G.711 µ-law.
+
+        µ-law rather than whatever the file happens to hold: PT 0 is the one codec every
+        endpoint here negotiates. ``RTPPlayer.play_file`` re-encodes 16-bit PCM to G.722, which
+        a phone that agreed on µ-law cannot decode -- that alone made the notice inaudible.
+        """
+        import wave
+
+        from pbx.utils.audio import pcm16_to_ulaw, resample_pcm16
+
+        try:
+            with wave.open(str(path), "rb") as wav:
+                channels = wav.getnchannels()
+                width = wav.getsampwidth()
+                rate = wav.getframerate()
+                raw = wav.readframes(wav.getnframes())
+        except Exception as e:
+            self.logger.error(f"Recording notice audio is unreadable ({path}): {e}")
+            return None
+
+        if channels != 1:
+            self.logger.error(f"Recording notice audio must be mono ({path})")
+            return None
+        if width == 1:
+            # Already 8-bit; assume it is the µ-law a telephony prompt normally is.
+            return raw
+        if width != 2:
+            self.logger.error(f"Recording notice audio must be 8- or 16-bit ({path})")
+            return None
+
+        if rate != SAMPLE_RATE:
+            raw = resample_pcm16(raw, rate, SAMPLE_RATE)
+        return pcm16_to_ulaw(raw)
+
+    def _stream(
+        self, handler: Any, sock: Any, targets: list[tuple[str, int]], payload: bytes
+    ) -> bool:
+        """
+        Packetise once and send each packet to every target, paced at 20 ms.
+
+        One loop rather than one player per leg, so the legs stay sample-aligned instead of
+        drifting apart by however long the first one took.
+
+        Returns whether the whole notice was delivered. A call that hangs up mid-notice stops
+        the loop and reports False: the recording is then discarded, because somebody who heard
+        two seconds of a four-second disclosure was not told.
+        """
+        import random
+        import struct
+        import time
+
+        ssrc = random.getrandbits(32)
+        sequence = random.getrandbits(16)
+        timestamp = 0
+        next_send = time.monotonic()
+
+        for start in range(0, len(payload), FRAME_SAMPLES):
+            # Checked every frame. The relay stops when the call ends, and continuing would
+            # spend the rest of the notice talking to a closed socket before declaring success.
+            if not getattr(handler, "running", False):
+                return False
+
+            chunk = payload[start : start + FRAME_SAMPLES]
+            header = struct.pack("!BBHII", 0x80, PAYLOAD_ULAW, sequence & 0xFFFF, timestamp, ssrc)
+            for target in targets:
+                with contextlib.suppress(OSError):
+                    sock.sendto(header + chunk, target)
+
+            sequence += 1
+            timestamp += FRAME_SAMPLES
+            next_send += FRAME_INTERVAL_SECONDS
+            delay = next_send - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+
+        return True
+
+    def _feed_tap(self, handler: Any, path: Path) -> None:
+        """
+        Put the notice on the recording, on its own channel.
+
+        Fed as 20 ms frames with advancing timestamps rather than one blob, because a channel
+        places audio by RTP timestamp -- one frame claiming to be seconds long would be written
+        contiguously but would misreport where it sits relative to the speakers.
+
+        Best-effort throughout: failing to record the notice is not a reason to withhold it
+        from the person it protects, so nothing here stops playback.
+        """
+        tap = getattr(handler, "tap", None)
+        if tap is None:
+            return
+
+        try:
+            import wave
+
+            from pbx.rtp.tap import RtpFrame
+
+            with wave.open(str(path), "rb") as wav:
+                if wav.getsampwidth() != 2 or wav.getnchannels() != 1:
+                    self.logger.debug("Recording notice is not 16-bit mono; not added to the tape")
+                    return
+                pcm = wav.readframes(wav.getnframes())
+        except Exception as e:
+            self.logger.debug(f"Recording notice not added to the tape: {e}")
+            return
+
+        step = FRAME_SAMPLES * 2
+        try:
+            for index, start in enumerate(range(0, len(pcm), step)):
+                tap.feed_frame(
+                    RtpFrame(
+                        source=SYSTEM_SOURCE,
+                        timestamp=index * FRAME_SAMPLES,
+                        payload_type=PAYLOAD_L16,
+                        sequence=index,
+                        payload=pcm[start : start + step],
+                    )
+                )
+        except Exception as e:
+            self.logger.debug(f"Recording notice not added to the tape: {e}")
+
+    def _record(
+        self,
+        handler: Any,
+        played: bool,
+        session_id: str | None = None,
+        participants: Sequence[str] | None = None,
+        legs: int = 2,
+        reason: str = "",
+    ) -> None:
+        """
+        Write the row that says these people were told.
+
+        The only durable proof notice was given -- the counters are in memory and the audio
+        expires. Participants are stored on the row rather than looked up later: this log is
+        kept indefinitely while the recording it justifies expires at 90 days, so by the time
+        anyone needs it there is nothing left to join to. Naming who was told is the whole
+        difference between an audit record and a timestamp.
+
+        Never raises: failing to log a notice is not a reason to fail the call it protected.
+        """
+        if not (self.database and getattr(self.database, "enabled", False)):
+            return
+
+        call_id = getattr(handler, "call_id", None)
+        try:
+            self.database.execute(
+                """
+                INSERT INTO recording_notices
+                    (session_id, call_id, played, notice_text, participants, legs,
+                     failure_reason)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    # The conversation, which survives transfers; call_id names one dialog.
+                    session_id or call_id,
+                    call_id,
+                    played,
+                    # Verbatim: the configured wording changes, what this caller heard does not.
+                    self.settings.text if played else None,
+                    json.dumps(list(participants)) if participants else None,
+                    legs if played else 0,
+                    # Why it was not given. "Prompt file missing" needs a fix; "caller hung
+                    # up" is ordinary. Both discard the recording, so only this tells them apart.
+                    None if played else (reason or "notice did not play"),
+                ),
+            )
+        except Exception as e:
+            self.logger.error(f"Could not record recording notice: {e}")
+
+    def recent(self, limit: int = 50) -> list[dict[str, Any]]:
+        """The latest notices, for the admin view. Empty on any failure."""
+        if not (self.database and getattr(self.database, "enabled", False)):
+            return []
+        try:
+            return (
+                self.database.fetch_all(
+                    "SELECT session_id, call_id, played, notice_text, participants, legs, "
+                    "failure_reason, "
+                    f"played_at FROM recording_notices ORDER BY played_at DESC LIMIT {int(limit)}"
+                )
+                or []
+            )
+        except Exception as e:
+            self.logger.error(f"Could not read recording notices: {e}")
+            return []
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "announce_for": self.settings.announce_for,
+            "audio_file": str(self.audio_path()),
+            "audio_present": self.audio_path().is_file(),
+            "announced": self.announced,
+            "failed": self.failed,
+            "text": self.settings.text,
+        }

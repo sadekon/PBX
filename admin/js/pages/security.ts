@@ -41,10 +41,6 @@ interface MobilePushDevicesResponse {
     devices?: MobilePushDevice[];
 }
 
-interface SpeechAnalyticsResponse {
-    configs?: unknown[];
-}
-
 export async function loadFraudAlerts(): Promise<void> {
     try {
         const API_BASE = getApiBaseUrl();
@@ -178,52 +174,9 @@ export async function loadMobilePushDevices(): Promise<void> {
     }
 }
 
-export async function loadSpeechAnalyticsConfigs(): Promise<void> {
-    try {
-        const API_BASE = getApiBaseUrl();
-        const response = await fetch(`${API_BASE}/api/framework/speech-analytics/configs`, {
-            headers: getAuthHeaders()
-        });
-        if (!response.ok) return;
-        const data: SpeechAnalyticsResponse = await response.json();
 
-        const container = document.getElementById('speech-analytics-configs-table') as HTMLElement | null;
-        if (container) {
-            const configs = data.configs ?? [];
-            if (configs.length === 0) {
-                container.innerHTML = '<div class="info-box">No speech analytics configurations</div>';
-            } else {
-                container.innerHTML = `
-                    <table class="table">
-                        <thead>
-                            <tr>
-                                <th>Configuration</th>
-                                <th>Status</th>
-                                <th>Details</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${configs.map((config: any) => `
-                                <tr>
-                                    <td>${escapeHtml(config.name || 'N/A')}</td>
-                                    <td>${escapeHtml(config.status || 'inactive')}</td>
-                                    <td><small>${escapeHtml(JSON.stringify(config))}</small></td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
-                `;
-            }
-        }
-    } catch (error: unknown) {
-        console.error('Error loading speech analytics:', error);
-    }
-}
-
-// Backward compatibility
 window.loadFraudAlerts = loadFraudAlerts;
 window.loadCallbackQueue = loadCallbackQueue;
 window.startCallback = startCallback;
 window.cancelCallback = cancelCallback;
 window.loadMobilePushDevices = loadMobilePushDevices;
-window.loadSpeechAnalyticsConfigs = loadSpeechAnalyticsConfigs;

@@ -213,6 +213,39 @@ class TestSettings:
 
         assert any("whisper_compute_type" in p for p in problems)
 
+    def test_vad_threshold_out_of_range_is_flagged(self, tmp_path: Any) -> None:
+        """
+        Silero clamps rather than raising, so an out-of-range value behaves as 0 or 1 while
+        the config claims something sensible. It is a probability, not a level.
+        """
+        problems = _settings(
+            provider="faster-whisper",
+            whisper_model_dir=str(tmp_path),
+            whisper_vad_threshold=200.0,
+        ).validate()
+
+        assert any("whisper_vad_threshold" in p for p in problems)
+
+    def test_a_sensible_vad_threshold_is_accepted(self, tmp_path: Any) -> None:
+        problems = _settings(
+            provider="faster-whisper",
+            whisper_model_dir=str(tmp_path),
+            whisper_vad_threshold=0.3,
+        ).validate()
+
+        assert not any("whisper_vad_threshold" in p for p in problems)
+
+    def test_negative_vad_timings_are_flagged(self, tmp_path: Any) -> None:
+        problems = _settings(
+            provider="faster-whisper",
+            whisper_model_dir=str(tmp_path),
+            whisper_vad_min_silence_ms=-1,
+            whisper_vad_speech_pad_ms=-1,
+        ).validate()
+
+        assert any("whisper_vad_min_silence_ms" in p for p in problems)
+        assert any("whisper_vad_speech_pad_ms" in p for p in problems)
+
     def test_whisper_settings_are_ignored_for_vosk(self, tmp_path: Any) -> None:
         """A vosk deployment must not be nagged about a whisper model it will never load."""
         problems = _settings(whisper_model_dir="/nonexistent", vosk_model_path=str(tmp_path))
@@ -801,6 +834,46 @@ class TestWhisperBackend:
         assert passed <= named, (
             f"{sorted(passed - named)} would be swallowed by **model_kwargs and forwarded "
             "to CTranslate2 raw -- use the faster-whisper parameter name instead"
+        )
+
+    @patch("pbx.speech.backends.whisper.WHISPER_AVAILABLE", True)
+    @patch("pbx.speech.backends.whisper.WhisperModel", create=True)
+    def test_transcribe_kwargs_are_named_by_the_real_signature(
+        self, whisper_model: Any, tmp_path: Any
+    ) -> None:
+        """
+        The same guard for transcribe(), which the model constructor's test does not cover.
+
+        A misspelled decoding option is worse than a crash: transcribe() would either raise on
+        a real install only, or silently ignore the setting while the config claims it is on.
+        """
+        import importlib.util
+        import inspect
+
+        if importlib.util.find_spec("faster_whisper") is None:
+            pytest.skip("faster-whisper is not installed; nothing to check the signature against")
+
+        from faster_whisper import WhisperModel as RealWhisperModel
+
+        from pbx.utils.audio import WAV_FORMAT_PCM
+
+        (tmp_path / "model.bin").write_bytes(b"")
+        backend = build_backend(_whisper_settings(whisper_model_dir=str(tmp_path)))
+        whisper_model.return_value.transcribe.return_value = ([], None)
+
+        audio = _write_wav(tmp_path / "clip.wav", b"\x00\x00" * 8000, WAV_FORMAT_PCM, 16)
+        backend.transcribe_file(audio)
+
+        passed = set(whisper_model.return_value.transcribe.call_args.kwargs)
+        named = {
+            name
+            for name, spec in inspect.signature(RealWhisperModel.transcribe).parameters.items()
+            if spec.kind not in (spec.VAR_KEYWORD, spec.VAR_POSITIONAL)
+        }
+
+        assert passed <= named, (
+            f"{sorted(passed - named)} is not a parameter of faster-whisper's transcribe(); "
+            "it would be ignored or raise on a real install"
         )
 
 

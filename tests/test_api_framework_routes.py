@@ -30,167 +30,6 @@ def _json(response) -> dict:
 
 
 @pytest.mark.unit
-class TestSpeechAnalyticsRoutes:
-    """Test speech analytics endpoints."""
-
-    def test_get_configs_success(self, api_client: FlaskClient, mock_pbx_core: MagicMock) -> None:
-        mock_pbx_core.database.enabled = True
-        with (
-            patch(AUTH_PATCH, return_value=AUTH_RETURN),
-            patch("pbx.features.speech_analytics.SpeechAnalyticsEngine") as MockEngine,
-        ):
-            MockEngine.return_value.get_all_configs.return_value = [{"id": 1}]
-            response = api_client.get("/api/framework/speech-analytics/configs")
-            assert response.status_code == 200
-            assert _json(response)["configs"] == [{"id": 1}]
-
-    def test_get_configs_no_auth(self, api_client: FlaskClient) -> None:
-        response = api_client.get("/api/framework/speech-analytics/configs")
-        assert response.status_code == 401
-
-    def test_get_configs_db_unavailable(
-        self, api_client: FlaskClient, mock_pbx_core: MagicMock
-    ) -> None:
-        mock_pbx_core.database.enabled = False
-        with patch(AUTH_PATCH, return_value=AUTH_RETURN):
-            response = api_client.get("/api/framework/speech-analytics/configs")
-            assert response.status_code == 500
-            assert "Database not available" in _json(response)["error"]
-
-    def test_get_config_by_extension(
-        self, api_client: FlaskClient, mock_pbx_core: MagicMock
-    ) -> None:
-        mock_pbx_core.database.enabled = True
-        with (
-            patch(AUTH_PATCH, return_value=AUTH_RETURN),
-            patch("pbx.features.speech_analytics.SpeechAnalyticsEngine") as MockEngine,
-        ):
-            MockEngine.return_value.get_config.return_value = {"extension": "1001"}
-            response = api_client.get("/api/framework/speech-analytics/config/1001")
-            assert response.status_code == 200
-
-    def test_get_config_not_found(self, api_client: FlaskClient, mock_pbx_core: MagicMock) -> None:
-        mock_pbx_core.database.enabled = True
-        with (
-            patch(AUTH_PATCH, return_value=AUTH_RETURN),
-            patch("pbx.features.speech_analytics.SpeechAnalyticsEngine") as MockEngine,
-        ):
-            MockEngine.return_value.get_config.return_value = None
-            response = api_client.get("/api/framework/speech-analytics/config/9999")
-            assert response.status_code == 404
-
-    def test_get_call_summary_success(
-        self, api_client: FlaskClient, mock_pbx_core: MagicMock
-    ) -> None:
-        mock_pbx_core.database.enabled = True
-        with (
-            patch(AUTH_PATCH, return_value=AUTH_RETURN),
-            patch("pbx.features.speech_analytics.SpeechAnalyticsEngine") as MockEngine,
-        ):
-            MockEngine.return_value.get_call_summary.return_value = {"text": "summary"}
-            response = api_client.get("/api/framework/speech-analytics/summary/call123")
-            assert response.status_code == 200
-
-    def test_get_call_summary_not_found(
-        self, api_client: FlaskClient, mock_pbx_core: MagicMock
-    ) -> None:
-        mock_pbx_core.database.enabled = True
-        with (
-            patch(AUTH_PATCH, return_value=AUTH_RETURN),
-            patch("pbx.features.speech_analytics.SpeechAnalyticsEngine") as MockEngine,
-        ):
-            MockEngine.return_value.get_call_summary.return_value = None
-            response = api_client.get("/api/framework/speech-analytics/summary/call999")
-            assert response.status_code == 404
-
-    def test_update_config_success(self, api_client: FlaskClient, mock_pbx_core: MagicMock) -> None:
-        mock_pbx_core.database.enabled = True
-        with (
-            patch(AUTH_PATCH, return_value=AUTH_RETURN),
-            patch("pbx.features.speech_analytics.SpeechAnalyticsEngine") as MockEngine,
-        ):
-            MockEngine.return_value.update_config.return_value = True
-            response = api_client.post(
-                "/api/framework/speech-analytics/config/1001",
-                json={"enabled": True},
-            )
-            assert response.status_code == 200
-            assert _json(response)["success"] is True
-
-    def test_update_config_failure(self, api_client: FlaskClient, mock_pbx_core: MagicMock) -> None:
-        mock_pbx_core.database.enabled = True
-        with (
-            patch(AUTH_PATCH, return_value=AUTH_RETURN),
-            patch("pbx.features.speech_analytics.SpeechAnalyticsEngine") as MockEngine,
-        ):
-            MockEngine.return_value.update_config.return_value = False
-            response = api_client.post(
-                "/api/framework/speech-analytics/config/1001",
-                json={"enabled": True},
-            )
-            assert response.status_code == 500
-
-    def test_analyze_sentiment_success(
-        self, api_client: FlaskClient, mock_pbx_core: MagicMock
-    ) -> None:
-        mock_pbx_core.database.enabled = True
-        with (
-            patch(AUTH_PATCH, return_value=AUTH_RETURN),
-            patch("pbx.features.speech_analytics.SpeechAnalyticsEngine") as MockEngine,
-        ):
-            MockEngine.return_value.analyze_sentiment.return_value = {"score": 0.8}
-            response = api_client.post(
-                "/api/framework/speech-analytics/analyze-sentiment",
-                json={"text": "great service"},
-            )
-            assert response.status_code == 200
-
-    def test_analyze_sentiment_no_text(
-        self, api_client: FlaskClient, mock_pbx_core: MagicMock
-    ) -> None:
-        mock_pbx_core.database.enabled = True
-        with patch(AUTH_PATCH, return_value=AUTH_RETURN):
-            response = api_client.post(
-                "/api/framework/speech-analytics/analyze-sentiment",
-                json={"text": ""},
-            )
-            assert response.status_code == 400
-
-    def test_generate_summary_success(
-        self, api_client: FlaskClient, mock_pbx_core: MagicMock
-    ) -> None:
-        mock_pbx_core.database.enabled = True
-        with (
-            patch(AUTH_PATCH, return_value=AUTH_RETURN),
-            patch("pbx.features.speech_analytics.SpeechAnalyticsEngine") as MockEngine,
-        ):
-            MockEngine.return_value.generate_summary.return_value = "Call summary text"
-            response = api_client.post(
-                "/api/framework/speech-analytics/generate-summary/call123",
-                json={"transcript": "Hello, I need help."},
-            )
-            assert response.status_code == 200
-            data = _json(response)
-            assert data["call_id"] == "call123"
-
-    def test_generate_summary_no_transcript(
-        self, api_client: FlaskClient, mock_pbx_core: MagicMock
-    ) -> None:
-        mock_pbx_core.database.enabled = True
-        with patch(AUTH_PATCH, return_value=AUTH_RETURN):
-            response = api_client.post(
-                "/api/framework/speech-analytics/generate-summary/call123",
-                json={"transcript": ""},
-            )
-            assert response.status_code == 400
-
-
-# =============================================================================
-# Video Conference
-# =============================================================================
-
-
-@pytest.mark.unit
 class TestVideoConferenceRoutes:
     """Test video conference endpoints."""
 
@@ -1825,9 +1664,15 @@ class TestRecordingAnalyticsRoutes:
             patch(AUTH_PATCH, return_value=AUTH_RETURN),
             patch("pbx.features.call_recording_analytics.get_recording_analytics") as mock_ra,
         ):
-            mock_ra.return_value.analyses = {"r1": {"status": "done"}}
+            # Stored, not in-memory: results survive a restart, and a page showing only what
+            # this process analysed would look empty after every deploy.
+            mock_ra.return_value.stored_analyses.return_value = [
+                {"recording_id": 1, "analyses": {}}
+            ]
             response = api_client.get("/api/framework/recording-analytics/analyses")
+
             assert response.status_code == 200
+            assert json.loads(response.data)["analyses"][0]["recording_id"] == 1
 
     def test_get_statistics(self, api_client: FlaskClient, mock_pbx_core: MagicMock) -> None:
         with (
@@ -1868,19 +1713,42 @@ class TestRecordingAnalyticsRoutes:
             mock_ra.return_value.analyze_recording.return_value = {"status": "complete"}
             response = api_client.post(
                 "/api/framework/recording-analytics/analyze",
-                json={"recording_id": "r1", "audio_path": "/tmp/recording.wav"},
+                json={"recording_id": "r1"},
             )
             assert response.status_code == 200
 
-    def test_analyze_recording_missing_fields(
+    def test_analyze_recording_requires_a_recording_id(
         self, api_client: FlaskClient, mock_pbx_core: MagicMock
     ) -> None:
+        """
+        recording_id is the only input now.
+
+        audio_path used to be required, caller-supplied and unvalidated, which made this an
+        arbitrary file read. Analysis reads the stored transcript instead, so there is no path
+        to pass.
+        """
         with patch(AUTH_PATCH, return_value=AUTH_RETURN):
-            response = api_client.post(
+            response = api_client.post("/api/framework/recording-analytics/analyze", json={})
+
+        assert response.status_code == 400
+
+    def test_analyze_recording_ignores_a_supplied_path(
+        self, api_client: FlaskClient, mock_pbx_core: MagicMock
+    ) -> None:
+        """An old client still sending audio_path must not get it read."""
+        with (
+            patch(AUTH_PATCH, return_value=AUTH_RETURN),
+            patch("pbx.features.call_recording_analytics.get_recording_analytics") as mock_ra,
+        ):
+            mock_ra.return_value.analyze_recording.return_value = {"status": "complete"}
+            api_client.post(
                 "/api/framework/recording-analytics/analyze",
-                json={"recording_id": "r1"},
+                json={"recording_id": "r1", "audio_path": "/etc/passwd"},
             )
-            assert response.status_code == 400
+
+        args, kwargs = mock_ra.return_value.analyze_recording.call_args
+        assert "/etc/passwd" not in args
+        assert "/etc/passwd" not in kwargs.values()
 
     def test_search_recordings(self, api_client: FlaskClient, mock_pbx_core: MagicMock) -> None:
         with (

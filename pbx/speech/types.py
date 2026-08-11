@@ -40,6 +40,11 @@ class Segment:
     end: float = 0.0
     confidence: float | None = None
     words: tuple[Word, ...] = ()
+    #: Who said it. Empty when unknown, which is every single-source transcript -- voicemail
+    #: has one speaker by definition, and a mixed recording cannot tell them apart. Filled in
+    #: when a call is transcribed per channel, where the recording already separated the
+    #: participants and attribution costs nothing more than carrying the label through.
+    speaker: str = ""
 
 
 @dataclass(frozen=True, slots=True)

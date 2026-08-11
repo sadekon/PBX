@@ -3,6 +3,7 @@ Call management and session handling
 """
 
 import threading
+import uuid
 from collections import deque
 from datetime import UTC, datetime
 from enum import Enum
@@ -38,6 +39,12 @@ class Call:
         self.call_id: str = call_id
         self.from_extension: str = from_extension
         self.to_extension: str = to_extension
+        # Identifies the *conversation*, which outlives any one leg. A call_id belongs to a
+        # single SIP dialog, and a transfer or a bridge replaces the dialog while the people
+        # keep talking -- so a recording or transcript keyed on call_id becomes several
+        # unrelated fragments. Legs that join an existing conversation adopt its session via
+        # join_session(); everything else starts its own.
+        self.session_id: str = str(uuid.uuid4())
         self.state: CallState = CallState.IDLE
         self.start_time: datetime | None = None
         self.answer_time: datetime | None = None
@@ -127,6 +134,16 @@ class Call:
     def ring(self) -> None:
         """set call state to ringing"""
         self.state = CallState.RINGING
+
+    def join_session(self, other: "Call") -> None:
+        """
+        Adopt `other`'s conversation, so both legs belong to one session.
+
+        Called wherever two legs are bridged or a transfer hands a caller onward. Without it
+        each leg keeps the id it was born with, and one conversation ends up as several
+        recordings and transcripts with nothing linking them.
+        """
+        self.session_id = other.session_id
 
     def connect(self) -> None:
         """Connect the call"""

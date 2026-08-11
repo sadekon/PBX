@@ -15,9 +15,18 @@ from flask import Blueprint, Response, request
 from pbx.api.utils import (
     get_pbx_core,
     get_request_body,
+    require_admin,
     require_auth,
     send_json,
+    validate_limit_param,
+    verify_authentication,
 )
+from pbx.features.retention_policies import (
+    SEED_POLICY_ID,
+    RetentionPolicy,
+    validate_match_rules,
+)
+from pbx.utils.audit_logger import get_audit_logger
 from pbx.utils.logger import get_logger
 
 logger = get_logger()
@@ -1060,7 +1069,10 @@ def update_inbound_route(route_id: int) -> tuple[Response, int]:
             data = get_request_body()
 
             destination_type = data.get("destination_type")
-            if destination_type is not None and destination_type not in _INBOUND_ROUTE_DESTINATION_TYPES:
+            if (
+                destination_type is not None
+                and destination_type not in _INBOUND_ROUTE_DESTINATION_TYPES
+            ):
                 return send_json(
                     {
                         "error": "destination_type must be one of: "
@@ -1083,9 +1095,7 @@ def update_inbound_route(route_id: int) -> tuple[Response, int]:
                 return send_json({"error": "Failed to update inbound route"}, 500), 500
 
             pbx_core.inbound_routing.reload_routes()
-            return send_json(
-                {"success": True, "message": f"Inbound route {route_id} updated"}
-            ), 200
+            return send_json({"success": True, "message": f"Inbound route {route_id} updated"}), 200
 
         except (KeyError, TypeError, ValueError) as e:
             logger.error(f"Error updating inbound route: {e}")
@@ -1109,9 +1119,7 @@ def delete_inbound_route(route_id: int) -> tuple[Response, int]:
                 return send_json({"error": "Failed to delete inbound route"}, 500), 500
 
             pbx_core.inbound_routing.reload_routes()
-            return send_json(
-                {"success": True, "message": f"Inbound route {route_id} removed"}
-            ), 200
+            return send_json({"success": True, "message": f"Inbound route {route_id} removed"}), 200
 
         except (KeyError, TypeError, ValueError) as e:
             logger.error(f"Error deleting inbound route: {e}")
@@ -1578,137 +1586,297 @@ def delete_time_routing_rule(rule_id: str) -> tuple[Response, int]:
 # ==========================================================================
 
 
+def _current_username() -> str:
+    """
+    Who is acting, for the audit trail. The session token identifies users by extension.
+
+    Falls back to "unknown" rather than raising: an unattributable hold is still better than
+    a hold that failed to be placed because the token lacked a display name.
+    """
+    _, payload = verify_authentication()
+    if not payload:
+        return "unknown"
+    return str(payload.get("name") or payload.get("extension") or "unknown")
+
+
+def _audit_hold(action: str, user: str, session_id: str, details: dict) -> None:
+    """
+    Record a hold change. Never raises into the request.
+
+    Holds exist to satisfy a legal obligation, so who placed or lifted one is the part that
+    makes the mechanism worth anything -- but a failing audit sink must not block the hold.
+    """
+    try:
+        get_audit_logger().log_action(
+            action=action,
+            user=user,
+            resource="retention_hold",
+            resource_id=session_id,
+            details=details,
+            ip_address=request.remote_addr,
+        )
+    except Exception as e:
+        logger.error(f"Could not audit {action} for session {session_id}: {e}")
+
+
 @features_bp.route("/api/recording-retention/policies", methods=["GET"])
-@require_auth
+@require_admin
 def get_retention_policies() -> tuple[Response, int]:
-    """Get all recording retention policies."""
+    """Get all retention policies, in the order the sweeper resolves them."""
     pbx_core = get_pbx_core()
-    if pbx_core and hasattr(pbx_core, "recording_retention"):
-        try:
-            policies = []
-            for (
-                policy_id,
-                policy,
-            ) in pbx_core.recording_retention.retention_policies.items():
-                # Sanitize output - don't expose sensitive paths
-                safe_policy = {
-                    "policy_id": policy_id,
-                    "name": policy.get("name", policy_id),
-                    "retention_days": policy.get("retention_days", 0),
-                    "tags": policy.get("tags", []),
-                    "created_at": None,
-                }
-
-                # Safely handle created_at datetime
-                created_at = policy.get("created_at")
-                if created_at and hasattr(created_at, "isoformat"):
-                    safe_policy["created_at"] = created_at.isoformat()
-
-                policies.append(safe_policy)
-
-            return send_json({"policies": policies, "count": len(policies)}), 200
-        except (KeyError, TypeError, ValueError) as e:
-            logger.error(f"Error getting retention policies: {e}")
-            return send_json({"error": "Error getting retention policies"}, 500), 500
-    else:
+    if not (pbx_core and hasattr(pbx_core, "recording_retention")):
         return send_json({"error": "Recording retention not initialized"}, 500), 500
+
+    try:
+        retention = pbx_core.recording_retention
+        policies = [
+            {
+                "policy_id": p.policy_id,
+                "name": p.name,
+                "description": p.description,
+                # Null means "inherit the fallback", which the UI has to render as such
+                # rather than as zero days.
+                "audio_days": p.audio_days,
+                "transcript_days": p.transcript_days,
+                "priority": p.priority,
+                "match_rules": p.match_rules,
+                "enabled": p.enabled,
+                "origin": p.origin,
+                "catch_all": p.is_catch_all,
+            }
+            for p in retention.policies.all()
+        ]
+        return send_json(
+            {
+                "policies": policies,
+                "count": len(policies),
+                "fallback_audio_days": retention.settings.audio_days,
+                "fallback_transcript_days": retention.settings.transcript_days,
+            }
+        ), 200
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error getting retention policies: {e}")
+        return send_json({"error": "Error getting retention policies"}, 500), 500
 
 
 @features_bp.route("/api/recording-retention/statistics", methods=["GET"])
-@require_auth
+@require_admin
 def get_retention_statistics() -> tuple[Response, int]:
-    """Get recording retention statistics."""
+    """Get retention statistics."""
     pbx_core = get_pbx_core()
-    if pbx_core and hasattr(pbx_core, "recording_retention"):
-        try:
-            stats = pbx_core.recording_retention.get_statistics()
-
-            # Transform to match frontend expectations
-            result = {
-                "total_policies": stats.get("policies", 0),
-                "total_recordings": stats.get("total_recordings", 0),
-                "deleted_count": stats.get("lifetime_deleted", 0),
-                "last_cleanup": stats.get("last_cleanup"),
-            }
-
-            return send_json(result), 200
-        except (KeyError, TypeError, ValueError) as e:
-            logger.error(f"Error getting retention statistics: {e}")
-            return send_json({"error": "Error getting retention statistics"}, 500), 500
-    else:
+    if not (pbx_core and hasattr(pbx_core, "recording_retention")):
         return send_json({"error": "Recording retention not initialized"}, 500), 500
+
+    try:
+        stats = pbx_core.recording_retention.statistics()
+        return send_json(
+            {
+                "total_policies": stats["policies"],
+                "total_recordings": stats["managed_recordings"],
+                "deleted_count": stats["lifetime_audio_deleted"],
+                "transcripts_deleted": stats["lifetime_transcripts_deleted"],
+                "last_cleanup": stats["last_sweep"],
+                "last_sweep_summary": stats["last_sweep_summary"],
+                "active_holds": stats["active_holds"],
+                # The UI must surface these two. Without them "0 deleted, never cleaned"
+                # reads as "retention is working and had nothing to do", when it usually
+                # means retention is disabled or still in report-only mode.
+                "enabled": stats["enabled"],
+                "dry_run": stats["dry_run"],
+                "fallback_audio_days": stats["fallback_audio_days"],
+                "fallback_transcript_days": stats["fallback_transcript_days"],
+            }
+        ), 200
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error getting retention statistics: {e}")
+        return send_json({"error": "Error getting retention statistics"}, 500), 500
 
 
 @features_bp.route("/api/recording-retention/policy", methods=["POST"])
-@require_auth
+@require_admin
 def add_retention_policy() -> tuple[Response, int]:
-    """Add a recording retention policy."""
+    """Create or update a retention policy."""
     pbx_core = get_pbx_core()
-    if pbx_core and hasattr(pbx_core, "recording_retention"):
-        try:
-            data = get_request_body()
-
-            # Validate required fields
-            required_fields = ["name", "retention_days"]
-            if not all(field in data for field in required_fields):
-                return send_json(
-                    {"error": "Missing required fields: name, retention_days"}, 400
-                ), 400
-
-            # Validate retention_days is a positive integer
-            try:
-                retention_days = int(data["retention_days"])
-                if retention_days < 1 or retention_days > 3650:  # Max 10 years
-                    return send_json(
-                        {"error": "retention_days must be between 1 and 3650"}, 400
-                    ), 400
-            except (ValueError, TypeError):
-                return send_json({"error": "retention_days must be a valid integer"}, 400), 400
-
-            # Sanitize name to prevent injection
-            if not re.match(r"^[a-zA-Z0-9_\-\s]+$", data["name"]):
-                return send_json({"error": "Policy name contains invalid characters"}, 400), 400
-
-            policy_id = pbx_core.recording_retention.add_policy(data)
-
-            if policy_id:
-                return send_json(
-                    {
-                        "success": True,
-                        "policy_id": policy_id,
-                        "message": f'Retention policy "{data["name"]}" added successfully',
-                    }
-                ), 200
-            return send_json({"error": "Failed to add retention policy"}, 500), 500
-
-        except json.JSONDecodeError:
-            return send_json({"error": "Invalid JSON"}, 400), 400
-        except (KeyError, TypeError, ValueError) as e:
-            logger.error(f"Error adding retention policy: {e}")
-            return send_json({"error": "Error adding retention policy"}, 500), 500
-    else:
+    if not (pbx_core and hasattr(pbx_core, "recording_retention")):
         return send_json({"error": "Recording retention not initialized"}, 500), 500
+
+    try:
+        data = get_request_body()
+
+        if "name" not in data:
+            return send_json({"error": "Missing required field: name"}, 400), 400
+
+        if not re.match(r"^[a-zA-Z0-9_\-\s]+$", str(data["name"])):
+            return send_json({"error": "Policy name contains invalid characters"}, 400), 400
+
+        # Both periods are optional and both may be null, meaning "inherit the fallback".
+        # A policy that only lengthens audio retention leaves transcript_days unset, and
+        # that must not be stored as zero.
+        periods: dict[str, int | None] = {}
+        for key in ("audio_days", "transcript_days"):
+            raw = data.get(key)
+            if raw is None or raw == "":
+                periods[key] = None
+                continue
+            try:
+                days = int(raw)
+            except (TypeError, ValueError):
+                return send_json({"error": f"{key} must be a valid integer"}, 400), 400
+            if days < 1 or days > 3650:
+                return send_json({"error": f"{key} must be between 1 and 3650"}, 400), 400
+            periods[key] = days
+
+        if periods["audio_days"] is None and periods["transcript_days"] is None:
+            return send_json(
+                {"error": "Set at least one of audio_days or transcript_days"}, 400
+            ), 400
+
+        rules = data.get("match_rules") or {}
+        problems = validate_match_rules(rules)
+        if problems:
+            return send_json({"error": "; ".join(problems)}, 400), 400
+
+        policy_id = str(data.get("policy_id") or data["name"]).strip()
+        if not re.match(r"^[a-zA-Z0-9_\-]+$", policy_id.replace(" ", "_")):
+            return send_json({"error": "policy_id contains invalid characters"}, 400), 400
+
+        policy_id = policy_id.replace(" ", "_").lower()
+        # Editing keeps whatever origin the row already had, so the seeded catch-all stays
+        # marked as config-seeded rather than being relabelled user-created on first edit.
+        existing = pbx_core.recording_retention.policies.get(policy_id)
+
+        policy = RetentionPolicy(
+            policy_id=policy_id,
+            name=str(data["name"]),
+            description=str(data.get("description") or ""),
+            audio_days=periods["audio_days"],
+            transcript_days=periods["transcript_days"],
+            priority=int(data.get("priority", 100)),
+            match_rules=rules,
+            enabled=bool(data.get("enabled", True)),
+            origin=existing.origin if existing else "api",
+        )
+
+        if not pbx_core.recording_retention.policies.save(policy):
+            return send_json({"error": "Failed to save retention policy"}, 500), 500
+
+        return send_json(
+            {
+                "success": True,
+                "policy_id": policy.policy_id,
+                "message": f'Retention policy "{policy.name}" saved',
+            }
+        ), 200
+
+    except json.JSONDecodeError:
+        return send_json({"error": "Invalid JSON"}, 400), 400
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error adding retention policy: {e}")
+        return send_json({"error": "Error adding retention policy"}, 500), 500
 
 
 @features_bp.route("/api/recording-retention/policy/<policy_id>", methods=["DELETE"])
-@require_auth
+@require_admin
 def delete_retention_policy(policy_id: str) -> tuple[Response, int]:
     """Delete a retention policy."""
     pbx_core = get_pbx_core()
-    if pbx_core and hasattr(pbx_core, "recording_retention"):
-        try:
-            if policy_id in pbx_core.recording_retention.retention_policies:
-                del pbx_core.recording_retention.retention_policies[policy_id]
-                return send_json(
-                    {"success": True, "message": f"Retention policy {policy_id} deleted"}
-                ), 200
-            return send_json({"error": "Policy not found"}, 404), 404
-
-        except Exception as e:
-            logger.error(f"Error deleting retention policy: {e}")
-            return send_json({"error": "Error deleting retention policy"}, 500), 500
-    else:
+    if not (pbx_core and hasattr(pbx_core, "recording_retention")):
         return send_json({"error": "Recording retention not initialized"}, 500), 500
+
+    if policy_id == SEED_POLICY_ID:
+        # It governs everything no other policy matches. Deleting it would silently hand that
+        # job back to config.yml, which this page never shows -- edit it instead.
+        return send_json(
+            {"error": "The default policy cannot be deleted. Edit its periods instead."}, 403
+        ), 403
+
+    try:
+        if pbx_core.recording_retention.policies.delete(policy_id):
+            return send_json(
+                {"success": True, "message": f"Retention policy {policy_id} deleted"}
+            ), 200
+        return send_json({"error": "Policy not found"}, 404), 404
+    except Exception as e:
+        logger.error(f"Error deleting retention policy: {e}")
+        return send_json({"error": "Error deleting retention policy"}, 500), 500
+
+
+@features_bp.route("/api/recording-retention/holds", methods=["GET"])
+@require_admin
+def get_retention_holds() -> tuple[Response, int]:
+    """List legal holds. Released ones are included only on request."""
+    pbx_core = get_pbx_core()
+    if not (pbx_core and hasattr(pbx_core, "recording_retention")):
+        return send_json({"error": "Recording retention not initialized"}, 500), 500
+
+    try:
+        include_released = request.args.get("include_released", "").lower() in ("1", "true")
+        holds = pbx_core.recording_retention.holds.list_holds(include_released)
+        return send_json({"holds": holds, "count": len(holds)}), 200
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error getting retention holds: {e}")
+        return send_json({"error": "Error getting retention holds"}, 500), 500
+
+
+@features_bp.route("/api/recording-retention/hold", methods=["POST"])
+@require_admin
+def place_retention_hold() -> tuple[Response, int]:
+    """
+    Put a call session beyond the reach of the sweeper until it is released.
+
+    A hold is not a long retention period: it suspends expiry entirely and has to be lifted
+    deliberately. Both the reason and the person are required, because a hold nobody can
+    explain is one nobody will ever dare release.
+    """
+    pbx_core = get_pbx_core()
+    if not (pbx_core and hasattr(pbx_core, "recording_retention")):
+        return send_json({"error": "Recording retention not initialized"}, 500), 500
+
+    try:
+        data = get_request_body()
+        session_id = str(data.get("session_id") or "").strip()
+        reason = str(data.get("reason") or "").strip()
+
+        if not session_id:
+            return send_json({"error": "Missing required field: session_id"}, 400), 400
+        if not reason:
+            return send_json({"error": "A hold requires a reason"}, 400), 400
+
+        placed_by = _current_username()
+        if not pbx_core.recording_retention.holds.place(session_id, reason, placed_by):
+            return send_json({"error": "Failed to place hold"}, 500), 500
+
+        _audit_hold("retention_hold_placed", placed_by, session_id, {"reason": reason})
+
+        return send_json({"success": True, "session_id": session_id, "placed_by": placed_by}), 200
+    except json.JSONDecodeError:
+        return send_json({"error": "Invalid JSON"}, 400), 400
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error placing retention hold: {e}")
+        return send_json({"error": "Error placing retention hold"}, 500), 500
+
+
+@features_bp.route("/api/recording-retention/hold/<session_id>", methods=["DELETE"])
+@require_admin
+def release_retention_hold(session_id: str) -> tuple[Response, int]:
+    """Release every active hold on a session. The rows are stamped, not deleted."""
+    pbx_core = get_pbx_core()
+    if not (pbx_core and hasattr(pbx_core, "recording_retention")):
+        return send_json({"error": "Recording retention not initialized"}, 500), 500
+
+    try:
+        released_by = _current_username()
+        if not pbx_core.recording_retention.holds.release(session_id, released_by):
+            return send_json({"error": "Failed to release hold"}, 500), 500
+
+        _audit_hold("retention_hold_released", released_by, session_id, {})
+
+        return send_json(
+            {"success": True, "session_id": session_id, "released_by": released_by}
+        ), 200
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error releasing retention hold: {e}")
+        return send_json({"error": "Error releasing retention hold"}, 500), 500
 
 
 # ==========================================================================
@@ -2310,42 +2478,58 @@ def test_push_notification() -> tuple[Response, int]:
 
 
 @features_bp.route("/api/recording-announcements/statistics", methods=["GET"])
-@require_auth
+@require_admin
 def get_announcement_statistics() -> tuple[Response, int]:
-    """Get recording announcements statistics."""
+    """
+    Statistics for the recording notice.
+
+    These used to come from a module whose playback path was unreachable, so the page showed
+    zeroes while a different system played the notices correctly. Both are the same object now.
+    """
     pbx_core = get_pbx_core()
-    if pbx_core and hasattr(pbx_core, "recording_announcements"):
-        try:
-            stats = {
-                "enabled": pbx_core.recording_announcements.enabled,
-                "announcements_played": pbx_core.recording_announcements.announcements_played,
-                "consent_accepted": pbx_core.recording_announcements.consent_accepted,
-                "consent_declined": pbx_core.recording_announcements.consent_declined,
-                "announcement_type": pbx_core.recording_announcements.announcement_type,
-                "require_consent": pbx_core.recording_announcements.require_consent,
+    if not (pbx_core and hasattr(pbx_core, "recording_announcements")):
+        return send_json({"error": "Recording announcements not initialized"}, 500), 500
+
+    try:
+        stats = pbx_core.recording_announcements.stats()
+        return send_json(
+            {
+                "enabled": stats["enabled"],
+                "announce_for": stats["announce_for"],
+                "announcements_played": stats["announced"],
+                # The number that matters: each failure discarded a recording, because notice
+                # is what makes keeping it lawful.
+                "announcements_failed": stats["failed"],
+                "audio_file": stats["audio_file"],
+                "audio_present": stats["audio_present"],
+                "text": stats["text"],
             }
-            return send_json(stats), 200
-        except Exception as e:
-            logger.error(f"Error getting announcement statistics: {e}")
-            return send_json({"error": "Error getting announcement statistics"}, 500), 500
-    else:
-        return send_json({"error": "Recording announcements not initialized"}, 500), 500
+        ), 200
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error getting announcement statistics: {e}")
+        return send_json({"error": "Error getting announcement statistics"}, 500), 500
 
 
-@features_bp.route("/api/recording-announcements/config", methods=["GET"])
-@require_auth
-def get_announcement_config() -> tuple[Response, int]:
-    """Get recording announcements configuration."""
+@features_bp.route("/api/recording-announcements/log", methods=["GET"])
+@require_admin
+def get_announcement_log() -> tuple[Response, int]:
+    """
+    The record that callers were told, newest first.
+
+    Kept indefinitely and not swept by retention: it is the evidence justifying a recording,
+    and a call expiring at 90 days must not take that with it.
+    """
     pbx_core = get_pbx_core()
-    if pbx_core and hasattr(pbx_core, "recording_announcements"):
-        try:
-            config = pbx_core.recording_announcements.get_announcement_config()
-            return send_json(config), 200
-        except Exception as e:
-            logger.error(f"Error getting announcement config: {e}")
-            return send_json({"error": "Error getting announcement config"}, 500), 500
-    else:
+    if not (pbx_core and hasattr(pbx_core, "recording_announcements")):
         return send_json({"error": "Recording announcements not initialized"}, 500), 500
+
+    try:
+        limit = validate_limit_param(default=50, max_value=500) or 50
+        notices = pbx_core.recording_announcements.recent(limit)
+        return send_json({"notices": notices, "count": len(notices)}), 200
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        logger.error(f"Error getting announcement log: {e}")
+        return send_json({"error": "Error getting announcement log"}, 500), 500
 
 
 # ==========================================================================

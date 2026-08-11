@@ -3,20 +3,13 @@ Call Recording Analytics
 AI analysis of recorded calls using FREE open-source libraries
 """
 
+import json
+import re
 from datetime import UTC, datetime
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 from pbx.utils.logger import get_logger
-
-# Import Vosk for FREE offline transcription (already integrated)
-try:
-    from vosk import Model
-
-    VOSK_AVAILABLE = True
-except ImportError:
-    VOSK_AVAILABLE = False
 
 # Import spaCy for NLP and sentiment analysis
 try:
@@ -38,6 +31,29 @@ class AnalysisType(Enum):
     TRANSCRIPT = "transcript"
 
 
+#: A dialogue line: ``[04:12] 1512 (overlapping): the words``.
+#:
+#: Both the timestamp and the speaker label are optional in the pattern but the timestamp
+#: anchors it, so a plain sentence that happens to contain a colon is never touched. The label
+#: is bounded because a long line with a mid-sentence colon should keep its first clause.
+_DIALOGUE_PREFIX = re.compile(r"^\[\d{1,2}:\d{2}(?::\d{2})?\]\s*(?:[^:\n]{0,40}:\s*)?")
+
+
+def spoken_text(transcript: str) -> str:
+    """
+    Strip the speaker and timestamp prefixes, leaving only what was said.
+
+    Transcripts are stored as formatted dialogue -- ``[04:12] 1512: ...`` -- because that is
+    what a person reads. Handing that to the analysers feeds them the furniture: the summary
+    picks sentences and can return "[04:12] 1512" as though it were content, sentiment counts
+    extension numbers toward its totals, and keyword matching scans timestamps.
+
+    Speaker labels are not lost information here. Nothing consults them -- ``agent_sentiment``
+    is hardcoded -- so there is nothing to preserve by keeping them in the text.
+    """
+    return "\n".join(_DIALOGUE_PREFIX.sub("", line) for line in transcript.splitlines()).strip()
+
+
 class RecordingAnalytics:
     """
     Call Recording Analytics
@@ -49,11 +65,9 @@ class RecordingAnalytics:
     - Compliance checking
     - Quality scoring
     - Automatic summarization (spaCy)
-    - Transcription (Vosk - already integrated)
     - Trend analysis
 
     Uses FREE open-source libraries:
-    - Vosk for offline transcription
     - spaCy for NLP and sentiment analysis
     - NLTK for text processing
 
@@ -63,14 +77,19 @@ class RecordingAnalytics:
     - Custom ML models (compliance, quality)
     """
 
-    def __init__(self, config: Any | None = None) -> None:
+    def __init__(self, config: Any | None = None, database: Any | None = None) -> None:
         """Initialize recording analytics"""
         self.logger = get_logger()
         self.config = config or {}
+        #: Where the transcript comes from. Analysis no longer transcribes anything: the
+        #: recording was already transcribed post-call by faster-whisper and stored, so
+        #: re-deriving it here would be slower, worse and redundant.
+        self.database = database
 
         # Configuration
-        analytics_config = self.config.get("features", {}).get("recording_analytics", {})
-        self.enabled = analytics_config.get("enabled", False)
+        # Under recording.* with the rest of the recording pipeline, not features.*: it is
+        # configuration for recordings, not a feature toggle.
+        analytics_config = self.config.get("recording", {}).get("analytics", {})
         self.auto_analyze = analytics_config.get("auto_analyze", False)
         self.analysis_types = analytics_config.get(
             "analysis_types", ["sentiment", "keywords", "summary"]
@@ -84,34 +103,16 @@ class RecordingAnalytics:
         self.analyses_by_type = {}
 
         # Initialize NLP models
-        self.vosk_model = None
         self.spacy_nlp = None
         self._initialize_models()
 
         self.logger.info("Call recording analytics initialized")
         self.logger.info(f"  Auto-analyze: {self.auto_analyze}")
         self.logger.info(f"  Analysis types: {', '.join(self.analysis_types)}")
-        self.logger.info(f"  Vosk available: {VOSK_AVAILABLE}")
         self.logger.info(f"  spaCy available: {SPACY_AVAILABLE}")
-        self.logger.info(f"  Enabled: {self.enabled}")
 
     def _initialize_models(self) -> None:
         """Initialize NLP models for analysis"""
-        # Initialize Vosk for transcription
-        if VOSK_AVAILABLE:
-            try:
-                model_path = (
-                    self.config.get("voicemail", {})
-                    .get("transcription", {})
-                    .get("vosk_model_path", "/opt/vosk-model-small-en-us-0.15")
-                )
-                if Path(model_path).exists():
-                    self.vosk_model = Model(model_path)
-                    self.logger.info(f"Vosk model loaded from {model_path}")
-                else:
-                    self.logger.warning(f"Vosk model not found at {model_path}")
-            except (KeyError, OSError, TypeError, ValueError) as e:
-                self.logger.warning(f"Could not load Vosk model: {e}")
 
         # Initialize spaCy for NLP
         if SPACY_AVAILABLE:
@@ -122,47 +123,66 @@ class RecordingAnalytics:
                 self.logger.warning(f"Could not load spaCy model: {e}")
                 self.logger.info("Download with: python -m spacy download en_core_web_sm")
 
-    def analyze_recording(
-        self, recording_id: str, audio_path: str, analysis_types: list[str] | None = None
-    ) -> dict:
+    def analyze_recording(self, recording_id: str, analysis_types: list[str] | None = None) -> dict:
         """
-        Analyze a call recording
+        Analyze a call recording from its stored transcript.
 
         Args:
             recording_id: Recording identifier
-            audio_path: Path to audio file
             analysis_types: Types of analysis to perform
 
         Returns:
             dict: Analysis results
+
+        This used to take an ``audio_path`` and transcribe it once per analysis type -- three
+        times for the default set, six if all were requested -- reloading the Vosk model on
+        every one, synchronously inside the request. Each pass produced the same text from the
+        same bytes.
+
+        None of it was necessary. Post-call transcription already ran faster-whisper over this
+        recording and stored the result, so analysis reads that: one query instead of N model
+        loads, better text than Vosk produced, and no audio file touched. Taking a recording id
+        rather than a caller-supplied path also closes the arbitrary file read that came with it.
         """
         analysis_types = analysis_types or self.analysis_types
 
-        results = {
+        results: dict[str, Any] = {
             "recording_id": recording_id,
             "analyzed_at": datetime.now(UTC).isoformat(),
             "analyses": {},
         }
 
-        # Perform each type of analysis
+        row = self._transcript_row(recording_id)
+        stored = None if row is None else str(row.get("text") or "")
+        # The analysers get the words; the transcript analysis returns the
+        # dialogue as stored, which is the form a person wants to read.
+        transcript = None if stored is None else spoken_text(stored)
+        if transcript is None:
+            # Transcription runs after the call and is queued, so a recording that has just
+            # finished legitimately has no transcript yet. Saying so beats transcribing it
+            # again here and beats returning analyses of an empty string as though they meant
+            # something.
+            results["error"] = "no transcript stored for this recording yet"
+            return results
+
         for analysis_type in analysis_types:
             if analysis_type == "transcript":
-                results["analyses"]["transcript"] = self._transcribe(audio_path)
+                results["analyses"]["transcript"] = {"transcript": stored}
             elif analysis_type == "sentiment":
-                results["analyses"]["sentiment"] = self._analyze_sentiment(audio_path)
+                results["analyses"]["sentiment"] = self._analyze_sentiment(transcript)
             elif analysis_type == "keywords":
-                results["analyses"]["keywords"] = self._detect_keywords(audio_path)
+                results["analyses"]["keywords"] = self._detect_keywords(transcript)
             elif analysis_type == "compliance":
-                results["analyses"]["compliance"] = self._check_compliance(audio_path)
+                results["analyses"]["compliance"] = self._check_compliance(transcript)
             elif analysis_type == "quality":
-                results["analyses"]["quality"] = self._score_quality(audio_path)
+                results["analyses"]["quality"] = self._score_quality(transcript)
             elif analysis_type == "summary":
-                results["analyses"]["summary"] = self._summarize(audio_path)
+                results["analyses"]["summary"] = self._summarize(transcript)
 
-            # Track statistics
             self.analyses_by_type[analysis_type] = self.analyses_by_type.get(analysis_type, 0) + 1
 
         self.analyses[recording_id] = results
+        self._persist(row.get("id"), recording_id, results)
         self.total_analyses += 1
 
         self.logger.info(f"Analyzed recording {recording_id}")
@@ -170,140 +190,141 @@ class RecordingAnalytics:
 
         return results
 
-    def _load_vosk_model(self) -> None:
-        """Load Vosk speech recognition model"""
-        from vosk import Model
+    def _persist(self, transcript_id: Any, recording_id: str, results: dict[str, Any]) -> None:
+        """
+        Store the whole analysis, not just its summary.
 
-        model_path = "models/vosk-model-small-en-us-0.15"
+        Results used to live only in ``self.analyses`` on a module-level singleton, so a
+        restart emptied them and ``search_recordings`` could only ever see calls analysed since
+        boot. Keywords and quality are stored too, because those are what search filters on.
+
+        Never raises: an analysis that could not be stored is still worth returning.
+        """
+        if not (self.database and getattr(self.database, "enabled", False)):
+            return
+        if transcript_id is None:
+            return
+
+        analyses = results.get("analyses", {})
+        sentiment = analyses.get("sentiment") or {}
+        summary = analyses.get("summary") or {}
+        quality = analyses.get("quality") or {}
 
         try:
-            if Path(model_path).exists():
-                return Model(model_path)
-            self.logger.warning(f"Vosk model not found at {model_path}")
-            self.logger.info("Download from: https://alphacephei.com/vosk/models")
-        except OSError as e:
-            self.logger.warning(f"Could not load Vosk model: {e}")
+            self.database.execute(
+                """
+                INSERT INTO recording_analyses (
+                    transcript_id, recording_id, summary, sentiment, sentiment_score,
+                    keywords, compliance, quality, analysis_types, quality_score
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    transcript_id,
+                    recording_id,
+                    summary.get("summary") if isinstance(summary, dict) else None,
+                    sentiment.get("overall_sentiment"),
+                    sentiment.get("sentiment_score"),
+                    json.dumps(analyses.get("keywords")) if "keywords" in analyses else None,
+                    json.dumps(analyses.get("compliance")) if "compliance" in analyses else None,
+                    json.dumps(quality) if quality else None,
+                    json.dumps(sorted(analyses)),
+                    quality.get("overall_score") if isinstance(quality, dict) else None,
+                ),
+            )
+        except Exception as e:
+            self.logger.error(f"Could not store analysis for transcript {transcript_id}: {e}")
 
-        return None
-
-    def _process_vosk_audio(self, recognizer: Any, wf: Any) -> str:
-        """Process audio file with Vosk recognizer"""
-        import json
-
-        full_transcript = []
-        all_words = []
-        total_confidence = 0.0
-        confidence_count = 0
-
-        while True:
-            data = wf.readframes(4000)
-            if len(data) == 0:
-                break
-
-            if recognizer.AcceptWaveform(data):
-                result = json.loads(recognizer.Result())
-                if result.get("text"):
-                    full_transcript.append(result["text"])
-                    if "result" in result:
-                        all_words.extend(result["result"])
-                        for word in result["result"]:
-                            if "conf" in word:
-                                total_confidence += word["conf"]
-                                confidence_count += 1
-
-        # Get final result
-        final_result = json.loads(recognizer.FinalResult())
-        if final_result.get("text"):
-            full_transcript.append(final_result["text"])
-            if "result" in final_result:
-                all_words.extend(final_result["result"])
-                for word in final_result["result"]:
-                    if "conf" in word:
-                        total_confidence += word["conf"]
-                        confidence_count += 1
-
-        return full_transcript, all_words, total_confidence, confidence_count
-
-    def _transcribe(self, audio_path: str) -> dict:
+    def stored_analyses(self, limit: int = 200) -> list[dict[str, Any]]:
         """
-        Transcribe audio to text using Vosk (offline speech-to-text)
+        Every stored analysis, newest first, shaped like the in-memory results.
 
-        Args:
-            audio_path: Path to audio file (WAV format, 16kHz recommended)
-
-        Returns:
-            dict: Transcription results with transcript, confidence, duration, words
+        This is what makes search and trends survive a restart: they read here rather than
+        from a dict that only ever held what this process analysed.
         """
+        if not (self.database and getattr(self.database, "enabled", False)):
+            return []
+
         try:
-            # Try to use Vosk for offline transcription (already in requirements.txt)
-            import wave
+            rows = self.database.fetch_all(
+                "SELECT id, transcript_id, recording_id, summary, sentiment, sentiment_score, "
+                "keywords, compliance, quality, analysis_types, quality_score, analyzed_at "
+                f"FROM recording_analyses ORDER BY analyzed_at DESC LIMIT {int(limit)}"
+            )
+        except Exception as e:
+            self.logger.error(f"Could not read stored analyses: {e}")
+            return []
 
-            from vosk import KaldiRecognizer
+        return [self._row_to_result(row) for row in rows or []]
 
-            # Try to get Vosk model
-            vosk_model = self._load_vosk_model()
+    @staticmethod
+    def _row_to_result(row: dict[str, Any]) -> dict[str, Any]:
+        """Turn a stored row back into the nested shape callers already expect."""
 
-            if not vosk_model:
-                # Return empty result if model not available
-                return {
-                    "transcript": "",
-                    "confidence": 0.0,
-                    "duration": 0,
-                    "words": [],
-                    "error": "Vosk model not available",
-                }
+        def decode(value: Any) -> Any:
+            if isinstance(value, str):
+                try:
+                    return json.loads(value)
+                except (TypeError, ValueError):
+                    return None
+            return value
 
-            # Open audio file with context manager for proper cleanup
-            with wave.open(audio_path, "rb") as wf:
-                sample_rate = wf.getframerate()
-
-                # Create recognizer
-                rec = KaldiRecognizer(vosk_model, sample_rate)
-                rec.SetWords(True)
-
-                # Process audio
-                full_transcript, all_words, total_confidence, confidence_count = (
-                    self._process_vosk_audio(rec, wf)
-                )
-
-                # Get duration from wave file before closing
-                duration = wf.getnframes() / sample_rate if sample_rate > 0 else 0
-
-            # Calculate average confidence
-            avg_confidence = total_confidence / confidence_count if confidence_count > 0 else 0.0
-
-            return {
-                "transcript": " ".join(full_transcript),
-                "confidence": avg_confidence,
-                "duration": duration,
-                "words": all_words,
+        analyses: dict[str, Any] = {}
+        if row.get("sentiment"):
+            analyses["sentiment"] = {
+                "overall_sentiment": row.get("sentiment"),
+                "sentiment_score": row.get("sentiment_score"),
             }
+        if row.get("summary"):
+            analyses["summary"] = {"summary": row.get("summary")}
+        for column in ("keywords", "compliance", "quality"):
+            decoded = decode(row.get(column))
+            if decoded is not None:
+                analyses[column] = decoded
 
-        except ImportError:
-            self.logger.warning("Vosk not available. Install with: pip install vosk")
-            return {
-                "transcript": "",
-                "confidence": 0.0,
-                "duration": 0,
-                "words": [],
-                "error": "Vosk not installed",
-            }
-        except OSError as e:
-            self.logger.error(f"Transcription error: {e}")
-            return {
-                "transcript": "",
-                "confidence": 0.0,
-                "duration": 0,
-                "words": [],
-                "error": str(e),
-            }
+        return {
+            "recording_id": row.get("recording_id"),
+            "transcript_id": row.get("transcript_id"),
+            "analyzed_at": row.get("analyzed_at"),
+            "analyses": analyses,
+        }
 
-    def _analyze_sentiment(self, audio_path: str) -> dict:
+    def _all_analyses(self) -> dict[str, dict]:
         """
-        Analyze call sentiment using spaCy and Vosk transcription
+        Everything analysed, stored first and falling back to memory.
+
+        Without a database the in-memory dict is all there is, which is what a test or a
+        database-less install has anyway.
+        """
+        stored = {
+            str(r["recording_id"]): r for r in self.stored_analyses() if r.get("recording_id")
+        }
+        merged = dict(self.analyses)
+        merged.update(stored)
+        return merged
+
+    def _transcript_row(self, recording_id: str) -> dict[str, Any] | None:
+        """
+        The transcript row for this recording, or None if there is not one yet.
+
+        Read once and reused for both the text and the id the analysis is stored against --
+        fetching it twice was the kind of thing this whole change exists to stop doing.
+
+        Newest first: re-transcribing with a better model appends a row rather than replacing
+        the old one, so the most recent is the best available.
+        """
+        if not (self.database and getattr(self.database, "enabled", False)):
+            return None
+
+        from pbx.speech.store import TranscriptStore
+
+        rows = TranscriptStore(self.database, self.logger).for_recording(recording_id, limit=1)
+        return rows[0] if rows else None
+
+    def _analyze_sentiment(self, transcript: str) -> dict:
+        """
+        Analyze call sentiment from the stored transcript
 
         Uses FREE open-source tools:
-        - Vosk for transcription
         - spaCy for NLP and sentiment analysis
 
         Can also integrate with:
@@ -312,16 +333,11 @@ class RecordingAnalytics:
         - Custom ML sentiment models
 
         Args:
-            audio_path: Path to audio file
+            transcript: The call's stored transcript
 
         Returns:
             dict: Sentiment analysis results
         """
-        # First, get the transcript using Vosk
-        transcript = ""
-        if self.vosk_model:
-            transcript_result = self._transcribe(audio_path)
-            transcript = transcript_result.get("transcript", "")
 
         # Sentiment keywords for fallback
         positive_words = {
@@ -427,7 +443,7 @@ class RecordingAnalytics:
             "sentiment_timeline": [],
         }
 
-    def _detect_keywords(self, audio_path: str) -> dict:
+    def _detect_keywords(self, transcript: str) -> dict:
         """
         Detect important keywords and topics
 
@@ -437,14 +453,12 @@ class RecordingAnalytics:
         - Custom domain-specific keyword models
 
         Args:
-            audio_path: Path to audio file
+            transcript: The call's stored transcript
 
         Returns:
             dict: Detected keywords and topics
         """
         # Transcribe audio to get text for keyword analysis
-        transcript_result = self._transcribe(audio_path)
-        transcript = transcript_result.get("transcript", "")
 
         # Keyword categories
         competitor_keywords = ["competitor", "alternative", "other company", "switch"]
@@ -496,7 +510,7 @@ class RecordingAnalytics:
             "issue_keywords": issue_keywords_found,
         }
 
-    def _check_compliance(self, audio_path: str) -> dict:
+    def _check_compliance(self, transcript: str) -> dict:
         """
         Check compliance requirements
 
@@ -506,14 +520,12 @@ class RecordingAnalytics:
         - Regulatory compliance databases
 
         Args:
-            audio_path: Path to audio file
+            transcript: The call's stored transcript
 
         Returns:
             dict: Compliance check results
         """
         # Transcribe audio to get text for compliance checking
-        transcript_result = self._transcribe(audio_path)
-        transcript = transcript_result.get("transcript", "")
 
         # Compliance requirements
         required_phrases = [
@@ -564,7 +576,7 @@ class RecordingAnalytics:
             "prohibited_phrases_found": prohibited_found,
         }
 
-    def _score_quality(self, audio_path: str) -> dict:
+    def _score_quality(self, transcript: str) -> dict:
         """
         Score call quality based on multiple factors
 
@@ -574,14 +586,12 @@ class RecordingAnalytics:
         - Customer satisfaction prediction models
 
         Args:
-            audio_path: Path to audio file
+            transcript: The call's stored transcript
 
         Returns:
             dict: Quality scores
         """
         # Transcribe audio to get text for quality scoring
-        transcript_result = self._transcribe(audio_path)
-        transcript = transcript_result.get("transcript", "")
 
         # Quality indicators
         positive_indicators = [
@@ -673,7 +683,7 @@ class RecordingAnalytics:
             "professionalism": round(professionalism, 2),
         }
 
-    def _summarize(self, audio_path: str) -> dict:
+    def _summarize(self, transcript: str) -> dict:
         """
         Generate call summary using extractive summarization
 
@@ -683,14 +693,12 @@ class RecordingAnalytics:
         - Custom domain-specific summarization models
 
         Args:
-            audio_path: Path to audio file
+            transcript: The call's stored transcript
 
         Returns:
             dict: Call summary with key points and action items
         """
         # Transcribe audio to get text for summarization
-        transcript_result = self._transcribe(audio_path)
-        transcript = transcript_result.get("transcript", "")
 
         summary = ""
         key_points = []
@@ -774,7 +782,7 @@ class RecordingAnalytics:
         """
         matching = []
 
-        for recording_id, analysis in self.analyses.items():
+        for recording_id, analysis in self._all_analyses().items():
             match = True
 
             # Check sentiment criteria
@@ -818,12 +826,12 @@ class RecordingAnalytics:
         Returns:
             dict | None: Analysis results or None if not found
         """
-        return self.analyses.get(recording_id)
+        return self._all_analyses().get(recording_id)
 
     def _filter_analyses_by_date(self, start_date: datetime, end_date: datetime) -> list:
         """Filter analyses by date range"""
         filtered_analyses = []
-        for recording_id, analysis in self.analyses.items():
+        for recording_id, analysis in self._all_analyses().items():
             try:
                 analyzed_at = datetime.fromisoformat(analysis["analyzed_at"])
                 if start_date <= analyzed_at <= end_date:
@@ -933,7 +941,6 @@ class RecordingAnalytics:
     def get_statistics(self) -> dict:
         """Get analytics statistics"""
         return {
-            "enabled": self.enabled,
             "auto_analyze": self.auto_analyze,
             "total_analyses": self.total_analyses,
             "analyses_by_type": self.analyses_by_type,
@@ -945,9 +952,11 @@ class RecordingAnalytics:
 _recording_analytics = None
 
 
-def get_recording_analytics(config: Any | None = None) -> RecordingAnalytics:
+def get_recording_analytics(
+    config: Any | None = None, database: Any | None = None
+) -> RecordingAnalytics:
     """Get or create recording analytics instance"""
     global _recording_analytics
     if _recording_analytics is None:
-        _recording_analytics = RecordingAnalytics(config)
+        _recording_analytics = RecordingAnalytics(config, database)
     return _recording_analytics

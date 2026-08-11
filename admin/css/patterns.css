@@ -1,0 +1,361 @@
+/* ==========================================================================
+   patterns.css — shared UI vocabulary
+
+   The reusable half of the admin interface: pills, ghost buttons, labelled
+   stats, filter bars, card shells, empty states. Page stylesheets compose
+   these; nothing here knows about a queue, a recording or an extension.
+
+   WHY THIS FILE EXISTS
+   The call recordings page was built by borrowing the call queues page's
+   classes (.queue-card, .qch-stat, .en-pill, .qbtn). That worked, but it left
+   two pages sharing selectors named after only one of them, and a third page
+   would have had to borrow from a page it has nothing to do with. These are
+   the same rules under names that do not presuppose the caller.
+
+   MIGRATION STATUS
+   Deliberately additive. The queue-named originals in admin.css are still
+   there, untouched, and the queues page still uses them — so this file
+   duplicates a handful of rules on purpose. Migrating those pages onto these
+   names, and deleting the originals, is a separate change. Until then:
+
+       new pages          -> use these
+       queues / others    -> leave on the old names until migrated
+
+   CONVENTIONS
+   - Colours come from variables.css. No hardcoded hex except where a value is
+     genuinely semantic and has no token (see the status colours below).
+   - Modifiers read as `.block-modifier`, matching the existing house style
+     (.btn-primary, .btn-sm) rather than BEM.
+   - Nothing here sets margins on its outer edge; spacing belongs to the
+     layout that places it.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   Card stack — a vertical list of cards.
+
+   A list of cards rather than a table whenever the rows carry attributes that
+   would make no sense as shared columns.
+   -------------------------------------------------------------------------- */
+
+.card-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.card-shell {
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-bg-card);
+    overflow: hidden;
+}
+
+/* One-line header: identity, state, stats, actions. Wraps on narrow viewports
+   rather than truncating, since every part of it is load-bearing. */
+.card-head {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 11px 16px;
+    background: var(--color-bg-hover);
+    border-bottom: 1px solid var(--color-border);
+    flex-wrap: wrap;
+}
+
+/* Collapsed cards keep their header and drop the body as one unit. */
+.card-body {
+    padding: 4px 0 10px;
+}
+
+.card-body.collapsed {
+    display: none;
+}
+
+/* The clickable identity region of a card header. */
+.card-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.98rem;
+    white-space: nowrap;
+    flex-shrink: 0;
+    cursor: pointer;
+    user-select: none;
+}
+
+.card-title:focus-visible {
+    outline: 2px solid var(--color-border-medium);
+    outline-offset: 2px;
+    border-radius: 4px;
+}
+
+.card-chevron {
+    display: inline-block;
+    color: var(--color-text-secondary);
+    font-size: 0.75rem;
+    transition: transform 0.15s ease;
+    width: 1em;
+    text-align: center;
+}
+
+.card-chevron.open {
+    transform: rotate(90deg);
+}
+
+.card-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+/* --------------------------------------------------------------------------
+   Labelled stats — a small key over/beside its value.
+
+   For attributes that belong to one record. Table columns are the wrong shape
+   for these: they only mean something for the row they sit on.
+   -------------------------------------------------------------------------- */
+
+.meta-stats {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-left: 4px;
+}
+
+.meta-stat {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    white-space: nowrap;
+}
+
+.meta-stat .k {
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-secondary);
+    font-weight: 600;
+}
+
+/* Tabular figures so durations and times line up down a list of cards. */
+.meta-stat .v {
+    font-size: 0.86rem;
+    color: var(--color-text);
+    font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------------------------
+   Pills — a short state label.
+
+   Reserve these for states worth interrupting a scan for. A pill on every row
+   saying the same thing is noise: if a state is the norm, say nothing and let
+   the exceptions carry a pill.
+   -------------------------------------------------------------------------- */
+
+.pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 2px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--color-border);
+    flex-shrink: 0;
+}
+
+.pill .pill-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+/* Semantic status colours. Kept as literals because there are no tokens for
+   them, and they must read the same in light and dark. */
+.pill-ok {
+    color: #22c55e;
+}
+
+.pill-warn {
+    color: #d97706;
+}
+
+.pill-danger {
+    color: #ef4444;
+}
+
+.pill-muted {
+    color: var(--color-text-secondary);
+}
+
+.pill-info {
+    color: #3b9dd6;
+    border-color: rgba(59, 157, 214, 0.4);
+    background: rgba(59, 157, 214, 0.08);
+}
+
+/* --------------------------------------------------------------------------
+   Ghost buttons — flat, quiet row-level actions.
+
+   Scoped away from the global .btn (gradients, weight) so a card header does
+   not read as a row of calls to action.
+   -------------------------------------------------------------------------- */
+
+.btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    padding: 5px 11px;
+    border-radius: 7px;
+    border: 1px solid var(--color-border);
+    background: transparent;
+    color: var(--color-text-secondary);
+    cursor: pointer;
+    transition:
+        background 0.12s ease,
+        color 0.12s ease,
+        border-color 0.12s ease;
+}
+
+.btn-ghost:hover {
+    background: var(--color-bg-hover);
+    color: var(--color-text);
+    border-color: var(--color-text-secondary);
+}
+
+.btn-ghost:focus-visible {
+    outline: 2px solid var(--color-border-medium);
+    outline-offset: 2px;
+}
+
+.btn-ghost .icon {
+    width: 15px;
+    height: 15px;
+}
+
+/* Destructive actions stay quiet until hover, so a list of rows is not a wall
+   of red. */
+.btn-ghost-danger:hover {
+    color: #ef4444;
+    border-color: rgba(239, 68, 68, 0.45);
+    background: rgba(239, 68, 68, 0.1);
+}
+
+/* --------------------------------------------------------------------------
+   Filter bar — the controls above a list.
+   -------------------------------------------------------------------------- */
+
+/* The `hidden` attribute only wins against a UA stylesheet. Any component here that
+   sets its own display -- .btn-ghost, .pill, .filter-check are all inline-flex --
+   silently overrides it, so `el.hidden = true` does nothing and the element stays on
+   screen. Restated as an author rule so hiding works on all of them. */
+[hidden] {
+    display: none !important;
+}
+
+.filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+}
+
+/* A label, its control and that control's own affordances travel as one unit.
+   Without this they are separate flex children, and a narrow viewport wraps a
+   field's Clear button onto the next line, detached from the input it clears. */
+.filter-field {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: nowrap;
+}
+
+.filter-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-secondary);
+    font-weight: 600;
+}
+
+.filter-bar input[type="text"],
+.filter-bar input[type="search"] {
+    min-width: 220px;
+    padding: 6px 10px;
+    border: 1px solid var(--color-border);
+    border-radius: 7px;
+    background: var(--color-bg-card);
+    color: var(--color-text);
+    font-size: 0.86rem;
+}
+
+.filter-bar input[type="text"]:focus,
+.filter-bar input[type="search"]:focus {
+    outline: none;
+    border-color: var(--color-border-medium);
+}
+
+/* A checkbox reads as a sentence, so it keeps sentence case and normal weight
+   rather than the uppercase treatment .filter-label uses. */
+.filter-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    font-size: 0.86rem;
+    color: var(--color-text);
+}
+
+/* Result count and similar. Pushed to the far end of the bar. */
+.filter-summary {
+    margin-left: auto;
+    font-size: 0.82rem;
+    color: var(--color-text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------------------------
+   List states and grouping
+   -------------------------------------------------------------------------- */
+
+.list-empty,
+.list-loading {
+    color: var(--color-text-secondary);
+    padding: 24px;
+    text-align: center;
+}
+
+/* Separator above a run of cards belonging together — a date, a status, a
+   category. Sits in the flow of a .card-stack. */
+.group-label {
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-secondary);
+    font-weight: 600;
+    padding-top: 6px;
+}
+
+.group-label:first-child {
+    padding-top: 0;
+}
+
+/* "Load more" and similar, centred under a list. */
+.list-more {
+    display: flex;
+    justify-content: center;
+    padding: 16px 0 4px;
+}
+
+/* Quiet supporting text inside a card body. */
+.muted-note {
+    font-size: 0.86rem;
+    color: var(--color-text-secondary);
+    padding: 4px 0 10px;
+}

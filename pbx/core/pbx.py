@@ -54,8 +54,7 @@ if TYPE_CHECKING:
     from pbx.features.phone_book import PhoneBook
     from pbx.features.phone_provisioning import PhoneProvisioning
     from pbx.features.presence import PresenceSystem
-    from pbx.features.recording_announcements import RecordingAnnouncements
-    from pbx.features.recording_retention import RecordingRetentionManager
+    from pbx.features.recording_consent import ConsentAnnouncer
     from pbx.features.retention import RetentionSweeper
     from pbx.features.session_border_controller import SessionBorderController
     from pbx.features.sip_trunk import SIPTrunkSystem
@@ -110,12 +109,15 @@ class PBXCore:
     hot_desking: HotDeskingSystem | None
     find_me_follow_me: FindMeFollowMe
     time_based_routing: TimeBasedRouting
-    recording_retention: RecordingRetentionManager
+    # Same object as retention_sweeper. The retention API and admin UI address it under
+    # this name, which used to be a separate policy manager that never deleted anything.
+    recording_retention: RetentionSweeper
     retention_sweeper: RetentionSweeper
     fraud_detection: FraudDetectionSystem
     callback_queue: CallbackQueue
     mobile_push: MobilePushNotifications
-    recording_announcements: RecordingAnnouncements
+    # Same object as consent_announcer; the admin page addresses it under this name.
+    recording_announcements: ConsentAnnouncer
     mfa_manager: MFAManager | None
     threat_detector: ThreatDetector | None
     security_monitor: SecurityMonitor

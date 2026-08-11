@@ -18,6 +18,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Final
 
+from pbx.utils.audio import SILENCE_RMS_FLOOR
+
 __all__ = ["TranscriptionSettings"]
 
 #: Config section this reads. One place, so the eventual move to a top-level key is one edit.
@@ -138,6 +140,47 @@ class TranscriptionSettings:
     #: Silero VAD, which drops non-speech before the decoder sees it. Turning this off invites
     #: confident hallucinated sentences on every silent voicemail -- see backends/whisper.py.
     whisper_vad_filter: bool = True
+    #: Silence, in milliseconds, that Silero must see before it ends a speech chunk.
+    #:
+    #: faster-whisper defaults this to 2000 ms, which is far too coarse once a call is
+    #: transcribed one channel per participant. The silence being stripped from your channel
+    #: is exactly the time the other person was speaking, so two remarks either side of their
+    #: turn arrive at the decoder adjacent, and whisper -- seeing continuous speech with no
+    #: acoustic reason to break -- emits them as a single segment. The result reads as one
+    #: uninterrupted sentence spanning somebody else's entire turn.
+    #:
+    #: Shorter means more chunks, which means whisper transcribes each separately and the
+    #: boundaries survive. 500 ms is below a conversational turn gap and above the pauses
+    #: inside ordinary speech.
+    whisper_vad_min_silence_ms: int = 500
+    #: How sure Silero must be that a frame is speech, 0.0 to 1.0.
+    #:
+    #: Note this is a *probability* from a small neural net, not an energy threshold -- Silero
+    #: has no power knob. Lower admits quieter or noisier speech at the cost of transcribing
+    #: more non-speech; higher is stricter and starts clipping soft talkers. faster-whisper
+    #: defaults to 0.5, which is a sensible middle for telephone audio.
+    #:
+    #: For a genuine power threshold, see `silence_rms_floor` -- that one gates whole channels
+    #: before any model runs, and is plain RMS.
+    whisper_vad_threshold: float = 0.5
+    #: Milliseconds of audio kept either side of a detected speech chunk.
+    #:
+    #: **Must stay below half of `whisper_vad_min_silence_ms`.** Padding is applied to both
+    #: ends and overlapping chunks are then merged, so a gap shorter than twice this value is
+    #: padded shut and the chunks rejoin -- detecting a boundary and then erasing it.
+    #: faster-whisper defaults to 400, which silently undoes any silence threshold under
+    #: 800 ms.
+    #:
+    #: Below that ceiling, higher is safer: cutting close to the speech clips leading
+    #: consonants, and a clipped onset is how "seven" becomes "eleven".
+    whisper_vad_speech_pad_ms: int = 200
+    #: RMS below which a 20 ms frame counts as silence when deciding whether a recording
+    #: channel is worth transcribing at all. A real power threshold, unlike the VAD one above.
+    #:
+    #: G.711 idle and comfort noise sit under 100; telephone speech runs in the low thousands.
+    #: Raise it if silent channels are still being transcribed; lower it if a quiet talker's
+    #: channel is being skipped entirely. See pbx/utils/audio.active_speech_seconds.
+    silence_rms_floor: float = SILENCE_RMS_FLOOR
 
     #: Worker threads. 0 means run inline on the caller's thread -- used by tests, and a
     #: legitimate production choice for a box that would rather block than queue.
@@ -187,6 +230,10 @@ class TranscriptionSettings:
             whisper_cpu_threads=_as_int(section.get("whisper_cpu_threads"), 1),
             whisper_beam_size=_as_int(section.get("whisper_beam_size"), 1),
             whisper_vad_filter=_as_bool(section.get("whisper_vad_filter"), True),
+            whisper_vad_min_silence_ms=_as_int(section.get("whisper_vad_min_silence_ms"), 500),
+            whisper_vad_threshold=_as_float(section.get("whisper_vad_threshold"), 0.5),
+            whisper_vad_speech_pad_ms=_as_int(section.get("whisper_vad_speech_pad_ms"), 200),
+            silence_rms_floor=_as_float(section.get("silence_rms_floor"), SILENCE_RMS_FLOOR),
             workers=workers,
             queue_size=_as_int(section.get("queue_size"), DEFAULT_QUEUE_SIZE),
             deadline_seconds=_as_float(section.get("deadline_seconds"), DEFAULT_DEADLINE_SECONDS),
@@ -256,6 +303,34 @@ class TranscriptionSettings:
                 problems.append(
                     f"{CONFIG_SECTION}.whisper_cpu_threads {self.whisper_cpu_threads} "
                     "must be positive"
+                )
+            # Out of range is not a crash -- Silero clamps -- so it would silently behave as
+            # 0 or 1 while the config claimed something sensible.
+            if not 0.0 <= self.whisper_vad_threshold <= 1.0:
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_vad_threshold {self.whisper_vad_threshold} "
+                    "must be between 0.0 and 1.0; it is a speech probability, not a level"
+                )
+            if self.whisper_vad_min_silence_ms < 0:
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_vad_min_silence_ms "
+                    f"{self.whisper_vad_min_silence_ms} must not be negative"
+                )
+            if self.whisper_vad_speech_pad_ms < 0:
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_vad_speech_pad_ms "
+                    f"{self.whisper_vad_speech_pad_ms} must not be negative"
+                )
+            # The silent failure this exists to catch: padding is added to both ends and
+            # overlapping chunks merge, so a gap under twice the padding is closed again and
+            # the silence threshold does nothing.
+            if self.whisper_vad_speech_pad_ms * 2 >= self.whisper_vad_min_silence_ms > 0:
+                problems.append(
+                    f"{CONFIG_SECTION}.whisper_vad_speech_pad_ms "
+                    f"({self.whisper_vad_speech_pad_ms}ms) is at least half of "
+                    f"whisper_vad_min_silence_ms ({self.whisper_vad_min_silence_ms}ms), so "
+                    "padding closes every gap the silence threshold finds and speech chunks "
+                    "never split"
                 )
             if self.whisper_beam_size <= 0:
                 problems.append(

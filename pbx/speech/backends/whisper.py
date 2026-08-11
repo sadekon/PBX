@@ -271,7 +271,11 @@ class WhisperBackend:
 
         samples = np.frombuffer(pcm16, dtype="<i2").astype("float32") / PCM16_FULL_SCALE
 
-        raw_segments, _info = self.model.transcribe(
+        model = self.model
+        if model is None:  # pragma: no cover - `ready` is checked before every call
+            return []
+
+        raw_segments, _info = model.transcribe(
             samples,
             language=language,
             # beam_size=1 is greedy decoding. Beam search costs multiples of the runtime for a
@@ -282,6 +286,24 @@ class WhisperBackend:
             # about; condition_on_previous_text=False stops one hallucination from seeding the
             # next, which is what produces the infamous repetition loops.
             vad_filter=self.settings.whisper_vad_filter,
+            # How Silero is allowed to cut. The default 2000 ms is too coarse for per-channel
+            # call audio: the silence stripped from one participant's channel is the time the
+            # other was speaking, so remarks either side of somebody else's turn reach the
+            # decoder adjacent and come back as one segment spanning that turn. A shorter
+            # threshold keeps the boundaries. Passed only when VAD is on, since it means
+            # nothing otherwise.
+            vad_parameters=(
+                {
+                    "min_silence_duration_ms": self.settings.whisper_vad_min_silence_ms,
+                    # Silero's speech *probability*, not a level -- it has no power knob.
+                    "threshold": self.settings.whisper_vad_threshold,
+                    # Kept generous because the silence threshold above is short: cutting
+                    # close to the speech is how a leading consonant gets clipped.
+                    "speech_pad_ms": self.settings.whisper_vad_speech_pad_ms,
+                }
+                if self.settings.whisper_vad_filter
+                else None
+            ),
             condition_on_previous_text=False,
             no_speech_threshold=0.6,
             log_prob_threshold=-1.0,

@@ -19,6 +19,7 @@ from pbx.api.utils import (
     require_auth,
     send_json,
 )
+from pbx.utils.audit_logger import get_audit_logger
 from pbx.utils.logger import get_logger
 
 logger = get_logger()
@@ -56,6 +57,22 @@ def handle_get_voicemail(subpath: str) -> Response:
         if len(parts) == 1:
             # list all messages
             messages = mailbox.get_messages()
+
+            # Someone reading a mailbox that is not their own is an admin looking at another
+            # person's messages, transcripts included. That is a legitimate thing to do and a
+            # thing worth being able to account for later, so it is recorded once per listing.
+            # A user reading their own mailbox is not audited -- it would bury the events that
+            # matter under routine traffic.
+            payload = getattr(request, "auth_payload", None) or {}
+            if str(payload.get("extension", "")) != str(extension):
+                get_audit_logger().log_recording_access(
+                    user=str(payload.get("extension", "unknown")),
+                    recording_id=f"mailbox:{extension}",
+                    kind="voicemail_listing",
+                    ip_address=request.remote_addr,
+                    granted=True,
+                )
+
             data = [
                 {
                     "id": msg["id"],
@@ -63,6 +80,13 @@ def handle_get_voicemail(subpath: str) -> Response:
                     "timestamp": msg["timestamp"].isoformat() if msg["timestamp"] else None,
                     "listened": msg["listened"],
                     "duration": msg["duration"],
+                    # Included in the listing, unlike call-recording transcripts, because this
+                    # response is already one mailbox that the caller has been authorised for
+                    # -- there is no bulk read to widen here, and visual voicemail is the
+                    # point of transcribing at all. Absent when nothing was transcribed.
+                    "transcription": msg.get("transcription"),
+                    "transcription_confidence": msg.get("transcription_confidence"),
+                    "transcription_provider": msg.get("transcription_provider"),
                 }
                 for msg in messages
             ]

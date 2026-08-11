@@ -19,7 +19,7 @@ from pbx.features.inbound_routing import InboundRoutingSystem
 from pbx.features.music_on_hold import MusicOnHold
 from pbx.features.phone_provisioning import PhoneProvisioning
 from pbx.features.presence import PresenceSystem
-from pbx.features.recording_retention import RecordingRetentionManager
+from pbx.features.recording_store import RecordingStore
 from pbx.features.retention import (
     CONFIG_SECTION as RETENTION_CONFIG_SECTION,
     RetentionSettings,
@@ -104,8 +104,16 @@ class FeatureInitializer:
         )
         pbx_core.conference_system = ConferenceSystem()
         pbx_core.recording_system = CallRecordingSystem(
-            auto_record=config.get("features.call_recording", False)
+            # Was never passed, so recordings always landed in ./recordings regardless of
+            # what recording.storage_path said.
+            recording_path=config.get("recording.storage_path", "recordings"),
+            requested=config.get("features.call_recording", False),
+            # Registers each finished recording, which is what makes it visible to retention,
+            # to the admin view, and to the transcript that references it.
+            store=RecordingStore(database if getattr(database, "enabled", False) else None),
         )
+        FeatureInitializer._build_consent_announcer(pbx_core, config, logger)
+        FeatureInitializer._wire_call_recording(pbx_core)
         pbx_core.queue_system = QueueSystem(
             database=database if database.enabled else None, config=config
         )
@@ -255,9 +263,10 @@ class FeatureInitializer:
         if pbx_core.time_based_routing.enabled:
             logger.info("Time-based routing initialized")
 
-        # Initialize Recording Retention Manager
+        # Initialize retention: one sweeper, one policy store, one set of holds.
         # Retention owns the only thing in the PBX that deletes user data on a timer, so it
-        # is constructed with dry_run defaulted on and says so at startup.
+        # is constructed with dry_run defaulted on and says so at startup. start() seeds the
+        # policy table from config the first time it finds it empty.
         pbx_core.retention_sweeper = RetentionSweeper(
             RetentionSettings.from_dict(config.get(RETENTION_CONFIG_SECTION, {}) or {}),
             database=database,
@@ -265,9 +274,10 @@ class FeatureInitializer:
         )
         pbx_core.retention_sweeper.start()
 
-        pbx_core.recording_retention = RecordingRetentionManager(config=config)
-        if pbx_core.recording_retention.enabled:
-            logger.info("Recording retention manager initialized")
+        # The admin UI and the retention API address the sweeper through this name. It used to
+        # point at a second, policy-owning manager that never deleted anything; both halves are
+        # the same object now, which is the entire point of the reconciliation.
+        pbx_core.recording_retention = pbx_core.retention_sweeper
 
         # Initialize Fraud Detection System
         pbx_core.fraud_detection = FraudDetectionSystem(config=config)
@@ -289,11 +299,6 @@ class FeatureInitializer:
             logger.info("Mobile push notifications initialized")
 
         # Initialize Recording Announcements
-        from pbx.features.recording_announcements import RecordingAnnouncements
-
-        pbx_core.recording_announcements = RecordingAnnouncements(config=config, database=database)
-        if pbx_core.recording_announcements.enabled:
-            logger.info("Recording announcements initialized")
 
         # Initialize MFA if enabled
         if config.get("security.mfa.enabled", False):
@@ -369,6 +374,232 @@ class FeatureInitializer:
             logger.info("Skills-Based Routing initialized")
         else:
             pbx_core.skills_router = None
+
+    @staticmethod
+    def _build_consent_announcer(pbx_core: Any, config: Any, logger: Any) -> None:
+        """
+        Build the recording-notice announcer.
+
+        "Internal" means "resolves to a provisioned extension" -- the same question the
+        recorder answers when it labels a channel, so the two cannot disagree about who was
+        on a call. Anything else is an outside party and gets the notice.
+        """
+        from pbx.features.recording_consent import ConsentAnnouncer, ConsentSettings
+
+        def is_internal(number: str) -> bool:
+            """
+            Whether `number` is a provisioned extension.
+
+            Database first, then config.yml, matching how the rest of the codebase resolves
+            extensions. A lookup that *fails* is logged rather than swallowed: an earlier
+            version caught everything and returned False, so calling a method that did not
+            exist looked exactly like "this number is external" and announced on every
+            internal call. A wrong answer here is a policy change, so it has to be noisy.
+            """
+            if not number or number == "unknown":
+                return False
+
+            extension_db = getattr(pbx_core, "extension_db", None)
+            if extension_db is not None:
+                try:
+                    if extension_db.get(number):
+                        return True
+                except Exception as e:
+                    logger.warning("Extension lookup failed for %s: %s", number, e)
+
+            try:
+                return bool(config.get_extension(number))
+            except Exception as e:
+                logger.warning("Config extension lookup failed for %s: %s", number, e)
+                # Unresolvable means treated as external, which announces rather than
+                # records silently -- the safe direction for a consent gate.
+                return False
+
+        settings = ConsentSettings.from_dict(config.get("recording.consent", {}) or {})
+        for problem in settings.validate():
+            logger.warning("Recording consent config: %s", problem)
+
+        announcer = ConsentAnnouncer(
+            settings,
+            is_internal=is_internal,
+            logger=logger,
+            database=getattr(pbx_core, "database", None),
+        )
+        pbx_core.consent_announcer = announcer
+        # The admin page and the announcement API address it under this name. It used to be
+        # a separate module that never played anything; both are the same object now.
+        pbx_core.recording_announcements = announcer
+
+        # Recording with no notice at all is legitimate in a one-party-consent jurisdiction,
+        # but it must never be a quiet state -- this is the config that used to require a
+        # separate consent_acknowledged key to reach.
+        if config.get("features.call_recording", False) and not announcer.enabled:
+            logger.warning(
+                "Call recording is on with %s.announce_for=off: calls are recorded and no "
+                "notice is played. This is unlawful in two-party-consent jurisdictions.",
+                "recording.consent",
+            )
+        # Synthesise the prompt now, so a missing one is a startup error rather than a silent
+        # loss of every external recording later.
+        ready = announcer.prepare()
+        logger.info(
+            "Recording consent: announce_for=%s, prompt ready=%s",
+            settings.announce_for,
+            ready,
+        )
+
+    @staticmethod
+    def _wire_call_recording(pbx_core: Any) -> None:
+        """
+        Have every bridged call start recording itself.
+
+        The trigger lives on the RTP relay rather than in the call router, because the relay
+        is where audio actually is. A router-level hook only covers the one signalling path
+        it was added to -- the earlier version missed WebRTC and PBX-originated calls
+        entirely -- whereas anything that bridges two endpoints necessarily goes through
+        here.
+
+        This function is the only place that knows about both layers. ``pbx/rtp/`` holds a
+        plain callback and never learns that recording exists, which keeps the dependency
+        pointing the right way (features depend on rtp, not the reverse).
+        """
+        relay = getattr(pbx_core, "rtp_relay", None)
+        if relay is None:
+            return
+
+        def on_bridged(handler: Any) -> None:
+            """Called by the relay once both endpoints are known. Must not raise."""
+            recording_system = getattr(pbx_core, "recording_system", None)
+            if recording_system is None or not recording_system.auto_record:
+                return
+
+            # The relay knows a call_id and nothing else; names and the session come from
+            # the call record, which this layer can reach and the RTP layer cannot.
+            call = pbx_core.call_manager.get_call(handler.call_id)
+            caller = getattr(call, "from_extension", None) or "unknown"
+            callee = getattr(call, "to_extension", None) or "unknown"
+
+            tap = recording_system.start_recording(
+                handler.call_id,
+                caller,
+                callee,
+                session_id=getattr(call, "session_id", None) or handler.call_id,
+                # First-generation sources. A transfer bumps these, so the party who
+                # arrives gets their own channel instead of the departed party's.
+                labels={"a0": caller, "b0": callee},
+            )
+            if tap is None:
+                return
+            handler.attach_tap(tap)
+
+            # Recording starts first so the notice lands on its own tape -- the recording is
+            # then the evidence that notice was given. If the notice does not play, the
+            # audio captured in the meantime is audio we had no right to keep, so it is
+            # destroyed rather than finished.
+            announcer = getattr(pbx_core, "consent_announcer", None)
+            session_id = getattr(call, "session_id", None) or handler.call_id
+            if announcer is None or not announcer.required_for(caller, callee):
+                return
+
+            def on_announced(delivered: bool) -> None:
+                if delivered:
+                    return
+                handler.detach_tap()
+                recording_system.abandon(
+                    session_id, "recording notice could not be played to the caller"
+                )
+
+            # Both legs hear it. The outside party is who the disclosure is for, but it is
+            # also what tells the employee why the line is quiet -- see recording_consent.
+            #
+            # The parties are passed through so the notice log can name who was told. It is
+            # kept indefinitely while the recording expires, so there is nothing to join to
+            # later -- a row that cannot identify anyone proves nothing.
+            announcer.announce(
+                handler,
+                on_announced,
+                session_id=session_id,
+                participants=[p for p in (caller, callee) if p and p != "unknown"],
+            )
+
+        relay.on_bridged = on_bridged
+
+        # Relays allocated before this ran would otherwise never record. Startup order puts
+        # this well before any call, but a reload should not silently stop recording.
+        for entry in getattr(relay, "active_relays", {}).values():
+            entry["handler"].on_bridged = on_bridged
+
+        FeatureInitializer._wire_recording_transcription(pbx_core)
+
+    @staticmethod
+    def _wire_recording_transcription(pbx_core: Any) -> None:
+        """
+        Transcribe each recording once it is finished.
+
+        Post-call rather than live: a completed recording is just a file, and the shared
+        worker already transcribes files. One pass per participant, because the recording
+        already separated them and that is what makes the transcript say who spoke.
+        """
+        from pbx.speech.recording import DEFAULT_MAX_REGION_SECONDS, RecordingTranscriber
+        from pbx.speech.store import TranscriptStore
+        from pbx.utils.audio import SILENCE_RMS_FLOOR
+
+        recording_system = getattr(pbx_core, "recording_system", None)
+        worker = getattr(pbx_core, "transcription_service", None)
+        if recording_system is None or worker is None:
+            return
+
+        database = getattr(pbx_core, "database", None)
+        config = pbx_core.config
+        logger = pbx_core.logger
+        settings = getattr(worker, "settings", None)
+
+        # Stay clear of the worker's own limit: it refuses anything longer, and a refused
+        # region is audio that never gets transcribed at all. 90% leaves room for the padding
+        # a region carries either side of its speech.
+        cap = getattr(settings, "max_audio_seconds", 0) or 0
+        max_region = (
+            min(DEFAULT_MAX_REGION_SECONDS, cap * 0.9) if cap else DEFAULT_MAX_REGION_SECONDS
+        )
+
+        transcriber = RecordingTranscriber(
+            worker=worker,
+            store=TranscriptStore(database if getattr(database, "enabled", False) else None),
+            recordings=RecordingStore(database if getattr(database, "enabled", False) else None),
+            silence_floor=getattr(settings, "silence_rms_floor", SILENCE_RMS_FLOOR),
+            max_region_seconds=max_region,
+            # Verbatim from config, so the transcript records what was played rather than
+            # what a model made of it.
+            notice_text=getattr(
+                getattr(getattr(pbx_core, "consent_announcer", None), "settings", None),
+                "text",
+                "",
+            ),
+        )
+        pbx_core.recording_transcriber = transcriber
+        recording_system.on_recording_finished = transcriber.submit
+
+        # Analyse each recording as soon as its transcript exists. `auto_analyze` has been in
+        # config since analytics was written and was read by nothing; this is what it meant.
+        if config.get("recording.analytics.auto_analyze", False):
+            from pbx.features.call_recording_analytics import get_recording_analytics
+
+            analytics = get_recording_analytics(config, database)
+
+            def analyse(recording_id: Any, _transcript_id: Any) -> None:
+                """Runs on the transcription worker thread; never raises into it."""
+                try:
+                    analytics.analyze_recording(str(recording_id))
+                except Exception as e:
+                    logger.error("Analysis of recording %s failed: %s", recording_id, e)
+
+            transcriber.on_transcribed = analyse
+            pbx_core.recording_analytics = analytics
+            logger.info("Recording analytics will run automatically after transcription")
+
+        # Anything still in the scratch directory belongs to a run that died; nothing can be
+        # transcribing in a process that has only just started.
+        transcriber.clear_scratch(recording_system.recording_path)
 
     @staticmethod
     def _init_active_directory(pbx_core: Any, config: Any) -> None:

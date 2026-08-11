@@ -13,6 +13,11 @@
 
 @import 'variables.css';
 
+/* Shared UI vocabulary (pills, ghost buttons, labelled stats, card shells).
+   New pages compose these; the queue-named equivalents below are the older,
+   not-yet-migrated originals. See patterns.css for the migration note. */
+@import 'patterns.css';
+
 /* Skip Navigation Link (Accessibility) */
 .skip-nav {
     position: absolute;
@@ -802,6 +807,122 @@ header h1 {
     color: #3b9dd6;
     background: rgba(59, 157, 214, 0.08);
 }
+
+/* ==========================================================================
+   Call recordings
+
+   Page-specific only. The card shell, pills, ghost buttons, labelled stats,
+   filter bar and empty states all come from patterns.css; what is left here
+   is the transcript, which nothing else has.
+   ========================================================================== */
+
+.rec-player-slot {
+    margin-bottom: 12px;
+}
+
+.rec-player {
+    width: 100%;
+}
+
+.rec-body {
+    padding: 10px 16px 4px;
+}
+
+.rec-transcript-run {
+    border-top: 1px solid var(--color-border);
+    padding-top: 10px;
+    margin-top: 4px;
+}
+
+.rec-transcript-run:first-child {
+    border-top: none;
+    padding-top: 0;
+}
+
+.rec-transcript-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
+.rec-transcript-head .k {
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-secondary);
+    font-weight: 600;
+}
+
+.rec-transcript-meta {
+    font-size: 0.76rem;
+    color: var(--color-text-secondary);
+}
+
+/* Clamped on rendered lines rather than a character count, so the preview
+   never cuts mid-word and adapts to however wide the card is. */
+.rec-transcript-preview {
+    margin: 0 0 10px;
+    font-size: 0.88rem;
+    line-height: 1.65;
+    color: var(--color-text-secondary);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.rec-transcript-flat {
+    margin: 0 0 10px;
+    font-size: 0.88rem;
+    line-height: 1.7;
+}
+
+.rec-lines {
+    margin-bottom: 10px;
+}
+
+/* One row per speaker turn. Fixed-width time and speaker columns so the text
+   edge stays straight down the whole transcript. */
+.rec-line {
+    display: flex;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--color-border-light);
+}
+
+.rec-line:last-child {
+    border-bottom: none;
+}
+
+.rec-line-time {
+    flex-shrink: 0;
+    width: 38px;
+    font-size: 0.74rem;
+    color: var(--color-text-muted);
+    font-variant-numeric: tabular-nums;
+    padding-top: 2px;
+}
+
+.rec-line-speaker {
+    flex-shrink: 0;
+    width: 82px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--color-text-secondary);
+    padding-top: 1px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.rec-line-text {
+    font-size: 0.88rem;
+    line-height: 1.6;
+}
+
 
 /* Status pill for agent state (Available / Paused / Logged out) */
 .status-pill {
