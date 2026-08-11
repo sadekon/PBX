@@ -459,47 +459,6 @@ class DatabaseBackend:
         """
         )
 
-        # Call Detail Records table
-        cdr_table = self._build_table_sql(
-            """
-        CREATE TABLE IF NOT EXISTS call_records (
-            id {SERIAL},
-            call_id VARCHAR(100) UNIQUE NOT NULL,
-            from_extension VARCHAR(20),
-            to_extension VARCHAR(20),
-            caller_id VARCHAR(50),
-            start_time TIMESTAMP,
-            end_time TIMESTAMP,
-            duration INTEGER,
-            status VARCHAR(20),
-            recording_path VARCHAR(255),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-        )
-
-        # Voicemail messages table
-        voicemail_table = self._build_table_sql(
-            """
-        CREATE TABLE IF NOT EXISTS voicemail_messages (
-            id {SERIAL},
-            message_id VARCHAR(100) UNIQUE NOT NULL,
-            extension_number VARCHAR(20) NOT NULL,
-            caller_id VARCHAR(50),
-            file_path VARCHAR(255),
-            duration INTEGER,
-            listened BOOLEAN DEFAULT {BOOLEAN_FALSE},
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            transcription_text TEXT,
-            transcription_confidence FLOAT,
-            transcription_language VARCHAR(10),
-            transcription_provider VARCHAR(20),
-            transcribed_at TIMESTAMP,
-            audio_deleted_at TIMESTAMP
-        )
-        """
-        )
-
         # Registered phones table - tracks phones by MAC (if available) or IP address
         registered_phones_table = self._build_table_sql(
             """
@@ -631,8 +590,6 @@ class DatabaseBackend:
         success = True
         for table_sql in [
             vip_table,
-            cdr_table,
-            voicemail_table,
             registered_phones_table,
             provisioned_devices_table,
             extensions_table,
@@ -649,11 +606,6 @@ class DatabaseBackend:
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_vip_caller_id ON vip_callers(caller_id)",
             "CREATE INDEX IF NOT EXISTS idx_vip_priority ON vip_callers(priority_level)",
-            "CREATE INDEX IF NOT EXISTS idx_cdr_call_id ON call_records(call_id)",
-            "CREATE INDEX IF NOT EXISTS idx_cdr_from ON call_records(from_extension)",
-            "CREATE INDEX IF NOT EXISTS idx_cdr_start_time ON call_records(start_time)",
-            "CREATE INDEX IF NOT EXISTS idx_vm_extension ON voicemail_messages(extension_number)",
-            "CREATE INDEX IF NOT EXISTS idx_vm_listened ON voicemail_messages(listened)",
             "CREATE INDEX IF NOT EXISTS idx_phones_mac ON registered_phones(mac_address)",
             "CREATE INDEX IF NOT EXISTS idx_phones_extension ON registered_phones(extension)",
             "CREATE INDEX IF NOT EXISTS idx_provisioned_mac ON provisioned_devices(mac_address)",
@@ -732,21 +684,6 @@ class DatabaseBackend:
         Safe migrations that handle existing columns gracefully
         """
         self.logger.info("Checking for schema migrations...")
-
-        # Migration: Add transcription columns to voicemail_messages
-        transcription_columns = [
-            ("transcription_text", "TEXT"),
-            ("transcription_confidence", "FLOAT"),
-            ("transcription_language", "VARCHAR(10)"),
-            ("transcription_provider", "VARCHAR(20)"),
-            ("transcribed_at", "TIMESTAMP"),
-            # Set when the recording is deleted but the transcript is kept. Retention treats
-            # audio and text on separate clocks: the .wav is ~170 KB against ~2 KB of text,
-            # and deleting a mailbox should not destroy the record of what was said.
-            ("audio_deleted_at", "TIMESTAMP"),
-        ]
-
-        self._add_missing_columns("voicemail_messages", transcription_columns)
 
         # Migration: Add security columns to extensions table
         extensions_columns = [
@@ -850,7 +787,15 @@ class DatabaseBackend:
             if migration_manager.apply_migrations():
                 self.logger.info("✓ Framework migrations applied successfully")
             else:
-                self.logger.warning("Some framework migrations may have failed")
+                # Startup deliberately continues -- a PBX that will not answer calls because
+                # of a schema problem is worse than one running on a stale schema. But this is
+                # an ERROR, not a warning: the failed migration was not recorded, so the
+                # process is now running against a schema it believes is current and is not.
+                self.logger.error(
+                    "✗ A framework migration FAILED and was not recorded. The database schema "
+                    "is incomplete; features touching the affected tables will misbehave. "
+                    "Fix the cause and restart -- it will be retried."
+                )
 
         except Exception as e:
             self.logger.error(f"Failed to apply framework migrations: {e}")

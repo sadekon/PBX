@@ -8,6 +8,7 @@ from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Any, ClassVar
 
+from pbx.features.recording_store import KIND_VOICEMAIL, RecordingStore
 from pbx.mail import Attachment, EmailError
 from pbx.speech.store import SOURCE_VOICEMAIL, TranscriptStore
 from pbx.utils.logger import get_logger, get_vm_ivr_logger
@@ -30,6 +31,9 @@ except ImportError:
 
 # Constants
 GREETING_FILENAME = "greeting.wav"
+
+#: Voicemail is recorded at telephony rate, like everything else on the media path.
+VOICEMAIL_SAMPLE_RATE = 8000
 MIN_WAV_HEADER_SIZE = 12  # Minimum size for RIFF/WAVE header check
 
 # Cache the debug PIN logging flag at module level to avoid repeated environment lookups
@@ -202,6 +206,17 @@ class VoicemailBox:
         # Load existing messages from disk
         self._load_messages()
 
+    @property
+    def recordings(self) -> RecordingStore:
+        """
+        Registers voicemail audio the same way call recordings are registered.
+
+        Built per access rather than held, because ``self.database`` is reassigned after
+        construction in places, and a store that captured the old value would silently stop
+        writing rows. The object is two attributes; constructing it is free.
+        """
+        return RecordingStore(self.database, self.logger)
+
     def _get_db_placeholder(self) -> str:
         """Get database parameter placeholder"""
         return "%s"
@@ -247,22 +262,38 @@ class VoicemailBox:
         if self.database and self.database.enabled:
             self.logger.info("Saving voicemail metadata to database...")
             try:
+                # The audio is registered as a recording first. A voicemail is a recording
+                # with a mailbox attached, not a separate kind of thing -- modelling them
+                # apart is what made every retention bug need fixing twice. The mailbox row
+                # now holds only mailbox facts and points at the media.
+                recording_id = self.recordings.register(
+                    path=file_path,
+                    kind=KIND_VOICEMAIL,
+                    session_id=message_id,
+                    duration_seconds=duration,
+                    sample_rate=VOICEMAIL_SAMPLE_RATE,
+                    participants=[self.extension_number, caller_id],
+                    started_at=timestamp,
+                    ended_at=timestamp,
+                    bytes_written=len(audio_data),
+                )
+
                 placeholder = self._get_db_placeholder()
                 query = f"""
                 INSERT INTO voicemail_messages
-                (message_id, extension_number, caller_id, file_path, duration, listened, created_at)
-                VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder})
+                (message_id, recording_id, extension_number, caller_id, listened, created_at)
+                VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder})
                 """  # nosec B608 - placeholder is safely parameterized
 
                 params = (
                     message_id,
+                    recording_id,
                     self.extension_number,
                     caller_id,
-                    str(file_path),
-                    duration,
                     False,
                     timestamp,
                 )
+                message["recording_id"] = recording_id
 
                 self.logger.debug(f"  Database type: {self.database.db_type}")
                 self.logger.debug(f"  Executing INSERT query for message_id: {message_id}")
@@ -411,7 +442,15 @@ class VoicemailBox:
         return accepted
 
     def _store_transcript(self, message: dict, message_id: str, transcript: Any) -> None:
-        """Record the transcript on the in-memory message and in the database."""
+        """
+        Record the transcript on the in-memory message and in the database.
+
+        One copy now. It used to be written to ``voicemail_messages`` *and* ``call_transcripts``
+        because the email path read the former, and only the latter was ever swept -- so the
+        text on the message row outlived its own retention period indefinitely, and survived
+        the user deleting the voicemail. The email path reads the in-memory message, which is
+        populated here either way, so the duplicate bought nothing.
+        """
         message["transcription"] = transcript.text
         message["transcription_confidence"] = transcript.confidence
         message["transcription_language"] = transcript.language
@@ -421,42 +460,20 @@ class VoicemailBox:
         if not (self.database and self.database.enabled):
             return
 
-        try:
-            placeholder = self._get_db_placeholder()
-            query = f"""
-            UPDATE voicemail_messages
-            SET transcription_text = {placeholder},
-                transcription_confidence = {placeholder},
-                transcription_language = {placeholder},
-                transcription_provider = {placeholder},
-                transcribed_at = {placeholder}
-            WHERE message_id = {placeholder}
-            """  # nosec B608 - placeholder is safely parameterized
-            self.database.execute(
-                query,
-                (
-                    transcript.text,
-                    transcript.confidence,
-                    transcript.language,
-                    transcript.provider,
-                    message["transcribed_at"],
-                    message_id,
-                ),
+        recording_id = message.get("recording_id")
+        if recording_id is None:
+            self.logger.warning(
+                f"Voicemail {message_id} has no recording row; transcript not stored"
             )
-            self.logger.info(f"✓ Transcription saved to database for {message_id}")
-        except Exception as e:
-            self.logger.error(f"✗ Error saving transcription to database: {e}")
+            return
 
-        # Also written to call_transcripts. The columns above stay because the email path
-        # reads them and changing that is not worth the churn; this second write is what gives
-        # retention one table to sweep and the admin view one table to query, across voicemail,
-        # recordings and -- when it lands -- live transcription.
-        TranscriptStore(self.database, self.logger).save(
+        if TranscriptStore(self.database, self.logger).save(
             transcript,
             source=SOURCE_VOICEMAIL,
-            call_id=message_id,
-            media_path=str(message.get("file_path") or ""),
-        )
+            recording_id=recording_id,
+            session_id=message_id,
+        ):
+            self.logger.info(f"✓ Transcription saved for {message_id}")
 
     def _lookup_extension(self) -> tuple[dict | None, str | None]:
         """
@@ -794,17 +811,16 @@ class VoicemailBox:
 
             if self.database and self.database.enabled:
                 try:
-                    placeholder = self._get_db_placeholder()
-                    query = f"""
-                    UPDATE voicemail_messages
-                    SET audio_deleted_at = {placeholder}
-                    WHERE message_id = {placeholder}
-                    """  # nosec B608 - placeholder is safely parameterized
-                    self.database.execute(query, (datetime.now(UTC), message_id))
-                    self.logger.info(
-                        f"  ✓ Audio removed for {message_id}; transcript retained in "
-                        f"{self.database.db_type} database"
-                    )
+                    # Tombstoned on the recording, which is where the audio lives now. The
+                    # mailbox row and the transcript stay until retention expires them.
+                    recording_id = msg.get("recording_id")
+                    if recording_id is not None:
+                        self.recordings.mark_audio_deleted([recording_id])
+                        self.logger.info(f"  ✓ Audio removed for {message_id}; transcript retained")
+                    else:
+                        self.logger.warning(
+                            f"  Voicemail {message_id} has no recording row to tombstone"
+                        )
                 except Exception as e:
                     self.logger.error(f"  ✗ Error tombstoning voicemail in database: {e}")
             else:
@@ -826,22 +842,36 @@ class VoicemailBox:
                 placeholder = self._get_db_placeholder()
                 # Build query safely - placeholder is only '%s' or '?' from
                 # internal method
+                # The mailbox row holds mailbox facts; the media and the text live on the
+                # recording and its transcript. One join rather than three copies of the same
+                # information, each with its own retention story.
+                #
+                # DISTINCT ON keeps one row per message when a recording carries several
+                # transcripts -- a re-run with a better model appends rather than replaces.
                 query = f"""
-                SELECT message_id, caller_id, file_path, duration, listened, created_at,
-                       transcription_text, transcription_confidence, transcription_language,
-                       transcription_provider, transcribed_at
-                FROM voicemail_messages
-                WHERE extension_number = {placeholder}
-                  -- Tombstoned rows are deleted as far as the mailbox is concerned; the row
-                  -- survives only so the transcript does. Without this the message reappears
-                  -- on restart, pointing at a recording that is no longer on disk.
-                  AND audio_deleted_at IS NULL
-                ORDER BY created_at DESC
+                SELECT DISTINCT ON (v.message_id)
+                       v.message_id, v.recording_id, v.caller_id, v.listened, v.created_at,
+                       r.path, r.duration_seconds,
+                       t.text, t.confidence, t.language, t.provider,
+                       t.created_at AS transcribed_at
+                FROM voicemail_messages v
+                JOIN recordings r ON r.id = v.recording_id
+                LEFT JOIN transcripts t ON t.recording_id = r.id
+                WHERE v.extension_number = {placeholder}
+                  -- Tombstoned recordings are deleted as far as the mailbox is concerned; the
+                  -- rows survive only so the transcript does. Without this the message
+                  -- reappears on restart, pointing at audio that is no longer on disk.
+                  AND r.audio_deleted_at IS NULL
+                ORDER BY v.message_id, t.created_at DESC
                 """  # nosec B608 - placeholder is safely parameterized
                 self.logger.debug(
                     f"  Query: SELECT from voicemail_messages WHERE extension_number = {self.extension_number}"  # nosec B608 - log statement only
                 )
                 rows = self.database.fetch_all(query, (self.extension_number,))
+                # DISTINCT ON dictates the SQL ordering, so newest-first is restored here.
+                rows = sorted(
+                    rows or [], key=lambda r: str(r.get("created_at") or ""), reverse=True
+                )
 
                 for row in rows:
                     # Convert created_at to datetime if it's a string
@@ -877,19 +907,23 @@ class VoicemailBox:
 
                     message = {
                         "id": row["message_id"],
+                        "recording_id": row.get("recording_id"),
                         "caller_id": row["caller_id"],
                         "timestamp": timestamp,
-                        "file_path": row["file_path"],
+                        "file_path": row.get("path"),
                         "listened": bool(row["listened"]),
-                        "duration": row["duration"],
+                        "duration": row.get("duration_seconds"),
                     }
 
-                    # Add transcription data if available
-                    if row.get("transcription_text"):
-                        message["transcription"] = row["transcription_text"]
-                        message["transcription_confidence"] = row.get("transcription_confidence")
-                        message["transcription_language"] = row.get("transcription_language")
-                        message["transcription_provider"] = row.get("transcription_provider")
+                    # Transcript text lives on the transcript row now, not on this one. It is
+                    # read here so the mailbox and the email keep working unchanged, but there
+                    # is only one copy to expire.
+                    transcript = row.get("text")
+                    if transcript:
+                        message["transcription"] = transcript
+                        message["transcription_confidence"] = row.get("confidence")
+                        message["transcription_language"] = row.get("language")
+                        message["transcription_provider"] = row.get("provider")
                         message["transcribed_at"] = row.get("transcribed_at")
 
                     self.messages.append(message)

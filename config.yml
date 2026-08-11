@@ -16,17 +16,15 @@
 # UTC, in which case unset means recipients see UTC times with no clue that is what they are.
 timezone: America/New_York
 
-# How long recordings, voicemail and transcripts are kept before being deleted.
+# Deletion of recordings, voicemail and transcripts.
 #
-# READ THIS BEFORE ENABLING: retention has never actually run on this system, so the first
-# real sweep deletes everything already past its period -- which may be everything. Leave
-# dry_run on, read a sweep in the log, then turn it off.
+# These are the fallback periods, used when no retention policy matches. On first start they
+# are seeded into retention_policies as a catch-all; after that the admin UI owns the table
+# and editing these has no effect. Legal holds override everything.
 #
-# Two clocks on purpose. Audio is where the bytes and the privacy weight are (~170 KB for a
-# 21-second recording); a transcript is ~2% of that and carries most of the value, so it is
-# kept longer. Deleting a voicemail already keeps its transcript.
+# The first real sweep deletes everything already past its period. Read a dry run first.
 retention:
-  enabled: true           # Master switch. Nothing is swept while this is false.
+  enabled: true            # Master switch. Nothing is swept while this is false.
   dry_run: true            # Log what would be deleted, delete nothing. Turn off deliberately.
   interval_hours: 24       # How often the sweep runs
   audio_days: 90           # Recordings and voicemail .wav files
@@ -434,9 +432,48 @@ features:
   find_me_follow_me:
     enabled: true                      # Enable Find Me/Follow Me feature
 recording:
-  auto_record: false
+  # Recordings are always PCM16 at 8 kHz, one channel per participant -- the two legs can
+  # negotiate different codecs, so there is no single wire format to preserve.
   storage_path: recordings
-  format: wav
+
+  # Who may play a recording or read its transcript through the admin API.
+  #
+  # false (default) = administrators only.
+  # true            = an extension may also reach recordings of calls it was a party to,
+  #                   matched against the participant list the recorder stores per call.
+  #
+  # Off by default deliberately. A recording is the most sensitive thing this system keeps,
+  # the admin login authenticates against the user's voicemail PIN, and many deployments are
+  # required to keep call audio to compliance staff. Turning this on is a decision to make
+  # on purpose, not one to have to remember to undo.
+  #
+  # Independent of this setting, every playback and transcript read -- allowed or refused --
+  # is written to the audit log.
+  participant_access: false
+
+  # Analysis of finished recordings: sentiment, keywords, compliance phrases, quality scores.
+  # Reads the transcript post-call transcription already produced -- it never transcribes.
+  analytics:
+    # Analyse each recording as soon as its transcript lands. Off means the admin page only
+    # shows calls somebody analysed by hand.
+    auto_analyze: false
+    # Which analysers run. transcript | sentiment | keywords | compliance | quality | summary
+    analysis_types: [sentiment, keywords, summary]
+
+  # Spoken notice played at bridge. If it does not play, the recording is discarded --
+  # recording without notice is unlawful in two-party-consent jurisdictions.
+  consent:
+    # Which calls get one. Both legs always hear it: the notice is also what tells the
+    # employee why the line is quiet.
+    #   external = a party is not a provisioned extension (production)
+    #   all      = every bridged call, internal included (testing)
+    #   off      = no notice; calls still record
+    announce_for: external
+    # Spoken to callers, and copied verbatim into the transcript rather than re-recognised.
+    # Synthesised to audio_file at startup if that file is missing.
+    text: "This call is being recorded for quality assurance."
+    audio_file: auto_attendant/recording_notice.wav
+
 # SMTP transport. Owned by pbx/mail and shared by every feature that sends email
 # (voicemail notification, Kari's Law emergency notification). What each email *says* is
 # configured by the feature that sends it -- see voicemail.email below.

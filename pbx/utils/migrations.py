@@ -125,8 +125,20 @@ class MigrationManager:
             for migration in pending:
                 self.logger.info(f"Applying migration {migration['version']}: {migration['name']}")
 
-                # Execute migration SQL using execute_script for multi-statement support
-                self.db.execute_script(migration["sql"])
+                # Execute migration SQL using execute_script for multi-statement support.
+                #
+                # The result is checked. It used to be ignored, so a migration that failed
+                # halfway was still recorded as applied -- and because versions only move
+                # forward, it was never retried. execute_script stops at the first failing
+                # statement, so the tables after that point simply never existed, on an
+                # install that believed itself up to date.
+                if not self.db.execute_script(migration["sql"]):
+                    self.logger.error(
+                        f"✗ Migration {migration['version']} ({migration['name']}) failed; "
+                        "not recording it, and stopping here so later migrations do not run "
+                        "against a schema that never got this one"
+                    )
+                    return False
 
                 # Record migration
                 self.db.execute(
@@ -825,5 +837,343 @@ def register_all_migrations(manager: MigrationManager) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_summaries_call ON call_summaries(call_id);
+    """),
+    )
+
+    # Migration 1018: Retention policies, legal holds, transcript participants
+    #
+    # Retention policies existed before this only as a dict on RecordingRetentionManager, so
+    # the admin UI's "Add Policy" wrote to memory and lost it on restart -- and, because
+    # features.recording_retention was never in config.yml, the manager was disabled and the
+    # write failed outright. Policies are operator configuration; they belong in a table.
+    #
+    # Two periods, not one. Audio is the bytes and the privacy weight; transcripts are ~2% of
+    # the size and carry most of the value. Either may be NULL, meaning "inherit the fallback
+    # from the retention: config block", so a policy can extend audio without touching text.
+    #
+    # match_rules is JSON, evaluated in Python rather than SQL: the facts it matches against
+    # live in a sidecar file on disk, not in this database, so the join could not happen here
+    # anyway. Policy counts are in the tens, so a linear scan per file costs nothing.
+    manager.register_migration(
+        1018,
+        "Retention Policies and Legal Holds",
+        manager._build_migration_sql("""
+        CREATE TABLE IF NOT EXISTS retention_policies (
+            id {SERIAL},
+            policy_id VARCHAR(100) NOT NULL UNIQUE,
+            name VARCHAR(255) NOT NULL,
+            description {TEXT},
+            -- NULL means inherit the corresponding retention.* fallback rather than "delete
+            -- immediately". A policy that only lengthens audio leaves transcript_days NULL.
+            audio_days INTEGER,
+            transcript_days INTEGER,
+            -- Lowest number wins. The seeded catch-all sits at 1000 so anything added later
+            -- outranks it without the operator having to think about ordering.
+            priority INTEGER NOT NULL DEFAULT 100,
+            -- JSON object of ANDed conditions; '{}' matches every recording. Keys are a fixed
+            -- vocabulary (media, extensions, min/max_duration_seconds) -- deliberately closed,
+            -- because an open expression language would mean evaluating operator-supplied
+            -- strings on a live PBX and could not be rendered as a form.
+            match_rules {TEXT} NOT NULL DEFAULT '{}',
+            enabled BOOLEAN NOT NULL DEFAULT {BOOLEAN_TRUE},
+            -- 'config' rows were seeded from config.yml on a first, empty run; 'api' rows came
+            -- from an operator. Seeding happens only when the table is empty, so an operator
+            -- editing a seeded row keeps that edit across restarts.
+            origin VARCHAR(20) NOT NULL DEFAULT 'api',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_retention_policies_priority
+            ON retention_policies(enabled, priority);
+
+        -- A legal hold is not a retention policy and must not be modelled as one: it applies
+        -- to one specific call rather than a class, it is placed by a person after an event,
+        -- it suspends expiry rather than setting a period, and it has to be releasable. The
+        -- tag vocabulary this replaces mapped 'legal' to a fixed 2555 days, which is wrong in
+        -- both directions -- a dispute lasting longer still lost the audio, and one settled in
+        -- a month held the recording for another seven years with no way to let it go.
+        CREATE TABLE IF NOT EXISTS retention_holds (
+            id {SERIAL},
+            -- session_id, not call_id: a session spans transfers and re-INVITEs, so holding a
+            -- conversation holds every leg of it. Recordings are named by session.
+            session_id VARCHAR(100) NOT NULL,
+            reason {TEXT} NOT NULL,
+            placed_by VARCHAR(100) NOT NULL,
+            placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            -- NULL means active. Released rows are kept, never deleted: the audit value of a
+            -- hold is the record that it existed and who lifted it.
+            released_at TIMESTAMP,
+            released_by VARCHAR(100)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_retention_holds_session
+            ON retention_holds(session_id, released_at);
+
+        -- Who was on the call, as a JSON array of extension labels. Two consumers: the
+        -- transcript sweep, which cannot re-read the sidecar because audio expires first and
+        -- the manifest goes with it; and the review surface, where "was I on this call?" must
+        -- not mean parsing the segments JSON of every row.
+        ALTER TABLE call_transcripts ADD COLUMN IF NOT EXISTS participants {TEXT};
+
+        -- The session this transcript belongs to, so a hold placed on a conversation covers
+        -- its text as well as its audio.
+        ALTER TABLE call_transcripts ADD COLUMN IF NOT EXISTS session_id VARCHAR(100);
+
+        CREATE INDEX IF NOT EXISTS idx_transcripts_session ON call_transcripts(session_id);
+    """),
+    )
+
+    # Migration 1019: one home for recorded media
+    #
+    # DESTRUCTIVE. It drops call_transcripts, call_summaries and voicemail_messages and
+    # rebuilds them. There is no backfill: every stored voicemail and transcript is discarded,
+    # deliberately, because the alternative was carrying a compatibility shim through a schema
+    # that was wrong in four separate ways.
+    #
+    # What was wrong. Transcript text lived in three tables (call_transcripts,
+    # voicemail_messages.transcription_text, call_summaries.transcript), each needing its own
+    # retention treatment, and each one that got missed was a leak found weeks apart. Recordings
+    # had no row at all -- only a file and a .json sidecar -- so a transcript's only link to its
+    # audio was a path string that dangled the moment retention expired the file. And voicemail
+    # was modelled as a separate universe from call recording, though a voicemail is exactly a
+    # recording with a mailbox attached, which meant every retention bug had to be fixed twice.
+    #
+    # The shape here says what belongs to what, and lets the database enforce it: deleting a
+    # recording takes its transcripts, and their summaries, by cascade rather than by anyone
+    # remembering to. Every retention hole this replaces was a missed second place.
+    manager.register_migration(
+        1019,
+        "Unified Recording and Transcript Storage",
+        manager._build_migration_sql("""
+        -- Superseded by the tables below.
+        DROP TABLE IF EXISTS call_summaries;
+        DROP TABLE IF EXISTS call_transcripts;
+        DROP TABLE IF EXISTS voicemail_messages;
+
+        -- Never had a writer or a reader. call_records duplicated the file-based CDR in
+        -- features/cdr.py; call_recording_analytics was written by nothing; and
+        -- recording_announcements_log was written by a module the call path never invokes.
+        -- Left in place they invite someone to wire the wrong one.
+        DROP TABLE IF EXISTS call_records;
+        DROP TABLE IF EXISTS call_recording_analytics;
+        DROP TABLE IF EXISTS recording_announcements_log;
+
+        -- One row per captured media file, whatever produced it. A voicemail and a call
+        -- recording differ in metadata, not in kind.
+        CREATE TABLE IF NOT EXISTS recordings (
+            id {SERIAL},
+            -- The conversation, which survives transfers and re-INVITEs. call_id names a
+            -- single SIP dialog and is kept only for tracing back to signalling.
+            session_id VARCHAR(100),
+            call_id VARCHAR(100),
+            kind VARCHAR(20) NOT NULL DEFAULT 'call',
+            -- Null once retention has expired the audio. The row outlives the file: audio and
+            -- text run on separate clocks, and this is what marks the gap between them.
+            path VARCHAR(255),
+            bytes BIGINT,
+            duration_seconds FLOAT,
+            sample_rate INTEGER,
+            -- The channel map: which track holds whom. Previously a .json sidecar that had to
+            -- be swept in lockstep with the audio and could orphan when it was not.
+            channels {TEXT},
+            -- Extension labels, indexed for "was I on this call?" and matched by retention
+            -- policy. Derivable from channels, denormalised so neither has to parse JSON.
+            participants {TEXT},
+            started_at TIMESTAMP,
+            ended_at TIMESTAMP,
+            audio_deleted_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_recordings_session ON recordings(session_id);
+        CREATE INDEX IF NOT EXISTS idx_recordings_call ON recordings(call_id);
+        CREATE INDEX IF NOT EXISTS idx_recordings_created ON recordings(kind, created_at);
+
+        -- One row per transcription run, not per recording: re-transcribing with a better
+        -- model appends rather than overwriting what somebody already read.
+        --
+        -- recording_id is nullable because a live transcript has no file. Those expire on
+        -- their own created_at instead of by cascade.
+        CREATE TABLE IF NOT EXISTS transcripts (
+            id {SERIAL},
+            recording_id INTEGER REFERENCES recordings(id) ON DELETE CASCADE,
+            session_id VARCHAR(100),
+            source VARCHAR(20) NOT NULL DEFAULT 'recording',
+            provider VARCHAR(30),
+            model VARCHAR(255),
+            language VARCHAR(20),
+            text {TEXT},
+            -- JSON: per-segment timing and speaker. Nullable because word timing is opt-in.
+            segments {TEXT},
+            -- Null when the engine cannot report one. Whisper genuinely cannot, and a 0.0
+            -- default renders to a user as "Estimated accuracy 0%".
+            confidence FLOAT,
+            processing_duration FLOAT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_transcripts_recording ON transcripts(recording_id);
+        CREATE INDEX IF NOT EXISTS idx_transcripts_session ON transcripts(session_id);
+        CREATE INDEX IF NOT EXISTS idx_transcripts_created ON transcripts(created_at);
+
+        -- Analysis derived from one transcript. No transcript column this time: it keyed on
+        -- call_id and carried a third full copy of the text, which is what made it a retention
+        -- hole rather than a cache.
+        CREATE TABLE IF NOT EXISTS call_summaries (
+            id {SERIAL},
+            transcript_id INTEGER REFERENCES transcripts(id) ON DELETE CASCADE,
+            summary {TEXT},
+            sentiment VARCHAR(20),
+            sentiment_score FLOAT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_summaries_transcript ON call_summaries(transcript_id);
+
+        -- Mailbox facts only. The audio, duration, channel map and transcript all live on the
+        -- recording now; this says whose mailbox it landed in and whether they have heard it.
+        CREATE TABLE IF NOT EXISTS voicemail_messages (
+            id {SERIAL},
+            message_id VARCHAR(100) UNIQUE NOT NULL,
+            recording_id INTEGER REFERENCES recordings(id) ON DELETE CASCADE,
+            extension_number VARCHAR(20) NOT NULL,
+            caller_id VARCHAR(50),
+            listened BOOLEAN DEFAULT {BOOLEAN_FALSE},
+            notified_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_vm_extension ON voicemail_messages(extension_number);
+        CREATE INDEX IF NOT EXISTS idx_vm_listened ON voicemail_messages(listened);
+        CREATE INDEX IF NOT EXISTS idx_vm_recording ON voicemail_messages(recording_id);
+    """),
+    )
+
+    # Migration 1020: the record that notice was given
+    #
+    # Replaces recording_announcements_log, which belonged to a module that never played
+    # anything -- its playback path guarded on a pbx_core attribute nothing ever set, and then
+    # called a method the relay handler does not have. Dropping it here is only half the job:
+    # that module recreated the table at startup, *after* migrations run, which is why a
+    # DROP in 1019 did not stick.
+    #
+    # Deliberately NOT swept by retention. This is the evidence that a caller was told, and it
+    # has to outlive the recording it justifies -- a call expiring at 90 days must not take the
+    # proof with it. Rows are ~100 bytes, so growth is not a concern.
+    manager.register_migration(
+        1020,
+        "Recording Notice Log",
+        manager._build_migration_sql("""
+        DROP TABLE IF EXISTS recording_announcements_log;
+
+        CREATE TABLE IF NOT EXISTS recording_notices (
+            id {SERIAL},
+            -- The conversation, so a notice can be tied to its recording and to a legal hold.
+            session_id VARCHAR(100),
+            call_id VARCHAR(100),
+            -- False rows are the ones that matter: the notice did not reach anyone, so the
+            -- recording was discarded.
+            played BOOLEAN NOT NULL DEFAULT {BOOLEAN_FALSE},
+            -- Stored verbatim rather than referenced. The configured wording changes; what a
+            -- given caller was actually told does not, and that is the whole point of this row.
+            notice_text {TEXT},
+            -- How many legs heard it. Both, normally.
+            legs INTEGER,
+            -- Why it did not play, when it did not.
+            failure_reason {TEXT},
+            played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_notices_session ON recording_notices(session_id);
+        CREATE INDEX IF NOT EXISTS idx_notices_played ON recording_notices(played, played_at);
+    """),
+    )
+
+    # Migration 1021: who the notice was given to
+    #
+    # Belongs in 1020 and is here instead because 1020 had already been applied by the time
+    # the column was added. Editing an applied migration does nothing -- versions only move
+    # forward and there is no checksum -- so the edit silently produced installs whose
+    # recording_notices had no participants column while INSERTs named one.
+    #
+    # Denormalised, and deliberately NOT a foreign key to recordings: this log is kept
+    # indefinitely while the recording it justifies expires at 90 days, so a cascade would
+    # delete the evidence along with the thing it proves, and a plain reference would dangle.
+    # For an external call this holds the caller's number -- exactly what "we informed this
+    # person at this time" has to be able to name.
+    manager.register_migration(
+        1021,
+        "Recording Notice Participants",
+        manager._build_migration_sql("""
+        ALTER TABLE recording_notices ADD COLUMN IF NOT EXISTS participants {TEXT};
+    """),
+    )
+
+    # Migration 1022: remove speech analytics
+    #
+    # The module is gone. It was the live, per-extension half of analytics -- streaming audio
+    # in, sentiment and keyword alerts out -- and its entry point ``analyze_audio_stream`` never
+    # had a feeder, so it never ran. Its post-call half duplicated recording analytics with its
+    # own Vosk path.
+    #
+    # speech_analytics_configs held per-extension settings for a feature that never executed,
+    # so there is nothing to migrate anywhere. Recording analytics is the only analytics now,
+    # and it persists to call_summaries instead.
+    manager.register_migration(
+        1022,
+        "Remove Speech Analytics",
+        manager._build_migration_sql("""
+        DROP TABLE IF EXISTS speech_analytics_configs;
+    """),
+    )
+
+    # Migration 1023: one row per analysis run
+    #
+    # Analytics results lived only in a dict on a module-level singleton, so a restart emptied
+    # them and search_recordings could only ever see calls analysed since boot. They were
+    # briefly written to call_summaries, which was the wrong shape: it holds a summary and a
+    # sentiment, while analysis also produces keywords, compliance findings and four quality
+    # scores -- and search filters on keywords and quality, neither of which fit.
+    #
+    # Keyed on the transcript rather than the recording, so migration 1019's cascade expires an
+    # analysis with the call it describes. Nothing has to remember to sweep it.
+    #
+    # call_summaries goes: its only writer and reader were in speech_analytics, which is gone,
+    # and the brief window where analytics wrote to it never reached a deployed system.
+    manager.register_migration(
+        1023,
+        "Recording Analyses",
+        manager._build_migration_sql("""
+        DROP TABLE IF EXISTS call_summaries;
+
+        CREATE TABLE IF NOT EXISTS recording_analyses (
+            id {SERIAL},
+            transcript_id INTEGER REFERENCES transcripts(id) ON DELETE CASCADE,
+            -- Denormalised so the list view does not join for its commonest columns.
+            recording_id INTEGER,
+            summary {TEXT},
+            sentiment VARCHAR(20),
+            sentiment_score FLOAT,
+            -- JSON. Stored whole rather than split into columns because each analyser owns
+            -- its own result shape, and pinning those to columns would make every tweak a
+            -- migration.
+            keywords {TEXT},
+            compliance {TEXT},
+            quality {TEXT},
+            -- Which analysers actually ran. A missing section and a section that found
+            -- nothing look identical otherwise.
+            analysis_types {TEXT},
+            -- Pulled out of quality for sorting and for the search filter.
+            quality_score FLOAT,
+            analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_analyses_transcript
+            ON recording_analyses(transcript_id);
+        CREATE INDEX IF NOT EXISTS idx_analyses_recording
+            ON recording_analyses(recording_id);
+        CREATE INDEX IF NOT EXISTS idx_analyses_sentiment
+            ON recording_analyses(sentiment, analyzed_at);
     """),
     )

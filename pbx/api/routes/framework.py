@@ -27,161 +27,6 @@ framework_bp = Blueprint("framework", __name__, url_prefix="/api/framework")
 
 
 # =============================================================================
-# Speech Analytics
-# =============================================================================
-
-
-@framework_bp.route("/speech-analytics/configs", methods=["GET"])
-@require_auth
-def get_speech_analytics_configs() -> tuple[Response, int]:
-    """Get all speech analytics configurations."""
-    pbx_core = get_pbx_core()
-    if pbx_core and pbx_core.database.enabled:
-        try:
-            from pbx.features.speech_analytics import SpeechAnalyticsEngine
-
-            engine = SpeechAnalyticsEngine(pbx_core.database, pbx_core.config)
-            configs = engine.get_all_configs()
-            return send_json({"configs": configs}), 200
-        except Exception as e:
-            logger.error(f"Error getting speech analytics configs: {e}")
-            return send_json({"error": str(e)}, 500), 500
-    else:
-        return send_json({"error": "Database not available"}, 500), 500
-
-
-@framework_bp.route("/speech-analytics/config/<extension>", methods=["GET"])
-@require_auth
-def get_speech_analytics_config(extension: str) -> tuple[Response, int]:
-    """Get speech analytics config for extension."""
-    pbx_core = get_pbx_core()
-    if pbx_core and pbx_core.database.enabled:
-        try:
-            from pbx.features.speech_analytics import SpeechAnalyticsEngine
-
-            engine = SpeechAnalyticsEngine(pbx_core.database, pbx_core.config)
-            config = engine.get_config(extension)
-            if config:
-                return send_json(config), 200
-            return send_json({"error": "Config not found"}, 404), 404
-        except Exception as e:
-            logger.error(f"Error getting speech analytics config: {e}")
-            return send_json({"error": str(e)}, 500), 500
-    else:
-        return send_json({"error": "Database not available"}, 500), 500
-
-
-@framework_bp.route("/speech-analytics/summary/<call_id>", methods=["GET"])
-@require_auth
-def get_call_summary(call_id: str) -> tuple[Response, int]:
-    """Get stored call summary."""
-    pbx_core = get_pbx_core()
-    if pbx_core and pbx_core.database.enabled:
-        try:
-            from pbx.features.speech_analytics import SpeechAnalyticsEngine
-
-            engine = SpeechAnalyticsEngine(pbx_core.database, pbx_core.config)
-            summary = engine.get_call_summary(call_id)
-            if summary:
-                return send_json(summary), 200
-            return send_json({"error": "Summary not found"}, 404), 404
-        except Exception as e:
-            logger.error(f"Error getting call summary: {e}")
-            return send_json({"error": str(e)}, 500), 500
-    else:
-        return send_json({"error": "Database not available"}, 500), 500
-
-
-@framework_bp.route("/speech-analytics/config/<extension>", methods=["POST"])
-@require_auth
-def update_speech_analytics_config(extension: str) -> tuple[Response, int]:
-    """Update speech analytics configuration."""
-    pbx_core = get_pbx_core()
-    if pbx_core and pbx_core.database.enabled:
-        try:
-            body = get_request_body()
-            from pbx.features.speech_analytics import SpeechAnalyticsEngine
-
-            engine = SpeechAnalyticsEngine(pbx_core.database, pbx_core.config)
-            if engine.update_config(extension, body):
-                return send_json({"success": True}), 200
-            return send_json({"error": "Failed to update config"}, 500), 500
-        except Exception as e:
-            logger.error(f"Error updating speech analytics config: {e}")
-            return send_json({"error": str(e)}, 500), 500
-    else:
-        return send_json({"error": "Database not available"}, 500), 500
-
-
-@framework_bp.route("/speech-analytics/config/<extension>", methods=["DELETE"])
-@require_auth
-def delete_speech_analytics_config(extension: str) -> tuple[Response, int]:
-    """Delete speech analytics configuration for an extension."""
-    pbx_core = get_pbx_core()
-    if pbx_core and pbx_core.database.enabled:
-        try:
-            from pbx.features.speech_analytics import SpeechAnalyticsEngine
-
-            engine = SpeechAnalyticsEngine(pbx_core.database, pbx_core.config)
-            if engine.delete_config(extension):
-                return send_json({"success": True}), 200
-            return send_json({"error": "Failed to delete config"}, 500), 500
-        except Exception as e:
-            logger.error(f"Error deleting speech analytics config: {e}")
-            return send_json({"error": str(e)}, 500), 500
-    else:
-        return send_json({"error": "Database not available"}, 500), 500
-
-
-@framework_bp.route("/speech-analytics/analyze-sentiment", methods=["POST"])
-@require_auth
-def analyze_sentiment() -> tuple[Response, int]:
-    """Analyze sentiment of provided text."""
-    pbx_core = get_pbx_core()
-    if pbx_core and pbx_core.database.enabled:
-        try:
-            body = get_request_body()
-            text = body.get("text", "")
-            if not text:
-                return send_json({"error": "Text required"}, 400), 400
-
-            from pbx.features.speech_analytics import SpeechAnalyticsEngine
-
-            engine = SpeechAnalyticsEngine(pbx_core.database, pbx_core.config)
-            result = engine.analyze_sentiment(text)
-            return send_json(result), 200
-        except (KeyError, TypeError, ValueError) as e:
-            logger.error(f"Error analyzing sentiment: {e}")
-            return send_json({"error": str(e)}, 500), 500
-    else:
-        return send_json({"error": "Database not available"}, 500), 500
-
-
-@framework_bp.route("/speech-analytics/generate-summary/<call_id>", methods=["POST"])
-@require_auth
-def generate_summary(call_id: str) -> tuple[Response, int]:
-    """Generate call summary from transcript."""
-    pbx_core = get_pbx_core()
-    if pbx_core and pbx_core.database.enabled:
-        try:
-            body = get_request_body()
-            transcript = body.get("transcript", "")
-            if not transcript:
-                return send_json({"error": "Transcript required"}, 400), 400
-
-            from pbx.features.speech_analytics import SpeechAnalyticsEngine
-
-            engine = SpeechAnalyticsEngine(pbx_core.database, pbx_core.config)
-            summary = engine.generate_summary(call_id, transcript)
-            return send_json({"call_id": call_id, "summary": summary}), 200
-        except (KeyError, TypeError, ValueError) as e:
-            logger.error(f"Error generating summary: {e}")
-            return send_json({"error": str(e)}, 500), 500
-    else:
-        return send_json({"error": "Database not available"}, 500), 500
-
-
-# =============================================================================
 # Video Conference
 # =============================================================================
 
@@ -2360,30 +2205,37 @@ def delete_mobile_mapping(business_number: str) -> tuple[Response, int]:
 
 
 @framework_bp.route("/recording-analytics/analyses", methods=["GET"])
-@require_auth
+@require_admin
 def get_recording_analyses() -> tuple[Response, int]:
     """Get all recording analyses."""
     try:
         pbx_core = get_pbx_core()
         from pbx.features.call_recording_analytics import get_recording_analytics
 
-        ra = get_recording_analytics(pbx_core.config if pbx_core else None)
-        analyses = ra.analyses.copy()
-        return send_json({"analyses": analyses}), 200
+        ra = get_recording_analytics(
+            pbx_core.config if pbx_core else None,
+            getattr(pbx_core, "database", None) if pbx_core else None,
+        )
+        # Stored, not just in-memory: results survive a restart now, and a page that showed
+        # only what this process had analysed would look empty after every deploy.
+        return send_json({"analyses": ra.stored_analyses()}), 200
     except Exception as e:
         logger.error(f"Error getting recording analyses: {e}")
         return send_json({"error": str(e)}, 500), 500
 
 
 @framework_bp.route("/recording-analytics/statistics", methods=["GET"])
-@require_auth
+@require_admin
 def get_recording_statistics() -> tuple[Response, int]:
     """Get recording analytics statistics."""
     try:
         pbx_core = get_pbx_core()
         from pbx.features.call_recording_analytics import get_recording_analytics
 
-        ra = get_recording_analytics(pbx_core.config if pbx_core else None)
+        ra = get_recording_analytics(
+            pbx_core.config if pbx_core else None,
+            getattr(pbx_core, "database", None) if pbx_core else None,
+        )
         stats = ra.get_statistics()
         return send_json(stats), 200
     except Exception as e:
@@ -2392,14 +2244,17 @@ def get_recording_statistics() -> tuple[Response, int]:
 
 
 @framework_bp.route("/recording-analytics/analysis/<recording_id>", methods=["GET"])
-@require_auth
+@require_admin
 def get_recording_analysis(recording_id: str) -> tuple[Response, int]:
     """Get specific recording analysis."""
     try:
         pbx_core = get_pbx_core()
         from pbx.features.call_recording_analytics import get_recording_analytics
 
-        ra = get_recording_analytics(pbx_core.config if pbx_core else None)
+        ra = get_recording_analytics(
+            pbx_core.config if pbx_core else None,
+            getattr(pbx_core, "database", None) if pbx_core else None,
+        )
         analysis = ra.get_analysis(recording_id)
         if analysis:
             return send_json(analysis), 200
@@ -2410,24 +2265,32 @@ def get_recording_analysis(recording_id: str) -> tuple[Response, int]:
 
 
 @framework_bp.route("/recording-analytics/analyze", methods=["POST"])
-@require_auth
+@require_admin
 def analyze_recording() -> tuple[Response, int]:
-    """Analyze a recording."""
+    """
+    Analyze a recording from its stored transcript.
+
+    ``audio_path`` is gone. It was caller-supplied and unvalidated, so this endpoint was an
+    arbitrary file read; and analysis then transcribed that file once per analysis type,
+    reloading the speech model each time, synchronously in the request. Analysis now reads the
+    transcript post-call transcription already produced, so there is no path to supply and no
+    file to open.
+    """
     try:
         pbx_core = get_pbx_core()
         body = get_request_body()
         recording_id = body.get("recording_id")
-        audio_path = body.get("audio_path")
 
-        if not recording_id or not audio_path:
-            return send_json({"error": "recording_id and audio_path required"}, 400), 400
+        if not recording_id:
+            return send_json({"error": "recording_id required"}, 400), 400
 
         from pbx.features.call_recording_analytics import get_recording_analytics
 
-        ra = get_recording_analytics(pbx_core.config if pbx_core else None)
-        result = ra.analyze_recording(
-            recording_id, audio_path, analysis_types=body.get("analysis_types")
+        ra = get_recording_analytics(
+            pbx_core.config if pbx_core else None,
+            getattr(pbx_core, "database", None) if pbx_core else None,
         )
+        result = ra.analyze_recording(recording_id, analysis_types=body.get("analysis_types"))
 
         return send_json(result), 200
     except (KeyError, TypeError, ValueError) as e:
@@ -2436,7 +2299,7 @@ def analyze_recording() -> tuple[Response, int]:
 
 
 @framework_bp.route("/recording-analytics/search", methods=["POST"])
-@require_auth
+@require_admin
 def search_recordings() -> tuple[Response, int]:
     """Search recordings."""
     try:
@@ -2446,7 +2309,10 @@ def search_recordings() -> tuple[Response, int]:
 
         from pbx.features.call_recording_analytics import get_recording_analytics
 
-        ra = get_recording_analytics(pbx_core.config if pbx_core else None)
+        ra = get_recording_analytics(
+            pbx_core.config if pbx_core else None,
+            getattr(pbx_core, "database", None) if pbx_core else None,
+        )
         results = ra.search_recordings(criteria)
 
         return send_json({"results": results}), 200

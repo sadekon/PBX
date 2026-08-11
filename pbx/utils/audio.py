@@ -221,6 +221,155 @@ def alaw_to_pcm16(payload: bytes) -> "np.ndarray":
     return _ALAW_DECODE_TABLE[np.frombuffer(payload, dtype=np.uint8)]
 
 
+def read_wav_format(path: "str | Path") -> tuple[int, int, int] | None:
+    """
+    Read a WAV file's ``fmt`` chunk without decoding the audio.
+
+    Returns:
+        ``(audio_format, sample_rate, channels)``, or None when the file is not a readable
+        RIFF/WAVE. ``audio_format`` is the raw code -- compare against ``WAV_FORMAT_*``.
+    """
+    try:
+        with Path(path).open("rb") as f:
+            if f.read(4) != b"RIFF":
+                return None
+            f.read(4)
+            if f.read(4) != b"WAVE":
+                return None
+
+            while True:
+                chunk_id = f.read(4)
+                if not chunk_id or len(chunk_id) < 4:
+                    return None
+                size_bytes = f.read(4)
+                if len(size_bytes) < 4:
+                    return None
+                chunk_size = struct.unpack("<I", size_bytes)[0]
+
+                if chunk_id == b"fmt ":
+                    fmt = f.read(chunk_size)
+                    if len(fmt) < 16:
+                        return None
+                    return (
+                        struct.unpack("<H", fmt[0:2])[0],
+                        struct.unpack("<I", fmt[4:8])[0],
+                        struct.unpack("<H", fmt[2:4])[0],
+                    )
+                # Chunks are word-aligned; an odd size carries a pad byte.
+                f.seek(chunk_size + (chunk_size & 1), 1)
+    except (OSError, struct.error):
+        return None
+
+
+def wav_as_pcm16_wav(path: "str | Path") -> tuple[bytes | None, int | None]:
+    """
+    Read a WAV file as one a browser will actually play.
+
+    Telephony audio is routinely stored as G.711, which every mainstream browser refuses --
+    an ``<audio>`` element given µ-law reports "no supported source was found" rather than any
+    decode error, so the failure looks like a broken URL. Decoding to linear PCM here is what
+    makes voicemail and call audio playable from the admin UI at all.
+
+    Returns:
+        ``(data, audio_format)``. ``data`` is None when the file needs no conversion (already
+        linear PCM -- serve the file directly so range requests keep working) **or** when the
+        format cannot be decoded; the two cases are told apart by ``audio_format``, which is
+        None only when the file could not be parsed. Callers should refuse to serve a format
+        that is neither PCM nor G.711 rather than send bytes that will not play.
+    """
+    header = read_wav_format(path)
+    if header is None:
+        return None, None
+
+    audio_format, sample_rate, channels = header
+
+    if audio_format == WAV_FORMAT_PCM:
+        # Already playable *if* the header is truthful. `wave.open(..., "wb")` patches the RIFF
+        # and data sizes in on close(), so a recording whose writer was killed -- or one still
+        # being written -- carries size 0 while otherwise looking like a valid WAV. A browser
+        # decodes that to zero samples and reports "no supported sources", identical to a codec
+        # failure. Rebuilding the header from the bytes actually present makes it playable.
+        payload, declared_ok = _read_wav_data_chunk(path)
+        if payload is None:
+            return None, audio_format
+        if declared_ok:
+            return None, audio_format
+
+        repaired = build_wav_header(
+            len(payload), sample_rate=sample_rate, channels=channels, bits_per_sample=16
+        )
+        return repaired + payload, audio_format
+
+    if audio_format not in (WAV_FORMAT_ULAW, WAV_FORMAT_ALAW):
+        return None, audio_format
+
+    # Read the data chunk directly rather than through the stdlib: wave.open refuses G.711
+    # outright with "unknown format: 7", which is the whole reason this function exists.
+    payload, _ = _read_wav_data_chunk(path)
+    if payload is None:
+        return None, audio_format
+
+    decode = ulaw_to_pcm16 if audio_format == WAV_FORMAT_ULAW else alaw_to_pcm16
+    try:
+        samples = decode(payload).astype("<i2").tobytes()
+    except (ValueError, TypeError):
+        return None, audio_format
+
+    header_bytes = build_wav_header(
+        len(samples), sample_rate=sample_rate, channels=channels, bits_per_sample=16
+    )
+    return header_bytes + samples, audio_format
+
+
+def _read_wav_data_chunk(path: str | Path) -> tuple[bytes | None, bool]:
+    """
+    The raw contents of a WAV's ``data`` chunk, whatever the encoding.
+
+    The declared chunk size is treated as a hint, not a fact. A file whose writer never closed
+    reports 0, and a truncated one reports more than it holds; in both cases the audio that is
+    actually present is still perfectly decodable, so the bytes from here to end-of-file are
+    returned instead.
+
+    Returns:
+        ``(payload, declared_size_was_correct)``. The payload is None when the file is not a
+        readable RIFF/WAVE.
+    """
+    payload: bytes | None = None
+    declared_ok = True
+
+    try:
+        with Path(path).open("rb") as f:
+            if f.read(4) != b"RIFF":
+                return None, False
+            f.read(4)
+            if f.read(4) != b"WAVE":
+                return None, False
+
+            while True:
+                chunk_id = f.read(4)
+                if not chunk_id or len(chunk_id) < 4:
+                    break
+                size_bytes = f.read(4)
+                if len(size_bytes) < 4:
+                    break
+                chunk_size = struct.unpack("<I", size_bytes)[0]
+
+                if chunk_id == b"data":
+                    rest = f.read()
+                    if chunk_size == 0 or chunk_size > len(rest):
+                        # Unfinalised or truncated: keep everything that is really there.
+                        payload, declared_ok = rest, False
+                    else:
+                        payload, declared_ok = rest[:chunk_size], True
+                    break
+
+                f.seek(chunk_size + (chunk_size & 1), 1)
+    except (OSError, struct.error):
+        return None, False
+
+    return payload, declared_ok
+
+
 def _encode_index(samples: "np.ndarray") -> "np.ndarray":
     """Shift int16 samples into the 0..65535 range the encode tables use."""
     return np.asarray(samples, dtype=np.int16).astype(np.int32) + 32768
@@ -487,6 +636,209 @@ def resample_pcm16(pcm16: bytes, from_rate: int, to_rate: int) -> bytes:
         )
 
     return np.clip(np.round(resampled), -32768, 32767).astype("<i2").tobytes()
+
+
+#: RMS below which a 20 ms frame is treated as silence rather than speech, for int16 samples.
+#:
+#: G.711 idle and comfort noise sit well under 100; telephone speech runs in the low thousands.
+#: 200 is comfortably between the two, and deliberately near the noise end -- the cost of
+#: calling silence speech is one wasted transcription, while the cost of calling speech silence
+#: is a transcript that is missing what somebody said.
+SILENCE_RMS_FLOOR = 200.0
+
+#: Frame length used when measuring activity. Matches one RTP packet of G.711.
+_ACTIVITY_FRAME_SAMPLES = 160
+
+
+def active_speech_seconds(
+    pcm16: bytes, sample_rate: int = 8000, floor: float = SILENCE_RMS_FLOOR
+) -> float:
+    """
+    How many seconds of this audio are above the noise floor.
+
+    Used to decide whether audio is worth handing to a speech model at all. It answers only
+    "is there anything here", not "where is the speech" -- the recogniser does the second part
+    far better, and faster-whisper's ``vad_filter`` already skips non-speech internally.
+
+    This matters most when a call is transcribed per participant: each channel is silent for
+    the whole time the other party is speaking, and a channel where somebody never spoke at
+    all -- a leg on hold, a participant who only listened -- would otherwise cost a full model
+    run to produce nothing, or worse, produce a hallucination.
+
+    Args:
+        pcm16: Mono PCM16 little-endian samples.
+        sample_rate: Samples per second.
+        floor: RMS below which a frame counts as silence.
+
+    Returns:
+        Seconds of audio above the floor. 0.0 for empty input.
+    """
+    if not pcm16 or sample_rate <= 0:
+        return 0.0
+
+    samples = np.frombuffer(pcm16, dtype="<i2")
+    if samples.size == 0:
+        return 0.0
+
+    # The remainder that does not fill a frame is at most 20 ms and cannot change the
+    # decision, except when the whole clip is shorter than one frame.
+    rms = _frame_rms(samples, _ACTIVITY_FRAME_SAMPLES)
+    if rms.size == 0:
+        whole = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+        return samples.size / sample_rate if whole > floor else 0.0
+
+    return float(np.count_nonzero(rms > floor) * _ACTIVITY_FRAME_SAMPLES / sample_rate)
+
+
+#: Silence that must elapse before audio either side of it is treated as separate speech.
+#:
+#: Deliberately generous. Splitting audio before it reaches a speech model costs quality: the
+#: model punctuates and capitalises from context, so a cut mid-sentence produces a lowercase
+#: fragment with no closing punctuation and worse accuracy on the words either side. The only
+#: safe place to cut is a gap no sentence would contain.
+#:
+#: Pauses inside ordinary speech run to about 0.3 s, and clause boundaries to about 1 s.
+#: A conversational turn -- the case this exists for, where the gap is the other participant's
+#: entire turn -- is several seconds. 1.5 s sits clearly above the first and below the second.
+#: Raising it is the safe direction; lowering it risks cutting sentences in half.
+DEFAULT_SPLIT_GAP_SECONDS = 1.5
+
+#: Audio kept either side of a region, so a cut never lands on a leading consonant.
+#: Must stay below half of the gap threshold or padded regions merge back together.
+DEFAULT_REGION_PAD_SECONDS = 0.2
+
+#: Regions shorter than this are dropped. A fragment this brief carries no context for the
+#: model, which is the condition under which it invents words.
+DEFAULT_MIN_REGION_SECONDS = 0.3
+
+
+def _frame_rms(samples: "np.ndarray", frame: int) -> "np.ndarray":
+    """RMS per fixed-length frame. Trailing samples that do not fill a frame are ignored."""
+    frames = samples.size // frame
+    if frames == 0:
+        return np.zeros(0)
+    block = samples[: frames * frame].astype(np.float64).reshape(frames, frame)
+    return np.sqrt(np.mean(block**2, axis=1))
+
+
+def frame_rms(pcm16: bytes) -> "np.ndarray":
+    """
+    RMS per 20 ms frame, for callers measuring audio they are reading in pieces.
+
+    One float per 20 ms is about 400 KB per hour per channel, so a caller can summarise a
+    whole call this way and never hold the audio itself. That is the difference between
+    bounded memory and holding every channel of every simultaneously-ending call.
+    """
+    return _frame_rms(np.frombuffer(pcm16, dtype="<i2"), _ACTIVITY_FRAME_SAMPLES)
+
+
+def frame_seconds(sample_rate: int = 8000) -> float:
+    """How much time one :func:`frame_rms` frame covers."""
+    return _ACTIVITY_FRAME_SAMPLES / sample_rate
+
+
+def regions_from_rms(
+    rms: "np.ndarray",
+    *,
+    seconds_per_frame: float,
+    duration: float,
+    floor: float = SILENCE_RMS_FLOOR,
+    min_gap_seconds: float = DEFAULT_SPLIT_GAP_SECONDS,
+    pad_seconds: float = DEFAULT_REGION_PAD_SECONDS,
+    min_region_seconds: float = DEFAULT_MIN_REGION_SECONDS,
+) -> list[tuple[float, float]]:
+    """
+    Speech regions from precomputed frame energies. See :func:`speech_regions` for the why.
+
+    Split out so a caller streaming a long file can summarise it frame by frame and decide
+    where to cut without ever holding the audio.
+    """
+    if rms.size == 0:
+        return []
+
+    active = rms > floor
+    if not active.any():
+        return []
+
+    # Runs of consecutive active frames. diff on the padded boolean array marks every
+    # transition, so starts and ends come out in pairs.
+    edges = np.diff(np.concatenate(([0], active.view(np.int8), [0])))
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+
+    # Join runs separated by less than the gap threshold: those are pauses within speech,
+    # not turn boundaries, and cutting there is what damages the transcript.
+    merged: list[list[float]] = []
+    for start, end in zip(starts * seconds_per_frame, ends * seconds_per_frame, strict=True):
+        if merged and start - merged[-1][1] < min_gap_seconds:
+            merged[-1][1] = end
+        else:
+            merged.append([start, end])
+
+    regions: list[tuple[float, float]] = []
+    for start, end in merged:
+        if end - start < min_region_seconds:
+            continue
+        padded_start = float(max(0.0, start - pad_seconds))
+        padded_end = float(min(duration, end + pad_seconds))
+        # Padding cannot reintroduce an overlap while pad_seconds stays below half the gap
+        # threshold, but clamp anyway rather than trust the caller's arithmetic.
+        if regions and padded_start <= regions[-1][1]:
+            regions[-1] = (regions[-1][0], padded_end)
+        else:
+            regions.append((padded_start, padded_end))
+
+    return regions
+
+
+def speech_regions(
+    pcm16: bytes,
+    sample_rate: int = 8000,
+    *,
+    floor: float = SILENCE_RMS_FLOOR,
+    min_gap_seconds: float = DEFAULT_SPLIT_GAP_SECONDS,
+    pad_seconds: float = DEFAULT_REGION_PAD_SECONDS,
+    min_region_seconds: float = DEFAULT_MIN_REGION_SECONDS,
+) -> list[tuple[float, float]]:
+    """
+    Find stretches of speech separated by gaps long enough to be real turn boundaries.
+
+    Exists because a speech model will not split a segment across silence it never receives.
+    faster-whisper's VAD removes non-speech and transcribes what remains as one stream, so two
+    utterances either side of a long pause arrive adjacent and come back as a single segment
+    spanning both. On a per-participant recording that pause is the other person's entire turn,
+    which makes the merged output actively wrong rather than merely ugly.
+
+    Splitting the audio *before* the model sees it is the only way to force the boundary. The
+    cost is that every cut removes context the model uses for punctuation and capitalisation,
+    so this cuts as rarely as possible: only at gaps of `min_gap_seconds`, which no sentence
+    contains, and never inside continuous speech however long it runs.
+
+    Args:
+        pcm16: Mono PCM16 little-endian samples.
+        sample_rate: Samples per second.
+        floor: RMS below which a frame counts as silence.
+        min_gap_seconds: Silence shorter than this never splits a region.
+        pad_seconds: Audio kept either side of each region.
+        min_region_seconds: Regions shorter than this are discarded.
+
+    Returns:
+        (start, end) pairs in seconds, in order, non-overlapping. Empty when there is no
+        speech. A single region covering everything means there was nothing safe to split on.
+    """
+    if not pcm16 or sample_rate <= 0:
+        return []
+
+    samples = np.frombuffer(pcm16, dtype="<i2")
+    return regions_from_rms(
+        _frame_rms(samples, _ACTIVITY_FRAME_SAMPLES),
+        seconds_per_frame=frame_seconds(sample_rate),
+        duration=samples.size / sample_rate,
+        floor=floor,
+        min_gap_seconds=min_gap_seconds,
+        pad_seconds=pad_seconds,
+        min_region_seconds=min_region_seconds,
+    )
 
 
 def read_wav_as_pcm16(path: str | Path) -> tuple[bytes, int]:

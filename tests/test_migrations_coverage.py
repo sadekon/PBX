@@ -15,8 +15,11 @@ def _make_db_backend(db_type: str = "sqlite") -> MagicMock:
     """Return a mock database backend configured for the given db_type."""
     db = MagicMock()
     db.db_type = db_type
-    db.execute.return_value = None
-    db.execute_script.return_value = None
+    # Both return bool on the real DatabaseBackend. Returning None here made the mock
+    # disagree with the interface, which is part of why apply_migrations ignoring the
+    # execute_script result went unnoticed for so long.
+    db.execute.return_value = True
+    db.execute_script.return_value = True
     db.fetch_one.return_value = None
     db.fetch_all.return_value = []
     return db
@@ -623,21 +626,21 @@ class TestRegisterAllMigrations:
     """Tests for the register_all_migrations function."""
 
     @patch("pbx.utils.migrations.get_logger")
-    def test_registers_all_eleven_migrations(self, mock_get_logger: MagicMock) -> None:
-        """Must register exactly 17 migrations (1000-1016)."""
+    def test_registers_every_migration(self, mock_get_logger: MagicMock) -> None:
+        """Must register exactly 24 migrations (1000-1023)."""
         db = _make_db_backend("sqlite")
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
-        assert len(mgr.migrations) == 17
+        assert len(mgr.migrations) == 24
 
     @patch("pbx.utils.migrations.get_logger")
     def test_migration_versions_are_sequential(self, mock_get_logger: MagicMock) -> None:
-        """Migration versions must be 1000 through 1016."""
+        """Migration versions must be 1000 through 1023, with no gaps."""
         db = _make_db_backend("sqlite")
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
         versions = sorted(m["version"] for m in mgr.migrations)
-        assert versions == list(range(1000, 1017))
+        assert versions == list(range(1000, 1024))
 
     @patch("pbx.utils.migrations.get_logger")
     def test_migration_names(self, mock_get_logger: MagicMock) -> None:
@@ -735,6 +738,7 @@ class TestRegisterAllMigrationsTableNames:
     def test_1000_ai_features_tables(self) -> None:
         """Migration 1000 must create AI feature tables."""
         sql = self._get_migration_sql(1000)
+        # 1000 still creates it; 1022 drops it along with the module that used it.
         assert "speech_analytics_configs" in sql
         assert "ai_assistant_configs" in sql
         assert "voice_biometrics" in sql
@@ -822,18 +826,18 @@ class TestRegisterAllMigrationsCanApply:
         register_all_migrations(mgr)
         result = mgr.apply_migrations()
         assert result is True
-        assert db.execute_script.call_count == 17
+        assert db.execute_script.call_count == 24
 
     @patch("pbx.utils.migrations.get_logger")
     def test_apply_partial_from_midpoint(self, mock_get_logger: MagicMock) -> None:
-        """Applying migrations from version 1005 should apply 1006-1016 (11 migrations)."""
+        """Applying migrations from version 1005 should apply 1006-1023 (18 migrations)."""
         db = _make_db_backend("sqlite")
         db.fetch_one.return_value = {"max_version": 1005}
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
         result = mgr.apply_migrations()
         assert result is True
-        assert db.execute_script.call_count == 11
+        assert db.execute_script.call_count == 18
 
     @patch("pbx.utils.migrations.get_logger")
     def test_apply_with_target_version(self, mock_get_logger: MagicMock) -> None:
@@ -850,9 +854,164 @@ class TestRegisterAllMigrationsCanApply:
     def test_already_up_to_date(self, mock_get_logger: MagicMock) -> None:
         """Applying when already at latest version should be a no-op."""
         db = _make_db_backend("sqlite")
-        db.fetch_one.return_value = {"max_version": 1016}
+        db.fetch_one.return_value = {"max_version": 1023}
         mgr = MigrationManager(db)
         register_all_migrations(mgr)
         result = mgr.apply_migrations()
         assert result is True
         assert db.execute_script.call_count == 0
+
+
+@pytest.mark.unit
+class TestFailedMigrationsAreNotRecorded:
+    """
+    A migration that fails must not be marked applied.
+
+    apply_migrations used to ignore execute_script's result. execute_script stops at the first
+    failing statement, so a multi-table migration could create half its tables, fail, and still
+    be recorded as done -- and because versions only move forward it was never retried. That is
+    how call_summaries came to be missing on an install that believed itself up to date.
+    """
+
+    @patch("pbx.utils.migrations.get_logger")
+    def test_a_failing_migration_is_not_recorded(self, mock_get_logger: MagicMock) -> None:
+        db = _make_db_backend()
+        db.fetch_one.return_value = {"max_version": 0}
+        db.execute_script.return_value = False
+
+        mgr = MigrationManager(db)
+        mgr.register_migration(1, "breaks", "CREATE TABLE x (id INT);")
+
+        assert mgr.apply_migrations() is False
+        inserts = [
+            c for c in db.execute.call_args_list if "schema_migrations" in str(c[0][0]).lower()
+        ]
+        assert not [c for c in inserts if "INSERT" in str(c[0][0]).upper()]
+
+    @patch("pbx.utils.migrations.get_logger")
+    def test_later_migrations_do_not_run_after_a_failure(self, mock_get_logger: MagicMock) -> None:
+        """Running 1002 against a schema that never got 1001 is how drift compounds."""
+        db = _make_db_backend()
+        db.fetch_one.return_value = {"max_version": 0}
+        db.execute_script.return_value = False
+
+        mgr = MigrationManager(db)
+        mgr.register_migration(1, "breaks", "CREATE TABLE x (id INT);")
+        mgr.register_migration(2, "later", "CREATE TABLE y (id INT);")
+
+        assert mgr.apply_migrations() is False
+        assert db.execute_script.call_count == 1
+
+
+@pytest.mark.unit
+class TestUnifiedStorage:
+    """1019 replaces the three places transcript text used to live with one owned by a cascade."""
+
+    def _sql(self) -> str:
+        from pbx.utils.migrations import register_all_migrations
+
+        mgr = MigrationManager(_make_db_backend())
+        mgr.migrations = []
+        register_all_migrations(mgr)
+        return next(m["sql"] for m in mgr.migrations if m["version"] == 1019)
+
+    def test_it_creates_the_new_tables(self) -> None:
+        sql = self._sql()
+        for table in ("recordings", "transcripts", "call_summaries", "voicemail_messages"):
+            assert f"CREATE TABLE IF NOT EXISTS {table}" in sql
+
+    def test_it_drops_the_superseded_and_dead_tables(self) -> None:
+        sql = self._sql()
+        for table in (
+            "call_transcripts",
+            "call_records",
+            "call_recording_analytics",
+            "recording_announcements_log",
+        ):
+            assert f"DROP TABLE IF EXISTS {table}" in sql
+
+    def test_deleting_a_recording_cascades(self) -> None:
+        """
+        The point of the restructure: one delete, and everything derived goes with it. Every
+        retention hole it replaced was a second place somebody forgot to sweep.
+        """
+        import sqlite3
+
+        sql = (
+            self._sql()
+            .replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+            .replace("BIGINT", "INTEGER")
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(sql)
+
+        conn.execute("INSERT INTO recordings (session_id, kind, path) VALUES ('s','recording','a')")
+        rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO transcripts (recording_id, text) VALUES (?, 'hi')", (rid,))
+        tid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO call_summaries (transcript_id, summary) VALUES (?, 's')", (tid,))
+        conn.execute(
+            "INSERT INTO voicemail_messages (message_id, recording_id, extension_number)"
+            " VALUES ('m', ?, '1500')",
+            (rid,),
+        )
+
+        conn.execute("DELETE FROM recordings WHERE id = ?", (rid,))
+
+        for table in ("transcripts", "call_summaries", "voicemail_messages"):
+            assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+
+    def test_a_live_transcript_survives_without_a_recording(self) -> None:
+        """Live transcription has no file, so recording_id must be nullable."""
+        import sqlite3
+
+        sql = (
+            self._sql()
+            .replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+            .replace("BIGINT", "INTEGER")
+        )
+        conn = sqlite3.connect(":memory:")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(sql)
+
+        conn.execute(
+            "INSERT INTO transcripts (recording_id, source, text) VALUES (NULL,'live','x')"
+        )
+
+        assert conn.execute("SELECT count(*) FROM transcripts").fetchone()[0] == 1
+
+
+@pytest.mark.unit
+class TestNoticeParticipantsRepair:
+    """
+    1021 exists because 1020 was edited after it had already been applied.
+
+    Versions only move forward and there is no checksum, so the edit was silently a no-op on
+    every install that already had 1020 -- producing a recording_notices table with no
+    participants column while the INSERT named one. The rule is add a migration, never edit one.
+    """
+
+    def _sql(self, version: int) -> str:
+        from pbx.utils.migrations import register_all_migrations
+
+        mgr = MigrationManager(_make_db_backend())
+        mgr.migrations = []
+        register_all_migrations(mgr)
+        return next(m["sql"] for m in mgr.migrations if m["version"] == version)
+
+    def test_1021_adds_the_column(self) -> None:
+        sql = self._sql(1021)
+        assert "ALTER TABLE recording_notices" in sql
+        assert "participants" in sql
+
+    def test_it_is_idempotent(self) -> None:
+        """It has to be harmless on a fresh install and on one that already ran it."""
+        assert "IF NOT EXISTS" in self._sql(1021)
+
+    def test_1020_stays_as_it_was_applied(self) -> None:
+        """
+        Reverted deliberately. A migration already applied somewhere must keep matching what
+        actually ran there, or the code and the deployed schema tell different stories.
+        """
+        assert "participants" not in self._sql(1020)

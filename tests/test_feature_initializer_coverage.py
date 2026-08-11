@@ -71,7 +71,7 @@ _TOP_LEVEL_PATCHES = {
     "SIPTrunkSystem": "pbx.core.feature_initializer.SIPTrunkSystem",
     "FindMeFollowMe": "pbx.core.feature_initializer.FindMeFollowMe",
     "TimeBasedRouting": "pbx.core.feature_initializer.TimeBasedRouting",
-    "RecordingRetentionManager": "pbx.core.feature_initializer.RecordingRetentionManager",
+    "RetentionSweeper": "pbx.core.feature_initializer.RetentionSweeper",
     "FraudDetectionSystem": "pbx.core.feature_initializer.FraudDetectionSystem",
     "PhoneProvisioning": "pbx.core.feature_initializer.PhoneProvisioning",
 }
@@ -83,7 +83,6 @@ _LAZY_PATCHES = {
     "get_security_monitor": "pbx.utils.security_monitor.get_security_monitor",
     "CallbackQueue": "pbx.features.callback_queue.CallbackQueue",
     "MobilePushNotifications": "pbx.features.mobile_push.MobilePushNotifications",
-    "RecordingAnnouncements": "pbx.features.recording_announcements.RecordingAnnouncements",
 }
 
 
@@ -139,7 +138,12 @@ class TestFeatureInitializerInitialize:
         mocks["ConferenceSystem"].assert_called_once()
         assert pbx_core.conference_system == mocks["ConferenceSystem"].return_value
 
-        mocks["CallRecordingSystem"].assert_called_once_with(auto_record=False)
+        mocks["CallRecordingSystem"].assert_called_once()
+        kwargs = mocks["CallRecordingSystem"].call_args.kwargs
+        assert kwargs["recording_path"] == "recordings"
+        assert kwargs["requested"] is False
+        # Registering finished recordings is what makes them visible to retention.
+        assert kwargs["store"] is not None
         assert pbx_core.recording_system == mocks["CallRecordingSystem"].return_value
 
         mocks["QueueSystem"].assert_called_once()
@@ -166,8 +170,12 @@ class TestFeatureInitializerInitialize:
         mocks["TimeBasedRouting"].assert_called_once()
         assert pbx_core.time_based_routing == mocks["TimeBasedRouting"].return_value
 
-        mocks["RecordingRetentionManager"].assert_called_once()
-        assert pbx_core.recording_retention == mocks["RecordingRetentionManager"].return_value
+        # One object under both names. recording_retention used to be a separate manager
+        # that owned policies and never deleted anything, while the sweeper deleted and knew
+        # no policies; the reconciliation is precisely that they are now the same thing.
+        mocks["RetentionSweeper"].assert_called_once()
+        assert pbx_core.retention_sweeper == mocks["RetentionSweeper"].return_value
+        assert pbx_core.recording_retention is pbx_core.retention_sweeper
 
         mocks["FraudDetectionSystem"].assert_called_once()
         assert pbx_core.fraud_detection == mocks["FraudDetectionSystem"].return_value
@@ -236,11 +244,24 @@ class TestFeatureInitializerInitialize:
         )
 
     def test_call_recording_enabled(self) -> None:
-        """CallRecordingSystem receives auto_record=True from config."""
+        """CallRecordingSystem receives requested=True from config."""
         pbx_core = _make_pbx_core(config_overrides={"features.call_recording": True})
         mocks = _run_initialize_with_all_patches(pbx_core)
 
-        mocks["CallRecordingSystem"].assert_called_once_with(auto_record=True)
+        mocks["CallRecordingSystem"].assert_called_once()
+        assert mocks["CallRecordingSystem"].call_args.kwargs["requested"] is True
+
+    def test_recording_is_gated_by_the_feature_flag_alone(self) -> None:
+        """
+        There is no second key any more. ``recording.consent_acknowledged`` stood in for a
+        notice this PBX could not play; the recording notice replaced it, and it fails closed
+        against real playback rather than against a boolean.
+        """
+        pbx_core = _make_pbx_core(config_overrides={"features.call_recording": True})
+        mocks = _run_initialize_with_all_patches(pbx_core)
+
+        mocks["CallRecordingSystem"].assert_called_once()
+        assert mocks["CallRecordingSystem"].call_args.kwargs["requested"] is True
 
     # ------------------------------------------------------------------ #
     # Optional features: auto_attendant
@@ -685,15 +706,20 @@ class TestFeatureInitializerInitialize:
         )
         assert pbx_core.mobile_push == mocks["MobilePushNotifications"].return_value
 
-    def test_recording_announcements_always_initialized(self) -> None:
-        """RecordingAnnouncements is always created."""
-        pbx_core = _make_pbx_core()
-        mocks = _run_initialize_with_all_patches(pbx_core)
+    def test_the_notice_announcer_is_always_built(self) -> None:
+        """
+        One announcer under both names.
 
-        mocks["RecordingAnnouncements"].assert_called_once_with(
-            config=pbx_core.config, database=pbx_core.database
-        )
-        assert pbx_core.recording_announcements == mocks["RecordingAnnouncements"].return_value
+        recording_announcements used to be a separate module whose playback path was
+        unreachable -- it guarded on a pbx_core attribute nothing set, then called a method the
+        relay handler does not have. The admin page reported its zeroes while a different
+        system played the notices. They are the same object now.
+        """
+        pbx_core = _make_pbx_core()
+        _run_initialize_with_all_patches(pbx_core)
+
+        assert pbx_core.consent_announcer is not None
+        assert pbx_core.recording_announcements is pbx_core.consent_announcer
 
     # ------------------------------------------------------------------ #
     # All optional features disabled at once

@@ -110,5 +110,8 @@ def enable_smtp_debug(settings: SmtpSettings) -> None:
     def patched(self: object, *bits: object) -> None:
         print(redactor(" ".join(str(bit) for bit in bits)), file=sys.stderr)
 
-    smtplib.SMTP._print_debug = patched  # type: ignore[method-assign]
+    # _print_debug is private and unannotated in typeshed, so this is an attribute set on a
+    # class type mypy does not know has it. Deliberate: there is no public hook for
+    # intercepting smtplib's debug output, and redacting it is the whole point of this module.
+    smtplib.SMTP._print_debug = patched  # type: ignore[attr-defined]
     smtplib.SMTP.debuglevel = 1

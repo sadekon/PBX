@@ -487,6 +487,8 @@ class CallRouter:
             # relay
             pbx.rtp_relay.set_endpoints(call_id, caller_endpoint, callee_endpoint)
             pbx.logger.info(f"RTP relay connected for call {call_id}")
+            # Recording starts itself: setting both endpoints fires the relay's on_bridged
+            # hook. Nothing to do here, and no other signalling path needs wiring either.
 
         # Mark call as connected
         call.connect()

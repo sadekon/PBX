@@ -276,6 +276,8 @@ class CallOriginator:
         leg_a_call.bridged_peer_call_id = leg_b_call.call_id
         leg_b_call.bridged_peer_call_id = leg_a_call.call_id
         leg_b_call.bridge_peer_side = "b"
+        # Two legs, one conversation: the recording and its transcripts key off the session.
+        leg_b_call.join_session(leg_a_call)
 
         if leg_b_call.callee_rtp:
             dest_endpoint = (leg_b_call.callee_rtp["address"], leg_b_call.callee_rtp["port"])

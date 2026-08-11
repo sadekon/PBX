@@ -119,6 +119,7 @@ def _register_blueprints(app: Flask) -> None:
     from pbx.api.routes.provisioning import provisioning_bp
     from pbx.api.routes.qos import qos_bp
     from pbx.api.routes.queues import queues_bp
+    from pbx.api.routes.recordings import recordings_bp
     from pbx.api.routes.security import security_bp
     from pbx.api.routes.static import static_bp
     from pbx.api.routes.voicemail import voicemail_bp
@@ -134,6 +135,7 @@ def _register_blueprints(app: Flask) -> None:
         phones_bp,
         config_bp,
         voicemail_bp,
+        recordings_bp,
         webrtc_bp,
         integrations_bp,
         phone_book_bp,

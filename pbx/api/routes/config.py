@@ -169,9 +169,15 @@ def get_full_config() -> tuple[Response, int]:
                 },
             },
             "recording": {
-                "auto_record": pbx_core.config.get("recording.auto_record", False),
-                "format": pbx_core.config.get("recording.format", "wav"),
+                "enabled": pbx_core.config.get("features.call_recording", False),
+                # Which calls get a spoken notice. A recording whose notice fails to play is
+                # discarded, so this is the other half of whether recording actually happens.
+                "consent_announce_for": pbx_core.config.get(
+                    "recording.consent.announce_for", "external"
+                ),
                 "storage_path": pbx_core.config.get("recording.storage_path", "recordings"),
+                # Not configurable: always PCM16 8 kHz, one channel per participant.
+                "format": "wav",
             },
             "security": {
                 "password": {
@@ -277,9 +283,12 @@ def get_features_config() -> tuple[Response, int]:
             ),
             "description": "Speech-to-text voicemail transcription",
         },
-        "call_recording_announcements": {
-            "enabled": pbx_core.config.get("features.call_recording_announcements.enabled", False),
-            "description": "Play recording announcements to callers",
+        "recording_notice": {
+            # Not a features.* flag: which calls get a notice is recording.consent.announce_for,
+            # and "off" is the only way to disable it. The old key never existed in config.yml,
+            # so this always reported False while notices were in fact playing.
+            "enabled": pbx_core.config.get("recording.consent.announce_for", "external") != "off",
+            "description": "Play a recording notice to call participants",
         },
         "fraud_detection": {
             "enabled": pbx_core.config.get("features.fraud_detection.enabled", True),
