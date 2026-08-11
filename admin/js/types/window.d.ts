@@ -140,7 +140,6 @@ declare global {
         sendTestNotificationForm: (event: Event) => void;
         sendTestNotification: (userId: string) => Promise<void>;
         loadRecordingAnnouncementsStats: () => Promise<void>;
-        loadSpeechAnalyticsConfigs: () => Promise<void>;
         loadCRMActivityLog: (() => Promise<void>) | (() => void);
         clearCRMActivityLog: () => Promise<void>;
 
@@ -217,7 +216,6 @@ declare global {
         loadWebRTCPhoneConfig: (() => Promise<void>) | (() => void);
         saveWebRTCPhoneConfig: (event: Event) => Promise<void>;
 
-        // pages/speech-analytics.ts
         loadE911Sites: () => Promise<void>;
         loadExtensionLocations: () => Promise<void>;
         loadLocationHistory: () => Promise<void>;
@@ -228,9 +226,6 @@ declare global {
         showUpdateLocationModal: () => void;
         updateExtensionLocation: (extension: string) => void;
         removeLocationModal: () => void;
-        showAddSpeechAnalyticsConfigModal: () => void;
-        editSpeechAnalyticsConfig: (extension: string) => void;
-        deleteSpeechAnalyticsConfig: ((extension: string) => Promise<void>) | ((extension: string) => void);
         removeSpeechConfigModal: () => void;
 
         // pages/sbc-management.ts
@@ -255,6 +250,7 @@ declare global {
         loadWebhooks?: () => void;
         loadHotDeskSessions?: () => void;
         loadRetentionPolicies?: () => void;
+        loadRecordingAnalytics?: () => void;
         loadJitsiConfig?: () => void;
         loadMatrixConfig?: () => void;
         loadEspoCRMConfig?: () => void;

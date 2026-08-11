@@ -650,24 +650,52 @@ function bindActions(): void {
 
 let filterTimer: ReturnType<typeof setTimeout> | undefined;
 
+/** The filter controls, looked up together since every one of them affects the others. */
+function filterControls(): {
+    participant: HTMLInputElement | null;
+    voicemail: HTMLInputElement | null;
+    clear: HTMLElement | null;
+} {
+    return {
+        participant: document.getElementById('recordings-participant-filter') as HTMLInputElement | null,
+        voicemail: document.getElementById('recordings-include-voicemail') as HTMLInputElement | null,
+        clear: document.getElementById('recordings-clear-filter')
+    };
+}
+
+/**
+ * Show "Clear filters" only when there is something to clear.
+ *
+ * It sits on the bar rather than inside the participant field, so it belongs to the bar as a
+ * whole: it reflects every filter and resets every filter. A per-field clear would need a
+ * second one the moment a date range is added.
+ */
+function updateClearVisibility(): void {
+    const { participant, voicemail, clear } = filterControls();
+    if (!clear) return;
+    const active = Boolean(participant?.value.trim()) || Boolean(voicemail?.checked);
+    clear.hidden = !active;
+}
+
 export function initCallRecordings(): void {
     bindActions();
 
-    const voicemail = document.getElementById('recordings-include-voicemail');
+    const { participant, voicemail, clear } = filterControls();
+
     if (voicemail && voicemail.dataset.bound !== 'true') {
         voicemail.dataset.bound = 'true';
-        voicemail.addEventListener('change', () => void loadCallRecordings());
+        voicemail.addEventListener('change', () => {
+            updateClearVisibility();
+            void loadCallRecordings();
+        });
     }
-
-    const participant = document.getElementById('recordings-participant-filter') as HTMLInputElement | null;
-    const clear = document.getElementById('recordings-clear-filter');
 
     if (participant && participant.dataset.bound !== 'true') {
         participant.dataset.bound = 'true';
         // Debounced: the filter runs server-side, and a query per keystroke would be one
         // audited list request per character typed.
         participant.addEventListener('input', () => {
-            if (clear) clear.hidden = participant.value.trim() === '';
+            updateClearVisibility();
             clearTimeout(filterTimer);
             // loadCallRecordings() starts a fresh query, which resets the cursor.
             filterTimer = setTimeout(() => void loadCallRecordings(), 300);
@@ -677,12 +705,17 @@ export function initCallRecordings(): void {
     if (clear && clear.dataset.bound !== 'true') {
         clear.dataset.bound = 'true';
         clear.addEventListener('click', () => {
-            if (participant) participant.value = '';
-            clear.hidden = true;
+            const current = filterControls();
+            if (current.participant) current.participant.value = '';
+            if (current.voicemail) current.voicemail.checked = false;
+            updateClearVisibility();
             void loadCallRecordings();
         });
     }
 
+    // The controls keep their values across tab switches, so the button's state is derived
+    // on init rather than assumed to start hidden.
+    updateClearVisibility();
     void loadCallRecordings();
 }
 

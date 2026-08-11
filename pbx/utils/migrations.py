@@ -1109,3 +1109,71 @@ def register_all_migrations(manager: MigrationManager) -> None:
         ALTER TABLE recording_notices ADD COLUMN IF NOT EXISTS participants {TEXT};
     """),
     )
+
+    # Migration 1022: remove speech analytics
+    #
+    # The module is gone. It was the live, per-extension half of analytics -- streaming audio
+    # in, sentiment and keyword alerts out -- and its entry point ``analyze_audio_stream`` never
+    # had a feeder, so it never ran. Its post-call half duplicated recording analytics with its
+    # own Vosk path.
+    #
+    # speech_analytics_configs held per-extension settings for a feature that never executed,
+    # so there is nothing to migrate anywhere. Recording analytics is the only analytics now,
+    # and it persists to call_summaries instead.
+    manager.register_migration(
+        1022,
+        "Remove Speech Analytics",
+        manager._build_migration_sql("""
+        DROP TABLE IF EXISTS speech_analytics_configs;
+    """),
+    )
+
+    # Migration 1023: one row per analysis run
+    #
+    # Analytics results lived only in a dict on a module-level singleton, so a restart emptied
+    # them and search_recordings could only ever see calls analysed since boot. They were
+    # briefly written to call_summaries, which was the wrong shape: it holds a summary and a
+    # sentiment, while analysis also produces keywords, compliance findings and four quality
+    # scores -- and search filters on keywords and quality, neither of which fit.
+    #
+    # Keyed on the transcript rather than the recording, so migration 1019's cascade expires an
+    # analysis with the call it describes. Nothing has to remember to sweep it.
+    #
+    # call_summaries goes: its only writer and reader were in speech_analytics, which is gone,
+    # and the brief window where analytics wrote to it never reached a deployed system.
+    manager.register_migration(
+        1023,
+        "Recording Analyses",
+        manager._build_migration_sql("""
+        DROP TABLE IF EXISTS call_summaries;
+
+        CREATE TABLE IF NOT EXISTS recording_analyses (
+            id {SERIAL},
+            transcript_id INTEGER REFERENCES transcripts(id) ON DELETE CASCADE,
+            -- Denormalised so the list view does not join for its commonest columns.
+            recording_id INTEGER,
+            summary {TEXT},
+            sentiment VARCHAR(20),
+            sentiment_score FLOAT,
+            -- JSON. Stored whole rather than split into columns because each analyser owns
+            -- its own result shape, and pinning those to columns would make every tweak a
+            -- migration.
+            keywords {TEXT},
+            compliance {TEXT},
+            quality {TEXT},
+            -- Which analysers actually ran. A missing section and a section that found
+            -- nothing look identical otherwise.
+            analysis_types {TEXT},
+            -- Pulled out of quality for sorting and for the search filter.
+            quality_score FLOAT,
+            analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_analyses_transcript
+            ON recording_analyses(transcript_id);
+        CREATE INDEX IF NOT EXISTS idx_analyses_recording
+            ON recording_analyses(recording_id);
+        CREATE INDEX IF NOT EXISTS idx_analyses_sentiment
+            ON recording_analyses(sentiment, analyzed_at);
+    """),
+    )

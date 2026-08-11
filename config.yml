@@ -451,6 +451,15 @@ recording:
   # is written to the audit log.
   participant_access: false
 
+  # Analysis of finished recordings: sentiment, keywords, compliance phrases, quality scores.
+  # Reads the transcript post-call transcription already produced -- it never transcribes.
+  analytics:
+    # Analyse each recording as soon as its transcript lands. Off means the admin page only
+    # shows calls somebody analysed by hand.
+    auto_analyze: false
+    # Which analysers run. transcript | sentiment | keywords | compliance | quality | summary
+    analysis_types: [sentiment, keywords, summary]
+
   # Spoken notice played at bridge. If it does not play, the recording is discarded --
   # recording without notice is unlawful in two-party-consent jurisdictions.
   consent:

@@ -21,6 +21,33 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+def _with_transcript(text: str = "thank you so much, that was great") -> MagicMock:
+    """
+    A database whose stored transcript for any recording is `text`.
+
+    Dispatches on the statement: a single return_value would hand transcript rows to the
+    stored-analyses query too, and those get decoded as analyses.
+    """
+
+    def fetch_all(query, params=None):
+        if "recording_analyses" in query:
+            return []
+        return [{"id": 1, "text": text, "segments": None}]
+
+    db = MagicMock()
+    db.enabled = True
+    db.fetch_all.side_effect = fetch_all
+    return db
+
+
+def _without_transcript() -> MagicMock:
+    """A database with no transcript yet -- the normal state right after a call ends."""
+    db = MagicMock()
+    db.enabled = True
+    db.fetch_all.side_effect = lambda q, p=None: []
+    return db
+
+
 @pytest.mark.unit
 class TestAnalysisType:
     """Tests for the AnalysisType enumeration."""
@@ -59,38 +86,34 @@ class TestAnalysisType:
 
 
 def _make_config(
-    enabled: bool = False,
     auto_analyze: bool = False,
     analysis_types: list[str] | None = None,
-    vosk_model_path: str = "/opt/vosk-model-small-en-us-0.15",
 ) -> dict:
-    """Build a minimal config dict for RecordingAnalytics."""
-    cfg: dict = {
-        "features": {
-            "recording_analytics": {
-                "enabled": enabled,
-                "auto_analyze": auto_analyze,
-            }
-        },
-        "voicemail": {
-            "transcription": {
-                "vosk_model_path": vosk_model_path,
-            }
-        },
-    }
+    """
+    Build a minimal config dict for RecordingAnalytics.
+
+    Under ``recording.analytics`` rather than ``features.recording_analytics``: it configures
+    the recording pipeline, not a feature toggle. There is no ``enabled`` key any more -- it
+    gated nothing while reporting itself as though it did, which is how a switch comes to look
+    meaningful for months without being consulted.
+    """
+    analytics: dict = {"auto_analyze": auto_analyze}
     if analysis_types is not None:
-        cfg["features"]["recording_analytics"]["analysis_types"] = analysis_types
-    return cfg
+        analytics["analysis_types"] = analysis_types
+    return {"recording": {"analytics": analytics}}
 
 
 def _build_analytics(
     config: dict | None = None,
-    vosk_available: bool = False,
     spacy_available: bool = False,
 ) -> RecordingAnalytics:
-    """Construct a RecordingAnalytics with mocked optional imports."""
+    """
+    Construct a RecordingAnalytics with mocked optional imports.
+
+    There is no speech model to mock any more. Analysis reads the transcript post-call
+    transcription already stored rather than producing its own, so the analysers take text.
+    """
     with (
-        patch("pbx.features.call_recording_analytics.VOSK_AVAILABLE", vosk_available),
         patch("pbx.features.call_recording_analytics.SPACY_AVAILABLE", spacy_available),
         patch("pbx.features.call_recording_analytics.get_logger") as mock_logger_fn,
     ):
@@ -112,19 +135,16 @@ class TestRecordingAnalyticsInit:
     def test_init_with_none_config(self) -> None:
         analytics = _build_analytics(config=None)
         assert analytics.config == {}
-        assert analytics.enabled is False
         assert analytics.auto_analyze is False
         assert analytics.analysis_types == ["sentiment", "keywords", "summary"]
 
     def test_init_with_empty_config(self) -> None:
         analytics = _build_analytics(config={})
-        assert analytics.enabled is False
         assert analytics.auto_analyze is False
 
     def test_init_enabled(self) -> None:
-        cfg = _make_config(enabled=True, auto_analyze=True)
+        cfg = _make_config(auto_analyze=True)
         analytics = _build_analytics(config=cfg)
-        assert analytics.enabled is True
         assert analytics.auto_analyze is True
 
     def test_init_custom_analysis_types(self) -> None:
@@ -143,468 +163,109 @@ class TestRecordingAnalyticsInit:
         assert analytics.total_analyses == 0
         assert analytics.analyses_by_type == {}
 
-    def test_init_models_none_when_libs_unavailable(self) -> None:
-        analytics = _build_analytics(vosk_available=False, spacy_available=False)
-        assert analytics.vosk_model is None
-        assert analytics.spacy_nlp is None
-
-    def test_init_vosk_model_loaded_when_path_exists(self) -> None:
-        cfg = _make_config(vosk_model_path="/fake/vosk")
-        mock_model = MagicMock()
-        with (
-            patch("pbx.features.call_recording_analytics.VOSK_AVAILABLE", True),
-            patch("pbx.features.call_recording_analytics.SPACY_AVAILABLE", False),
-            patch("pbx.features.call_recording_analytics.get_logger") as mock_log,
-            patch("pbx.features.call_recording_analytics.Path") as mock_path_cls,
-            patch("pbx.features.call_recording_analytics.Model", mock_model, create=True),
-        ):
-            mock_log.return_value = MagicMock()
-            mock_path_cls.return_value.exists.return_value = True
-
-            from pbx.features.call_recording_analytics import RecordingAnalytics
-
-            ra = RecordingAnalytics(cfg)
-            mock_model.assert_called_once_with("/fake/vosk")
-            assert ra.vosk_model is not None
-
-    def test_init_vosk_model_not_found(self) -> None:
-        cfg = _make_config(vosk_model_path="/nonexistent/path")
-        with (
-            patch("pbx.features.call_recording_analytics.VOSK_AVAILABLE", True),
-            patch("pbx.features.call_recording_analytics.SPACY_AVAILABLE", False),
-            patch("pbx.features.call_recording_analytics.get_logger") as mock_log,
-            patch("pbx.features.call_recording_analytics.Path") as mock_path_cls,
-            patch("pbx.features.call_recording_analytics.Model", create=True),
-        ):
-            mock_log.return_value = MagicMock()
-            mock_path_cls.return_value.exists.return_value = False
-
-            from pbx.features.call_recording_analytics import RecordingAnalytics
-
-            ra = RecordingAnalytics(cfg)
-            assert ra.vosk_model is None
-
-    def test_init_vosk_model_load_exception(self) -> None:
-        cfg = _make_config(vosk_model_path="/bad/path")
-        with (
-            patch("pbx.features.call_recording_analytics.VOSK_AVAILABLE", True),
-            patch("pbx.features.call_recording_analytics.SPACY_AVAILABLE", False),
-            patch("pbx.features.call_recording_analytics.get_logger") as mock_log,
-            patch("pbx.features.call_recording_analytics.Path") as mock_path_cls,
-            patch(
-                "pbx.features.call_recording_analytics.Model",
-                side_effect=OSError("boom"),
-                create=True,
-            ),
-        ):
-            mock_log.return_value = MagicMock()
-            mock_path_cls.return_value.exists.return_value = True
-
-            from pbx.features.call_recording_analytics import RecordingAnalytics
-
-            ra = RecordingAnalytics(cfg)
-            assert ra.vosk_model is None
-
-    def test_init_spacy_model_loaded(self) -> None:
-        mock_spacy = MagicMock()
-        mock_nlp = MagicMock()
-        mock_spacy.load.return_value = mock_nlp
-
-        with (
-            patch("pbx.features.call_recording_analytics.VOSK_AVAILABLE", False),
-            patch("pbx.features.call_recording_analytics.SPACY_AVAILABLE", True),
-            patch("pbx.features.call_recording_analytics.get_logger") as mock_log,
-            patch("pbx.features.call_recording_analytics.spacy", mock_spacy, create=True),
-        ):
-            mock_log.return_value = MagicMock()
-
-            from pbx.features.call_recording_analytics import RecordingAnalytics
-
-            ra = RecordingAnalytics({})
-            mock_spacy.load.assert_called_once_with("en_core_web_sm")
-            assert ra.spacy_nlp is mock_nlp
-
-    def test_init_spacy_model_load_fails(self) -> None:
-        mock_spacy = MagicMock()
-        mock_spacy.load.side_effect = RuntimeError("no model")
-
-        with (
-            patch("pbx.features.call_recording_analytics.VOSK_AVAILABLE", False),
-            patch("pbx.features.call_recording_analytics.SPACY_AVAILABLE", True),
-            patch("pbx.features.call_recording_analytics.get_logger") as mock_log,
-            patch("pbx.features.call_recording_analytics.spacy", mock_spacy, create=True),
-        ):
-            mock_log.return_value = MagicMock()
-
-            from pbx.features.call_recording_analytics import RecordingAnalytics
-
-            ra = RecordingAnalytics({})
-            assert ra.spacy_nlp is None
-
-
-# ---------------------------------------------------------------------------
-# RecordingAnalytics.analyze_recording
-# ---------------------------------------------------------------------------
-
 
 @pytest.mark.unit
 class TestAnalyzeRecording:
-    """Tests for the main analyze_recording entry point."""
+    """
+    The entry point, which no longer transcribes anything.
 
-    def test_analyze_recording_returns_expected_structure(self) -> None:
-        analytics = _build_analytics()
-        result = analytics.analyze_recording("rec-1", "/audio.wav", ["sentiment"])
+    It used to take an audio path and transcribe it once per analysis type -- three times for
+    the default set, six if all were requested -- reloading the speech model on each, inside
+    the request. Every pass produced the same text from the same bytes. It now reads the
+    transcript post-call transcription already stored.
+    """
+
+    def _analytics(self, db, config=None):
+        analytics = _build_analytics(config=config)
+        analytics.database = db
+        return analytics
+
+    def test_it_returns_the_expected_structure(self) -> None:
+        analytics = self._analytics(_with_transcript())
+
+        result = analytics.analyze_recording("rec-1", ["sentiment"])
+
         assert result["recording_id"] == "rec-1"
         assert "analyzed_at" in result
         assert "sentiment" in result["analyses"]
 
-    def test_analyze_recording_uses_instance_types_when_none(self) -> None:
-        cfg = _make_config(analysis_types=["quality"])
-        analytics = _build_analytics(config=cfg)
-        result = analytics.analyze_recording("rec-2", "/audio.wav")
+    def test_the_transcript_is_read_once_however_many_analyses(self) -> None:
+        """The whole point: N analyses, one lookup, no transcription at all."""
+        db = _with_transcript()
+        analytics = self._analytics(db)
+
+        analytics.analyze_recording(
+            "rec-1", ["transcript", "sentiment", "keywords", "compliance", "quality", "summary"]
+        )
+
+        reads = [c for c in db.fetch_all.call_args_list if "transcripts" in str(c[0][0])]
+        assert len(reads) == 1
+
+    def test_the_stored_transcript_reaches_the_analysers(self) -> None:
+        analytics = self._analytics(_with_transcript("thank you, wonderful service"))
+
+        result = analytics.analyze_recording("rec-1", ["transcript"])
+
+        assert result["analyses"]["transcript"]["transcript"] == "thank you, wonderful service"
+
+    def test_no_transcript_yet_says_so(self) -> None:
+        """
+        Transcription is queued and runs after the call, so a recording that just finished
+        legitimately has none. Saying so beats analysing an empty string as though it meant
+        something.
+        """
+        analytics = self._analytics(_without_transcript())
+
+        result = analytics.analyze_recording("rec-1", ["sentiment"])
+
+        assert "error" in result
+        assert result["analyses"] == {}
+
+    def test_no_database_is_survivable(self) -> None:
+        result = _build_analytics().analyze_recording("rec-1", ["sentiment"])
+
+        assert "error" in result
+
+    def test_it_uses_configured_types_when_none_given(self) -> None:
+        analytics = self._analytics(
+            _with_transcript(), config=_make_config(analysis_types=["quality"])
+        )
+
+        result = analytics.analyze_recording("rec-2")
+
         assert "quality" in result["analyses"]
 
-    def test_analyze_recording_tracks_statistics(self) -> None:
-        analytics = _build_analytics()
-        analytics.analyze_recording("rec-1", "/audio.wav", ["sentiment", "keywords"])
+    def test_it_tracks_statistics(self) -> None:
+        analytics = self._analytics(_with_transcript())
+
+        analytics.analyze_recording("rec-1", ["sentiment", "keywords"])
+
         assert analytics.total_analyses == 1
         assert analytics.analyses_by_type["sentiment"] == 1
         assert analytics.analyses_by_type["keywords"] == 1
 
-    def test_analyze_recording_stores_results(self) -> None:
-        analytics = _build_analytics()
-        analytics.analyze_recording("rec-1", "/audio.wav", ["summary"])
+    def test_it_stores_results(self) -> None:
+        analytics = self._analytics(_with_transcript())
+
+        analytics.analyze_recording("rec-1", ["summary"])
+
         assert "rec-1" in analytics.analyses
 
-    def test_analyze_recording_all_types(self) -> None:
-        analytics = _build_analytics()
+    def test_every_type_is_handled(self) -> None:
+        analytics = self._analytics(_with_transcript())
         all_types = ["transcript", "sentiment", "keywords", "compliance", "quality", "summary"]
-        result = analytics.analyze_recording("rec-all", "/audio.wav", all_types)
-        for t in all_types:
-            assert t in result["analyses"]
 
-    def test_analyze_recording_unknown_type_ignored(self) -> None:
-        analytics = _build_analytics()
-        result = analytics.analyze_recording("rec-1", "/audio.wav", ["nonexistent"])
+        result = analytics.analyze_recording("rec-all", all_types)
+
+        for analysis in all_types:
+            assert analysis in result["analyses"]
+
+    def test_an_unknown_type_is_ignored(self) -> None:
+        analytics = self._analytics(_with_transcript())
+
+        result = analytics.analyze_recording("rec-1", ["nonsense"])
+
         assert result["analyses"] == {}
-        assert analytics.analyses_by_type["nonexistent"] == 1
-
-    def test_analyze_multiple_recordings_increments_total(self) -> None:
-        analytics = _build_analytics()
-        analytics.analyze_recording("r1", "/a.wav", ["sentiment"])
-        analytics.analyze_recording("r2", "/b.wav", ["sentiment"])
-        assert analytics.total_analyses == 2
-        assert analytics.analyses_by_type["sentiment"] == 2
-
-    def test_analyzed_at_is_utc_isoformat(self) -> None:
-        analytics = _build_analytics()
-        result = analytics.analyze_recording("rec-1", "/audio.wav", ["sentiment"])
-        parsed = datetime.fromisoformat(result["analyzed_at"])
-        assert parsed.tzinfo is not None
-
-
-# ---------------------------------------------------------------------------
-# RecordingAnalytics._transcribe
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestTranscribe:
-    """Tests for the _transcribe method."""
-
-    def test_transcribe_import_error_path(self) -> None:
-        """When vosk is not installed, should return error dict."""
-        analytics = _build_analytics()
-        with patch.dict("sys.modules", {"vosk": None}):
-            result = analytics._transcribe("/fake.wav")
-        # The method catches ImportError internally
-        assert isinstance(result, dict)
-        assert "transcript" in result
-
-    def test_transcribe_no_vosk_model_returns_error(self) -> None:
-        """When _load_vosk_model returns None, should return error dict."""
-        analytics = _build_analytics()
-        mock_vosk_module = MagicMock()
-        with (
-            patch.dict("sys.modules", {"vosk": mock_vosk_module}),
-            patch.object(analytics, "_load_vosk_model", return_value=None),
-        ):
-            result = analytics._transcribe("/fake.wav")
-        assert result["error"] == "Vosk model not available"
-        assert result["transcript"] == ""
-        assert result["confidence"] == 0.0
-
-    def test_transcribe_happy_path(self) -> None:
-        """Full transcription happy path with mocked wave and vosk."""
-        import json
-
-        analytics = _build_analytics()
-
-        mock_vosk_module = MagicMock()
-        mock_model = MagicMock()
-        mock_recognizer = MagicMock()
-        mock_vosk_module.KaldiRecognizer.return_value = mock_recognizer
-
-        # Mock wave file context manager
-        mock_wf = MagicMock()
-        mock_wf.getframerate.return_value = 16000
-        mock_wf.getnframes.return_value = 32000  # 2 seconds at 16kHz
-        mock_wf.readframes.side_effect = [b"\x00" * 4000, b""]
-        mock_wf.__enter__ = MagicMock(return_value=mock_wf)
-        mock_wf.__exit__ = MagicMock(return_value=False)
-
-        mock_recognizer.AcceptWaveform.return_value = True
-        mock_recognizer.Result.return_value = json.dumps(
-            {"text": "hello world", "result": [{"word": "hello", "conf": 0.95}]}
-        )
-        mock_recognizer.FinalResult.return_value = json.dumps(
-            {"text": "goodbye", "result": [{"word": "goodbye", "conf": 0.9}]}
-        )
-
-        mock_wave_module = MagicMock()
-        mock_wave_module.open.return_value = mock_wf
-
-        with (
-            patch.dict("sys.modules", {"vosk": mock_vosk_module, "wave": mock_wave_module}),
-            patch.object(analytics, "_load_vosk_model", return_value=mock_model),
-        ):
-            result = analytics._transcribe("/audio.wav")
-
-        assert "hello world" in result["transcript"]
-        assert "goodbye" in result["transcript"]
-        assert result["confidence"] > 0
-        assert result["duration"] == 2.0
-
-    def test_transcribe_happy_path_zero_confidence_count(self) -> None:
-        """Transcription with no confidence data returns 0.0 confidence."""
-        import json
-
-        analytics = _build_analytics()
-
-        mock_vosk_module = MagicMock()
-        mock_model = MagicMock()
-        mock_recognizer = MagicMock()
-        mock_vosk_module.KaldiRecognizer.return_value = mock_recognizer
-
-        mock_wf = MagicMock()
-        mock_wf.getframerate.return_value = 16000
-        mock_wf.getnframes.return_value = 0
-        mock_wf.readframes.side_effect = [b""]
-        mock_wf.__enter__ = MagicMock(return_value=mock_wf)
-        mock_wf.__exit__ = MagicMock(return_value=False)
-
-        mock_recognizer.FinalResult.return_value = json.dumps({})
-
-        mock_wave_module = MagicMock()
-        mock_wave_module.open.return_value = mock_wf
-
-        with (
-            patch.dict("sys.modules", {"vosk": mock_vosk_module, "wave": mock_wave_module}),
-            patch.object(analytics, "_load_vosk_model", return_value=mock_model),
-        ):
-            result = analytics._transcribe("/audio.wav")
-
-        assert result["transcript"] == ""
-        assert result["confidence"] == 0.0
-
-    def test_transcribe_happy_path_zero_sample_rate(self) -> None:
-        """Zero sample rate yields duration 0."""
-        import json
-
-        analytics = _build_analytics()
-
-        mock_vosk_module = MagicMock()
-        mock_model = MagicMock()
-        mock_recognizer = MagicMock()
-        mock_vosk_module.KaldiRecognizer.return_value = mock_recognizer
-
-        mock_wf = MagicMock()
-        mock_wf.getframerate.return_value = 0
-        mock_wf.getnframes.return_value = 100
-        mock_wf.readframes.side_effect = [b""]
-        mock_wf.__enter__ = MagicMock(return_value=mock_wf)
-        mock_wf.__exit__ = MagicMock(return_value=False)
-
-        mock_recognizer.FinalResult.return_value = json.dumps({})
-
-        mock_wave_module = MagicMock()
-        mock_wave_module.open.return_value = mock_wf
-
-        with (
-            patch.dict("sys.modules", {"vosk": mock_vosk_module, "wave": mock_wave_module}),
-            patch.object(analytics, "_load_vosk_model", return_value=mock_model),
-        ):
-            result = analytics._transcribe("/audio.wav")
-
-        assert result["duration"] == 0
-
-    def test_transcribe_oserror_path(self) -> None:
-        """When file can't be opened, should return error dict."""
-        analytics = _build_analytics()
-        mock_vosk_module = MagicMock()
-        mock_wave_module = MagicMock()
-        mock_wave_module.open.side_effect = OSError("no such file")
-
-        with (
-            patch.dict("sys.modules", {"vosk": mock_vosk_module, "wave": mock_wave_module}),
-            patch.object(analytics, "_load_vosk_model", return_value=MagicMock()),
-        ):
-            result = analytics._transcribe("/nonexistent.wav")
-        assert result["error"] == "no such file"
-        assert result["transcript"] == ""
-
-
-# ---------------------------------------------------------------------------
-# RecordingAnalytics._load_vosk_model
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestLoadVoskModel:
-    """Tests for _load_vosk_model."""
-
-    def test_load_vosk_model_path_exists(self) -> None:
-        analytics = _build_analytics()
-        mock_model_instance = MagicMock()
-        mock_model_cls = MagicMock(return_value=mock_model_instance)
-
-        with (
-            patch("pbx.features.call_recording_analytics.Path") as mock_path_cls,
-            patch.dict("sys.modules", {"vosk": MagicMock(Model=mock_model_cls)}),
-        ):
-            mock_path_cls.return_value.exists.return_value = True
-            result = analytics._load_vosk_model()
-        assert result is mock_model_instance
-
-    def test_load_vosk_model_path_does_not_exist(self) -> None:
-        analytics = _build_analytics()
-        with (
-            patch("pbx.features.call_recording_analytics.Path") as mock_path_cls,
-            patch.dict("sys.modules", {"vosk": MagicMock()}),
-        ):
-            mock_path_cls.return_value.exists.return_value = False
-            result = analytics._load_vosk_model()
-        assert result is None
-
-    def test_load_vosk_model_oserror(self) -> None:
-        analytics = _build_analytics()
-        mock_model_cls = MagicMock(side_effect=OSError("bad model"))
-        with (
-            patch("pbx.features.call_recording_analytics.Path") as mock_path_cls,
-            patch.dict("sys.modules", {"vosk": MagicMock(Model=mock_model_cls)}),
-        ):
-            mock_path_cls.return_value.exists.return_value = True
-            result = analytics._load_vosk_model()
-        assert result is None
-
-
-# ---------------------------------------------------------------------------
-# RecordingAnalytics._process_vosk_audio
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestProcessVoskAudio:
-    """Tests for _process_vosk_audio helper."""
-
-    def test_process_vosk_audio_basic(self) -> None:
-        import json
-
-        analytics = _build_analytics()
-
-        mock_recognizer = MagicMock()
-        mock_wf = MagicMock()
-
-        # Simulate 2 frames of audio then empty
-        mock_wf.readframes.side_effect = [b"\x00" * 4000, b"\x00" * 4000, b""]
-
-        # First frame accepted, second not
-        mock_recognizer.AcceptWaveform.side_effect = [True, False]
-        mock_recognizer.Result.return_value = json.dumps(
-            {"text": "hello world", "result": [{"word": "hello", "conf": 0.9}]}
-        )
-        mock_recognizer.FinalResult.return_value = json.dumps(
-            {"text": "goodbye", "result": [{"word": "goodbye", "conf": 0.8}]}
-        )
-
-        transcript, words, total_conf, conf_count = analytics._process_vosk_audio(
-            mock_recognizer, mock_wf
-        )
-
-        assert "hello world" in transcript
-        assert "goodbye" in transcript
-        assert len(words) == 2
-        assert conf_count == 2
-        assert abs(total_conf - 1.7) < 0.001
-
-    def test_process_vosk_audio_empty_results(self) -> None:
-        import json
-
-        analytics = _build_analytics()
-
-        mock_recognizer = MagicMock()
-        mock_wf = MagicMock()
-        mock_wf.readframes.side_effect = [b""]
-
-        mock_recognizer.FinalResult.return_value = json.dumps({})
-
-        transcript, words, total_conf, conf_count = analytics._process_vosk_audio(
-            mock_recognizer, mock_wf
-        )
-
-        assert transcript == []
-        assert words == []
-        assert total_conf == 0.0
-        assert conf_count == 0
-
-    def test_process_vosk_audio_result_without_conf(self) -> None:
-        import json
-
-        analytics = _build_analytics()
-
-        mock_recognizer = MagicMock()
-        mock_wf = MagicMock()
-        mock_wf.readframes.side_effect = [b"\x00" * 4000, b""]
-
-        mock_recognizer.AcceptWaveform.return_value = True
-        mock_recognizer.Result.return_value = json.dumps(
-            {"text": "test", "result": [{"word": "test"}]}
-        )
-        mock_recognizer.FinalResult.return_value = json.dumps({})
-
-        transcript, words, _total_conf, conf_count = analytics._process_vosk_audio(
-            mock_recognizer, mock_wf
-        )
-
-        assert "test" in transcript
-        assert len(words) == 1
-        assert conf_count == 0  # No confidence values
-
-    def test_process_vosk_audio_text_without_result_key(self) -> None:
-        import json
-
-        analytics = _build_analytics()
-
-        mock_recognizer = MagicMock()
-        mock_wf = MagicMock()
-        mock_wf.readframes.side_effect = [b"\x00" * 4000, b""]
-
-        mock_recognizer.AcceptWaveform.return_value = True
-        mock_recognizer.Result.return_value = json.dumps({"text": "just text"})
-        mock_recognizer.FinalResult.return_value = json.dumps({"text": "final"})
-
-        transcript, words, _total_conf, _conf_count = analytics._process_vosk_audio(
-            mock_recognizer, mock_wf
-        )
-
-        assert "just text" in transcript
-        assert "final" in transcript
-        assert words == []
-
-
-# ---------------------------------------------------------------------------
-# RecordingAnalytics._analyze_sentiment
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -613,10 +274,9 @@ class TestAnalyzeSentiment:
 
     def test_sentiment_no_transcript_no_models(self) -> None:
         analytics = _build_analytics()
-        analytics.vosk_model = None
         analytics.spacy_nlp = None
 
-        result = analytics._analyze_sentiment("/audio.wav")
+        result = analytics._analyze_sentiment("")
 
         assert result["overall_sentiment"] == "neutral"
         assert result["sentiment_score"] == 0.0
@@ -625,12 +285,8 @@ class TestAnalyzeSentiment:
 
     def test_sentiment_with_vosk_and_spacy_positive(self) -> None:
         analytics = _build_analytics()
-        analytics.vosk_model = MagicMock()
 
         # Mock _transcribe to return positive text
-        analytics._transcribe = MagicMock(
-            return_value={"transcript": "thank you very much that was excellent and wonderful"}
-        )
 
         # Mock spaCy NLP pipeline
         mock_nlp = MagicMock()
@@ -656,18 +312,13 @@ class TestAnalyzeSentiment:
         mock_nlp.return_value = mock_doc
         analytics.spacy_nlp = mock_nlp
 
-        result = analytics._analyze_sentiment("/audio.wav")
+        result = analytics._analyze_sentiment("a transcript")
 
         assert result["overall_sentiment"] == "positive"
         assert result["sentiment_score"] > 0.2
 
     def test_sentiment_with_vosk_and_spacy_negative(self) -> None:
         analytics = _build_analytics()
-        analytics.vosk_model = MagicMock()
-
-        analytics._transcribe = MagicMock(
-            return_value={"transcript": "angry upset frustrated disappointed terrible"}
-        )
 
         mock_nlp = MagicMock()
         mock_tokens = []
@@ -682,16 +333,13 @@ class TestAnalyzeSentiment:
         mock_nlp.return_value = mock_doc
         analytics.spacy_nlp = mock_nlp
 
-        result = analytics._analyze_sentiment("/audio.wav")
+        result = analytics._analyze_sentiment("a transcript")
 
         assert result["overall_sentiment"] == "negative"
         assert result["sentiment_score"] < -0.2
 
     def test_sentiment_with_vosk_and_spacy_neutral(self) -> None:
         analytics = _build_analytics()
-        analytics.vosk_model = MagicMock()
-
-        analytics._transcribe = MagicMock(return_value={"transcript": "hello goodbye yes no"})
 
         mock_nlp = MagicMock()
         mock_tokens = []
@@ -706,66 +354,48 @@ class TestAnalyzeSentiment:
         mock_nlp.return_value = mock_doc
         analytics.spacy_nlp = mock_nlp
 
-        result = analytics._analyze_sentiment("/audio.wav")
+        result = analytics._analyze_sentiment("a transcript")
 
         assert result["overall_sentiment"] == "neutral"
         assert result["sentiment_score"] == 0.0
 
     def test_sentiment_spacy_exception_fallback(self) -> None:
         analytics = _build_analytics()
-        analytics.vosk_model = MagicMock()
-
-        analytics._transcribe = MagicMock(return_value={"transcript": "thank you"})
 
         mock_nlp = MagicMock(side_effect=RuntimeError("spacy error"))
         analytics.spacy_nlp = mock_nlp
 
-        result = analytics._analyze_sentiment("/audio.wav")
+        result = analytics._analyze_sentiment("a transcript")
 
         # Should not crash; falls through to return
         assert result["overall_sentiment"] == "neutral"
 
     def test_sentiment_fallback_keyword_positive(self) -> None:
-        """Keyword-based fallback when spaCy not available but transcript exists."""
+        """Keyword scoring when spaCy is unavailable but a transcript exists."""
         analytics = _build_analytics()
-        analytics.vosk_model = MagicMock()
         analytics.spacy_nlp = None
 
-        analytics._transcribe = MagicMock(
-            return_value={"transcript": "thank appreciate excellent great wonderful"}
-        )
-
-        result = analytics._analyze_sentiment("/audio.wav")
+        result = analytics._analyze_sentiment("thank appreciate excellent great wonderful")
 
         assert result["overall_sentiment"] == "positive"
         assert result["sentiment_score"] > 0.2
 
     def test_sentiment_fallback_keyword_negative(self) -> None:
         analytics = _build_analytics()
-        analytics.vosk_model = MagicMock()
         analytics.spacy_nlp = None
 
-        analytics._transcribe = MagicMock(
-            return_value={
-                "transcript": "angry upset frustrated disappointed terrible awful horrible bad"
-            }
+        result = analytics._analyze_sentiment(
+            "angry upset frustrated disappointed terrible awful horrible bad"
         )
-
-        result = analytics._analyze_sentiment("/audio.wav")
 
         assert result["overall_sentiment"] == "negative"
         assert result["sentiment_score"] < -0.2
 
     def test_sentiment_fallback_keyword_neutral(self) -> None:
         analytics = _build_analytics()
-        analytics.vosk_model = MagicMock()
         analytics.spacy_nlp = None
 
-        analytics._transcribe = MagicMock(
-            return_value={"transcript": "the quick brown fox jumps over the lazy dog"}
-        )
-
-        result = analytics._analyze_sentiment("/audio.wav")
+        result = analytics._analyze_sentiment("the appointment is on tuesday at three")
 
         assert result["overall_sentiment"] == "neutral"
         assert result["sentiment_score"] == 0.0
@@ -773,12 +403,9 @@ class TestAnalyzeSentiment:
     def test_sentiment_equal_positive_and_negative(self) -> None:
         """When pos == neg, score is 0 and sentiment is neutral."""
         analytics = _build_analytics()
-        analytics.vosk_model = MagicMock()
         analytics.spacy_nlp = None
 
-        analytics._transcribe = MagicMock(return_value={"transcript": "thank angry"})
-
-        result = analytics._analyze_sentiment("/audio.wav")
+        result = analytics._analyze_sentiment("")
 
         assert result["overall_sentiment"] == "neutral"
         assert result["sentiment_score"] == 0.0
@@ -795,7 +422,7 @@ class TestDetectKeywords:
 
     def test_keywords_empty_transcript(self) -> None:
         analytics = _build_analytics()
-        result = analytics._detect_keywords("/audio.wav")
+        result = analytics._detect_keywords("")
 
         assert result["keywords"] == []
         assert result["competitor_mentions"] == []
@@ -804,7 +431,7 @@ class TestDetectKeywords:
 
     def test_keywords_return_structure(self) -> None:
         analytics = _build_analytics()
-        result = analytics._detect_keywords("/audio.wav")
+        result = analytics._detect_keywords("")
         assert "keywords" in result
         assert "competitor_mentions" in result
         assert "product_mentions" in result
@@ -822,7 +449,7 @@ class TestCheckCompliance:
 
     def test_compliance_empty_transcript_is_compliant(self) -> None:
         analytics = _build_analytics()
-        result = analytics._check_compliance("/audio.wav")
+        result = analytics._check_compliance("")
 
         assert result["compliant"] is True
         assert result["violations"] == []
@@ -832,7 +459,7 @@ class TestCheckCompliance:
 
     def test_compliance_return_structure(self) -> None:
         analytics = _build_analytics()
-        result = analytics._check_compliance("/audio.wav")
+        result = analytics._check_compliance("")
         expected_keys = {
             "compliant",
             "violations",
@@ -854,7 +481,7 @@ class TestScoreQuality:
 
     def test_quality_empty_transcript_base_scores(self) -> None:
         analytics = _build_analytics()
-        result = analytics._score_quality("/audio.wav")
+        result = analytics._score_quality("")
 
         assert result["overall_score"] == 50.0
         assert result["agent_performance"] == 50.0
@@ -864,7 +491,7 @@ class TestScoreQuality:
 
     def test_quality_return_structure(self) -> None:
         analytics = _build_analytics()
-        result = analytics._score_quality("/audio.wav")
+        result = analytics._score_quality("")
         expected_keys = {
             "overall_score",
             "agent_performance",
@@ -876,7 +503,7 @@ class TestScoreQuality:
 
     def test_quality_scores_are_rounded(self) -> None:
         analytics = _build_analytics()
-        result = analytics._score_quality("/audio.wav")
+        result = analytics._score_quality("")
         for key in result:
             value = result[key]
             assert value == round(value, 2)
@@ -893,7 +520,7 @@ class TestSummarize:
 
     def test_summarize_empty_transcript(self) -> None:
         analytics = _build_analytics()
-        result = analytics._summarize("/audio.wav")
+        result = analytics._summarize("")
 
         assert result["summary"] == ""
         assert result["key_points"] == []
@@ -902,7 +529,7 @@ class TestSummarize:
 
     def test_summarize_return_structure(self) -> None:
         analytics = _build_analytics()
-        result = analytics._summarize("/audio.wav")
+        result = analytics._summarize("")
         expected_keys = {"summary", "key_points", "action_items", "outcomes"}
         assert set(result.keys()) == expected_keys
 
@@ -1489,7 +1116,6 @@ class TestGetStatistics:
     def test_statistics_defaults(self) -> None:
         analytics = _build_analytics()
         stats = analytics.get_statistics()
-        assert stats["enabled"] is False
         assert stats["auto_analyze"] is False
         assert stats["total_analyses"] == 0
         assert stats["analyses_by_type"] == {}
@@ -1497,17 +1123,17 @@ class TestGetStatistics:
 
     def test_statistics_after_analysis(self) -> None:
         analytics = _build_analytics()
-        analytics.analyze_recording("r1", "/a.wav", ["sentiment", "quality"])
+        analytics.database = _with_transcript()
+        analytics.analyze_recording("r1", ["sentiment", "quality"])
         stats = analytics.get_statistics()
         assert stats["total_analyses"] == 1
         assert stats["analyses_by_type"]["sentiment"] == 1
         assert stats["analyses_by_type"]["quality"] == 1
 
     def test_statistics_enabled(self) -> None:
-        cfg = _make_config(enabled=True, auto_analyze=True)
+        cfg = _make_config(auto_analyze=True)
         analytics = _build_analytics(config=cfg)
         stats = analytics.get_statistics()
-        assert stats["enabled"] is True
         assert stats["auto_analyze"] is True
 
 
@@ -1523,7 +1149,6 @@ class TestGetRecordingAnalytics:
     def test_get_recording_analytics_creates_instance(self) -> None:
         with (
             patch("pbx.features.call_recording_analytics._recording_analytics", None),
-            patch("pbx.features.call_recording_analytics.VOSK_AVAILABLE", False),
             patch("pbx.features.call_recording_analytics.SPACY_AVAILABLE", False),
             patch("pbx.features.call_recording_analytics.get_logger") as mock_log,
         ):
@@ -1544,7 +1169,6 @@ class TestGetRecordingAnalytics:
     def test_get_recording_analytics_none_config(self) -> None:
         with (
             patch("pbx.features.call_recording_analytics._recording_analytics", None),
-            patch("pbx.features.call_recording_analytics.VOSK_AVAILABLE", False),
             patch("pbx.features.call_recording_analytics.SPACY_AVAILABLE", False),
             patch("pbx.features.call_recording_analytics.get_logger") as mock_log,
         ):
@@ -1564,11 +1188,6 @@ class TestGetRecordingAnalytics:
 class TestModuleLevelConstants:
     """Tests that verify module-level constants exist and are boolean."""
 
-    def test_vosk_available_is_bool(self) -> None:
-        from pbx.features.call_recording_analytics import VOSK_AVAILABLE
-
-        assert isinstance(VOSK_AVAILABLE, bool)
-
     def test_spacy_available_is_bool(self) -> None:
         from pbx.features.call_recording_analytics import SPACY_AVAILABLE
 
@@ -1586,21 +1205,24 @@ class TestAnalyzeAndSearchFlow:
 
     def test_analyze_then_search_by_sentiment(self) -> None:
         analytics = _build_analytics()
-        analytics.analyze_recording("rec-1", "/a.wav", ["sentiment"])
-        # Default sentiment is neutral (empty transcript)
+        # A transcript with no sentiment words either way.
+        analytics.database = _with_transcript("the appointment is on tuesday at three")
+        analytics.analyze_recording("rec-1", ["sentiment"])
         result = analytics.search_recordings({"sentiment": "neutral"})
         assert "rec-1" in result
 
     def test_analyze_then_get_analysis(self) -> None:
         analytics = _build_analytics()
-        analytics.analyze_recording("rec-1", "/a.wav", ["quality"])
+        analytics.database = _with_transcript()
+        analytics.analyze_recording("rec-1", ["quality"])
         result = analytics.get_analysis("rec-1")
         assert result is not None
         assert "quality" in result["analyses"]
 
     def test_analyze_then_trend_analysis(self) -> None:
         analytics = _build_analytics()
-        analytics.analyze_recording("rec-1", "/a.wav", ["sentiment", "quality"])
+        analytics.database = _with_transcript()
+        analytics.analyze_recording("rec-1", ["sentiment", "quality"])
 
         now = datetime.now(UTC)
         trends = analytics.get_trend_analysis(now - timedelta(hours=1), now + timedelta(hours=1))
@@ -1608,9 +1230,10 @@ class TestAnalyzeAndSearchFlow:
 
     def test_multiple_analyses_then_statistics(self) -> None:
         analytics = _build_analytics()
-        analytics.analyze_recording("r1", "/a.wav", ["sentiment"])
-        analytics.analyze_recording("r2", "/b.wav", ["quality", "compliance"])
-        analytics.analyze_recording("r3", "/c.wav", ["sentiment", "keywords"])
+        analytics.database = _with_transcript()
+        analytics.analyze_recording("r1", ["sentiment"])
+        analytics.analyze_recording("r2", ["quality", "compliance"])
+        analytics.analyze_recording("r3", ["sentiment", "keywords"])
 
         stats = analytics.get_statistics()
         assert stats["total_analyses"] == 3
@@ -1633,7 +1256,8 @@ class TestEdgeCases:
         """Empty list is falsy, so it falls back to instance analysis_types."""
         cfg = _make_config(analysis_types=["sentiment", "keywords", "summary"])
         analytics = _build_analytics(config=cfg)
-        result = analytics.analyze_recording("rec-1", "/a.wav", [])
+        analytics.database = _with_transcript()
+        result = analytics.analyze_recording("rec-1", [])
         # Falls back to instance defaults
         assert "sentiment" in result["analyses"]
         assert "keywords" in result["analyses"]
@@ -1669,17 +1293,20 @@ class TestEdgeCases:
 
     def test_config_with_missing_features_key(self) -> None:
         analytics = _build_analytics(config={"other": "stuff"})
-        assert analytics.enabled is False
         assert analytics.auto_analyze is False
 
-    def test_config_with_missing_recording_analytics_key(self) -> None:
-        analytics = _build_analytics(config={"features": {}})
-        assert analytics.enabled is False
+    def test_config_without_an_analytics_block(self) -> None:
+        """Defaults have to hold: config.yml may not carry the block at all."""
+        analytics = _build_analytics(config={"recording": {}})
+
+        assert analytics.auto_analyze is False
+        assert analytics.analysis_types == ["sentiment", "keywords", "summary"]
 
     def test_overwrite_analysis_for_same_recording(self) -> None:
         analytics = _build_analytics()
-        analytics.analyze_recording("rec-1", "/a.wav", ["sentiment"])
-        analytics.analyze_recording("rec-1", "/a.wav", ["quality"])
+        analytics.database = _with_transcript()
+        analytics.analyze_recording("rec-1", ["sentiment"])
+        analytics.analyze_recording("rec-1", ["quality"])
         # Second call overwrites
         result = analytics.get_analysis("rec-1")
         assert "quality" in result["analyses"]
@@ -1709,8 +1336,6 @@ class TestEdgeCases:
 
     def test_sentiment_spacy_with_non_alpha_tokens(self) -> None:
         analytics = _build_analytics()
-        analytics.vosk_model = MagicMock()
-        analytics._transcribe = MagicMock(return_value={"transcript": "thank 123 !!! excellent"})
 
         mock_nlp = MagicMock()
         mock_tokens = []
@@ -1730,7 +1355,7 @@ class TestEdgeCases:
         mock_nlp.return_value = mock_doc
         analytics.spacy_nlp = mock_nlp
 
-        result = analytics._analyze_sentiment("/audio.wav")
+        result = analytics._analyze_sentiment("a transcript")
         # Only alpha tokens considered; "thank" and "excellent" are positive
         assert result["overall_sentiment"] == "positive"
         assert result["sentiment_score"] == 1.0
@@ -1739,7 +1364,7 @@ class TestEdgeCases:
         """Verify clamping logic in _score_quality wouldn't go below 0 or above 100."""
         analytics = _build_analytics()
         # With empty transcript, base scores are 50.0 -- we trust the logic is correct
-        result = analytics._score_quality("/audio.wav")
+        result = analytics._score_quality("")
         for key in [
             "overall_score",
             "agent_performance",
@@ -1748,3 +1373,64 @@ class TestEdgeCases:
             "professionalism",
         ]:
             assert 0.0 <= result[key] <= 100.0
+
+
+@pytest.mark.unit
+class TestResultsArePersisted:
+    """
+    Analyses survive a restart now.
+
+    They used to live only in a dict on a module-level singleton, so every restart emptied
+    them -- and search_recordings and get_trend_analysis, which read that dict, could only ever
+    see calls analysed since boot. They are stored against the transcript, so migration 1019's
+    cascade expires them with the recording they describe.
+    """
+
+    def _analytics(self, db):
+        analytics = _build_analytics()
+        analytics.database = db
+        return analytics
+
+    def test_the_analysis_is_written(self) -> None:
+        db = _with_transcript("thank you, wonderful service")
+
+        self._analytics(db).analyze_recording("rec-1", ["sentiment", "summary"])
+
+        inserts = [c for c in db.execute.call_args_list if "recording_analyses" in str(c[0][0])]
+        assert len(inserts) == 1
+
+    def test_it_is_keyed_to_the_transcript(self) -> None:
+        """Not to the recording: the cascade runs transcript -> summary."""
+        db = _with_transcript()
+
+        self._analytics(db).analyze_recording("rec-1", ["sentiment"])
+
+        insert = next(c for c in db.execute.call_args_list if "recording_analyses" in str(c[0][0]))
+        assert "transcript_id" in str(insert[0][0])
+        assert insert[0][1][0] == 1
+
+    def test_sentiment_reaches_the_row(self) -> None:
+        db = _with_transcript("thank you excellent wonderful great appreciate")
+
+        self._analytics(db).analyze_recording("rec-1", ["sentiment"])
+
+        params = next(c for c in db.execute.call_args_list if "recording_analyses" in str(c[0][0]))[
+            0
+        ][1]
+        assert params[3] == "positive"
+
+    def test_nothing_is_written_without_a_transcript(self) -> None:
+        db = _without_transcript()
+
+        self._analytics(db).analyze_recording("rec-1", ["sentiment"])
+
+        assert not [c for c in db.execute.call_args_list if "recording_analyses" in str(c[0][0])]
+
+    def test_a_write_failure_still_returns_the_analysis(self) -> None:
+        """An analysis that could not be stored is still worth returning."""
+        db = _with_transcript()
+        db.execute.side_effect = RuntimeError("connection reset")
+
+        result = self._analytics(db).analyze_recording("rec-1", ["sentiment"])
+
+        assert "sentiment" in result["analyses"]

@@ -54,6 +54,8 @@ from pbx.utils.audio import (
 from pbx.utils.logger import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pbx.speech.worker import TranscriptionWorker
 
 __all__ = ["MIN_SPEECH_SECONDS", "RecordingTranscriber", "combine_regions", "merge_channels"]
@@ -229,6 +231,9 @@ class RecordingTranscriber:
         #: What the recording notice said, injected verbatim rather than recognised. Empty
         #: when consent announcements are off, in which case no notice channel exists.
         self.notice_text = notice_text
+        #: Called with (recording_id, transcript_id) when a transcript is stored. How
+        #: analysis is triggered without this module having to know analysis exists.
+        self.on_transcribed: Callable[[Any, Any], None] | None = None
         #: Silence that must elapse before a channel is cut into separate regions. Raising it
         #: cuts less and protects punctuation; lowering it risks splitting sentences.
         self.split_gap_seconds = split_gap_seconds
@@ -601,12 +606,19 @@ class RecordingTranscriber:
         # channel, so the keys here are exactly the labels the recording manifest named.
         # Stored on the row because the manifest expires with the audio, long before the
         # transcript does, and retention still has to know whose call this was.
-        self.store.save(
+        transcript_id = self.store.save(
             merged,
             source=SOURCE_RECORDING,
             recording_id=pending.recording_id,
             session_id=pending.session_id,
         )
+
+        if transcript_id is not None and self.on_transcribed is not None:
+            # Guarded: an analysis failure must not lose the transcript that just succeeded.
+            try:
+                self.on_transcribed(pending.recording_id, transcript_id)
+            except Exception as e:
+                self.logger.error(f"Analysis after transcription of {pending.session_id}: {e}")
         self.logger.info(
             f"Transcribed {pending.media_path.name}: "
             f"{len(merged.segments)} segment(s) across {len(pending.results)} speaker(s)"

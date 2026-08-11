@@ -550,6 +550,8 @@ class FeatureInitializer:
             return
 
         database = getattr(pbx_core, "database", None)
+        config = pbx_core.config
+        logger = pbx_core.logger
         settings = getattr(worker, "settings", None)
 
         # Stay clear of the worker's own limit: it refuses anything longer, and a refused
@@ -576,6 +578,24 @@ class FeatureInitializer:
         )
         pbx_core.recording_transcriber = transcriber
         recording_system.on_recording_finished = transcriber.submit
+
+        # Analyse each recording as soon as its transcript exists. `auto_analyze` has been in
+        # config since analytics was written and was read by nothing; this is what it meant.
+        if config.get("recording.analytics.auto_analyze", False):
+            from pbx.features.call_recording_analytics import get_recording_analytics
+
+            analytics = get_recording_analytics(config, database)
+
+            def analyse(recording_id: Any, _transcript_id: Any) -> None:
+                """Runs on the transcription worker thread; never raises into it."""
+                try:
+                    analytics.analyze_recording(str(recording_id))
+                except Exception as e:
+                    logger.error("Analysis of recording %s failed: %s", recording_id, e)
+
+            transcriber.on_transcribed = analyse
+            pbx_core.recording_analytics = analytics
+            logger.info("Recording analytics will run automatically after transcription")
 
         # Anything still in the scratch directory belongs to a run that died; nothing can be
         # transcribing in a process that has only just started.

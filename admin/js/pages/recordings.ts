@@ -1,7 +1,7 @@
 /**
  * Recordings page module.
  * Handles fraud alerts, blocked patterns, callback queue, mobile push devices,
- * test notifications, recording announcements, speech analytics configs,
+ * test notifications, recording announcements,
  * and CRM activity log.
  */
 
@@ -114,17 +114,6 @@ interface RecordingAnnouncementsStats {
 interface RecordingAnnouncementsConfig {
     audio_path?: string;
     announcement_text?: string;
-}
-
-interface SpeechAnalyticsConfig {
-    extension: string;
-    transcription_enabled?: boolean;
-    sentiment_enabled?: boolean;
-    summarization_enabled?: boolean;
-}
-
-interface SpeechAnalyticsConfigsResponse {
-    configs?: SpeechAnalyticsConfig[];
 }
 
 interface CRMActivity {
@@ -1023,43 +1012,6 @@ export async function loadRecordingAnnouncementsStats(): Promise<void> {
     }
 }
 
-// --- Speech Analytics Configs ---
-
-export async function loadSpeechAnalyticsConfigs(): Promise<void> {
-    try {
-        const API_BASE = getApiBaseUrl();
-        const response = await fetchWithTimeout(
-            `${API_BASE}/api/framework/speech-analytics/configs`,
-            { headers: getAuthHeaders() }
-        );
-        const data: SpeechAnalyticsConfigsResponse = await response.json();
-        const tableBody = document.getElementById('speech-analytics-configs-table') as HTMLElement | null;
-        if (!tableBody) return;
-
-        if (!data.configs || data.configs.length === 0) {
-            tableBody.innerHTML =
-                '<tr><td colspan="5" class="loading">No extension-specific configurations. Using system defaults.</td></tr>';
-            return;
-        }
-
-        tableBody.innerHTML = data.configs.map((config: SpeechAnalyticsConfig) => `
-            <tr>
-                <td>${escapeHtml(config.extension)}</td>
-                <td>${config.transcription_enabled ? 'Enabled' : 'Disabled'}</td>
-                <td>${config.sentiment_enabled ? 'Enabled' : 'Disabled'}</td>
-                <td>${config.summarization_enabled ? 'Enabled' : 'Disabled'}</td>
-                <td>
-                    <button class="btn btn-sm btn-primary" onclick="editSpeechAnalyticsConfig('${escapeHtml(config.extension)}')">Edit</button>
-                    <button class="btn btn-sm btn-danger" onclick="deleteSpeechAnalyticsConfig('${escapeHtml(config.extension)}')">Delete</button>
-                </td>
-            </tr>
-        `).join('');
-    } catch (error: unknown) {
-        console.error('Error loading speech analytics configs:', error);
-        showNotification('Error loading speech analytics configurations', 'error');
-    }
-}
-
 // --- CRM Activity Log ---
 
 export async function loadCRMActivityLog(): Promise<void> {
@@ -1173,7 +1125,6 @@ window.closeTestNotificationModal = closeTestNotificationModal;
 window.sendTestNotificationForm = sendTestNotificationForm;
 window.sendTestNotification = sendTestNotification;
 window.loadRecordingAnnouncementsStats = loadRecordingAnnouncementsStats;
-window.loadSpeechAnalyticsConfigs = loadSpeechAnalyticsConfigs;
 window.loadCRMActivityLog = loadCRMActivityLog;
 window.clearCRMActivityLog = clearCRMActivityLog;
 

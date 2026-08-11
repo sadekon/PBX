@@ -38,16 +38,6 @@ function loadFrameworkOverview() {
                 <button onclick="switchTab('paging')" class="btn-success" style="margin-top: 10px;">Use Now</button>
             </div>
             <div class="stat-card" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
-                <div class="stat-icon">🎙️</div>
-                <h3>Speech Analytics</h3>
-                <div style="margin: 10px 0;">
-                    <span class="status-badge status-fully-implemented">✅ Fully Implemented</span>
-                </div>
-                <p>Real-time transcription and sentiment analysis (FREE: Vosk offline)</p>
-                <small style="color: #2e7d32; display: block; margin-top: 8px;">✓ Live transcription ✓ Sentiment analysis ✓ Call summaries ✓ No cloud costs</small>
-                <button onclick="switchTab('speech-analytics')" class="btn-success" style="margin-top: 10px;">Use Now</button>
-            </div>
-            <div class="stat-card" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
                 <div class="stat-icon">📍</div>
                 <h3>Nomadic E911</h3>
                 <div style="margin: 10px 0;">

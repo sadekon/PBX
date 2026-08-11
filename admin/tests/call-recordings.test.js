@@ -144,22 +144,46 @@ describe('Call recordings page', () => {
     expect(document.getElementById('recordings-load-more')).toBeNull();
   });
 
-  it('reveals Clear only while the filter has a value', async () => {
+  it('reveals Clear filters when any filter is active', async () => {
     await load({ recordings: [], count: 0 });
 
     const input = document.getElementById('recordings-participant-filter');
+    const voicemail = document.getElementById('recordings-include-voicemail');
     const clear = document.getElementById('recordings-clear-filter');
+    expect(clear.hidden).toBe(true);
+
+    // The checkbox alone counts: it is a filter, and it lives on the same bar.
+    voicemail.checked = true;
+    voicemail.dispatchEvent(new Event('change'));
+    expect(clear.hidden).toBe(false);
+
+    voicemail.checked = false;
+    voicemail.dispatchEvent(new Event('change'));
     expect(clear.hidden).toBe(true);
 
     input.value = '1001';
     input.dispatchEvent(new Event('input'));
     expect(clear.hidden).toBe(false);
+  });
+
+  it('Clear filters resets every filter, not only the text field', async () => {
+    await load({ recordings: [], count: 0 });
+
+    const input = document.getElementById('recordings-participant-filter');
+    const voicemail = document.getElementById('recordings-include-voicemail');
+    const clear = document.getElementById('recordings-clear-filter');
+
+    input.value = '1001';
+    input.dispatchEvent(new Event('input'));
+    voicemail.checked = true;
+    voicemail.dispatchEvent(new Event('change'));
 
     fetch.mockResolvedValueOnce(jsonResponse({ recordings: [], count: 0 }));
     clear.click();
     await Promise.resolve();
 
     expect(input.value).toBe('');
+    expect(voicemail.checked).toBe(false);
     expect(clear.hidden).toBe(true);
   });
 
