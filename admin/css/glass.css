@@ -50,6 +50,38 @@
    ========================================================================== */
 
 /* --------------------------------------------------------------------------
+   The page surface
+
+   Carries the texture the panes refract. It has to have fine detail in it:
+   backdrop-filter blurs what is behind it, and blurring a flat colour returns
+   the same flat colour, so the dot lattice is what makes a pane read as frosted
+   rather than merely tinted. A page can override this with its own backdrop;
+   the requirement is detail, not this particular one.
+   -------------------------------------------------------------------------- */
+
+/* Padding and radius are deliberately not set here: the host container already
+   has its own (`.tab-content` is 30px), that rule sits later in the cascade at
+   equal specificity, and it would win anyway. Spacing belongs to the layout
+   that places the page, not to the material. */
+.glass-page {
+    background-color: var(--color-bg);
+    background-attachment: fixed;
+    background-image:
+        radial-gradient(110% 80% at 12% 0%, rgba(93, 173, 226, 0.18), transparent 60%),
+        radial-gradient(rgba(255, 255, 255, 0.10) 1px, transparent 1px);
+    background-size: auto, 22px 22px;
+}
+
+/* A solid wrapper between the page and the panes is what they would frost, so
+   the section that normally supplies one steps out of the way. */
+.glass-page .config-section {
+    background: transparent;
+    border: none;
+    padding: 0;
+    box-shadow: none;
+}
+
+/* --------------------------------------------------------------------------
    The pane
    -------------------------------------------------------------------------- */
 
@@ -280,6 +312,35 @@
 }
 
 /* --------------------------------------------------------------------------
+   Clickable things that are not buttons.
+
+   A card title that expands a row, and a checkbox label, are both targets but
+   neither looks like one at rest. A fill alone is enough to say so: these sit
+   inside a pane that already has a rim, and a second bordered box nested in the
+   first reads as a control that was pasted on. The negative margin cancels the
+   padding, so adding a hit area does not shift the layout around it.
+   -------------------------------------------------------------------------- */
+
+.glass-page .card-title,
+.glass-page .filter-check {
+    border-radius: 8px;
+    padding: 3px 8px;
+    margin: -3px -8px;
+    transition: background 0.15s ease;
+}
+
+.glass-page .card-title:hover,
+.glass-page .filter-check:hover {
+    background: rgba(255, 255, 255, 0.10);
+}
+
+.glass-page .card-title:focus-visible,
+.glass-page .filter-check:focus-within {
+    outline: 2px solid rgba(124, 196, 234, 0.85);
+    outline-offset: 1px;
+}
+
+/* --------------------------------------------------------------------------
    Pill — restated as glass.
 
    The stock pill is a 999px lozenge with a flat 1px border and no fill. Next
@@ -468,6 +529,145 @@
     display: flex;
     gap: 9px;
     justify-content: center;
+}
+
+/* --------------------------------------------------------------------------
+   Legacy components, made to behave on glass.
+
+   These classes predate the treatment and are used everywhere — .config-section
+   101 times in index.html, .stat-card 77, .info-box 59. Each carries its own
+   opaque fill, its own shadow and in one case its own pseudo-element, all of
+   which fight a translucent pane. Neutralised once here rather than per page,
+   because the work is identical every time and the .stat-card conflict in
+   particular is not obvious from looking at it.
+   -------------------------------------------------------------------------- */
+
+/* Three short tiles read as one summary band. Pinned rather than left to the
+   shared `auto-fit` rule, whose `max-width: 768px` breakpoint drops them to a
+   single column and stacks them into full-width rows on a laptop in a split
+   window. */
+.glass-page .stats-grid {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+}
+
+@media (max-width: 560px) {
+    .glass-page .stats-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Geometry only — the surface comes from whichever tier the markup applies.
+   `transition: all` is dropped because the legacy card animates every property
+   it owns, including the ones the glass now supplies. */
+.glass-page .stat-card {
+    padding: 11px 16px;
+    text-align: left;
+    transition: none;
+}
+
+/* The legacy card paints a 3px accent bar on ::before — the same pseudo-element
+   the rim uses. The two merge rather than replace: the rim inherits
+   `height: 3px` and renders as a stub across the top instead of a full outline,
+   and inherits `transform: scaleX(0)` so it animates in on hover. */
+.glass-page .stat-card::before {
+    height: auto;
+    transform: none;
+    transition: none;
+}
+
+/* A stat tile is not clickable, so it gets no hover — the legacy lift, glow and
+   scaling figure are switched off rather than restyled. */
+.glass-page .stat-card:hover {
+    transform: none;
+    border-color: transparent;
+    box-shadow:
+        inset 0 1px 0 0 rgba(255, 255, 255, 0.18),
+        0 6px 18px rgba(0, 0, 0, 0.22);
+}
+
+.glass-page .stat-card:hover .stat-value {
+    transform: none;
+}
+
+/* The figure is gradient-clipped text app-wide, which renders blue. Accent
+   belongs to interactive things here, so the numbers read as ordinary text. */
+.glass-page .stat-value {
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--color-text);
+    font-size: 1.3rem;
+    font-weight: 700;
+    line-height: 1.05;
+    letter-spacing: normal;
+    margin-bottom: 0;
+    font-variant-numeric: tabular-nums;
+    transition: none;
+}
+
+.glass-page .stat-label {
+    margin-top: 2px;
+    font-size: 0.63rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--color-text-secondary);
+    font-weight: 600;
+}
+
+/* Squarer bottom corners and a tight gap below read as "this governs what
+   follows"; equal margins on both sides read as an unrelated pane. */
+.glass-page .filter-bar {
+    padding: 11px 16px;
+    border-radius: 14px 14px 7px 7px;
+    margin-bottom: 8px;
+}
+
+.glass-page .info-box {
+    margin-top: 44px;
+    padding: 16px 20px;
+    background: none;
+    border: none;
+}
+
+.glass-page .info-box h3 {
+    margin: 0 0 8px;
+    font-size: 0.86rem;
+    color: var(--color-text-secondary);
+}
+
+.glass-page .info-box p,
+.glass-page .info-box li {
+    font-size: 0.82rem;
+    line-height: 1.6;
+    color: var(--color-text-secondary);
+}
+
+/* The dot is ringed in the pane colour so it reads as attached to the avatar
+   rather than floating over whatever is behind it. */
+.glass-page .avatar-dot {
+    border-color: #1b232e;
+}
+
+.glass-page .avatar {
+    background: rgba(255, 255, 255, 0.09);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    transition: background 0.18s ease, box-shadow 0.18s ease;
+}
+
+.glass-page .g-hover:hover .avatar {
+    background: rgba(255, 255, 255, 0.13);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26);
+}
+
+/* An icon depicting direction — motion is its meaning rather than decoration,
+   which is why it moves when nothing else does. */
+.glass-page .card-title:hover .card-chevron {
+    color: var(--color-text);
+    transform: translateX(2px);
+}
+
+.glass-page .card-title:hover .card-chevron.open {
+    transform: rotate(90deg) translateX(2px);
 }
 
 /* --------------------------------------------------------------------------
