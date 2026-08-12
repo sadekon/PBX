@@ -56,18 +56,51 @@ function orEmpty(value: string | null | undefined, placeholder = 'Not set'): str
     return value ? escapeHtml(value) : `<span class="field-empty">${placeholder}</span>`;
 }
 
+interface NameParts {
+    first: string;
+    last: string;
+}
+
+/**
+ * Splits a display name into forename and surname.
+ *
+ * Handles both orders Active Directory produces: "Maya Rodriguez" and the comma
+ * form "Rodriguez, Maya". Everything before the last space is the forename, so a
+ * particle stays with it and "Jean-Luc de Vries" files under V — which is also
+ * how the Dutch convention sorts it. A single word is its own surname, covering
+ * mononyms and service accounts.
+ */
+function splitName(name: string): NameParts {
+    const trimmed = name.trim();
+
+    const comma = trimmed.indexOf(',');
+    if (comma !== -1) {
+        return {
+            last: trimmed.slice(0, comma).trim(),
+            first: trimmed.slice(comma + 1).trim(),
+        };
+    }
+
+    const words = trimmed.split(/\s+/).filter(Boolean);
+    if (words.length <= 1) {
+        return { first: '', last: words[0] ?? '' };
+    }
+    return {
+        first: words.slice(0, -1).join(' '),
+        last: words[words.length - 1]!,
+    };
+}
+
 /**
  * Up to two initials for the avatar.
  *
- * Takes the first and last word so "Maya Rodriguez" gives MR and
- * "Jean-Luc de Vries" gives JV rather than JD.
+ * "Maya Rodriguez" gives MR, "Jean-Luc de Vries" gives JV rather than JD, and
+ * the comma form "Rodriguez, Maya" gives MR rather than RM.
  */
 function initials(name: string): string {
-    const words = name.trim().split(/\s+/).filter(Boolean);
-    if (words.length === 0) return '?';
-    const first = words[0]!.charAt(0);
-    const last = words.length > 1 ? words[words.length - 1]!.charAt(0) : '';
-    return (first + last).toUpperCase();
+    const { first, last } = splitName(name);
+    const combined = first.charAt(0) + last.charAt(0);
+    return combined ? combined.toUpperCase() : '?';
 }
 
 /**
@@ -198,14 +231,57 @@ function shouldGroup(entries: DirectoryEntry[]): boolean {
     return withDept / entries.length >= GROUPING_THRESHOLD;
 }
 
-function sortedByName(entries: DirectoryEntry[]): DirectoryEntry[] {
-    return [...entries].sort((a, b) => a.name.localeCompare(b.name));
+type SortKey = 'name' | 'extension' | 'status';
+
+function currentSort(): SortKey {
+    const value = (el('directory-sort') as HTMLSelectElement | null)?.value;
+    return value === 'extension' || value === 'status' ? value : 'name';
+}
+
+/** Online first, then do-not-disturb, then offline — most reachable first. */
+function presenceRank(entry: DirectoryEntry): number {
+    if (entry.dnd_enabled) return 1;
+    return entry.registered ? 0 : 2;
+}
+
+/**
+ * Surname first, forename as the tiebreak — the order a printed directory uses,
+ * so the two Rodriguezes sit together rather than being separated by whoever
+ * else happens to share their forename's initial.
+ */
+function bySurname(a: DirectoryEntry, b: DirectoryEntry): number {
+    const left = splitName(a.name);
+    const right = splitName(b.name);
+    return left.last.localeCompare(right.last) || left.first.localeCompare(right.first);
+}
+
+/**
+ * Orders one run of people by the current dropdown.
+ *
+ * Every key falls back to name, so the list has a stable order rather than
+ * leaving everyone who shares a status in whatever sequence the API returned.
+ * When grouping is active this runs per department, not across the whole list.
+ */
+function sorted(entries: DirectoryEntry[]): DirectoryEntry[] {
+    const key = currentSort();
+
+    return [...entries].sort((a, b) => {
+        if (key === 'extension') {
+            // numeric so 999 comes before 1000, which a plain string sort reverses.
+            const order = a.extension.localeCompare(b.extension, undefined, { numeric: true });
+            return order || bySurname(a, b);
+        }
+        if (key === 'status') {
+            return presenceRank(a) - presenceRank(b) || bySurname(a, b);
+        }
+        return bySurname(a, b);
+    });
 }
 
 /** Cards, grouped under department headings when the data supports it. */
 function listHtml(visible: DirectoryEntry[]): string {
     if (!shouldGroup(visible)) {
-        return sortedByName(visible).map(cardHtml).join('');
+        return sorted(visible).map(cardHtml).join('');
     }
 
     const byDepartment = new Map<string, DirectoryEntry[]>();
@@ -229,7 +305,7 @@ function listHtml(visible: DirectoryEntry[]): string {
 
     return names
         .map((name) => {
-            const cards = sortedByName(byDepartment.get(name) ?? []).map(cardHtml).join('');
+            const cards = sorted(byDepartment.get(name) ?? []).map(cardHtml).join('');
             return `<div class="group-label">${escapeHtml(name)}</div>${cards}`;
         })
         .join('');
@@ -412,6 +488,10 @@ function attachDirectoryListeners(): void {
     });
 
     el('directory-online-only')?.addEventListener('change', renderDirectory);
+
+    // Sort order is a view preference rather than a filter, so it is not reset
+    // by Clear filters and does not count towards the "n of m shown" summary.
+    el('directory-sort')?.addEventListener('change', renderDirectory);
 
     el('directory-clear-filter')?.addEventListener('click', () => {
         searchInput.value = '';

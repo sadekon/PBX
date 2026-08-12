@@ -360,6 +360,27 @@
     border-color: var(--color-border-medium);
 }
 
+/* Matches the inputs above, minus their min-width: a select is only as wide as
+   its longest option, and stretching it to 220px would leave a gap the native
+   arrow floats away from. The arrow itself is left to the platform rather than
+   redrawn, so it stays correct in both colour schemes and keeps its keyboard
+   behaviour. */
+.filter-bar select {
+    padding: 6px 10px;
+    border: 1px solid var(--color-border);
+    border-radius: 7px;
+    background: var(--color-bg-card);
+    color: var(--color-text);
+    font-size: 0.86rem;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.filter-bar select:focus {
+    outline: none;
+    border-color: var(--color-border-medium);
+}
+
 /* A checkbox reads as a sentence, so it keeps sentence case and normal weight
    rather than the uppercase treatment .filter-label uses. */
 .filter-check {

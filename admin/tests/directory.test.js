@@ -49,6 +49,11 @@ function jsonResponse(body, status = 200) {
 function setupDom() {
   document.body.innerHTML = `
     <input type="search" id="directory-search">
+    <select id="directory-sort">
+      <option value="name" selected>Name</option>
+      <option value="extension">Extension</option>
+      <option value="status">Status</option>
+    </select>
     <input type="checkbox" id="directory-online-only">
     <button id="directory-clear-filter" hidden>Clear filters</button>
     <button id="directory-refresh">Refresh</button>
@@ -81,15 +86,21 @@ describe('Company directory page', () => {
     expect(list().querySelectorAll('.card-shell')).toHaveLength(2);
   });
 
-  it('builds initials from the first and last word of the name', async () => {
+  it('builds initials from the forename and surname', async () => {
     await load([
       person({ name: 'Maya Rodriguez' }),
       person({ extension: '1002', name: 'Jean-Luc de Vries' }),
       person({ extension: '1003', name: 'Cher' })
     ]);
-    // Listed in name order, not the order the API returned them.
+    // Ordered by surname — Cher, Rodriguez, Vries — not by the API's order.
     const avatars = [...list().querySelectorAll('.avatar')].map((a) => a.textContent);
-    expect(avatars).toEqual(['C', 'JV', 'MR']);
+    expect(avatars).toEqual(['C', 'MR', 'JV']);
+  });
+
+  it('reads the comma form as surname-first', async () => {
+    await load([person({ name: 'Rodriguez, Maya' })]);
+    // RM would mean the comma form was parsed as though it were forename-first.
+    expect(list().querySelector('.avatar').textContent).toBe('MR');
   });
 
   it('shows presence as a dot rather than a pill when online', async () => {
@@ -125,8 +136,9 @@ describe('Company directory page', () => {
       expect(list().querySelectorAll('.card-shell')).toHaveLength(3);
       expect(list().querySelector('.list-empty')).toBeNull();
 
+      // By surname: Chen, Diaz, Ncube.
       const names = [...list().querySelectorAll('.card-title strong')].map((n) => n.textContent);
-      expect(names).toEqual(['Alice Chen', 'Bob Ncube', 'Carol Diaz']);
+      expect(names).toEqual(['Alice Chen', 'Carol Diaz', 'Bob Ncube']);
     });
 
     it('treats an empty-string department as absent rather than as a group named ""', async () => {
@@ -201,6 +213,116 @@ describe('Company directory page', () => {
       ]);
       const headings = [...list().querySelectorAll('.group-label')].map((h) => h.textContent);
       expect(headings).toEqual(['Zoology', 'Unassigned']);
+    });
+  });
+
+  describe('sorting', () => {
+    const names = () =>
+      [...list().querySelectorAll('.card-title strong')].map((n) => n.textContent);
+
+    function sortBy(value) {
+      const select = document.getElementById('directory-sort');
+      select.value = value;
+      select.dispatchEvent(new Event('change'));
+    }
+
+    async function loadMixed() {
+      await load([
+        person({ extension: '1000', name: 'Zoe Adams', registered: false, dnd_enabled: false }),
+        person({ extension: '999', name: 'Alice Chen', registered: false, dnd_enabled: true }),
+        person({ extension: '1042', name: 'Bob Ncube', registered: true, dnd_enabled: false })
+      ]);
+    }
+
+    it('sorts by surname out of the box, not forename', async () => {
+      await loadMixed();
+      // Adams, Chen, Ncube — forename order would be Alice, Bob, Zoe.
+      expect(names()).toEqual(['Zoe Adams', 'Alice Chen', 'Bob Ncube']);
+    });
+
+    it('groups people sharing a surname together, ordered by forename', async () => {
+      await load([
+        person({ extension: '1001', name: 'Zoe Rodriguez' }),
+        person({ extension: '1002', name: 'Bob Chen' }),
+        person({ extension: '1003', name: 'Alice Rodriguez' })
+      ]);
+      expect(names()).toEqual(['Bob Chen', 'Alice Rodriguez', 'Zoe Rodriguez']);
+    });
+
+    it('files a surname particle under the last word', async () => {
+      await load([
+        person({ extension: '1001', name: 'Jean-Luc de Vries' }),
+        person({ extension: '1002', name: 'Ada Unwin' }),
+        person({ extension: '1003', name: 'Bo Deng' })
+      ]);
+      // Deng, Unwin, Vries — filing "de Vries" under D would put it first.
+      expect(names()).toEqual(['Bo Deng', 'Ada Unwin', 'Jean-Luc de Vries']);
+    });
+
+    it('sorts a mononym by the only name it has', async () => {
+      await load([
+        person({ extension: '1001', name: 'Zoe Adams' }),
+        person({ extension: '1002', name: 'Cher' }),
+        person({ extension: '1003', name: 'Bob Ncube' })
+      ]);
+      expect(names()).toEqual(['Zoe Adams', 'Cher', 'Bob Ncube']);
+    });
+
+    it('sorts extensions numerically, so 999 precedes 1000', async () => {
+      await loadMixed();
+      sortBy('extension');
+      // A plain string sort would put 1000 and 1042 ahead of 999.
+      expect(names()).toEqual(['Alice Chen', 'Zoe Adams', 'Bob Ncube']);
+    });
+
+    it('sorts by reachability: online, then do-not-disturb, then offline', async () => {
+      await loadMixed();
+      sortBy('status');
+      expect(names()).toEqual(['Bob Ncube', 'Alice Chen', 'Zoe Adams']);
+    });
+
+    it('breaks status ties by surname rather than by API order', async () => {
+      await load([
+        person({ extension: '1003', name: 'Carol Diaz', registered: true }),
+        person({ extension: '1001', name: 'Alice Chen', registered: true }),
+        person({ extension: '1002', name: 'Bob Ncube', registered: true })
+      ]);
+      sortBy('status');
+      expect(names()).toEqual(['Alice Chen', 'Carol Diaz', 'Bob Ncube']);
+    });
+
+    it('sorts within each department rather than across the whole list', async () => {
+      await load([
+        person({ extension: '1002', name: 'Zoe Adams', department: 'Engineering' }),
+        person({ extension: '1001', name: 'Bob Ncube', department: 'Engineering' }),
+        person({ extension: '2002', name: 'Yuki Tanaka', department: 'Support' }),
+        person({ extension: '2001', name: 'Alice Chen', department: 'Support' })
+      ]);
+      sortBy('extension');
+      // Groups stay alphabetical; the ordering applies inside them, so Support's
+      // 2001 does not jump above Engineering's 1002.
+      expect(names()).toEqual(['Bob Ncube', 'Zoe Adams', 'Alice Chen', 'Yuki Tanaka']);
+    });
+
+    it('keeps the chosen order while searching', async () => {
+      await loadMixed();
+      sortBy('extension');
+      const input = document.getElementById('directory-search');
+      input.value = 'e';
+      input.dispatchEvent(new Event('input'));
+      expect(names()).toEqual(['Alice Chen', 'Zoe Adams', 'Bob Ncube']);
+    });
+
+    it('survives Clear filters, because sort is a view preference not a filter', async () => {
+      await loadMixed();
+      sortBy('extension');
+      const input = document.getElementById('directory-search');
+      input.value = 'alice';
+      input.dispatchEvent(new Event('input'));
+      document.getElementById('directory-clear-filter').click();
+
+      expect(document.getElementById('directory-sort').value).toBe('extension');
+      expect(names()).toEqual(['Alice Chen', 'Zoe Adams', 'Bob Ncube']);
     });
   });
 
