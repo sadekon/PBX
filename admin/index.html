@@ -465,26 +465,38 @@
         </div>
 
         <!-- Company Directory Tab -->
-        <div id="phone-book" class="tab-content">
-            <h2>📇 Company Directory</h2>
+        <div id="phone-book" class="tab-content glass-page">
+            <div class="g g1 directory-head">
+                <span class="directory-mark" aria-hidden="true">📇</span>
+                <div>
+                    <h2>Company Directory</h2>
+                    <p class="directory-sub">Every extension on the system, visible to all signed-in users</p>
+                </div>
+                <span class="directory-head-actions">
+                    <button type="button" class="btn-ghost btn-ghost-accent" id="directory-refresh">Refresh</button>
+                </span>
+            </div>
 
-            <div class="stats-grid" style="margin-bottom: 20px;">
-                <div class="stat-card">
+            <div class="stats-grid" style="margin-bottom: 30px;">
+                <div class="g g2 stat-card">
                     <div class="stat-value" id="directory-total">-</div>
                     <div class="stat-label">People</div>
                 </div>
-                <div class="stat-card">
+                <div class="g g2 stat-card">
                     <div class="stat-value" id="directory-online">-</div>
                     <div class="stat-label">Online Now</div>
                 </div>
-                <div class="stat-card">
+                <div class="g g2 stat-card">
                     <div class="stat-value" id="directory-with-did">-</div>
                     <div class="stat-label">Direct Dial Numbers</div>
                 </div>
             </div>
 
             <div class="config-section">
-                <div class="filter-bar">
+                <p class="directory-caption">All extensions
+                    <span class="filter-summary" id="directory-count" aria-live="polite"></span>
+                </p>
+                <div class="g g2 filter-bar">
                     <span class="filter-field">
                         <label class="filter-label" for="directory-search">Search</label>
                         <input type="search" id="directory-search" autocomplete="off"
@@ -504,16 +516,12 @@
                     </label>
                     <button type="button" class="btn-ghost" id="directory-clear-filter"
                             hidden>Clear filters</button>
-                    <button type="button" class="btn-ghost" id="directory-refresh">Refresh</button>
-                    <span class="filter-summary" id="directory-count" aria-live="polite"></span>
                 </div>
 
-                <div id="directory-list">
-                    <div class="list-loading">Loading directory...</div>
-                </div>
+                <div id="directory-list"></div>
             </div>
 
-            <div class="info-box">
+            <div class="g g4 info-box">
                 <h3>ℹ️ About the Directory</h3>
                 <p>The directory lists every extension on the system and is visible to all signed-in users. Searching filters the list as you type across name, extension, direct dial, email, and department.</p>
                 <ul>
@@ -521,7 +529,7 @@
                     <li><strong>Expand a row</strong> to see email, mobile, and office location.</li>
                     <li><strong>The dot on each avatar</strong> shows live SIP registration at the moment the page loaded — press Refresh to update it.</li>
                 </ul>
-                <p>Name, extension, and email come from Active Directory. Department, mobile, and office location are maintained in the PBX and appear only where an administrator has filled them in. People are grouped by department once most of the directory has one.</p>
+                <p>Name, extension, and email come from Active Directory. Department, mobile, and office location are maintained in the PBX and appear only where an administrator has filled them in.</p>
             </div>
         </div>
 

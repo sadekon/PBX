@@ -18,6 +18,12 @@
    not-yet-migrated originals. See patterns.css for the migration note. */
 @import 'patterns.css';
 
+/* Translucent surface treatment layered over that vocabulary. Every rule in it
+   is scoped under `.glass-page`, so it costs nothing on the pages that have not
+   opted in. Currently the Directory only — see the header of glass.css for what
+   opting a second page in requires (notably: it is dark-mode only so far). */
+@import 'glass.css';
+
 /* Visually hidden, still read by screen readers. For labels that would be
    redundant next to a placeholder but are required for the input to be
    announced at all. */
@@ -593,10 +599,205 @@ header h1 {
     white-space: nowrap;
 }
 
-/* Placeholder for a directory field the record simply does not carry. */
+/* Placeholder for a directory field the record simply does not carry.
+   Not --color-text-muted: against the translucent panes on the Directory that
+   composites to 3.91:1, under the 4.5 needed for body text. This measures
+   4.72 and still reads as secondary. */
 .field-empty {
-    color: var(--color-text-muted);
+    color: #7d90a6;
     font-style: italic;
+}
+
+/* ==========================================================================
+   Company Directory — the one page currently on the glass treatment.
+
+   The backdrop lives here rather than on `body` so the rest of the admin panel
+   is untouched. It has to carry some fine detail: backdrop-filter blurs what is
+   behind it, and blurring a flat colour returns the same flat colour, so the
+   dot lattice is what actually makes the panes read as frosted rather than
+   merely tinted.
+   ========================================================================== */
+
+#phone-book.glass-page {
+    background-color: var(--color-bg);
+    background-attachment: fixed;
+    background-image:
+        radial-gradient(110% 80% at 12% 0%, rgba(93, 173, 226, 0.18), transparent 60%),
+        radial-gradient(rgba(255, 255, 255, 0.10) 1px, transparent 1px);
+    background-size: auto, 22px 22px;
+    padding: 24px;
+    border-radius: var(--radius-md);
+}
+
+/* A solid wrapper between the page and the panes would be what they frost, so
+   the section that normally supplies one steps out of the way. */
+#phone-book.glass-page .config-section {
+    background: transparent;
+    border: none;
+    padding: 0;
+    box-shadow: none;
+}
+
+#phone-book .directory-head {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 20px 24px;
+}
+
+#phone-book .directory-head h2 {
+    margin: 0;
+    font-size: 1.5rem;
+    letter-spacing: -0.015em;
+}
+
+#phone-book .directory-head .directory-sub {
+    margin: 4px 0 0;
+    font-size: 0.85rem;
+    color: var(--color-text-secondary);
+}
+
+#phone-book .directory-mark {
+    width: 46px;
+    height: 46px;
+    border-radius: 13px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.3rem;
+    background: rgba(93, 173, 226, 0.18);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26);
+}
+
+#phone-book .directory-head-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 8px;
+}
+
+/* Tiles tie upward to the header rather than sitting as a second band of
+   heading weight; the open space below them starts the list zone.
+
+   The columns are pinned rather than left to the shared `auto-fit` rule: three
+   short tiles read as one summary band, and the global `max-width: 768px`
+   breakpoint drops .stats-grid to a single column, which stacks them into three
+   full-width rows on a laptop in a split window. They only stack here when the
+   viewport is genuinely too narrow for three. */
+#phone-book.glass-page .stats-grid {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin-bottom: 30px !important;
+}
+
+@media (max-width: 560px) {
+    #phone-book.glass-page .stats-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Only geometry here. The surface itself comes from .g2 — restating background
+   or box-shadow at this specificity would beat the glass and silently undo it. */
+#phone-book.glass-page .stat-card {
+    padding: 11px 16px;
+    text-align: left;
+}
+
+#phone-book.glass-page .stat-value {
+    font-size: 1.3rem;
+    font-weight: 700;
+    line-height: 1.05;
+    font-variant-numeric: tabular-nums;
+}
+
+#phone-book.glass-page .stat-label {
+    margin-top: 2px;
+    font-size: 0.63rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--color-text-secondary);
+    font-weight: 600;
+}
+
+/* Names the list zone, so the toolbar is not the first thing in an unlabelled
+   region. */
+#phone-book .directory-caption {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-text-secondary);
+    font-weight: 700;
+    margin: 0 0 10px;
+    padding-left: 4px;
+}
+
+/* The count is a sentence ("6 people"), not a label, so it opts out of the
+   caption's uppercase rather than inheriting it. */
+#phone-book .directory-caption .filter-summary {
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 500;
+}
+
+/* Squarer bottom corners and a tight gap below read as "this governs what
+   follows"; equal margins on both sides read as an unrelated third pane. */
+#phone-book.glass-page .filter-bar {
+    padding: 11px 16px;
+    border-radius: 14px 14px 7px 7px;
+    margin-bottom: 8px;
+}
+
+#phone-book .avatar {
+    background: rgba(255, 255, 255, 0.09);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    transition: background 0.18s ease, box-shadow 0.18s ease;
+}
+
+#phone-book .g-hover:hover .avatar {
+    background: rgba(255, 255, 255, 0.13);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26);
+}
+
+#phone-book .avatar-dot {
+    border-color: #1b232e;
+}
+
+/* The chevron is an icon depicting direction, so motion is its meaning rather
+   than decoration — the one thing besides a button press that moves. */
+#phone-book .card-title:hover .card-chevron {
+    color: var(--color-text);
+    transform: translateX(2px);
+}
+
+#phone-book .card-title:hover .card-chevron.open {
+    transform: rotate(90deg) translateX(2px);
+}
+
+#phone-book.glass-page .card-stack {
+    gap: 7px;
+}
+
+#phone-book.glass-page .info-box {
+    margin-top: 44px;
+    padding: 16px 20px;
+    background: none;
+    border: none;
+}
+
+#phone-book.glass-page .info-box h3 {
+    margin: 0 0 8px;
+    font-size: 0.86rem;
+    color: var(--color-text-secondary);
+}
+
+#phone-book.glass-page .info-box p,
+#phone-book.glass-page .info-box li {
+    font-size: 0.82rem;
+    line-height: 1.6;
+    color: var(--color-text-secondary);
 }
 
 /* A button that reads as a link. Used where the action is inline in a table

@@ -32,16 +32,6 @@ interface DirectoryResponse {
 
 const DIRECTORY_LOAD_TIMEOUT = 10000;
 
-/**
- * Group by department only once most of the directory has one.
- *
- * Department is optional enrichment, so below this share the page would be one
- * long "No department" heading with a short real group above it — worse than
- * not grouping. Above it, the headings carry the structure. The threshold is
- * deliberately high: partial grouping reads as missing data, not as a category.
- */
-const GROUPING_THRESHOLD = 0.6;
-
 /** Full unfiltered directory, held so search never needs the network. */
 let directoryEntries: DirectoryEntry[] = [];
 let listenersAttached = false;
@@ -198,7 +188,7 @@ function cardHtml(entry: DirectoryEntry): string {
         : '';
 
     return `
-        <div class="card-shell">
+        <div class="card-shell g g3 g-hover">
             <div class="card-head">
                 <span class="card-title" role="button" tabindex="0"
                       aria-expanded="${open}" data-dir-toggle="${ext}">
@@ -222,13 +212,6 @@ function cardHtml(entry: DirectoryEntry): string {
             </div>
         </div>
     `;
-}
-
-/** True when enough of the directory has a department for headings to help. */
-function shouldGroup(entries: DirectoryEntry[]): boolean {
-    if (entries.length === 0) return false;
-    const withDept = entries.filter((entry) => entry.department).length;
-    return withDept / entries.length >= GROUPING_THRESHOLD;
 }
 
 type SortKey = 'name' | 'extension' | 'status';
@@ -278,37 +261,88 @@ function sorted(entries: DirectoryEntry[]): DirectoryEntry[] {
     });
 }
 
-/** Cards, grouped under department headings when the data supports it. */
+/**
+ * One flat list in the current sort order.
+ *
+ * Department headings were built and then removed: department is optional
+ * enrichment and is populated for a small minority of the directory, so the
+ * page spent most of its time either ungrouped anyway or showing a single
+ * "Unassigned" heading that grouped nothing. Department is still searchable
+ * and still shown on an expanded card. If it ever gets filled in properly,
+ * grouping is worth revisiting.
+ */
 function listHtml(visible: DirectoryEntry[]): string {
-    if (!shouldGroup(visible)) {
-        return sorted(visible).map(cardHtml).join('');
-    }
+    return sorted(visible).map(cardHtml).join('');
+}
 
-    const byDepartment = new Map<string, DirectoryEntry[]>();
-    for (const entry of visible) {
-        const key = entry.department || 'Unassigned';
-        const bucket = byDepartment.get(key);
-        if (bucket) {
-            bucket.push(entry);
-        } else {
-            byDepartment.set(key, [entry]);
-        }
-    }
+/**
+ * Placeholder rows shown while the list loads.
+ *
+ * Skeletons rather than a spinner: the geometry of what is arriving is already
+ * known, so the list assembles in place instead of a spinner collapsing into
+ * content of a different height. Widths vary so it does not read as a barcode.
+ */
+function skeletonHtml(): string {
+    const widths = [130, 96, 148, 112, 134];
+    const rows = widths.map((width) => `
+        <div class="card-shell g g3 skeleton" aria-hidden="true">
+            <div class="card-head">
+                <span class="card-title">
+                    <span class="sk-circle"></span>
+                    <span class="sk-bar" style="width: ${width}px; height: 12px;"></span>
+                </span>
+                <span class="meta-stats">
+                    <span class="meta-stat">
+                        <span class="sk-bar" style="width: 26px; height: 8px;"></span>
+                        <span class="sk-bar" style="width: 54px; height: 10px;"></span>
+                    </span>
+                    <span class="meta-stat">
+                        <span class="sk-bar" style="width: 26px; height: 8px;"></span>
+                        <span class="sk-bar" style="width: 104px; height: 10px;"></span>
+                    </span>
+                </span>
+                <span class="card-actions">
+                    <span class="sk-bar" style="width: 52px; height: 27px; border-radius: 9px;"></span>
+                    <span class="sk-bar" style="width: 52px; height: 27px; border-radius: 9px;"></span>
+                </span>
+            </div>
+        </div>
+    `).join('');
 
-    // Alphabetical, but Unassigned last however it sorts — it is a leftover
-    // bucket rather than a department, so it does not belong among them.
-    const names = [...byDepartment.keys()].sort((a, b) => {
-        if (a === 'Unassigned') return 1;
-        if (b === 'Unassigned') return -1;
-        return a.localeCompare(b);
-    });
+    return `<div class="card-stack">${rows}</div>
+            <span class="sr-only" role="status">Loading directory</span>`;
+}
 
-    return names
-        .map((name) => {
-            const cards = sorted(byDepartment.get(name) ?? []).map(cardHtml).join('');
-            return `<div class="group-label">${escapeHtml(name)}</div>${cards}`;
-        })
-        .join('');
+/** A mark, a headline, the likely cause, and the action that resolves it. */
+function emptyStateHtml(
+    mark: string,
+    heading: string,
+    detail: string,
+    action = ''
+): string {
+    return `
+        <div class="card-shell g g3 empty-state">
+            <div class="empty-mark${mark === '⚠️' ? ' empty-mark-warn' : ''}" aria-hidden="true">${mark}</div>
+            <h3>${heading}</h3>
+            <p>${detail}</p>
+            ${action ? `<div class="empty-actions">${action}</div>` : ''}
+        </div>
+    `;
+}
+
+/**
+ * Resets search and the online-only checkbox, then repaints.
+ *
+ * Shared by the toolbar button and the one inside the "nothing matched" state,
+ * so the two can never drift apart. Sort order is a view preference rather
+ * than a filter and is deliberately left alone.
+ */
+function clearFilters(): void {
+    const searchInput = el('directory-search') as HTMLInputElement | null;
+    if (searchInput) searchInput.value = '';
+    const checkbox = el('directory-online-only') as HTMLInputElement | null;
+    if (checkbox) checkbox.checked = false;
+    renderDirectory();
 }
 
 /** Applies the current filters to the cached list and repaints. */
@@ -342,8 +376,23 @@ function renderDirectory(): void {
     }
 
     if (visible.length === 0) {
-        const message = filtering ? 'No one matches those filters' : 'No extensions found';
-        container.innerHTML = `<div class="list-empty">${message}</div>`;
+        // Two different situations wearing the same word. Filtered-to-nothing
+        // has an obvious next action; an empty directory has a likely cause.
+        container.innerHTML = filtering
+            ? emptyStateHtml(
+                '🔍',
+                needle
+                    ? `No one matches <code>${escapeHtml(needle)}</code>`
+                    : 'No one matches those filters',
+                'No name, extension, direct dial, email or department contains that. Check the spelling, or widen the filters.',
+                '<button type="button" class="btn-ghost" data-dir-clear>Clear filters</button>'
+            )
+            : emptyStateHtml(
+                '📇',
+                'No extensions yet',
+                'Nothing is registered on the system. Extensions appear here once they exist in the PBX or arrive from the Active Directory sync.',
+                '<button type="button" class="btn-ghost" data-dir-retry>Refresh</button>'
+            );
         return;
     }
 
@@ -367,7 +416,7 @@ export async function loadPhoneBook(): Promise<void> {
     if (!container) return;
 
     attachDirectoryListeners();
-    container.innerHTML = '<div class="list-loading">Loading directory...</div>';
+    container.innerHTML = skeletonHtml();
 
     try {
         const API_BASE = getApiBaseUrl();
@@ -385,10 +434,18 @@ export async function loadPhoneBook(): Promise<void> {
     } catch (error: unknown) {
         console.error('Error loading directory:', error);
         const message = error instanceof Error ? error.message : String(error);
-        const text = message === 'Request timed out'
-            ? 'Request timed out. The system may still be starting.'
-            : 'Error loading directory';
-        container.innerHTML = `<div class="list-empty">${text}</div>`;
+        // A failed request used to render through the same empty state as "no
+        // results", which told the user nothing matched when in fact nothing
+        // was asked. Retrying is the whole point, so it is the only action.
+        const detail = message === 'Request timed out'
+            ? `The request timed out after ${DIRECTORY_LOAD_TIMEOUT / 1000} seconds. The PBX may still be starting up.`
+            : 'The directory could not be reached. It may be a temporary network problem.';
+        container.innerHTML = emptyStateHtml(
+            '⚠️',
+            'Could not load the directory',
+            detail,
+            '<button type="button" class="btn-ghost btn-ghost-accent" data-dir-retry>Try again</button>'
+        );
     }
 }
 
@@ -493,12 +550,7 @@ function attachDirectoryListeners(): void {
     // by Clear filters and does not count towards the "n of m shown" summary.
     el('directory-sort')?.addEventListener('change', renderDirectory);
 
-    el('directory-clear-filter')?.addEventListener('click', () => {
-        searchInput.value = '';
-        const checkbox = el('directory-online-only') as HTMLInputElement | null;
-        if (checkbox) checkbox.checked = false;
-        renderDirectory();
-    });
+    el('directory-clear-filter')?.addEventListener('click', clearFilters);
 
     el('directory-refresh')?.addEventListener('click', () => {
         void loadPhoneBook();
@@ -506,6 +558,17 @@ function attachDirectoryListeners(): void {
 
     container.addEventListener('click', (event: Event) => {
         const target = event.target as HTMLElement;
+
+        // Both live inside the list container, since an empty state replaces
+        // the rows rather than sitting beside them.
+        if (target.closest('[data-dir-clear]')) {
+            clearFilters();
+            return;
+        }
+        if (target.closest('[data-dir-retry]')) {
+            void loadPhoneBook();
+            return;
+        }
 
         const dial = target.closest('[data-dir-dial]');
         if (dial) {

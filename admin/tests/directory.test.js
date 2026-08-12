@@ -81,6 +81,7 @@ describe('Company directory page', () => {
 
   const list = () => document.getElementById('directory-list');
 
+
   it('renders one card per person', async () => {
     await load([person(), person({ extension: '1002', name: 'Dev Patel' })]);
     expect(list().querySelectorAll('.card-shell')).toHaveLength(2);
@@ -123,31 +124,20 @@ describe('Company directory page', () => {
     expect(list().querySelector('.avatar').getAttribute('title')).toBe('Offline');
   });
 
-  describe('adaptive grouping', () => {
-    // The live directory has department set for a small minority, so "nobody has
-    // one" is the shape this page actually renders today, not a hypothetical.
-    it('renders a plain sorted list when nobody has a department', async () => {
+  describe('list rendering', () => {
+    it('renders one flat sorted list', async () => {
       await load([
         person({ extension: '1003', name: 'Carol Diaz' }),
         person({ extension: '1001', name: 'Alice Chen' }),
         person({ extension: '1002', name: 'Bob Ncube' })
       ]);
-      expect(list().querySelectorAll('.group-label')).toHaveLength(0);
       expect(list().querySelectorAll('.card-shell')).toHaveLength(3);
-      expect(list().querySelector('.list-empty')).toBeNull();
+      // Department grouping was removed; no headings should reappear.
+      expect(list().querySelectorAll('.group-label')).toHaveLength(0);
 
       // By surname: Chen, Diaz, Ncube.
       const names = [...list().querySelectorAll('.card-title strong')].map((n) => n.textContent);
       expect(names).toEqual(['Alice Chen', 'Carol Diaz', 'Bob Ncube']);
-    });
-
-    it('treats an empty-string department as absent rather than as a group named ""', async () => {
-      await load([
-        person({ extension: '1001', name: 'A A', department: '' }),
-        person({ extension: '1002', name: 'B B', department: '' })
-      ]);
-      expect(list().querySelectorAll('.group-label')).toHaveLength(0);
-      expect(list().querySelectorAll('.card-shell')).toHaveLength(2);
     });
 
     it('omits the enrichment rows entirely rather than listing them as unset', async () => {
@@ -175,45 +165,15 @@ describe('Company directory page', () => {
       expect(body.querySelectorAll('.meta-stat')).toHaveLength(0);
     });
 
-    it('shows the empty state rather than a stray heading when there is nobody at all', async () => {
+    it('shows the empty state when there is nobody at all', async () => {
       await load([]);
-      expect(list().querySelector('.list-empty').textContent).toBe('No extensions found');
-      expect(list().querySelectorAll('.group-label')).toHaveLength(0);
+      expect(list().querySelector('.empty-state h3').textContent).toBe('No extensions yet');
+      // Nothing to show is not the same as nothing loaded, so the action is a
+      // plain refresh rather than the error state's "try again".
+      expect(list().querySelector('[data-dir-retry]')).not.toBeNull();
+      expect(list().textContent).not.toContain('Could not load');
     });
 
-    it('stays flat when too few people have a department', async () => {
-      // 1 of 4 = 25%, below the threshold.
-      await load([
-        person({ extension: '1001', department: 'Engineering' }),
-        person({ extension: '1002', name: 'B B' }),
-        person({ extension: '1003', name: 'C C' }),
-        person({ extension: '1004', name: 'D D' })
-      ]);
-      expect(list().querySelectorAll('.group-label')).toHaveLength(0);
-    });
-
-    it('groups once most people have one', async () => {
-      // 3 of 4 = 75%, above the threshold.
-      await load([
-        person({ extension: '1001', name: 'A A', department: 'Engineering' }),
-        person({ extension: '1002', name: 'B B', department: 'Support' }),
-        person({ extension: '1003', name: 'C C', department: 'Engineering' }),
-        person({ extension: '1004', name: 'D D' })
-      ]);
-      const headings = [...list().querySelectorAll('.group-label')].map((h) => h.textContent);
-      expect(headings).toEqual(['Engineering', 'Support', 'Unassigned']);
-    });
-
-    it('sorts Unassigned last even though it would sort first alphabetically', async () => {
-      await load([
-        person({ extension: '1001', name: 'A A', department: 'Zoology' }),
-        person({ extension: '1002', name: 'B B', department: 'Zoology' }),
-        person({ extension: '1003', name: 'C C', department: 'Zoology' }),
-        person({ extension: '1004', name: 'D D' })
-      ]);
-      const headings = [...list().querySelectorAll('.group-label')].map((h) => h.textContent);
-      expect(headings).toEqual(['Zoology', 'Unassigned']);
-    });
   });
 
   describe('sorting', () => {
@@ -291,19 +251,6 @@ describe('Company directory page', () => {
       expect(names()).toEqual(['Alice Chen', 'Carol Diaz', 'Bob Ncube']);
     });
 
-    it('sorts within each department rather than across the whole list', async () => {
-      await load([
-        person({ extension: '1002', name: 'Zoe Adams', department: 'Engineering' }),
-        person({ extension: '1001', name: 'Bob Ncube', department: 'Engineering' }),
-        person({ extension: '2002', name: 'Yuki Tanaka', department: 'Support' }),
-        person({ extension: '2001', name: 'Alice Chen', department: 'Support' })
-      ]);
-      sortBy('extension');
-      // Groups stay alphabetical; the ordering applies inside them, so Support's
-      // 2001 does not jump above Engineering's 1002.
-      expect(names()).toEqual(['Bob Ncube', 'Zoe Adams', 'Alice Chen', 'Yuki Tanaka']);
-    });
-
     it('keeps the chosen order while searching', async () => {
       await loadMixed();
       sortBy('extension');
@@ -375,9 +322,17 @@ describe('Company directory page', () => {
       expect(list().textContent).toContain('Maya Rodriguez');
     });
 
-    it('says so when nothing matches', () => {
+    it('echoes the search term back when nothing matches', () => {
       search('nobody');
-      expect(list().querySelector('.list-empty').textContent).toBe('No one matches those filters');
+      expect(list().querySelector('.empty-state h3').textContent).toContain('nobody');
+      expect(list().querySelector('[data-dir-clear]')).not.toBeNull();
+    });
+
+    it('clears the filters from inside the empty state', () => {
+      search('nobody');
+      list().querySelector('[data-dir-clear]').click();
+      expect(document.getElementById('directory-search').value).toBe('');
+      expect(list().querySelectorAll('.card-shell')).toHaveLength(2);
     });
   });
 
@@ -443,10 +398,27 @@ describe('Company directory page', () => {
     });
   });
 
-  it('explains a timeout rather than showing a bare error', async () => {
+  it('distinguishes a failed load from an empty result', async () => {
     fetch.mockRejectedValueOnce(new Error('Request timed out'));
     await page.loadPhoneBook();
-    expect(list().textContent).toContain('The system may still be starting');
+
+    expect(list().querySelector('.empty-state h3').textContent).toBe('Could not load the directory');
+    expect(list().textContent).toContain('may still be starting up');
+    // Retrying is the point of this state; "no results" must not offer one.
+    expect(list().querySelector('[data-dir-retry]')).not.toBeNull();
+  });
+
+  it('shows skeleton rows while loading rather than a bare string', async () => {
+    let resolve;
+    fetch.mockReturnValueOnce(new Promise((r) => { resolve = r; }));
+    const pending = page.loadPhoneBook();
+
+    expect(list().querySelectorAll('.skeleton').length).toBeGreaterThan(0);
+    expect(list().querySelector('[role="status"]')).not.toBeNull();
+
+    resolve(jsonResponse({ entries: [person()] }));
+    await pending;
+    expect(list().querySelectorAll('.skeleton')).toHaveLength(0);
   });
 
   it('counts people, online extensions and direct dial numbers', async () => {
