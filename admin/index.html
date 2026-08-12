@@ -468,16 +468,6 @@
         <div id="phone-book" class="tab-content">
             <h2>📇 Company Directory</h2>
 
-            <div class="table-toolbar">
-                <div class="table-search">
-                    <label for="directory-search" class="sr-only">Search the directory</label>
-                    <input type="search" id="directory-search" autocomplete="off"
-                           placeholder="Search by name, extension, email, or department">
-                </div>
-                <span class="table-result-count" id="directory-count" aria-live="polite"></span>
-                <button class="btn btn-primary" id="directory-refresh">🔄 Refresh</button>
-            </div>
-
             <div class="stats-grid" style="margin-bottom: 20px;">
                 <div class="stat-card">
                     <div class="stat-value" id="directory-total">-</div>
@@ -494,25 +484,24 @@
             </div>
 
             <div class="config-section">
-                <h3>📋 Directory</h3>
-                <div class="table-container">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th scope="col">Name</th>
-                                <th scope="col">Extension</th>
-                                <th scope="col">Direct Dial</th>
-                                <th scope="col">Email</th>
-                                <th scope="col">Department</th>
-                                <th scope="col">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody id="phone-book-body">
-                            <tr>
-                                <td colspan="6" class="loading">Loading directory...</td>
-                            </tr>
-                        </tbody>
-                    </table>
+                <div class="filter-bar">
+                    <span class="filter-field">
+                        <label class="filter-label" for="directory-search">Search</label>
+                        <input type="search" id="directory-search" autocomplete="off"
+                               placeholder="Name, extension, email, or department">
+                    </span>
+                    <label class="filter-check" for="directory-online-only">
+                        <input type="checkbox" id="directory-online-only">
+                        Online only
+                    </label>
+                    <button type="button" class="btn-ghost" id="directory-clear-filter"
+                            hidden>Clear filters</button>
+                    <button type="button" class="btn-ghost" id="directory-refresh">Refresh</button>
+                    <span class="filter-summary" id="directory-count" aria-live="polite"></span>
+                </div>
+
+                <div id="directory-list">
+                    <div class="list-loading">Loading directory...</div>
                 </div>
             </div>
 
@@ -521,10 +510,10 @@
                 <p>The directory lists every extension on the system and is visible to all signed-in users. Searching filters the list as you type across name, extension, direct dial, email, and department.</p>
                 <ul>
                     <li><strong>Click an extension</strong> to place a call from your desk phone.</li>
-                    <li><strong>Click an email address</strong> to open a new message.</li>
-                    <li><strong>Status</strong> reflects live SIP registration at the moment the page loaded — press Refresh to update it.</li>
+                    <li><strong>Expand a row</strong> to see email, mobile, and office location.</li>
+                    <li><strong>The dot on each avatar</strong> shows live SIP registration at the moment the page loaded — press Refresh to update it.</li>
                 </ul>
-                <p>Name, extension, and email come from Active Directory. Department is maintained in the PBX and appears only where an administrator has filled it in.</p>
+                <p>Name, extension, and email come from Active Directory. Department, mobile, and office location are maintained in the PBX and appear only where an administrator has filled them in. People are grouped by department once most of the directory has one.</p>
             </div>
         </div>
 

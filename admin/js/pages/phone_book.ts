@@ -4,6 +4,9 @@
  * Read-only view of every extension on the system, available to all signed-in
  * users. The full list is fetched once and filtered in the browser, so typing
  * in the search box costs no round trips.
+ *
+ * Presentation follows the shared vocabulary in patterns.css (card-stack,
+ * pill, meta-stats, filter-bar), the same one the call recordings page uses.
  */
 
 import { fetchWithTimeout, getAuthHeaders, getApiBaseUrl } from '../api/client.ts';
@@ -28,11 +31,23 @@ interface DirectoryResponse {
 }
 
 const DIRECTORY_LOAD_TIMEOUT = 10000;
-const COLUMN_COUNT = 6;
+
+/**
+ * Group by department only once most of the directory has one.
+ *
+ * Department is optional enrichment, so below this share the page would be one
+ * long "No department" heading with a short real group above it — worse than
+ * not grouping. Above it, the headings carry the structure. The threshold is
+ * deliberately high: partial grouping reads as missing data, not as a category.
+ */
+const GROUPING_THRESHOLD = 0.6;
 
 /** Full unfiltered directory, held so search never needs the network. */
 let directoryEntries: DirectoryEntry[] = [];
 let listenersAttached = false;
+
+/** Extensions whose card body is open. Survives re-renders from filtering. */
+const expanded = new Set<string>();
 
 const el = (id: string): HTMLElement | null => document.getElementById(id);
 
@@ -41,14 +56,39 @@ function orEmpty(value: string | null | undefined, placeholder = 'Not set'): str
     return value ? escapeHtml(value) : `<span class="field-empty">${placeholder}</span>`;
 }
 
-function presenceCell(entry: DirectoryEntry): string {
+/**
+ * Up to two initials for the avatar.
+ *
+ * Takes the first and last word so "Maya Rodriguez" gives MR and
+ * "Jean-Luc de Vries" gives JV rather than JD.
+ */
+function initials(name: string): string {
+    const words = name.trim().split(/\s+/).filter(Boolean);
+    if (words.length === 0) return '?';
+    const first = words[0]!.charAt(0);
+    const last = words.length > 1 ? words[words.length - 1]!.charAt(0) : '';
+    return (first + last).toUpperCase();
+}
+
+/**
+ * Presence as a dot on the avatar rather than a pill on every row.
+ *
+ * Offline deliberately renders no dot at all, rather than a grey one. The three
+ * states then differ by something other than hue — no dot, dot, dot plus a
+ * "Do not disturb" pill — so they stay distinguishable to a colourblind reader.
+ * The label is repeated for screen readers, which see none of it.
+ */
+function avatarHtml(entry: DirectoryEntry): string {
+    let dot = '';
+    let label = 'Offline';
     if (entry.dnd_enabled) {
-        return '<span class="presence presence-dnd">Do Not Disturb</span>';
+        dot = '<span class="avatar-dot avatar-dot-warn"></span>';
+        label = 'Do not disturb';
+    } else if (entry.registered) {
+        dot = '<span class="avatar-dot avatar-dot-ok"></span>';
+        label = 'Online';
     }
-    if (entry.registered) {
-        return '<span class="presence presence-online">Online</span>';
-    }
-    return '<span class="presence">Offline</span>';
+    return `<span class="avatar" title="${label}" aria-hidden="true">${escapeHtml(initials(entry.name))}${dot}</span><span class="sr-only">${label}</span>`;
 }
 
 function matches(entry: DirectoryEntry, needle: string): boolean {
@@ -61,59 +101,177 @@ function matches(entry: DirectoryEntry, needle: string): boolean {
     ].some((field) => (field ?? '').toLowerCase().includes(needle));
 }
 
-function rowHtml(entry: DirectoryEntry): string {
-    const extension = escapeHtml(entry.extension);
-    const email = entry.email
-        ? `<a href="mailto:${escapeHtml(entry.email)}">${escapeHtml(entry.email)}</a>`
-        : `<span class="field-empty">Not set</span>`;
+function currentNeedle(): string {
+    const searchInput = el('directory-search') as HTMLInputElement | null;
+    return (searchInput?.value ?? '').trim().toLowerCase();
+}
+
+function onlineOnly(): boolean {
+    return (el('directory-online-only') as HTMLInputElement | null)?.checked ?? false;
+}
+
+/**
+ * The expanded half of a card: the fields that have no room in the header.
+ *
+ * mobile, office_location and department are returned by the API and appear
+ * nowhere else in the interface, so this is the only place they surface.
+ *
+ * Only populated fields are listed. All three are optional enrichment that is
+ * frequently absent for everyone at once, and a row of "Not set / Not set / —"
+ * on every card is the same noise the pill rules above warn against: it costs a
+ * line of reading to learn nothing. When a record carries none of them the card
+ * says so once, in one short line.
+ */
+function cardBodyHtml(entry: DirectoryEntry): string {
+    const fields: string[] = [];
+
+    if (entry.email) {
+        const address = escapeHtml(entry.email);
+        fields.push(`<span class="meta-stat"><span class="k">Email</span><span class="v"><a href="mailto:${address}">${address}</a></span></span>`);
+    }
+    if (entry.mobile) {
+        fields.push(`<span class="meta-stat"><span class="k">Mobile</span><span class="v">${escapeHtml(entry.mobile)}</span></span>`);
+    }
+    if (entry.office_location) {
+        fields.push(`<span class="meta-stat"><span class="k">Office</span><span class="v">${escapeHtml(entry.office_location)}</span></span>`);
+    }
+    if (entry.department) {
+        fields.push(`<span class="meta-stat"><span class="k">Department</span><span class="v">${escapeHtml(entry.department)}</span></span>`);
+    }
+
+    if (fields.length === 0) {
+        return '<div class="muted-note" style="padding: 4px 16px 10px;">No email, mobile, office or department on record.</div>';
+    }
 
     return `
-        <tr>
-            <td><strong>${escapeHtml(entry.name)}</strong></td>
-            <td>
-                <button type="button" class="btn-link directory-dial"
-                        data-extension="${extension}"
-                        title="Call ${extension} from your phone">${extension}</button>
-            </td>
-            <td>${orEmpty(entry.did_number)}</td>
-            <td>${email}</td>
-            <td>${orEmpty(entry.department, '—')}</td>
-            <td>${presenceCell(entry)}</td>
-        </tr>
+        <div style="padding: 8px 16px;">
+            <span class="meta-stats" style="gap: 28px;">${fields.join('')}</span>
+        </div>
     `;
 }
 
-/** Applies the current search text to the cached list and repaints the table. */
-function renderDirectory(): void {
-    const tbody = el('phone-book-body');
-    if (!tbody) return;
+function cardHtml(entry: DirectoryEntry): string {
+    const ext = escapeHtml(entry.extension);
+    const open = expanded.has(entry.extension);
 
-    const searchInput = el('directory-search') as HTMLInputElement | null;
-    const needle = (searchInput?.value ?? '').trim().toLowerCase();
-    const visible = needle
-        ? directoryEntries.filter((entry) => matches(entry, needle))
-        : directoryEntries;
+    // Only a genuine exception earns a pill. Online is the norm here, and the
+    // avatar dot already carries it.
+    const pill = entry.dnd_enabled
+        ? '<span class="pill pill-warn">Do not disturb</span>'
+        : '';
+
+    const emailAction = entry.email
+        ? `<a class="btn-ghost" href="mailto:${escapeHtml(entry.email)}">Email</a>`
+        : '';
+
+    return `
+        <div class="card-shell">
+            <div class="card-head">
+                <span class="card-title" role="button" tabindex="0"
+                      aria-expanded="${open}" data-dir-toggle="${ext}">
+                    <span class="card-chevron${open ? ' open' : ''}" aria-hidden="true">&#9654;</span>
+                    ${avatarHtml(entry)}
+                    <strong>${escapeHtml(entry.name)}</strong>
+                </span>
+                ${pill}
+                <span class="meta-stats">
+                    <span class="meta-stat"><span class="k">Ext</span><span class="v">${ext}</span></span>
+                    <span class="meta-stat"><span class="k">Direct</span><span class="v">${orEmpty(entry.did_number)}</span></span>
+                </span>
+                <span class="card-actions">
+                    <button type="button" class="btn-ghost" data-dir-dial="${ext}"
+                            title="Call ${ext} from your phone">Call</button>
+                    ${emailAction}
+                </span>
+            </div>
+            <div class="card-body${open ? '' : ' collapsed'}" data-dir-body="${ext}">
+                ${open ? cardBodyHtml(entry) : ''}
+            </div>
+        </div>
+    `;
+}
+
+/** True when enough of the directory has a department for headings to help. */
+function shouldGroup(entries: DirectoryEntry[]): boolean {
+    if (entries.length === 0) return false;
+    const withDept = entries.filter((entry) => entry.department).length;
+    return withDept / entries.length >= GROUPING_THRESHOLD;
+}
+
+function sortedByName(entries: DirectoryEntry[]): DirectoryEntry[] {
+    return [...entries].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Cards, grouped under department headings when the data supports it. */
+function listHtml(visible: DirectoryEntry[]): string {
+    if (!shouldGroup(visible)) {
+        return sortedByName(visible).map(cardHtml).join('');
+    }
+
+    const byDepartment = new Map<string, DirectoryEntry[]>();
+    for (const entry of visible) {
+        const key = entry.department || 'Unassigned';
+        const bucket = byDepartment.get(key);
+        if (bucket) {
+            bucket.push(entry);
+        } else {
+            byDepartment.set(key, [entry]);
+        }
+    }
+
+    // Alphabetical, but Unassigned last however it sorts — it is a leftover
+    // bucket rather than a department, so it does not belong among them.
+    const names = [...byDepartment.keys()].sort((a, b) => {
+        if (a === 'Unassigned') return 1;
+        if (b === 'Unassigned') return -1;
+        return a.localeCompare(b);
+    });
+
+    return names
+        .map((name) => {
+            const cards = sortedByName(byDepartment.get(name) ?? []).map(cardHtml).join('');
+            return `<div class="group-label">${escapeHtml(name)}</div>${cards}`;
+        })
+        .join('');
+}
+
+/** Applies the current filters to the cached list and repaints. */
+function renderDirectory(): void {
+    const container = el('directory-list');
+    if (!container) return;
+
+    const needle = currentNeedle();
+    const online = onlineOnly();
+
+    const visible = directoryEntries.filter((entry) => {
+        if (needle && !matches(entry, needle)) return false;
+        return !(online && !entry.registered);
+    });
+
+    const filtering = Boolean(needle) || online;
+
+    const clearButton = el('directory-clear-filter');
+    if (clearButton) clearButton.hidden = !filtering;
 
     const countLabel = el('directory-count');
     if (countLabel) {
         if (directoryEntries.length === 0) {
             countLabel.textContent = '';
-        } else if (needle) {
+        } else if (filtering) {
             countLabel.textContent = `${visible.length} of ${directoryEntries.length} shown`;
         } else {
-            countLabel.textContent = `${directoryEntries.length} people`;
+            const plural = directoryEntries.length === 1 ? 'person' : 'people';
+            countLabel.textContent = `${directoryEntries.length} ${plural}`;
         }
     }
 
     if (visible.length === 0) {
-        const message = needle
-            ? `No one matches "${escapeHtml(needle)}"`
-            : 'No extensions found';
-        tbody.innerHTML = `<tr><td colspan="${COLUMN_COUNT}" class="loading">${message}</td></tr>`;
+        const message = filtering ? 'No one matches those filters' : 'No extensions found';
+        container.innerHTML = `<div class="list-empty">${message}</div>`;
         return;
     }
 
-    tbody.innerHTML = visible.map(rowHtml).join('');
+    container.innerHTML = `<div class="card-stack">${listHtml(visible)}</div>`;
 }
 
 function updateStats(): void {
@@ -129,11 +287,11 @@ function updateStats(): void {
 }
 
 export async function loadPhoneBook(): Promise<void> {
-    const tbody = el('phone-book-body');
-    if (!tbody) return;
+    const container = el('directory-list');
+    if (!container) return;
 
     attachDirectoryListeners();
-    tbody.innerHTML = `<tr><td colspan="${COLUMN_COUNT}" class="loading">Loading directory...</td></tr>`;
+    container.innerHTML = '<div class="list-loading">Loading directory...</div>';
 
     try {
         const API_BASE = getApiBaseUrl();
@@ -154,8 +312,48 @@ export async function loadPhoneBook(): Promise<void> {
         const text = message === 'Request timed out'
             ? 'Request timed out. The system may still be starting.'
             : 'Error loading directory';
-        tbody.innerHTML = `<tr><td colspan="${COLUMN_COUNT}" class="loading">${text}</td></tr>`;
+        container.innerHTML = `<div class="list-empty">${text}</div>`;
     }
+}
+
+/**
+ * Finds the element carrying `attribute="value"`.
+ *
+ * Matching in JS rather than building an attribute selector: an extension is
+ * caller-supplied, so interpolating it into a selector needs CSS.escape, which
+ * jsdom does not implement. Comparing the attribute directly needs no escaping
+ * and cannot be broken by a value containing selector syntax.
+ */
+function findByAttribute(attribute: string, value: string): Element | null {
+    const candidates = document.querySelectorAll(`[${attribute}]`);
+    for (const candidate of candidates) {
+        if (candidate.getAttribute(attribute) === value) return candidate;
+    }
+    return null;
+}
+
+/** Opens or closes one card, without repainting the rest of the list. */
+function toggleCard(extension: string): void {
+    const entry = directoryEntries.find((candidate) => candidate.extension === extension);
+    if (!entry) return;
+
+    const body = findByAttribute('data-dir-body', extension);
+    const title = findByAttribute('data-dir-toggle', extension);
+    if (!body || !title) return;
+
+    const open = expanded.has(extension);
+    if (open) {
+        expanded.delete(extension);
+        body.classList.add('collapsed');
+        body.innerHTML = '';
+    } else {
+        expanded.add(extension);
+        body.innerHTML = cardBodyHtml(entry);
+        body.classList.remove('collapsed');
+    }
+
+    title.setAttribute('aria-expanded', String(!open));
+    title.querySelector('.card-chevron')?.classList.toggle('open', !open);
 }
 
 /** Rings the signed-in user's own phone, then connects it to the target. */
@@ -194,15 +392,15 @@ async function dialExtension(target: string): Promise<void> {
 }
 
 /**
- * Wires the toolbar and table once. Uses delegation and addEventListener
+ * Wires the toolbar and list once. Uses delegation and addEventListener
  * rather than inline onclick, so this page adds no new CSP unsafe-inline debt.
  */
 function attachDirectoryListeners(): void {
     if (listenersAttached) return;
 
     const searchInput = el('directory-search') as HTMLInputElement | null;
-    const tbody = el('phone-book-body');
-    if (!searchInput || !tbody) return;
+    const container = el('directory-list');
+    if (!searchInput || !container) return;
 
     // Filtering is local, so render on every keystroke rather than debouncing.
     searchInput.addEventListener('input', renderDirectory);
@@ -213,15 +411,45 @@ function attachDirectoryListeners(): void {
         }
     });
 
+    el('directory-online-only')?.addEventListener('change', renderDirectory);
+
+    el('directory-clear-filter')?.addEventListener('click', () => {
+        searchInput.value = '';
+        const checkbox = el('directory-online-only') as HTMLInputElement | null;
+        if (checkbox) checkbox.checked = false;
+        renderDirectory();
+    });
+
     el('directory-refresh')?.addEventListener('click', () => {
         void loadPhoneBook();
     });
 
-    tbody.addEventListener('click', (event: Event) => {
-        const button = (event.target as HTMLElement).closest('.directory-dial');
-        if (!button) return;
-        const target = button.getAttribute('data-extension');
-        if (target) void dialExtension(target);
+    container.addEventListener('click', (event: Event) => {
+        const target = event.target as HTMLElement;
+
+        const dial = target.closest('[data-dir-dial]');
+        if (dial) {
+            const extension = dial.getAttribute('data-dir-dial');
+            if (extension) void dialExtension(extension);
+            return;
+        }
+
+        const toggle = target.closest('[data-dir-toggle]');
+        if (toggle) {
+            const extension = toggle.getAttribute('data-dir-toggle');
+            if (extension) toggleCard(extension);
+        }
+    });
+
+    // The card title is a span with role="button", so it gets no key handling
+    // for free the way a real button would.
+    container.addEventListener('keydown', (event: KeyboardEvent) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        const toggle = (event.target as HTMLElement).closest('[data-dir-toggle]');
+        if (!toggle) return;
+        event.preventDefault();
+        const extension = toggle.getAttribute('data-dir-toggle');
+        if (extension) toggleCard(extension);
     });
 
     listenersAttached = true;

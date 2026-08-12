@@ -593,34 +593,6 @@ header h1 {
     white-space: nowrap;
 }
 
-/* Presence indicator
-   A coloured dot plus a text label — the label carries the meaning so the
-   status is not communicated by colour alone. */
-.presence {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 0.85rem;
-    white-space: nowrap;
-}
-
-.presence::before {
-    content: '';
-    flex-shrink: 0;
-    width: 9px;
-    height: 9px;
-    border-radius: 50%;
-    background: var(--color-text-muted);
-}
-
-.presence-online::before {
-    background: var(--color-success);
-}
-
-.presence-dnd::before {
-    background: var(--color-warning);
-}
-
 /* Placeholder for a directory field the record simply does not carry. */
 .field-empty {
     color: var(--color-text-muted);

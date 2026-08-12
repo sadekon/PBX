@@ -260,8 +260,5 @@ declare global {
         loadRecordingAnnouncements?: () => void;
         loadComplianceData?: () => void;
         loadOpenSourceIntegrations?: () => void;
-
-        // pages/phone_book.ts — referenced in onclick handlers
-        editPhoneBookEntry?: (entryId: string) => void;
     }
 }
