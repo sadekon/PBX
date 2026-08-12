@@ -164,6 +164,20 @@ class CallOriginator:
                 self._fail_and_end(call, call_id, "no_route")
                 return None
 
+            # A WebRTC registration's "address" is the ("webrtc", session_id)
+            # marker, not a routable SIP contact. route_call() diverts it to
+            # the gateway (_dial_extension_leg); origination has no caller
+            # INVITE to hand the gateway, so it fails here instead -- letting
+            # it through would put the literal host "webrtc" into sendto()
+            # and turn a routing failure into a DNS error.
+            if call_router.is_webrtc_address(dest_ext_obj.address):
+                pbx.logger.warning(
+                    f"Cannot originate to extension {destination}: registered as a "
+                    f"WebRTC client, which the PBX cannot ring without a caller leg"
+                )
+                self._fail_and_end(call, call_id, "no_route")
+                return None
+
             dest_addr = dest_ext_obj.address
             invite_request = SIPMessageBuilder.build_request(
                 method="INVITE",
@@ -238,16 +252,28 @@ class CallOriginator:
             if user_on_answer:
                 user_on_answer(leg_a_call)
             # leg_a has answered -- it's now the "caller" context for leg_b.
-            self.originate_call(
+            leg_b_call = self.originate_call(
                 leg_a_call.to_extension,
                 leg_b,
-                on_answer=lambda leg_b_call: self._complete_bridge(
-                    leg_a_call, leg_b_call, on_leg_b_answer
+                on_answer=lambda answered: self._complete_bridge(
+                    leg_a_call, answered, on_leg_b_answer
                 ),
                 on_failure=on_leg_b_failure,
                 rtp_ports_override=leg_a_call.rtp_ports,
                 **kwargs,
             )
+            if leg_b_call is None:
+                # leg_b never got off the ground (no route, no channel). The
+                # party on leg_a is holding an answered call with nothing on
+                # the far end, so end it here.
+                pbx.sip_server._send_leg_bye(leg_a_call)
+                pbx.end_call(leg_a_call.call_id)
+                return
+            # One conversation from here on: ending either leg ends the
+            # other, so a hangup while leg_b is still ringing stops the
+            # ringing instead of leaving it to answer into a dead call.
+            leg_a_call.bridged_peer_call_id = leg_b_call.call_id
+            leg_b_call.bridged_peer_call_id = leg_a_call.call_id
 
         leg_a_call = self.originate_call(
             from_context,
@@ -267,14 +293,14 @@ class CallOriginator:
         """
         Cross-link two answered, PBX-originated legs and hand media on
         leg_a's relay over to leg_b, mirroring TransferHandler.bridge()'s
-        bridge-completion step.
+        bridge-completion step. The two legs are already cross-linked (that
+        happens when leg_b is originated, so a hangup mid-setup finds it);
+        what is left is the media side.
         """
         from pbx.core.call import CallState
 
         pbx = self.pbx_core
 
-        leg_a_call.bridged_peer_call_id = leg_b_call.call_id
-        leg_b_call.bridged_peer_call_id = leg_a_call.call_id
         leg_b_call.bridge_peer_side = "b"
         # Two legs, one conversation: the recording and its transcripts key off the session.
         leg_b_call.join_session(leg_a_call)
@@ -303,11 +329,16 @@ class CallOriginator:
         codebase releases them -- each of those steps already guards for
         "was this actually allocated" internally, so it's safe to call even
         when origination failed before a relay/trunk was ever acquired.
+
+        A leg bridged to another takes that leg down with it -- a click-to-dial
+        whose second leg never answers must not leave the first party holding
+        a connected call with no one on it.
         """
         pbx = self.pbx_core
         callbacks = getattr(call, "originate_callbacks", None)
         if callbacks and callbacks.get("on_failure"):
             callbacks["on_failure"](call, reason)
+        pbx.sip_server.end_bridged_peer(call)
         pbx.end_call(call_id)
 
     def _handle_originate_no_answer(self, call_id: str) -> None:

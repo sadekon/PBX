@@ -2321,6 +2321,66 @@ class TestRouteCallRegisteredPhonesDB:
         assert result is True
 
 
+@pytest.mark.unit
+class TestResolveExtensionRecovery:
+    """Recovering a lost in-memory registration from registered_phones."""
+
+    @staticmethod
+    def _unregistered_pbx() -> MagicMock:
+        pbx = _make_pbx_core()
+        stale = MagicMock()
+        stale.registered = False
+        stale.address = None
+        stale.is_expired.return_value = False
+        pbx.extension_registry.get.return_value = stale
+        return pbx
+
+    def test_recovers_a_sip_phone_row(self) -> None:
+        pbx = self._unregistered_pbx()
+        pbx.registered_phones_db.get_by_extension.return_value = [
+            {"ip_address": "10.0.0.7", "sip_port": 5062}
+        ]
+
+        resolved = CallRouter(pbx)._resolve_extension("1002")
+
+        assert resolved is not None
+        resolved.register.assert_called_once_with(("10.0.0.7", 5062))
+
+    def test_webrtc_row_is_not_recovered_as_a_sip_contact(self) -> None:
+        # "webrtc" is a marker, not a host: recovering it puts an
+        # unresolvable hostname into every INVITE sent to this extension.
+        pbx = self._unregistered_pbx()
+        pbx.registered_phones_db.get_by_extension.return_value = [
+            {"ip_address": "webrtc", "sip_port": 5060}
+        ]
+
+        assert CallRouter(pbx)._resolve_extension("1002") is None
+
+    def test_real_phone_is_preferred_over_a_newer_webrtc_row(self) -> None:
+        pbx = self._unregistered_pbx()
+        pbx.registered_phones_db.get_by_extension.return_value = [
+            {"ip_address": "webrtc", "sip_port": 5060},
+            {"ip_address": "10.0.0.7", "sip_port": 5060},
+        ]
+
+        resolved = CallRouter(pbx)._resolve_extension("1002")
+
+        assert resolved is not None
+        resolved.register.assert_called_once_with(("10.0.0.7", 5060))
+
+
+@pytest.mark.unit
+class TestIsWebRTCAddress:
+    def test_marker_tuple(self) -> None:
+        assert CallRouter.is_webrtc_address(("webrtc", "session-1")) is True
+
+    def test_sip_address(self) -> None:
+        assert CallRouter.is_webrtc_address(("10.0.0.7", 5060)) is False
+
+    def test_missing_address(self) -> None:
+        assert CallRouter.is_webrtc_address(None) is False
+
+
 # ===========================================================================
 # CallRouter.route_call - self-INVITE loop guard
 # ===========================================================================

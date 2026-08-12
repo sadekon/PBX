@@ -139,7 +139,7 @@ class ClickToDialEngine:
             )
 
             if self.pbx_core:
-                self.pbx_core.call_originator.originate_and_bridge(
+                leg_a_call, _ = self.pbx_core.call_originator.originate_and_bridge(
                     extension,
                     destination,
                     on_leg_b_answer=lambda _call: self.update_call_status(
@@ -152,6 +152,17 @@ class ClickToDialEngine:
                         call_id, f"failed:{reason}"
                     ),
                 )
+                # No leg_a means the caller's own phone could never be rung
+                # (unregistered, WebRTC-only, no relay). Reporting success
+                # would leave the UI saying "your phone will ring first"
+                # about a call that produced no INVITE at all; the status row
+                # was already set to failed:<reason> by on_failure.
+                if leg_a_call is None:
+                    self.logger.warning(
+                        f"Click-to-dial call could not be placed: {extension} -> "
+                        f"{destination} (source: {source}, c2d call_id: {call_id})"
+                    )
+                    return None
                 self.update_call_status(call_id, "ringing")
                 self.logger.info(
                     f"Click-to-dial call originated: {extension} -> {destination} "

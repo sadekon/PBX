@@ -1209,14 +1209,13 @@ class SIPServer:
         """
         Handle BYE for a call that was bridged by a transfer.
 
-        After a transfer bridge, each remaining party keeps its own Call
-        record (with its own dialog identity), cross-linked via
-        bridged_peer_call_id. A raw BYE cannot be forwarded across the
-        bridge -- the peer's dialog has a different Call-ID and tags -- so
-        a fresh BYE is built for the peer's leg instead, and both records
-        are torn down. A BYE from an address matching neither party is the
-        departed transferor's stale leg: acknowledge it without touching
-        the bridge.
+        Each leg of a bridge keeps its own Call record (with its own dialog
+        identity), cross-linked via bridged_peer_call_id. A raw BYE cannot be
+        forwarded across the bridge -- the peer's dialog has a different
+        Call-ID and tags -- so the peer's leg is ended on its own dialog
+        instead, and both records are torn down. A BYE from an address
+        matching neither party is the departed transferor's stale leg:
+        acknowledge it without touching the bridge.
 
         Args:
             message: The BYE SIPMessage.
@@ -1234,13 +1233,43 @@ class SIPServer:
             self.logger.info("")
             return
 
-        peer = self.pbx_core.call_manager.get_call(call.bridged_peer_call_id)
-        if peer:
-            self._send_leg_bye(peer)
-            self.pbx_core.end_call(peer.call_id)
+        peer_call_id = call.bridged_peer_call_id
+        self.end_bridged_peer(call)
         self.pbx_core.end_call(call.call_id)
-        self.logger.info(f"  Bridged call ended: {call.call_id} (peer {call.bridged_peer_call_id})")
+        self.logger.info(f"  Bridged call ended: {call.call_id} (peer {peer_call_id})")
         self.logger.info("")
+
+    def end_bridged_peer(self, call: Any) -> None:
+        """
+        End the leg bridged to `call`, if there is one, on its own dialog.
+
+        A peer that has answered gets a BYE; one that is still ringing gets a
+        CANCEL, since its INVITE has no final response yet and it would answer
+        a BYE with 481. That second case is what a PBX-placed pair spends its
+        setup in (click-to-dial rings the caller first, then dials the
+        destination), so every path that ends one leg of a pair goes through
+        here rather than leaving the other ringing into a dead call.
+
+        The cross-link is cleared on both records first, so ending the peer
+        cannot bounce the teardown back.
+        """
+        from pbx.core.call import CallState
+
+        if self.pbx_core is None or not call.bridged_peer_call_id:
+            return
+
+        peer = self.pbx_core.call_manager.get_call(call.bridged_peer_call_id)
+        call.bridged_peer_call_id = None
+        if not peer:
+            return
+        peer.bridged_peer_call_id = None
+
+        if peer.state == CallState.CONNECTED:
+            self._send_leg_bye(peer)
+        else:
+            self.pbx_core.call_router._send_cancel_to_callee(peer, peer.call_id)
+            self.logger.info(f"Cancelled still-ringing bridged leg {peer.call_id}")
+        self.pbx_core.end_call(peer.call_id)
 
     def _send_leg_bye(self, call: Any, side: str | None = None) -> None:
         """
@@ -2528,6 +2557,11 @@ class SIPServer:
                                 call.original_invite,
                             )
                             self._send_message(error_response.build(), call.caller_addr)
+                        # A rejected leg takes its bridged peer with it: on a
+                        # PBX-placed pair there is no caller leg for the error
+                        # to be relayed to, so nothing else would end the
+                        # party already waiting on the other side.
+                        self.end_bridged_peer(call)
                         # End the call on our side
                         self.pbx_core.end_call(call_id)
 

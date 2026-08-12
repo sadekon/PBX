@@ -31,6 +31,11 @@ class CallRouter:
     # PBX-initiated dial, so both resolve "internal vs. external" identically.
     EXTERNAL_NUMBER_PATTERN = re.compile(r"^1?\d{10}$")
 
+    # What a WebRTC registration stores instead of a routable host, in both
+    # the in-memory registry address and the registered_phones row
+    # (WebRTCGateway.create_session).
+    WEBRTC_HOST_MARKER = "webrtc"
+
     def __init__(self, pbx_core: Any) -> None:
         """
         Initialize CallRouter with reference to PBXCore.
@@ -593,6 +598,22 @@ class CallRouter:
                 pbx.sip_server._send_message(ok_response.build(), call.caller_addr)
                 pbx.logger.info(f"Sent 200 OK to caller for call {call_id}")
 
+    @staticmethod
+    def is_webrtc_address(address: Any) -> bool:
+        """
+        Is `address` the ("webrtc", session_id) marker a WebRTC registration
+        stands in for a SIP contact (see WebRTCGateway.create_session)?
+
+        Shared with CallOriginator so both entry points recognise the marker
+        instead of handing "webrtc" to the socket as a hostname.
+        """
+        return bool(
+            address
+            and isinstance(address, tuple)
+            and len(address) == 2
+            and address[0] == CallRouter.WEBRTC_HOST_MARKER
+        )
+
     def _resolve_extension(self, to_ext: str) -> Any | None:
         """
         Look up `to_ext` in the in-memory extension registry, recovering its
@@ -619,9 +640,22 @@ class CallRouter:
         recovered = False
         if pbx.registered_phones_db:
             try:
-                db_phones = pbx.registered_phones_db.get_by_extension(to_ext)
-                db_phone = db_phones[0] if db_phones else None
-                if db_phone and db_phone.get("ip_address"):
+                # Newest row first, but skip WebRTC rows: their "ip_address"
+                # is the marker string, not a host, and the browser session
+                # it stood for is gone once the in-memory registration is
+                # (that is why recovery is running at all). Recovering one
+                # would hand an unresolvable hostname to the socket; a real
+                # SIP phone further down the list is still worth recovering.
+                db_phone = next(
+                    (
+                        phone
+                        for phone in pbx.registered_phones_db.get_by_extension(to_ext)
+                        if phone.get("ip_address")
+                        and phone["ip_address"] != self.WEBRTC_HOST_MARKER
+                    ),
+                    None,
+                )
+                if db_phone:
                     phone_ip = db_phone["ip_address"]
                     # Use the port the phone actually registered from. Older rows predate
                     # the column, so fall back to the default rather than skipping recovery.
@@ -761,14 +795,7 @@ class CallRouter:
             return False
 
         # Check if destination is a WebRTC extension
-        is_webrtc_destination: bool = (
-            dest_ext_obj.address
-            and isinstance(dest_ext_obj.address, tuple)
-            and len(dest_ext_obj.address) == 2
-            and dest_ext_obj.address[0] == "webrtc"
-        )
-
-        if is_webrtc_destination:
+        if self.is_webrtc_address(dest_ext_obj.address):
             # Route call to WebRTC client
             # Extract session ID from address tuple
             session_id = dest_ext_obj.address[1]

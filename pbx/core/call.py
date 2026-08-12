@@ -74,12 +74,14 @@ class Call:
         # in progress and cleared when it resolves.
         self.transfer_session_id: str | None = None
 
-        # Cross-link describing a *completed* transfer bridge. Both surviving
-        # legs keep their own Call record (each with its own SIP dialog), and
-        # media flows through whichever record still owns the RTP relay; the
-        # peer points at it via bridged_peer_call_id plus the relay side its
-        # party occupies. Unlike the fields above this outlives the transfer --
-        # it describes an ordinary bridged call.
+        # Cross-link between two legs of one conversation. Both legs keep
+        # their own Call record (each with its own SIP dialog), and media
+        # flows through whichever record owns the RTP relay; the peer points
+        # at it via bridged_peer_call_id plus the relay side its party
+        # occupies. Set at the end of a transfer, and at origination time for
+        # a PBX-placed pair (CallOriginator.originate_and_bridge) -- from
+        # there on, ending either leg ends the other, whether the peer has
+        # answered yet or is still ringing.
         self.bridged_peer_call_id: str | None = None  # Other leg's record after bridge
         self.bridge_peer_side: str | None = None  # Relay side ("a"/"b") this leg's
         # party occupies on the bridged peer's relay
