@@ -1253,7 +1253,7 @@ class TestRouteToTrunkCallerID:
             captured["from_header"] = invite_request.get_header("From")
             return MagicMock()
 
-        with patch.object(router, "_build_and_send_leg_invite", side_effect=_capture):
+        with patch.object(router, "send_leg_invite", side_effect=_capture):
             router._route_to_trunk("1001", "12125551234", "call-1", msg, CALLER_ADDR)
 
         assert "19725550100" in captured["from_header"]
@@ -1512,58 +1512,6 @@ class TestRouteCallCDRWebhooks:
         from pbx.features.webhooks import WebhookEvent
 
         assert webhook_args[0][0] == WebhookEvent.CALL_STARTED
-
-
-# ===========================================================================
-# CallRouter._send_cancel_to_callee
-# ===========================================================================
-
-
-@pytest.mark.unit
-class TestSendCancelToCallee:
-    """Tests for _send_cancel_to_callee()."""
-
-    def test_sends_cancel_to_callee(self) -> None:
-        pbx = _make_pbx_core()
-
-        mock_call = MagicMock()
-        mock_call.callee_addr = ("10.0.0.2", 5060)
-        mock_call.callee_invite = MagicMock()
-        mock_call.callee_invite.uri = "sip:1002@10.0.0.1"
-        _callee_headers = {
-            "From": "<sip:1001@pbx.local>",
-            "To": "<sip:1002@pbx.local>",
-            "CSeq": "1 INVITE",
-            "Via": "SIP/2.0/UDP 10.0.0.1:5060",
-        }
-        mock_call.callee_invite.get_header.side_effect = _callee_headers.get
-        mock_call.to_extension = "1002"
-
-        router = CallRouter(pbx)
-        router._send_cancel_to_callee(mock_call, "call-1")
-
-        pbx.sip_server._send_message.assert_called_once()
-
-    def test_no_callee_addr_returns_early(self) -> None:
-        pbx = _make_pbx_core()
-        mock_call = MagicMock()
-        mock_call.callee_addr = None
-        mock_call.callee_invite = MagicMock()
-
-        router = CallRouter(pbx)
-        router._send_cancel_to_callee(mock_call, "call-1")
-
-        pbx.sip_server._send_message.assert_not_called()
-
-    def test_no_callee_invite_returns_early(self) -> None:
-        pbx = _make_pbx_core()
-        mock_call = MagicMock(spec=[])  # Empty spec so hasattr returns False
-        mock_call.callee_addr = ("10.0.0.2", 5060)
-
-        router = CallRouter(pbx)
-        router._send_cancel_to_callee(mock_call, "call-1")
-
-        pbx.sip_server._send_message.assert_not_called()
 
 
 # ===========================================================================
@@ -1844,7 +1792,6 @@ class TestHandleNoAnswer:
 
         router = CallRouter(pbx)
         router._answer_call_for_voicemail = MagicMock(return_value=True)
-        router._send_cancel_to_callee = MagicMock()
 
         with (
             patch("threading.Timer") as mock_timer_cls,
@@ -1859,7 +1806,7 @@ class TestHandleNoAnswer:
             router._handle_no_answer("call-1")
 
         assert mock_call.routed_to_voicemail is True
-        router._send_cancel_to_callee.assert_called_once()
+        pbx.sip_server.cancel_leg.assert_called_once()
         router._answer_call_for_voicemail.assert_called_once()
 
     @patch("pbx.utils.audio.get_prompt_audio")
@@ -1889,14 +1836,13 @@ class TestHandleNoAnswer:
         pbx.call_manager.get_call.return_value = mock_call
 
         router = CallRouter(pbx)
-        router._send_cancel_to_callee = MagicMock()
         router._answer_call_for_voicemail = MagicMock(return_value=True)
         router._end_unanswered_trunk_call = MagicMock()
 
         router._handle_no_answer("call-1")
 
         assert mock_call.routed_to_voicemail is True
-        router._send_cancel_to_callee.assert_called_once()
+        pbx.sip_server.cancel_leg.assert_called_once()
         router._end_unanswered_trunk_call.assert_called_once_with(mock_call, "call-1")
         router._answer_call_for_voicemail.assert_not_called()
         mock_get_prompt.assert_not_called()
@@ -1923,7 +1869,6 @@ class TestHandleNoAnswer:
 
         router = CallRouter(pbx)
         router._answer_call_for_voicemail = MagicMock(return_value=False)
-        router._send_cancel_to_callee = MagicMock()
 
         router._handle_no_answer("call-1")
 
@@ -1955,7 +1900,6 @@ class TestHandleNoAnswer:
 
         router = CallRouter(pbx)
         router._answer_call_for_voicemail = MagicMock(return_value=True)
-        router._send_cancel_to_callee = MagicMock()
 
         router._handle_no_answer("call-1")
 
@@ -2000,7 +1944,6 @@ class TestHandleNoAnswer:
 
         router = CallRouter(pbx)
         router._answer_call_for_voicemail = MagicMock(return_value=True)
-        router._send_cancel_to_callee = MagicMock()
 
         with (
             patch("threading.Timer") as mock_timer_cls,
@@ -2054,7 +1997,6 @@ class TestHandleNoAnswer:
 
         router = CallRouter(pbx)
         router._answer_call_for_voicemail = MagicMock(return_value=True)
-        router._send_cancel_to_callee = MagicMock()
 
         with patch("time.sleep"):
             router._handle_no_answer("call-1")
@@ -2100,7 +2042,6 @@ class TestHandleNoAnswer:
 
         router = CallRouter(pbx)
         router._answer_call_for_voicemail = MagicMock(return_value=True)
-        router._send_cancel_to_callee = MagicMock()
 
         with (
             patch("threading.Timer") as mock_timer_cls,
@@ -2161,7 +2102,6 @@ class TestHandleNoAnswer:
 
         router = CallRouter(pbx)
         router._answer_call_for_voicemail = MagicMock(return_value=True)
-        router._send_cancel_to_callee = MagicMock()
 
         with (
             patch("threading.Timer") as mock_timer_cls,
@@ -2216,7 +2156,6 @@ class TestHandleNoAnswer:
 
         router = CallRouter(pbx)
         router._answer_call_for_voicemail = MagicMock(return_value=True)
-        router._send_cancel_to_callee = MagicMock()
 
         with (
             patch("threading.Timer") as mock_timer_cls,
@@ -2341,7 +2280,7 @@ class TestResolveExtensionRecovery:
             {"ip_address": "10.0.0.7", "sip_port": 5062}
         ]
 
-        resolved = CallRouter(pbx)._resolve_extension("1002")
+        resolved = CallRouter(pbx).resolve_extension("1002")
 
         assert resolved is not None
         resolved.register.assert_called_once_with(("10.0.0.7", 5062))
@@ -2354,7 +2293,7 @@ class TestResolveExtensionRecovery:
             {"ip_address": "webrtc", "sip_port": 5060}
         ]
 
-        assert CallRouter(pbx)._resolve_extension("1002") is None
+        assert CallRouter(pbx).resolve_extension("1002") is None
 
     def test_real_phone_is_preferred_over_a_newer_webrtc_row(self) -> None:
         pbx = self._unregistered_pbx()
@@ -2363,7 +2302,7 @@ class TestResolveExtensionRecovery:
             {"ip_address": "10.0.0.7", "sip_port": 5060},
         ]
 
-        resolved = CallRouter(pbx)._resolve_extension("1002")
+        resolved = CallRouter(pbx).resolve_extension("1002")
 
         assert resolved is not None
         resolved.register.assert_called_once_with(("10.0.0.7", 5060))

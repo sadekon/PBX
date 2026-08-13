@@ -812,6 +812,64 @@ class TestHandleBye:
 
 
 @pytest.mark.unit
+class TestCancelLeg:
+    """Tests for cancel_leg()."""
+
+    @staticmethod
+    def _ringing_call() -> MagicMock:
+        call = MagicMock()
+        call.call_id = "call-1"
+        call.to_extension = "1002"
+        call.callee_addr = ("10.0.0.2", 5060)
+        call.callee_invite = MagicMock()
+        call.callee_invite.uri = "sip:1002@10.0.0.1"
+        call.callee_invite.get_header.side_effect = {
+            "From": "<sip:1001@pbx.local>",
+            "To": "<sip:1002@pbx.local>",
+            "CSeq": "1 INVITE",
+            "Via": "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKabc",
+        }.get
+        return call
+
+    @patch("pbx.sip.server.get_logger")
+    def test_cancel_reuses_the_invite_branch_and_cseq(self, mock_get_logger: MagicMock) -> None:
+        # RFC 3261 9.1: the CANCEL only matches the transaction it is
+        # cancelling if both are carried over from the INVITE.
+        server = SIPServer(pbx_core=MagicMock())
+        server._send_message = MagicMock()
+
+        server.cancel_leg(self._ringing_call())
+
+        sent, addr = server._send_message.call_args[0]
+        assert sent.startswith("CANCEL")
+        assert "z9hG4bKabc" in sent
+        assert "CSeq: 1 CANCEL" in sent
+        assert addr == ("10.0.0.2", 5060)
+
+    @patch("pbx.sip.server.get_logger")
+    def test_no_callee_addr_is_a_no_op(self, mock_get_logger: MagicMock) -> None:
+        server = SIPServer(pbx_core=MagicMock())
+        server._send_message = MagicMock()
+        call = self._ringing_call()
+        call.callee_addr = None
+
+        server.cancel_leg(call)
+
+        server._send_message.assert_not_called()
+
+    @patch("pbx.sip.server.get_logger")
+    def test_no_invite_in_flight_is_a_no_op(self, mock_get_logger: MagicMock) -> None:
+        server = SIPServer(pbx_core=MagicMock())
+        server._send_message = MagicMock()
+        call = self._ringing_call()
+        call.callee_invite = None
+
+        server.cancel_leg(call)
+
+        server._send_message.assert_not_called()
+
+
+@pytest.mark.unit
 class TestEndBridgedPeer:
     """Tests for end_bridged_peer()."""
 
@@ -827,6 +885,7 @@ class TestEndBridgedPeer:
 
         server = SIPServer(pbx_core=pbx)
         server._send_leg_bye = MagicMock()
+        server.cancel_leg = MagicMock()
         return server, call, peer
 
     @patch("pbx.sip.server.get_logger")
@@ -836,7 +895,7 @@ class TestEndBridgedPeer:
         server.end_bridged_peer(call)
 
         server._send_leg_bye.assert_called_once_with(peer)
-        server.pbx_core.call_router._send_cancel_to_callee.assert_not_called()
+        server.cancel_leg.assert_not_called()
         server.pbx_core.end_call.assert_called_once_with("peer-call-id")
 
     @patch("pbx.sip.server.get_logger")
@@ -847,9 +906,7 @@ class TestEndBridgedPeer:
 
         server.end_bridged_peer(call)
 
-        server.pbx_core.call_router._send_cancel_to_callee.assert_called_once_with(
-            peer, "peer-call-id"
-        )
+        server.cancel_leg.assert_called_once_with(peer)
         server._send_leg_bye.assert_not_called()
         server.pbx_core.end_call.assert_called_once_with("peer-call-id")
 

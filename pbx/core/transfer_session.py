@@ -612,7 +612,7 @@ class TransferSession:
 
         try:
             if ref.status in (LegStatus.PENDING, LegStatus.RINGING):
-                self.pbx.call_router._send_cancel_to_callee(call, ref.call_id)
+                self.pbx.sip_server.cancel_leg(call)
             else:
                 self.pbx.sip_server._send_leg_bye(call, side=ref.side)
         except Exception as exc:

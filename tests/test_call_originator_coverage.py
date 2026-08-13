@@ -438,6 +438,38 @@ class TestMidBridgeTeardown:
         assert leg_b_call.bridged_peer_call_id == leg_a_call.call_id
         assert leg_b_call.state != CallState.CONNECTED
 
+    def test_leg_a_is_rung_showing_the_destination_as_caller_id(self) -> None:
+        # From that party's side the call is with leg_b, not with the PBX,
+        # so "originator" on the display would be meaningless.
+        pbx = _make_pbx_core()
+        originator = CallOriginator(pbx)
+
+        with patch("threading.Timer"):
+            originator.originate_and_bridge("1001", "1002")
+
+        invite = pbx.sip_server._send_message.call_args[0][0]
+        assert "sip:1002@" in invite.split("From:")[1].split("\n")[0]
+
+    def test_early_media_plays_until_the_bridge_completes(self) -> None:
+        pbx = _make_pbx_core()
+        originator = CallOriginator(pbx)
+
+        leg_a_call, leg_b_call = _bridge_to_ringing_leg_b(pbx, originator)
+
+        # leg_a is answered and leg_b is ringing: without this the party on
+        # leg_a hears dead air until leg_b picks up.
+        pbx.moh_system.start_moh.assert_called_once()
+        assert pbx.moh_system.start_moh.call_args[0][0] == leg_a_call.call_id
+        assert pbx.moh_system.start_moh.call_args[0][2] == "a"
+        pbx.moh_system.stop_moh.assert_not_called()
+
+        response = MagicMock()
+        response.body = ""
+        response.get_header.return_value = "<sip:1002@10.0.0.3>;tag=b"
+        pbx.call_router.handle_callee_answer(leg_b_call.call_id, response, ("10.0.0.3", 5060))
+
+        pbx.moh_system.stop_moh.assert_called_once_with(leg_a_call.call_id)
+
     def test_ringing_leg_failure_ends_the_answered_leg(self) -> None:
         # Nobody picks up the destination, so the party who answered first
         # must not be left connected to a dead relay.

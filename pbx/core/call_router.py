@@ -184,7 +184,7 @@ class CallRouter:
 
         # Check if destination extension is registered and not expired,
         # recovering its registration from the database if necessary.
-        if not self._resolve_extension(to_ext):
+        if not self.resolve_extension(to_ext):
             return False
 
         # Check dialplan
@@ -614,7 +614,7 @@ class CallRouter:
             and address[0] == CallRouter.WEBRTC_HOST_MARKER
         )
 
-    def _resolve_extension(self, to_ext: str) -> Any | None:
+    def resolve_extension(self, to_ext: str) -> Any | None:
         """
         Look up `to_ext` in the in-memory extension registry, recovering its
         registration from the database if the PBX restarted since the phone
@@ -692,7 +692,7 @@ class CallRouter:
 
         return dest_ext
 
-    def _build_and_send_leg_invite(
+    def send_leg_invite(
         self,
         call: Any,
         call_id: str,
@@ -789,7 +789,7 @@ class CallRouter:
             if caller_sdp:
                 caller_codecs = caller_sdp.get("formats", None)
 
-        dest_ext_obj = self._resolve_extension(to_ext)
+        dest_ext_obj = self.resolve_extension(to_ext)
         if not dest_ext_obj or not dest_ext_obj.address:
             pbx.logger.error(f"Cannot get address for extension {to_ext}")
             return False
@@ -932,7 +932,7 @@ class CallRouter:
 
         # Add Contact header identifying the caller's extension. Via,
         # Content-type, and Max-Forwards are attached by
-        # _build_and_send_leg_invite() below, along with the other
+        # send_leg_invite() below, along with the other
         # transport mechanics every outbound leg needs.
         sip_port = pbx.config.get("server.sip_port", 5060)
         invite_to_callee.set_header(
@@ -988,7 +988,7 @@ class CallRouter:
                 pbx.logger.debug(f"Added X-MAC-Address header: {mac_address}")
 
         # Send INVITE to destination with retransmission (RFC 3261)
-        self._build_and_send_leg_invite(
+        self.send_leg_invite(
             call,
             call_id,
             invite_to_callee,
@@ -1164,7 +1164,7 @@ class CallRouter:
 
         # Add Contact header identifying the dialed number, per carrier
         # convention. Via, Content-type, and Max-Forwards are attached by
-        # _build_and_send_leg_invite() below.
+        # send_leg_invite() below.
         sip_port = pbx.config.get("server.sip_port", 5060)
         invite_to_trunk.set_header("Contact", f"<sip:{transformed_number}@{server_ip}:{sip_port}>")
 
@@ -1178,7 +1178,7 @@ class CallRouter:
             invite_to_trunk, caller_id_number, caller_id_name, server_ip
         )
 
-        self._build_and_send_leg_invite(
+        self.send_leg_invite(
             call,
             call_id,
             invite_to_trunk,
@@ -1357,30 +1357,6 @@ class CallRouter:
                 f"Could not redirect call {call_id} to {target_ext}; falling back to voicemail"
             )
             self._handle_no_answer(call_id)
-
-    def _send_cancel_to_callee(self, call: Any, call_id: str) -> None:
-        """Send CANCEL to callee to stop their phone from ringing"""
-        from pbx.sip.message import SIPMessageBuilder
-
-        if not (
-            hasattr(call, "callee_addr")
-            and call.callee_addr
-            and hasattr(call, "callee_invite")
-            and call.callee_invite
-        ):
-            return
-
-        cancel_request = SIPMessageBuilder.build_request(
-            method="CANCEL",
-            uri=call.callee_invite.uri,
-            from_addr=call.callee_invite.get_header("From"),
-            to_addr=call.callee_invite.get_header("To"),
-            call_id=call_id,
-            cseq=int((call.callee_invite.get_header("CSeq") or "1 CANCEL").split()[0]),
-        )
-        cancel_request.set_header("Via", call.callee_invite.get_header("Via"))
-        self.pbx_core.sip_server._send_message(cancel_request.build(), call.callee_addr)
-        self.pbx_core.logger.info(f"Sent CANCEL to callee {call.to_extension} to stop ringing")
 
     def _answer_call_for_voicemail(self, call: Any, call_id: str) -> bool:
         """Answer call for voicemail recording"""
@@ -1570,7 +1546,7 @@ class CallRouter:
             call.invite_transaction = None
 
         # Send CANCEL to the callee (or trunk) to stop it from ringing
-        self._send_cancel_to_callee(call, call_id)
+        pbx.sip_server.cancel_leg(call)
 
         if hasattr(call, "trunk") and call.trunk:
             pbx.logger.info(f"No answer for outbound trunk call {call_id}, ending call")
