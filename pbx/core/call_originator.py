@@ -72,6 +72,7 @@ class CallOriginator:
         *,
         answer_timeout: int = 30,
         caller_id: tuple[str, str] | None = None,
+        auto_answer: bool = False,
         on_answer: Callable[[Any], None] | None = None,
         on_failure: Callable[[Any, str], None] | None = None,
         rtp_ports_override: tuple[int, int] | None = None,
@@ -104,6 +105,11 @@ class CallOriginator:
                 id -- so callers placing a leg on someone's behalf (e.g.
                 click-to-dial ringing you first) should pass who the call is
                 really with.
+            auto_answer: Ask the destination phone to go off-hook by itself
+                rather than ring, via ``Call-Info: ;answer-after=0``. What
+                makes click-to-dial feel like dialling from the handset
+                instead of answering a call to nobody. Honoured per handset:
+                a phone that does not support it simply rings.
             on_answer: Called with the `Call` once the destination answers.
             on_failure: Called with the `Call` and a reason string
                 ("no_answer" | "busy" | "unreachable" | "no_route") if the
@@ -223,6 +229,12 @@ class CallOriginator:
         )
         invite_request.set_header("Contact", f"<sip:{contact_user}@{server_ip}:{sip_port}>")
         SIPMessageBuilder.add_caller_id_headers(invite_request, cid_number, cid_name, server_ip)
+        if auto_answer:
+            # The de-facto standard for per-call auto-answer (Polycom,
+            # Yealink, Grandstream, Snom): answer immediately rather than
+            # alert. Phones that do not honour it just ring, so this is safe
+            # to send to a mixed fleet.
+            invite_request.set_header("Call-Info", f"<sip:{server_ip}>;answer-after=0")
 
         call_router.send_leg_invite(
             call,
@@ -287,9 +299,9 @@ class CallOriginator:
                 on_answer(leg_a_call)
 
             def _bridge(leg_b_call: Any) -> None:
-                # Both legs are up: stop the ringback, point the far end of
-                # leg_a's relay at leg_b, and make the pair one conversation
-                # so recordings and transcripts stay together.
+                # Both legs are up: stop the early media, point the far end of
+                # leg_a's relay at leg_b, and make the pair one conversation so
+                # recordings and transcripts stay together.
                 pbx.moh_system.stop_moh(leg_a_call.call_id)
                 leg_b_call.bridge_peer_side = "b"
                 leg_b_call.join_session(leg_a_call)
@@ -331,9 +343,9 @@ class CallOriginator:
             leg_a_call.bridged_peer_call_id = leg_b_call.call_id
             leg_b_call.bridged_peer_call_id = leg_a_call.call_id
 
-            # Early media. leg_a is answered and its party would otherwise
-            # hear dead air until leg_b picks up; they sit on side "a" of the
-            # relay, which is the side that gets the music.
+            # Early media, stopped in _bridge. Started here rather than from
+            # leg_b's caller channel because it plays on leg_a's relay, and
+            # leg_b has none of its own -- it borrowed leg_a's ports.
             relay_handler = pbx.rtp_relay.get_handler(leg_a_call.call_id)
             if relay_handler:
                 pbx.moh_system.start_moh(leg_a_call.call_id, relay_handler, "a")
@@ -343,6 +355,10 @@ class CallOriginator:
             leg_a,
             answer_timeout=answer_timeout,
             caller_id=(leg_b, leg_b),
+            # Always asked for on leg_a: this party pressed a button to place
+            # this call, so taking their handset off-hook is what they meant.
+            # A phone that does not honour the header simply rings.
+            auto_answer=True,
             on_answer=_leg_a_answered,
             on_failure=on_failure,
         )

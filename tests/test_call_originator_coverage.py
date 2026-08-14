@@ -158,6 +158,27 @@ class TestOriginateCallExtension:
         on_failure.assert_called_once()
         pbx.sip_server._send_message.assert_not_called()
 
+    def test_auto_answer_asks_the_phone_to_go_off_hook(self) -> None:
+        pbx = _make_pbx_core()
+        originator = CallOriginator(pbx)
+
+        with patch("threading.Timer"):
+            originator.originate_call("c2d:web", "1002", auto_answer=True)
+
+        invite = pbx.sip_server._send_message.call_args[0][0]
+        assert "Call-Info:" in invite
+        assert "answer-after=0" in invite
+
+    def test_no_auto_answer_header_by_default(self) -> None:
+        # A phone that is not expecting this must ring normally.
+        pbx = _make_pbx_core()
+        originator = CallOriginator(pbx)
+
+        with patch("threading.Timer"):
+            originator.originate_call("c2d:web", "1002")
+
+        assert "answer-after" not in pbx.sip_server._send_message.call_args[0][0]
+
     def test_webrtc_registration_is_not_dialed_over_sip(self) -> None:
         # A WebRTC registration's address is the ("webrtc", session) marker,
         # not a host: dialling it would hand "webrtc" to the socket and fail
@@ -437,6 +458,46 @@ class TestMidBridgeTeardown:
         assert leg_a_call.bridged_peer_call_id == leg_b_call.call_id
         assert leg_b_call.bridged_peer_call_id == leg_a_call.call_id
         assert leg_b_call.state != CallState.CONNECTED
+
+    def test_busy_destination_is_not_sent_a_bye(self) -> None:
+        # The recipient declined; their transaction is closed by the ACK. A
+        # BYE on top would be answered 481. The party who needs telling is on
+        # the other leg, and end_bridged_peer() is what tells them.
+        from pbx.core.caller_channel import caller_of
+
+        pbx = _make_pbx_core()
+        originator = CallOriginator(pbx)
+        _leg_a, leg_b_call = _bridge_to_ringing_leg_b(pbx, originator)
+        pbx.sip_server._send_leg_bye.reset_mock()
+
+        caller_of(pbx, leg_b_call).reject(486, "Busy Here")
+
+        pbx.sip_server._send_leg_bye.assert_not_called()
+
+    def test_leg_a_is_always_asked_to_auto_answer(self) -> None:
+        # The party pressed a button to place this call, so their handset
+        # going off-hook is what they meant. Phones that ignore the header
+        # ring instead, which is why this needs no configuration.
+        pbx = _make_pbx_core()
+        originator = CallOriginator(pbx)
+
+        with patch("threading.Timer"):
+            originator.originate_and_bridge("1001", "1002")
+
+        leg_a_invite = pbx.sip_server._send_message.call_args[0][0]
+        assert "answer-after=0" in leg_a_invite
+
+    def test_leg_b_is_rung_normally(self) -> None:
+        # The person being called gets a normal ringing call, not a handset
+        # that answers itself.
+        pbx = _make_pbx_core()
+        originator = CallOriginator(pbx)
+
+        _leg_a, leg_b_call = _bridge_to_ringing_leg_b(pbx, originator)
+
+        leg_b_invite = pbx.sip_server._send_message.call_args[0][0]
+        assert leg_b_call is not None
+        assert "answer-after" not in leg_b_invite
 
     def test_leg_a_is_rung_showing_the_destination_as_caller_id(self) -> None:
         # From that party's side the call is with leg_b, not with the PBX,

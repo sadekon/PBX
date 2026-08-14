@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from pbx.core.caller_channel import caller_of
 from pbx.features.webhooks import WebhookEvent
 from pbx.sip.transaction import InviteClientTransaction
 
@@ -380,7 +381,6 @@ class CallRouter:
             response_message: 200 OK response from callee
             callee_addr: Callee's address
         """
-        from pbx.sip.message import SIPMessageBuilder
         from pbx.sip.sdp import SDPBuilder, SDPSession
 
         pbx = self.pbx_core
@@ -575,28 +575,11 @@ class CallRouter:
                 skip_static_rtpmap=skip_rtpmap,
             )
 
-            # Build 200 OK for caller using original INVITE
-            if call.original_invite:
-                ok_response = SIPMessageBuilder.build_response(
-                    200, "OK", call.original_invite, body=caller_response_sdp
-                )
-                ok_response.set_header("Content-type", "application/sdp")
-
-                # Build Contact header
-                sip_port = pbx.config.get("server.sip_port", 5060)
-                contact_uri = f"<sip:{call.to_extension}@{server_ip}:{sip_port}>"
-                ok_response.set_header("Contact", contact_uri)
-
-                # Capture the tagged To header actually sent to the caller --
-                # build_response() mints this tag fresh; it's the caller's own
-                # dialog identity for any later PBX-originated request toward
-                # it (e.g. a bridge-teardown BYE), and cannot be recovered from
-                # original_invite (whose To header predates this tag).
-                call.caller_dialog_to = ok_response.get_header("To")
-
-                # Send to caller
-                pbx.sip_server._send_message(ok_response.build(), call.caller_addr)
-                pbx.logger.info(f"Sent 200 OK to caller for call {call_id}")
+            # Tell the caller the call is up. A phone that dialled in gets a
+            # 200 OK carrying this SDP; a leg the PBX placed is already
+            # answered and just stops hearing ringback.
+            caller_of(pbx, call).answer(caller_response_sdp)
+            pbx.logger.info(f"Answered caller for call {call_id}")
 
     @staticmethod
     def is_webrtc_address(address: Any) -> bool:
