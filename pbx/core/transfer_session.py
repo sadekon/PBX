@@ -522,16 +522,7 @@ class TransferSession:
             sipfrag: Status line reported on the REFER subscription.
         """
         with self._lock:
-            if self._terminal:
-                return
-            # A recall in flight absorbs further aborts: retrying and giving
-            # up are _on_recall_failure's job, and letting every failure of a
-            # recall leg re-enter here would cancel the recall it just
-            # started. The exception is the transferee hanging up -- the
-            # recall exists solely to hand them back, so with them gone it
-            # has to be cancelled rather than left ringing at a transferor
-            # who would answer into an empty call.
-            if self.state is TransferState.RECALLING and not self._transferee_gone():
+            if self._terminal or self.state is TransferState.RECALLING:
                 return
 
             self._cancel_timer()
@@ -706,10 +697,6 @@ class TransferSession:
         original = self.pbx.call_manager.get_call(self.original_call_id)
         if original is None:
             return False
-        # A transferee who hung up still has a Call record for a moment; without
-        # this the mailbox gets a recording of the silence they left behind.
-        if self._transferee_gone():
-            return False
         transferee_side = "callee" if self.transferor_side == "caller" else "caller"
         party_rtp = original.caller_rtp if transferee_side == "caller" else original.callee_rtp
         return bool(
@@ -735,11 +722,6 @@ class TransferSession:
         if self.recall_attempts >= retries:
             return False
         if self.pbx.call_manager.get_call(self.original_call_id) is None:
-            return False
-        # Nobody to hand back: a transferee who has hung up still owns a Call
-        # record at this point (their BYE is acknowledged before the record is
-        # ended), so the check above cannot see it.
-        if self._transferee_gone():
             return False
         return bool(self.transferor_extension)
 
@@ -933,23 +915,6 @@ class TransferSession:
             call.caller_addr = None
         else:
             call.callee_addr = None
-
-    def _transferee_gone(self) -> bool:
-        """
-        Whether the transferee has demonstrably hung up -- every leg tracked
-        for them is terminated.
-
-        Their BYE marks the leg TERMINATED before the state machine reacts to
-        it, and their Call record outlives that by a moment (the BYE is
-        acknowledged before the record is ended), so leg status is the only
-        thing that distinguishes "the party we are working on behalf of left"
-        from "they are still waiting". Deliberately False when no transferee
-        leg is tracked at all: absence of evidence is not evidence of a
-        hangup, and every caller treats True as a reason to stop working on
-        their behalf.
-        """
-        refs = self.legs.get(LegRole.TRANSFEREE) or []
-        return bool(refs) and all(ref.status is LegStatus.TERMINATED for ref in refs)
 
     def _transferor_live(self) -> bool:
         """Whether the transferor still has a leg up that we can fall back to."""

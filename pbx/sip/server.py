@@ -9,7 +9,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
-from pbx.core.caller_channel import caller_of
 from pbx.sip.message import SIPMessage, SIPMessageBuilder
 from pbx.utils.logger import get_logger
 
@@ -1388,8 +1387,12 @@ class SIPServer:
         if call_id and self.pbx_core:
             call = self.pbx_core.call_manager.get_call(call_id)
             if call:
-                # Close out the caller's INVITE transaction (RFC 3261 9.2).
-                caller_of(self.pbx_core, call).reject(487, "Request Terminated")
+                # Send 487 Request Terminated for the original INVITE
+                if hasattr(call, "original_invite") and call.original_invite:
+                    response_487 = SIPMessageBuilder.build_response(
+                        487, "Request Terminated", call.original_invite
+                    )
+                    self._send_message(response_487.build(), addr)
 
                 # Cancel INVITE retransmission
                 if hasattr(call, "invite_transaction") and call.invite_transaction:
@@ -2400,9 +2403,22 @@ class SIPServer:
                     call = self.pbx_core.call_manager.get_call(call_id)
                     if call:
                         call.ring()  # Mark call as ringing
-                        # A phone that dialled in gets a 180 on its own
-                        # transaction; a leg the PBX placed hears ringback.
-                        caller_of(self.pbx_core, call).progress(180, "Ringing")
+                        if call.caller_addr and call.original_invite:
+                            ringing_response = SIPMessageBuilder.build_response(
+                                180, "Ringing", call.original_invite
+                            )
+                            # The tag minted here establishes the caller's
+                            # early dialog with the PBX. Keep it stable across
+                            # provisionals and capture it: for a consultation
+                            # leg adopted by a transfer while still ringing,
+                            # no 200 OK is ever sent to the caller, so this is
+                            # the only tag a teardown BYE can be matched by
+                            # (the phone's REFER Replaces references it too).
+                            if call.caller_dialog_to:
+                                ringing_response.set_header("To", call.caller_dialog_to)
+                            else:
+                                call.caller_dialog_to = ringing_response.get_header("To")
+                            self._send_message(ringing_response.build(), call.caller_addr)
 
             elif message.status_code == 183:
                 # Session Progress (early media) - build proper response to
@@ -2410,13 +2426,24 @@ class SIPServer:
                 self.logger.info(f"Session progress for call {call_id}")
                 if call_id:
                     call = self.pbx_core.call_manager.get_call(call_id)
-                    if call:
-                        # The callee's own SDP rides along when it has early
-                        # media to offer -- a carrier's ringback, IVR, or
-                        # "number disconnected" announcement.
-                        caller_of(self.pbx_core, call).progress(
-                            183, "Session Progress", body=message.body or None
+                    if call and call.caller_addr and call.original_invite:
+                        progress_response = SIPMessageBuilder.build_response(
+                            183, "Session Progress", call.original_invite
                         )
+                        # Same early-dialog tag handling as the 180 above.
+                        if call.caller_dialog_to:
+                            progress_response.set_header("To", call.caller_dialog_to)
+                        else:
+                            call.caller_dialog_to = progress_response.get_header("To")
+                        # Include SDP from callee's 183 for early media
+                        if message.body:
+                            progress_response.body = message.body
+                            progress_response.set_header(
+                                "Content-Length",
+                                str(len(message.body.encode("utf-8"))),
+                            )
+                            progress_response.set_header("Content-type", "application/sdp")
+                        self._send_message(progress_response.build(), call.caller_addr)
 
             elif message.status_code == 200:
                 # OK - only process as callee answer if this is a response to INVITE
@@ -2528,12 +2555,13 @@ class SIPServer:
                         cseq_header = message.get_header("CSeq") or ""
                         if "INVITE" in cseq_header:
                             self._send_ack_to_callee(message, addr, call_id, use_invite_branch=True)
-                        # Tell the caller why it failed: a dialled-in phone
-                        # gets the status on its own transaction and plays the
-                        # matching tone; a PBX-placed leg is hung up.
-                        caller_of(self.pbx_core, call).reject(
-                            message.status_code, message.status_text or "Error"
-                        )
+                        if call.caller_addr and call.original_invite:
+                            error_response = SIPMessageBuilder.build_response(
+                                message.status_code,
+                                message.status_text or "Error",
+                                call.original_invite,
+                            )
+                            self._send_message(error_response.build(), call.caller_addr)
                         # A rejected leg takes its bridged peer with it: on a
                         # PBX-placed pair there is no caller leg for the error
                         # to be relayed to, so nothing else would end the

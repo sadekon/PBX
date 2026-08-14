@@ -2444,15 +2444,13 @@ class TestHandleCalleeAnswer:
             "call-42", ("10.0.0.1", 20000), ("10.0.0.2", 20002)
         )
         mock_build_sdp.assert_called_once()
-        # The 200 OK itself is built by the caller channel now, so assert on
-        # what reached the caller rather than on which builder was called.
+        mock_build_response.assert_called_once()
+        # The tagged To header actually sent to the caller must be captured
+        # -- it's the caller's real dialog identity for any later
+        # PBX-originated request toward it (e.g. a transfer-bridge BYE),
+        # and can't be recovered from original_invite afterward.
+        assert mock_call.caller_dialog_to is ok_msg.get_header.return_value
         pbx.sip_server._send_message.assert_called_once()
-        _sent_raw, sent_to = pbx.sip_server._send_message.call_args[0]
-        assert sent_to == ("10.0.0.1", 5060)
-        # That the response is a real 200 OK carrying a Contact and a stable
-        # To tag is asserted end to end in tests/test_call_sequences.py, where
-        # the INVITE is a real message rather than a mock.
-        assert mock_call.caller_dialog_to is not None
 
     def test_callee_answer_no_body(self) -> None:
         """Handle callee answer when response has no SDP body."""

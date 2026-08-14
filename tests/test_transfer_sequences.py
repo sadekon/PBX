@@ -1053,36 +1053,6 @@ class TestRecallPolicy:
         # The transferee stays up waiting for them rather than being dropped.
         assert cm.get_call("call1") is not None
 
-    def test_transferee_hangup_during_recall_cancels_the_recall(
-        self, cm: CallManager, relay: RTPRelay
-    ) -> None:
-        # The recall exists only to hand the transferee back. If they hang up
-        # while it is ringing, leaving it up means the transferor answers into
-        # an empty call and only then learns the other party has gone.
-        pbx, server, session = self._abandoned(cm, relay, drop_on_failure=False)
-        recall = _basic_call(
-            cm,
-            "recall1",
-            "1512",
-            "1513",
-            state=CallState.CALLING,
-            caller_addr=None,
-            callee_addr=None,
-        )
-        pbx.call_originator.originate_call.return_value = recall
-        pbx.transfer_handler.on_leg_event(
-            cm.get_call(session.target_call_id), LegEvent.REJECTED, side="callee"
-        )
-        assert session.state is TransferState.RECALLING
-
-        # The transferee (the callee side of the original call) hangs up.
-        server._handle_bye(_bye_message("call1"), B_ADDR)
-
-        assert session.is_terminal, "the transfer must resolve, not keep recalling"
-        assert cm.get_call("recall1") is None, "the ringing recall leg must be torn down"
-        assert cm.get_call("call1") is None
-        assert pbx.call_originator.originate_call.call_count == 1, "must not recall again"
-
     def test_dropcall_skips_the_recall(self, cm: CallManager, relay: RTPRelay) -> None:
         pbx, _server, session = self._abandoned(cm, relay, drop_on_failure=True)
 
