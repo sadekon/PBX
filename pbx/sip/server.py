@@ -1151,11 +1151,23 @@ class SIPServer:
                 self.logger.info("")
                 return
 
-            # Bridged call (post-transfer): each leg keeps its own record;
-            # tear down both legs with properly rebuilt BYEs, or absorb a
-            # stale BYE from the departed transferor.
+            # Bridged call: each leg keeps its own record with its own dialog
+            # identity, so the BYE cannot be forwarded across the bridge --
+            # the peer is ended on its own dialog instead and both records go
+            # away. A BYE from an address matching neither party is the
+            # departed transferor's stale leg: acknowledge it and leave the
+            # bridge alone.
             if call and call.bridged_peer_call_id:
-                self._handle_bye_bridged(message, addr, call)
+                self._send_response(200, "OK", message, addr)
+                if addr not in (call.caller_addr, call.callee_addr):
+                    self.logger.info(f"  Absorbed stale BYE from {addr} on {call.call_id}")
+                    self.logger.info("")
+                    return
+                peer_call_id = call.bridged_peer_call_id
+                self.end_bridged_peer(call)
+                self.pbx_core.end_call(call.call_id)
+                self.logger.info(f"  Bridged call ended: {call.call_id} (peer {peer_call_id})")
+                self.logger.info("")
                 return
 
             # Forward BYE to the other party in the call if present
@@ -1205,42 +1217,65 @@ class SIPServer:
         self.logger.info(f"  Sent 200 OK response to {addr}")
         self.logger.info("")
 
-    def _handle_bye_bridged(self, message: SIPMessage, addr: AddrTuple, call: Any) -> None:
+    def end_bridged_peer(self, call: Any) -> None:
         """
-        Handle BYE for a call that was bridged by a transfer.
+        End the leg bridged to `call`, if there is one, on its own dialog.
 
-        After a transfer bridge, each remaining party keeps its own Call
-        record (with its own dialog identity), cross-linked via
-        bridged_peer_call_id. A raw BYE cannot be forwarded across the
-        bridge -- the peer's dialog has a different Call-ID and tags -- so
-        a fresh BYE is built for the peer's leg instead, and both records
-        are torn down. A BYE from an address matching neither party is the
-        departed transferor's stale leg: acknowledge it without touching
-        the bridge.
+        A peer that has answered gets a BYE; one that is still ringing gets a
+        CANCEL, since its INVITE has no final response yet and it would answer
+        a BYE with 481. That second case is what a PBX-placed pair spends its
+        setup in (click-to-dial rings the caller first, then dials the
+        destination), so every path that ends one leg of a pair goes through
+        here rather than leaving the other ringing into a dead call.
 
-        Args:
-            message: The BYE SIPMessage.
-            addr: Source address tuple.
-            call: The bridged Call record the BYE's Call-ID resolved to.
+        The cross-link is cleared on both records first, so ending the peer
+        cannot bounce the teardown back.
         """
-        if self.pbx_core is None:
-            return
+        from pbx.core.call import CallState
 
-        is_party = addr in (call.caller_addr, call.callee_addr)
-        self._send_response(200, "OK", message, addr)
-
-        if not is_party:
-            self.logger.info(f"  Absorbed stale BYE from {addr} on bridged call {call.call_id}")
-            self.logger.info("")
+        if self.pbx_core is None or not call.bridged_peer_call_id:
             return
 
         peer = self.pbx_core.call_manager.get_call(call.bridged_peer_call_id)
-        if peer:
+        call.bridged_peer_call_id = None
+        if not peer:
+            return
+        peer.bridged_peer_call_id = None
+
+        if peer.state == CallState.CONNECTED:
             self._send_leg_bye(peer)
-            self.pbx_core.end_call(peer.call_id)
-        self.pbx_core.end_call(call.call_id)
-        self.logger.info(f"  Bridged call ended: {call.call_id} (peer {call.bridged_peer_call_id})")
-        self.logger.info("")
+        else:
+            self.cancel_leg(peer)
+            self.logger.info(f"Cancelled still-ringing bridged leg {peer.call_id}")
+        self.pbx_core.end_call(peer.call_id)
+
+    def cancel_leg(self, call: Any) -> None:
+        """
+        CANCEL the INVITE this call has outstanding toward its callee, so the
+        destination stops ringing.
+
+        Paired with _send_leg_bye(): both are the in-dialog teardown requests
+        the PBX sends on a leg it INVITEd, and which one applies is decided by
+        whether that INVITE has had a final response yet. A no-op on a leg
+        with no INVITE in flight.
+        """
+        if self.pbx_core is None or not (call.callee_addr and call.callee_invite):
+            return
+
+        invite = call.callee_invite
+        cancel = SIPMessageBuilder.build_request(
+            method="CANCEL",
+            uri=invite.uri,
+            from_addr=invite.get_header("From"),
+            to_addr=invite.get_header("To"),
+            call_id=call.call_id,
+            # RFC 3261 9.1: a CANCEL reuses the INVITE's CSeq number and Via
+            # branch, which is what matches it to the transaction it cancels.
+            cseq=self._parse_cseq_number(invite.get_header("CSeq")),
+        )
+        cancel.set_header("Via", invite.get_header("Via"))
+        self._send_message(cancel.build(), call.callee_addr)
+        self.logger.info(f"Sent CANCEL to callee {call.to_extension} to stop ringing")
 
     def _send_leg_bye(self, call: Any, side: str | None = None) -> None:
         """
@@ -1365,8 +1400,7 @@ class SIPServer:
                     call.invite_transaction = None
 
                 # Forward CANCEL to callee to stop their phone from ringing
-                if call.callee_addr and hasattr(call, "callee_invite") and call.callee_invite:
-                    self.pbx_core.call_router._send_cancel_to_callee(call, call_id)
+                self.cancel_leg(call)
 
                 # End the call
                 self.pbx_core.end_call(call_id)
@@ -2528,6 +2562,11 @@ class SIPServer:
                                 call.original_invite,
                             )
                             self._send_message(error_response.build(), call.caller_addr)
+                        # A rejected leg takes its bridged peer with it: on a
+                        # PBX-placed pair there is no caller leg for the error
+                        # to be relayed to, so nothing else would end the
+                        # party already waiting on the other side.
+                        self.end_bridged_peer(call)
                         # End the call on our side
                         self.pbx_core.end_call(call_id)
 
@@ -2611,4 +2650,7 @@ class SIPServer:
             self.socket.sendto(message.encode("utf-8"), addr)
             self.logger.debug(f"Sent message to {addr}")
         except OSError as e:
-            self.logger.error(f"Error sending message: {e}")
+            # The destination belongs in the message: a send that fails in
+            # name resolution is only diagnosable if the log says what host
+            # was being resolved.
+            self.logger.error(f"Error sending message to {addr}: {e}")

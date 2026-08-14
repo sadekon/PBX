@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import pytest
 
+from pbx.core.call import CallState
 from pbx.sip.server import (
     RFC2833_EVENT_TO_DTMF,
     VALID_DTMF_DIGITS,
@@ -694,6 +695,7 @@ class TestHandleBye:
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
         mock_call.transfer_session_id = None
+        mock_call.queue_ctx = None  # not a queued call
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
         mock_call.state = "CONNECTED"
@@ -718,6 +720,7 @@ class TestHandleBye:
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
         mock_call.transfer_session_id = None
+        mock_call.queue_ctx = None  # not a queued call
         mock_call.caller_addr = ("10.0.0.1", 5060)
         mock_call.callee_addr = callee_addr
         mock_call.state = "CONNECTED"
@@ -754,6 +757,7 @@ class TestHandleBye:
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
         mock_call.transfer_session_id = None
+        mock_call.queue_ctx = None  # not a queued call
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
         mock_call.state = "CONNECTED"
@@ -787,6 +791,7 @@ class TestHandleBye:
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
         mock_call.transfer_session_id = None
+        mock_call.queue_ctx = None  # not a queued call
         mock_call.voicemail_access = True
         mock_call.voicemail_extension = "1001"
         mock_call.caller_addr = ADDR
@@ -803,6 +808,131 @@ class TestHandleBye:
 
         pbx.end_call.assert_called_once()
         server._send_response.assert_called_once_with(200, "OK", msg, ADDR)
+
+
+# ===========================================================================
+# SIPServer.end_bridged_peer
+# ===========================================================================
+
+
+@pytest.mark.unit
+class TestCancelLeg:
+    """Tests for cancel_leg()."""
+
+    @staticmethod
+    def _ringing_call() -> MagicMock:
+        call = MagicMock()
+        call.call_id = "call-1"
+        call.to_extension = "1002"
+        call.callee_addr = ("10.0.0.2", 5060)
+        call.callee_invite = MagicMock()
+        call.callee_invite.uri = "sip:1002@10.0.0.1"
+        call.callee_invite.get_header.side_effect = {
+            "From": "<sip:1001@pbx.local>",
+            "To": "<sip:1002@pbx.local>",
+            "CSeq": "1 INVITE",
+            "Via": "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKabc",
+        }.get
+        return call
+
+    @patch("pbx.sip.server.get_logger")
+    def test_cancel_reuses_the_invite_branch_and_cseq(self, mock_get_logger: MagicMock) -> None:
+        # RFC 3261 9.1: the CANCEL only matches the transaction it is
+        # cancelling if both are carried over from the INVITE.
+        server = SIPServer(pbx_core=MagicMock())
+        server._send_message = MagicMock()
+
+        server.cancel_leg(self._ringing_call())
+
+        sent, addr = server._send_message.call_args[0]
+        assert sent.startswith("CANCEL")
+        assert "z9hG4bKabc" in sent
+        assert "CSeq: 1 CANCEL" in sent
+        assert addr == ("10.0.0.2", 5060)
+
+    @patch("pbx.sip.server.get_logger")
+    def test_no_callee_addr_is_a_no_op(self, mock_get_logger: MagicMock) -> None:
+        server = SIPServer(pbx_core=MagicMock())
+        server._send_message = MagicMock()
+        call = self._ringing_call()
+        call.callee_addr = None
+
+        server.cancel_leg(call)
+
+        server._send_message.assert_not_called()
+
+    @patch("pbx.sip.server.get_logger")
+    def test_no_invite_in_flight_is_a_no_op(self, mock_get_logger: MagicMock) -> None:
+        server = SIPServer(pbx_core=MagicMock())
+        server._send_message = MagicMock()
+        call = self._ringing_call()
+        call.callee_invite = None
+
+        server.cancel_leg(call)
+
+        server._send_message.assert_not_called()
+
+
+@pytest.mark.unit
+class TestEndBridgedPeer:
+    """Tests for end_bridged_peer()."""
+
+    @staticmethod
+    def _server_with_peer(peer_state: CallState) -> tuple[SIPServer, MagicMock, MagicMock]:
+        pbx = MagicMock()
+        call = MagicMock()
+        call.bridged_peer_call_id = "peer-call-id"
+        peer = MagicMock()
+        peer.call_id = "peer-call-id"
+        peer.state = peer_state
+        pbx.call_manager.get_call.return_value = peer
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_leg_bye = MagicMock()
+        server.cancel_leg = MagicMock()
+        return server, call, peer
+
+    @patch("pbx.sip.server.get_logger")
+    def test_answered_peer_gets_a_bye(self, mock_get_logger: MagicMock) -> None:
+        server, call, peer = self._server_with_peer(CallState.CONNECTED)
+
+        server.end_bridged_peer(call)
+
+        server._send_leg_bye.assert_called_once_with(peer)
+        server.cancel_leg.assert_not_called()
+        server.pbx_core.end_call.assert_called_once_with("peer-call-id")
+
+    @patch("pbx.sip.server.get_logger")
+    def test_still_ringing_peer_gets_a_cancel(self, mock_get_logger: MagicMock) -> None:
+        # The click-to-dial case: BYEing a leg with no final response yet
+        # would just be answered 481, leaving the phone ringing.
+        server, call, peer = self._server_with_peer(CallState.CALLING)
+
+        server.end_bridged_peer(call)
+
+        server.cancel_leg.assert_called_once_with(peer)
+        server._send_leg_bye.assert_not_called()
+        server.pbx_core.end_call.assert_called_once_with("peer-call-id")
+
+    @patch("pbx.sip.server.get_logger")
+    def test_link_is_cleared_on_both_legs(self, mock_get_logger: MagicMock) -> None:
+        server, call, peer = self._server_with_peer(CallState.CONNECTED)
+
+        server.end_bridged_peer(call)
+
+        assert call.bridged_peer_call_id is None
+        assert peer.bridged_peer_call_id is None
+
+    @patch("pbx.sip.server.get_logger")
+    def test_unbridged_call_is_a_no_op(self, mock_get_logger: MagicMock) -> None:
+        pbx = MagicMock()
+        call = MagicMock()
+        call.bridged_peer_call_id = None
+        server = SIPServer(pbx_core=pbx)
+
+        server.end_bridged_peer(call)
+
+        pbx.end_call.assert_not_called()
 
 
 # ===========================================================================
@@ -1611,6 +1741,7 @@ class TestHandleResponse:
         mock_call.caller_addr = None
         mock_call.transfer_session_id = None
         mock_call.routed_to_voicemail = False
+        mock_call.bridged_peer_call_id = None  # nothing bridged to take down
         pbx.call_manager.get_call.return_value = mock_call
 
         server = SIPServer(pbx_core=pbx)
@@ -1631,6 +1762,7 @@ class TestHandleResponse:
         mock_call.caller_addr = None
         mock_call.transfer_session_id = None
         mock_call.routed_to_voicemail = False
+        mock_call.bridged_peer_call_id = None
         pbx.call_manager.get_call.return_value = mock_call
 
         server = SIPServer(pbx_core=pbx)
@@ -1641,6 +1773,32 @@ class TestHandleResponse:
         server._handle_response(msg, ADDR)
 
         server._retry_trunk_invite_with_auth.assert_not_called()
+        pbx.end_call.assert_called_once_with("test-call-id-123")
+
+    @patch("pbx.sip.server.get_logger")
+    def test_error_response_also_ends_the_bridged_peer(self, mock_get_logger: MagicMock) -> None:
+        # A PBX-placed leg has no caller to relay the error to, so ending it
+        # alone would strand the party waiting on the other leg.
+        pbx = MagicMock()
+        mock_call = MagicMock()
+        mock_call.trunk = None
+        mock_call.caller_addr = None
+        mock_call.original_invite = None
+        mock_call.transfer_session_id = None
+        mock_call.routed_to_voicemail = False
+        mock_call.state = CallState.CALLING
+        mock_call.bridged_peer_call_id = "leg-a-call-id"
+        pbx.call_manager.get_call.return_value = mock_call
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_ack_to_callee = MagicMock()
+        server.end_bridged_peer = MagicMock()
+
+        msg = _make_response_message(486)
+        msg.get_header.side_effect = {"Call-ID": "test-call-id-123", "CSeq": "1 INVITE"}.get
+        server._handle_response(msg, ADDR)
+
+        server.end_bridged_peer.assert_called_once_with(mock_call)
         pbx.end_call.assert_called_once_with("test-call-id-123")
 
 

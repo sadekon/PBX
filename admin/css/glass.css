@@ -1,0 +1,695 @@
+/* ==========================================================================
+   glass.css — translucent surface treatment
+
+   An opt-in visual layer over the vocabulary in patterns.css. Where
+   patterns.css says what a thing *is* (a card, a pill, a ghost button), this
+   says what it is *made of*: a translucent pane that frosts whatever the page
+   puts behind it.
+
+   WHY THIS IS A SEPARATE FILE
+   Applying it is a per-page decision, not a global one. A page opts in by
+   putting a textured background behind its content and adding `.glass-page`;
+   pages that have not opted in are untouched, because every rule here is
+   scoped under that class. The Directory is the first page migrated. Nothing
+   below knows what a directory is.
+
+   HOW A PAGE OPTS IN
+       1. give the page container a background with some detail in it
+          (a flat colour gives backdrop-filter nothing to refract)
+       2. add `.glass-page` to that container
+       3. make any solid wrapper inside it transparent, or the panes will
+          frost that wrapper instead of the page
+
+   THE ELEVATION RAMP
+   Four surface weights, brightest at the top of the page. Hierarchy comes from
+   the ramp rather than from spacing alone, which is what stops a stack of
+   panes reading as a flat list of equal siblings.
+
+       .g1   page identity   header
+       .g2   summary         stat tiles, toolbars
+       .g3   content         the rows themselves
+       .g4   footnote        info panels
+
+   The content tier is deliberately the quietest: a list of fifty rows should
+   not out-shout the chrome that frames it.
+
+   INTERACTION
+   State is carried by the material, never by position. Hover thickens the
+   pane; the press is the only motion, and it is a scale rather than a
+   translate, because a translate desynchronises a pane from its own shadow.
+   The exception is an icon that depicts direction (a chevron), where motion is
+   the meaning rather than decoration.
+
+   DARK MODE ONLY, FOR NOW
+   Every rim here is built from rgba(255,255,255,...), which is invisible on a
+   light background. variables.css switches on `prefers-color-scheme`, so the
+   light theme is what a viewer sees by default unless their OS is set to dark.
+   A light-mode rim needs to be a different construction (white highlight on
+   the lit edge, a dark shade on the shaded one) rather than an inversion, and
+   is not written yet. Do not roll this out to a second page until it is.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   The page surface
+
+   Carries the texture the panes refract. It has to have fine detail in it:
+   backdrop-filter blurs what is behind it, and blurring a flat colour returns
+   the same flat colour, so the dot lattice is what makes a pane read as frosted
+   rather than merely tinted. A page can override this with its own backdrop;
+   the requirement is detail, not this particular one.
+   -------------------------------------------------------------------------- */
+
+/* Padding and radius are deliberately not set here: the host container already
+   has its own (`.tab-content` is 30px), that rule sits later in the cascade at
+   equal specificity, and it would win anyway. Spacing belongs to the layout
+   that places the page, not to the material. */
+.glass-page {
+    background-color: var(--color-bg);
+    background-attachment: fixed;
+    background-image:
+        radial-gradient(110% 80% at 12% 0%, rgba(93, 173, 226, 0.18), transparent 60%),
+        radial-gradient(rgba(255, 255, 255, 0.10) 1px, transparent 1px);
+    background-size: auto, 22px 22px;
+}
+
+/* A solid wrapper between the page and the panes is what they would frost, so
+   the section that normally supplies one steps out of the way. */
+.glass-page .config-section {
+    background: transparent;
+    border: none;
+    padding: 0;
+    box-shadow: none;
+}
+
+/* --------------------------------------------------------------------------
+   The pane
+   -------------------------------------------------------------------------- */
+
+.glass-page .g {
+    position: relative;
+    border: none;
+    border-radius: 14px;
+}
+
+/* The rim. A plain `border` cannot hold a gradient, so this is a pseudo
+   element filled with one and masked down to a 1px ring. It is what reads as a
+   bevelled edge catching light, and it is the reason a flat 1px border looks
+   pasted on next to it. */
+.glass-page .g::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    pointer-events: none;
+    z-index: 2;
+    -webkit-mask:
+        linear-gradient(#000 0 0) content-box,
+        linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    transition: background 0.2s ease;
+}
+
+/* ---- tier 1: page identity ---- */
+.glass-page .g1 {
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.11);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    box-shadow:
+        inset 0 1px 0 0 rgba(255, 255, 255, 0.26),
+        inset 0 -1px 0 0 rgba(0, 0, 0, 0.16),
+        0 10px 30px rgba(0, 0, 0, 0.30);
+}
+
+.glass-page .g1::before {
+    background: linear-gradient(145deg,
+        rgba(255, 255, 255, 0.70), rgba(255, 255, 255, 0.12) 32%,
+        rgba(255, 255, 255, 0.03) 58%, rgba(255, 255, 255, 0.20) 82%,
+        rgba(255, 255, 255, 0.48));
+}
+
+/* ---- tier 2: summary ---- */
+.glass-page .g2 {
+    background: rgba(255, 255, 255, 0.075);
+    backdrop-filter: blur(16px) saturate(170%);
+    -webkit-backdrop-filter: blur(16px) saturate(170%);
+    box-shadow:
+        inset 0 1px 0 0 rgba(255, 255, 255, 0.18),
+        0 6px 18px rgba(0, 0, 0, 0.22);
+}
+
+.glass-page .g2::before {
+    background: linear-gradient(145deg,
+        rgba(255, 255, 255, 0.50), rgba(255, 255, 255, 0.08) 32%,
+        rgba(255, 255, 255, 0.02) 58%, rgba(255, 255, 255, 0.12) 82%,
+        rgba(255, 255, 255, 0.32));
+}
+
+/* ---- tier 3: content ---- */
+.glass-page .g3 {
+    background: rgba(255, 255, 255, 0.05);
+    backdrop-filter: blur(14px) saturate(160%);
+    -webkit-backdrop-filter: blur(14px) saturate(160%);
+    box-shadow:
+        inset 0 1px 0 0 rgba(255, 255, 255, 0.12),
+        0 3px 12px rgba(0, 0, 0, 0.18);
+}
+
+.glass-page .g3::before {
+    background: linear-gradient(145deg,
+        rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.05) 34%,
+        rgba(255, 255, 255, 0.01) 60%, rgba(255, 255, 255, 0.08) 84%,
+        rgba(255, 255, 255, 0.22));
+}
+
+/* ---- tier 4: footnote ---- */
+.glass-page .g4 {
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.032);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.07);
+}
+
+.glass-page .g4::before {
+    background: linear-gradient(145deg,
+        rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.02) 40%,
+        rgba(255, 255, 255, 0.10));
+}
+
+/* --------------------------------------------------------------------------
+   Edge lensing — the hover for a row.
+
+   Only the rim answers. Light gathers at a boundary, which is what a pane of
+   glass actually does; lighting the whole face reads as a spotlight. The fill
+   lifts just enough to confirm which row without changing its tone.
+   -------------------------------------------------------------------------- */
+
+.glass-page .g-hover {
+    transition:
+        background 0.2s ease,
+        box-shadow 0.2s ease;
+}
+
+.glass-page .g-hover:hover {
+    background: rgba(255, 255, 255, 0.062);
+    box-shadow:
+        inset 0 1px 0 0 rgba(255, 255, 255, 0.18),
+        0 4px 14px rgba(0, 0, 0, 0.22);
+}
+
+.glass-page .g-hover:hover::before {
+    background: linear-gradient(145deg,
+        rgba(255, 255, 255, 0.85), rgba(255, 255, 255, 0.22) 30%,
+        rgba(255, 255, 255, 0.06) 58%, rgba(255, 255, 255, 0.26) 84%,
+        rgba(255, 255, 255, 0.60));
+}
+
+/* Nothing in admin.css sets a link colour, so an <a> inside a pane falls back
+   to the user agent's dark blue — effectively invisible on a dark translucent
+   surface. Scoped to this treatment rather than fixed globally, since changing
+   link colour app-wide is a separate decision. */
+.glass-page a {
+    color: var(--color-accent);
+}
+
+.glass-page a:hover {
+    color: var(--color-accent-hover);
+}
+
+/* --------------------------------------------------------------------------
+   Controls
+   -------------------------------------------------------------------------- */
+
+.glass-page .btn-ghost {
+    /* Restated because .btn-ghost's own colour is a single class and loses to
+       the `.glass-page a` rule above, which would otherwise make an anchor
+       styled as a button the wrong colour beside a real <button>. */
+    color: var(--color-text-secondary);
+    border-color: rgba(255, 255, 255, 0.15);
+    background: rgba(255, 255, 255, 0.05);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+    backdrop-filter: blur(10px) saturate(150%);
+    -webkit-backdrop-filter: blur(10px) saturate(150%);
+    transition:
+        background 0.16s ease,
+        border-color 0.16s ease,
+        color 0.16s ease,
+        box-shadow 0.16s ease,
+        backdrop-filter 0.16s ease,
+        transform 0.1s ease;
+}
+
+/* Hover thickens the material: the fill rises, the bevel highlight strengthens
+   as though light were gathering on it, and saturation climbs. Nothing moves. */
+.glass-page .btn-ghost:hover {
+    background: rgba(255, 255, 255, 0.13);
+    border-color: rgba(255, 255, 255, 0.34);
+    color: var(--color-text);
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.34),
+        inset 0 -6px 12px -8px rgba(255, 255, 255, 0.16);
+    backdrop-filter: blur(14px) saturate(190%);
+    -webkit-backdrop-filter: blur(14px) saturate(190%);
+}
+
+/* The press inverts the light to come from below and adds an inner shadow at
+   the top, so the face reads as pushed into the pane. The scale is the only
+   displacement in the system: a press is a physical claim, and scale is the
+   honest way to make it on a material with no fixed position. */
+.glass-page .btn-ghost:active {
+    transform: scale(0.97);
+    background: rgba(255, 255, 255, 0.045);
+    border-color: rgba(255, 255, 255, 0.22);
+    box-shadow:
+        inset 0 2px 6px rgba(0, 0, 0, 0.34),
+        inset 0 -1px 0 rgba(255, 255, 255, 0.22);
+    transition-duration: 0.05s;
+}
+
+.glass-page .btn-ghost-accent {
+    background: rgba(93, 173, 226, 0.18);
+    border-color: rgba(124, 196, 234, 0.42);
+    color: #a9d8f2;
+}
+
+.glass-page .btn-ghost-accent:hover {
+    background: rgba(93, 173, 226, 0.34);
+    border-color: rgba(124, 196, 234, 0.75);
+}
+
+.glass-page .btn-ghost-accent:active {
+    background: rgba(93, 173, 226, 0.20);
+}
+
+.glass-page .filter-bar input[type="text"],
+.glass-page .filter-bar input[type="search"],
+.glass-page .filter-bar select {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.14);
+    border-radius: 8px;
+    transition:
+        background 0.15s ease,
+        border-color 0.15s ease,
+        box-shadow 0.15s ease;
+}
+
+.glass-page .filter-bar input[type="text"]:hover,
+.glass-page .filter-bar input[type="search"]:hover,
+.glass-page .filter-bar select:hover {
+    background: rgba(255, 255, 255, 0.09);
+    border-color: rgba(255, 255, 255, 0.24);
+}
+
+.glass-page .filter-bar input[type="text"]:focus,
+.glass-page .filter-bar input[type="search"]:focus,
+.glass-page .filter-bar select:focus {
+    background: rgba(255, 255, 255, 0.11);
+    border-color: rgba(124, 196, 234, 0.65);
+    box-shadow: 0 0 0 3px rgba(93, 173, 226, 0.15);
+}
+
+/* --------------------------------------------------------------------------
+   Clickable things that are not buttons.
+
+   A card title that expands a row, and a checkbox label, are both targets but
+   neither looks like one at rest. A fill alone is enough to say so: these sit
+   inside a pane that already has a rim, and a second bordered box nested in the
+   first reads as a control that was pasted on. The negative margin cancels the
+   padding, so adding a hit area does not shift the layout around it.
+   -------------------------------------------------------------------------- */
+
+.glass-page .card-title,
+.glass-page .filter-check {
+    border-radius: 8px;
+    padding: 3px 8px;
+    margin: -3px -8px;
+    transition: background 0.15s ease;
+}
+
+.glass-page .card-title:hover,
+.glass-page .filter-check:hover {
+    background: rgba(255, 255, 255, 0.10);
+}
+
+.glass-page .card-title:focus-visible,
+.glass-page .filter-check:focus-within {
+    outline: 2px solid rgba(124, 196, 234, 0.85);
+    outline-offset: 1px;
+}
+
+/* --------------------------------------------------------------------------
+   Pill — restated as glass.
+
+   The stock pill is a 999px lozenge with a flat 1px border and no fill. Next
+   to a bevelled translucent pane that reads as pasted on: nothing else has a
+   fully round corner, and nothing else has a hard uniform edge. This keeps the
+   semantics and changes the material.
+   -------------------------------------------------------------------------- */
+
+.glass-page .pill {
+    border-radius: 9px;
+    padding: 3px 10px;
+    border-color: rgba(255, 255, 255, 0.12);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+
+.glass-page .pill-warn {
+    color: #f0b45e;
+    background: rgba(217, 119, 6, 0.20);
+    border-color: rgba(240, 180, 94, 0.34);
+}
+
+.glass-page .pill-info {
+    color: #8fcdf0;
+    background: rgba(59, 157, 214, 0.18);
+    border-color: rgba(143, 205, 240, 0.32);
+}
+
+.glass-page .pill-danger {
+    color: #ff9b9b;
+    background: rgba(239, 68, 68, 0.18);
+    border-color: rgba(255, 155, 155, 0.32);
+}
+
+.glass-page .pill-ok {
+    color: #6fdc95;
+    background: rgba(34, 197, 94, 0.16);
+    border-color: rgba(111, 220, 149, 0.30);
+}
+
+.glass-page .pill-muted {
+    color: var(--color-text-secondary);
+    background: rgba(255, 255, 255, 0.06);
+}
+
+/* --------------------------------------------------------------------------
+   Group heading
+
+   The hairline carries the separation so the label can stay quiet; a bare run
+   of uppercase text floating between panes reads as debris.
+
+   Nothing on the Directory emits `.group-label` today — department grouping was
+   removed. Kept because `.group-label` is a patterns.css class the recordings
+   page uses for its per-day headings, so this is what it will need when that
+   page is ported rather than something written for a page that no longer does
+   it.
+   -------------------------------------------------------------------------- */
+
+.glass-page .group-label {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 4px 8px;
+}
+
+.glass-page .group-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0.13), transparent);
+}
+
+/* --------------------------------------------------------------------------
+   Loading — skeleton rows.
+
+   Skeletons rather than a spinner: the shape of what is arriving is already
+   known, so the list can assemble in place instead of a spinner collapsing
+   into content of a different height. The sweep is a light source crossing the
+   pane, which is the same vocabulary the hover uses, so it does not read as a
+   borrowed loading widget.
+   -------------------------------------------------------------------------- */
+
+.glass-page .skeleton {
+    pointer-events: none;
+}
+
+.glass-page .sk-bar,
+.glass-page .sk-circle {
+    position: relative;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.07);
+    border-radius: 5px;
+    display: inline-block;
+}
+
+.glass-page .sk-circle {
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.glass-page .sk-bar::after,
+.glass-page .sk-circle::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg,
+        transparent, rgba(255, 255, 255, 0.16) 50%, transparent);
+    transform: translateX(-100%);
+    animation: glass-sweep 1.5s ease-in-out infinite;
+}
+
+/* Staggered so the rows read as a list filling in rather than one block
+   pulsing. */
+.glass-page .skeleton:nth-child(2) .sk-bar::after,
+.glass-page .skeleton:nth-child(2) .sk-circle::after { animation-delay: 0.10s; }
+.glass-page .skeleton:nth-child(3) .sk-bar::after,
+.glass-page .skeleton:nth-child(3) .sk-circle::after { animation-delay: 0.20s; }
+.glass-page .skeleton:nth-child(4) .sk-bar::after,
+.glass-page .skeleton:nth-child(4) .sk-circle::after { animation-delay: 0.30s; }
+.glass-page .skeleton:nth-child(5) .sk-bar::after,
+.glass-page .skeleton:nth-child(5) .sk-circle::after { animation-delay: 0.40s; }
+
+@keyframes glass-sweep {
+    to { transform: translateX(100%); }
+}
+
+/* --------------------------------------------------------------------------
+   Empty, and its cousins.
+
+   `.list-empty` in patterns.css is one line of centred grey text, which is the
+   right amount for "no rows" and the wrong amount for "we could not ask". This
+   is the fuller shape: a mark, a headline, a sentence naming the likely cause,
+   and the action that resolves it.
+   -------------------------------------------------------------------------- */
+
+.glass-page .empty-state {
+    text-align: center;
+    padding: 40px 28px 42px;
+}
+
+.glass-page .empty-mark {
+    width: 52px;
+    height: 52px;
+    border-radius: 15px;
+    margin: 0 auto 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.35rem;
+    background: rgba(255, 255, 255, 0.07);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.20);
+}
+
+.glass-page .empty-mark-warn {
+    background: rgba(217, 119, 6, 0.16);
+    box-shadow: inset 0 1px 0 rgba(240, 180, 94, 0.28);
+}
+
+.glass-page .empty-state h3 {
+    margin: 0 0 6px;
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--color-text);
+}
+
+.glass-page .empty-state p {
+    margin: 0 auto 18px;
+    font-size: 0.86rem;
+    color: var(--color-text-secondary);
+    line-height: 1.55;
+    max-width: 46ch;
+}
+
+.glass-page .empty-state code {
+    background: rgba(255, 255, 255, 0.08);
+    padding: 1px 6px;
+    border-radius: 5px;
+    font-size: 0.86em;
+    color: var(--color-text);
+}
+
+.glass-page .empty-actions {
+    display: flex;
+    gap: 9px;
+    justify-content: center;
+}
+
+/* --------------------------------------------------------------------------
+   Legacy components, made to behave on glass.
+
+   These classes predate the treatment and are used everywhere — .config-section
+   101 times in index.html, .stat-card 77, .info-box 59. Each carries its own
+   opaque fill, its own shadow and in one case its own pseudo-element, all of
+   which fight a translucent pane. Neutralised once here rather than per page,
+   because the work is identical every time and the .stat-card conflict in
+   particular is not obvious from looking at it.
+   -------------------------------------------------------------------------- */
+
+/* Three short tiles read as one summary band. Pinned rather than left to the
+   shared `auto-fit` rule, whose `max-width: 768px` breakpoint drops them to a
+   single column and stacks them into full-width rows on a laptop in a split
+   window. */
+.glass-page .stats-grid {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+}
+
+@media (max-width: 560px) {
+    .glass-page .stats-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Geometry only — the surface comes from whichever tier the markup applies.
+   `transition: all` is dropped because the legacy card animates every property
+   it owns, including the ones the glass now supplies. */
+.glass-page .stat-card {
+    padding: 11px 16px;
+    text-align: left;
+    transition: none;
+}
+
+/* The legacy card paints a 3px accent bar on ::before — the same pseudo-element
+   the rim uses. The two merge rather than replace: the rim inherits
+   `height: 3px` and renders as a stub across the top instead of a full outline,
+   and inherits `transform: scaleX(0)` so it animates in on hover. */
+.glass-page .stat-card::before {
+    height: auto;
+    transform: none;
+    transition: none;
+}
+
+/* A stat tile is not clickable, so it gets no hover — the legacy lift, glow and
+   scaling figure are switched off rather than restyled. */
+.glass-page .stat-card:hover {
+    transform: none;
+    border-color: transparent;
+    box-shadow:
+        inset 0 1px 0 0 rgba(255, 255, 255, 0.18),
+        0 6px 18px rgba(0, 0, 0, 0.22);
+}
+
+.glass-page .stat-card:hover .stat-value {
+    transform: none;
+}
+
+/* The figure is gradient-clipped text app-wide, which renders blue. Accent
+   belongs to interactive things here, so the numbers read as ordinary text. */
+.glass-page .stat-value {
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--color-text);
+    font-size: 1.3rem;
+    font-weight: 700;
+    line-height: 1.05;
+    letter-spacing: normal;
+    margin-bottom: 0;
+    font-variant-numeric: tabular-nums;
+    transition: none;
+}
+
+.glass-page .stat-label {
+    margin-top: 2px;
+    font-size: 0.63rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--color-text-secondary);
+    font-weight: 600;
+}
+
+/* Squarer bottom corners and a tight gap below read as "this governs what
+   follows"; equal margins on both sides read as an unrelated pane. */
+.glass-page .filter-bar {
+    padding: 11px 16px;
+    border-radius: 14px 14px 7px 7px;
+    margin-bottom: 8px;
+}
+
+.glass-page .info-box {
+    margin-top: 44px;
+    padding: 16px 20px;
+    background: none;
+    border: none;
+}
+
+.glass-page .info-box h3 {
+    margin: 0 0 8px;
+    font-size: 0.86rem;
+    color: var(--color-text-secondary);
+}
+
+.glass-page .info-box p,
+.glass-page .info-box li {
+    font-size: 0.82rem;
+    line-height: 1.6;
+    color: var(--color-text-secondary);
+}
+
+/* The dot is ringed in the pane colour so it reads as attached to the avatar
+   rather than floating over whatever is behind it. */
+.glass-page .avatar-dot {
+    border-color: #1b232e;
+}
+
+.glass-page .avatar {
+    background: rgba(255, 255, 255, 0.09);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    transition: background 0.18s ease, box-shadow 0.18s ease;
+}
+
+.glass-page .g-hover:hover .avatar {
+    background: rgba(255, 255, 255, 0.13);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26);
+}
+
+/* An icon depicting direction — motion is its meaning rather than decoration,
+   which is why it moves when nothing else does. */
+.glass-page .card-title:hover .card-chevron {
+    color: var(--color-text);
+    transform: translateX(2px);
+}
+
+.glass-page .card-title:hover .card-chevron.open {
+    transform: rotate(90deg) translateX(2px);
+}
+
+/* --------------------------------------------------------------------------
+   Motion
+   -------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+    .glass-page .g::before,
+    .glass-page .g-hover,
+    .glass-page .btn-ghost,
+    .glass-page .filter-bar input,
+    .glass-page .filter-bar select {
+        transition: none;
+    }
+
+    .glass-page .btn-ghost:active {
+        transform: none;
+    }
+
+    .glass-page .sk-bar::after,
+    .glass-page .sk-circle::after {
+        animation: none;
+        opacity: 0.5;
+    }
+}

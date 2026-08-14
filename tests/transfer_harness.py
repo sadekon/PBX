@@ -8,8 +8,8 @@ prove the properties the transfer state machine exists to guarantee:
   relay leaks.
 - ``sip_server`` is a real SIPServer with only the socket mocked, so the actual
   BYE/CANCEL/NOTIFY builders run and their headers can be inspected.
-- ``call_router._send_cancel_to_callee`` is the real implementation, so a
-  cancelled leg is cancelled the way production cancels it.
+- CANCEL comes from that same real SIPServer (``cancel_leg``), so a cancelled
+  leg is cancelled the way production cancels it.
 """
 
 from __future__ import annotations
@@ -105,7 +105,6 @@ def make_pbx(
 
     router = CallRouter(pbx)
     pbx.call_router.handle_callee_answer.side_effect = router.handle_callee_answer
-    pbx.call_router._send_cancel_to_callee.side_effect = router._send_cancel_to_callee
 
     return pbx
 

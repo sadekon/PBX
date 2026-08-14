@@ -211,6 +211,9 @@ class TestInitiateCall:
         mock_db = MagicMock()
         mock_db.db_type = "postgresql"
         mock_pbx = MagicMock()
+        # originate_and_bridge returns (leg_a_call, leg_b_call_or_None); a
+        # live leg_a is what tells initiate_call the call really got placed.
+        mock_pbx.call_originator.originate_and_bridge.return_value = (MagicMock(), None)
         engine = ClickToDialEngine(db_backend=mock_db, config={}, pbx_core=mock_pbx)
         call_id = engine.initiate_call("1001", "5559999")
         assert call_id is not None

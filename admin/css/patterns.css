@@ -198,6 +198,62 @@
 }
 
 /* --------------------------------------------------------------------------
+   Identity avatar — initials, optionally carrying a status dot.
+
+   For lists of people. The dot is the quiet alternative to a pill: a state
+   that is true of most rows (online, active, subscribed) still has to be
+   visible, but putting a pill on 40 of 50 rows is the noise the pill section
+   above warns against. A dot shows the same thing without competing with the
+   name for attention, which leaves the pill slot free for real exceptions.
+   -------------------------------------------------------------------------- */
+
+.avatar {
+    width: 30px;
+    height: 30px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--color-bg-alt);
+    /* Accent, not primary: --color-primary is a dark navy that sits at roughly
+       1.2:1 on --color-bg-alt once the dark-mode overrides apply, i.e. invisible. */
+    color: var(--color-accent);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 0.7rem;
+    letter-spacing: 0.02em;
+    position: relative;
+    user-select: none;
+}
+
+.avatar-dot {
+    position: absolute;
+    right: -1px;
+    bottom: -1px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    /* Ringed in the card colour so the dot reads as attached to the avatar
+       rather than floating over whatever sits behind it. */
+    border: 2px solid var(--color-bg-card);
+    background: var(--color-border-medium);
+}
+
+/* Same semantics as the pill colours above, so a dot and a pill describing the
+   same state never disagree. */
+.avatar-dot-ok {
+    background: #22c55e;
+}
+
+.avatar-dot-warn {
+    background: #d97706;
+}
+
+.avatar-dot-danger {
+    background: #ef4444;
+}
+
+/* --------------------------------------------------------------------------
    Ghost buttons — flat, quiet row-level actions.
 
    Scoped away from the global .btn (gradients, weight) so a card header does
@@ -215,6 +271,9 @@
     border: 1px solid var(--color-border);
     background: transparent;
     color: var(--color-text-secondary);
+    /* Also used on <a> (mailto:, download links), where the global anchor rule
+       would otherwise underline it and it would not match the buttons beside it. */
+    text-decoration: none;
     cursor: pointer;
     transition:
         background 0.12s ease,
@@ -297,6 +356,27 @@
 
 .filter-bar input[type="text"]:focus,
 .filter-bar input[type="search"]:focus {
+    outline: none;
+    border-color: var(--color-border-medium);
+}
+
+/* Matches the inputs above, minus their min-width: a select is only as wide as
+   its longest option, and stretching it to 220px would leave a gap the native
+   arrow floats away from. The arrow itself is left to the platform rather than
+   redrawn, so it stays correct in both colour schemes and keeps its keyboard
+   behaviour. */
+.filter-bar select {
+    padding: 6px 10px;
+    border: 1px solid var(--color-border);
+    border-radius: 7px;
+    background: var(--color-bg-card);
+    color: var(--color-text);
+    font-size: 0.86rem;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.filter-bar select:focus {
     outline: none;
     border-color: var(--color-border-medium);
 }

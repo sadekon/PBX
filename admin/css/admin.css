@@ -18,6 +18,27 @@
    not-yet-migrated originals. See patterns.css for the migration note. */
 @import 'patterns.css';
 
+/* Translucent surface treatment layered over that vocabulary. Every rule in it
+   is scoped under `.glass-page`, so it costs nothing on the pages that have not
+   opted in. Currently the Directory only — see the header of glass.css for what
+   opting a second page in requires (notably: it is dark-mode only so far). */
+@import 'glass.css';
+
+/* Visually hidden, still read by screen readers. For labels that would be
+   redundant next to a placeholder but are required for the input to be
+   announced at all. */
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
 /* Skip Navigation Link (Accessibility) */
 .skip-nav {
     position: absolute;
@@ -520,6 +541,207 @@ header h1 {
     margin-bottom: 10px;
     font-size: 1.5rem;
     font-weight: 600;
+}
+
+/* Table Search
+   Reusable filter bar for any .data-table. Pairs a search box with a live
+   result count so a filtered table never looks like an empty one. */
+.table-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-md);
+    margin-bottom: 20px;
+}
+
+.table-search {
+    position: relative;
+    flex: 1 1 320px;
+    max-width: 480px;
+}
+
+.table-search::before {
+    content: '🔍';
+    position: absolute;
+    left: 13px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.85rem;
+    opacity: 0.55;
+    pointer-events: none;
+}
+
+.table-search input {
+    width: 100%;
+    padding: 12px 38px 12px 38px;
+    font-family: inherit;
+    font-size: 0.95rem;
+    color: var(--color-text);
+    background: var(--color-bg-input);
+    border: 1px solid var(--color-border-medium);
+    border-radius: var(--radius-md);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.table-search input::placeholder {
+    color: var(--color-text-muted);
+}
+
+.table-search input:focus {
+    outline: none;
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.15);
+}
+
+.table-result-count {
+    font-size: 0.85rem;
+    color: var(--color-text-secondary);
+    white-space: nowrap;
+}
+
+/* Placeholder for a directory field the record simply does not carry.
+   Not --color-text-muted: against the translucent panes on the Directory that
+   composites to 3.91:1, under the 4.5 needed for body text. This measures
+   4.72 and still reads as secondary. */
+.field-empty {
+    color: #7d90a6;
+    font-style: italic;
+}
+
+/* ==========================================================================
+   Company Directory — density only.
+
+   Everything that makes a legacy admin component behave on a glass surface now
+   lives in glass.css under `.glass-page`, because it is the same work on every
+   page: .config-section, .stats-grid/.stat-card, .info-box and .filter-bar are
+   used 101, 20/77 and 59 times across this file. What is left here is the one
+   thing that really is specific to this page — how tall a directory row is and
+   how big its type runs. A directory row is read; a recordings row is scanned.
+   ========================================================================== */
+
+#phone-book.glass-page .card-head {
+    padding: 15px 20px;
+    gap: 20px;
+}
+
+#phone-book .card-title {
+    font-size: 1.05rem;
+    gap: 11px;
+}
+
+#phone-book .meta-stats {
+    gap: 30px;
+}
+
+#phone-book .meta-stat .k {
+    font-size: 0.7rem;
+}
+
+#phone-book .meta-stat .v {
+    font-size: 0.95rem;
+}
+
+#phone-book .avatar {
+    width: 36px;
+    height: 36px;
+    font-size: 0.78rem;
+}
+
+#phone-book .avatar-dot {
+    width: 11px;
+    height: 11px;
+}
+
+#phone-book.glass-page .card-stack {
+    gap: 7px;
+}
+
+/* The page header and its caption. Directory-named for now: the shape is
+   general, but nothing else is on glass yet, so generalising it would be
+   guessing at what the second page needs. */
+#phone-book .directory-head {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 20px 24px;
+}
+
+#phone-book .directory-head h2 {
+    margin: 0;
+    font-size: 1.5rem;
+    letter-spacing: -0.015em;
+}
+
+#phone-book .directory-head .directory-sub {
+    margin: 4px 0 0;
+    font-size: 0.85rem;
+    color: var(--color-text-secondary);
+}
+
+#phone-book .directory-mark {
+    width: 46px;
+    height: 46px;
+    border-radius: 13px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.3rem;
+    background: rgba(93, 173, 226, 0.18);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26);
+}
+
+#phone-book .directory-head-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 8px;
+}
+
+/* Names the list zone, so the toolbar is not the first thing in an unlabelled
+   region. */
+#phone-book .directory-caption {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-text-secondary);
+    font-weight: 700;
+    margin: 0 0 10px;
+    padding-left: 4px;
+}
+
+/* The count is a sentence ("6 people"), not a label, so it opts out of the
+   caption's uppercase rather than inheriting it. */
+#phone-book .directory-caption .filter-summary {
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 500;
+}
+
+/* A button that reads as a link. Used where the action is inline in a table
+   cell and a full .btn would dominate the row. */
+.btn-link {
+    padding: 0;
+    font: inherit;
+    font-weight: 600;
+    color: var(--color-accent);
+    background: none;
+    border: none;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.btn-link:hover {
+    color: var(--color-accent-hover);
+}
+
+.btn-link:focus-visible {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 2px;
+    border-radius: 2px;
 }
 
 /* Table */
