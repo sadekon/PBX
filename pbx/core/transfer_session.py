@@ -324,9 +324,7 @@ class TransferSession:
                 return self._on_answered(role)
             if event is LegEvent.BYE:
                 return self._on_bye(role)
-            if event in (LegEvent.REJECTED, LegEvent.TIMEOUT):
-                return self._on_target_failure(role, event)
-            return LegEventResult.FORWARD
+            return self._on_target_failure(role, event)
 
     def _on_ringing(self, role: LegRole) -> LegEventResult:
         """Target started ringing: report progress on the REFER subscription."""
@@ -417,6 +415,19 @@ class TransferSession:
         if role is not LegRole.TARGET:
             return LegEventResult.FORWARD
         self._set_status(role, LegStatus.TERMINATED)
+
+        if self.state is TransferState.RECALLING:
+            # During a recall the TARGET *is* the recall leg, and abort() is
+            # deliberately deaf while recalling -- so routing this through it
+            # discards the answer. The leg is ended here (which also cancels
+            # its no-answer timer, or that timer would fire later and drive a
+            # second attempt), then its own failure handler decides: try again,
+            # or give up and honour transfer.atxfer_no_answer_action.
+            if self.target_call_id:
+                self.pbx.end_call(self.target_call_id)
+            self._on_recall_failure(None, event.value)
+            return LegEventResult.HANDLED
+
         sipfrag = NOTIFY_TIMEOUT if event is LegEvent.TIMEOUT else NOTIFY_BUSY
         self.abort(f"target_{event.value}", sipfrag=sipfrag)
         return LegEventResult.HANDLED

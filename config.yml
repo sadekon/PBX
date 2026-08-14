@@ -507,6 +507,7 @@ voicemail:
   allow_custom_greetings: true
   email_notifications: true
   no_answer_timeout: 30
+  on_reject: true  # send callers to voicemail when the callee rejects a ringing call
   # What the voicemail email says. The sender identity and every transport setting moved to
   # the top-level smtp: section.
   email:

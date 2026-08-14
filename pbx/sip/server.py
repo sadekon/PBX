@@ -59,6 +59,11 @@ RFC2833_EVENT_TO_DTMF: dict[str, str] = {
     "15": "D",
 }
 
+#: excludes 404/410/484 and 5xx: those mean the destination does not exist or
+#: is broken, which the caller should actually hear rather than have hidden
+#: behind a mailbox greeting.
+VOICEMAIL_ON_REJECT_STATUSES: frozenset[int] = frozenset({408, 480, 486, 600, 603})
+
 
 class SIPServer:
     """SIP server for handling registration and calls."""
@@ -2555,6 +2560,19 @@ class SIPServer:
                         cseq_header = message.get_header("CSeq") or ""
                         if "INVITE" in cseq_header:
                             self._send_ack_to_callee(message, addr, call_id, use_invite_branch=True)
+                        if (
+                            message.status_code in VOICEMAIL_ON_REJECT_STATUSES
+                            and call.caller_addr
+                            and call.original_invite
+                            and not getattr(call, "trunk", None)
+                            and self.pbx_core.config.get("voicemail.on_reject", True)
+                        ):
+                            self.logger.info(
+                                f"Callee rejected call {call_id} with {message.status_code}; "
+                                "routing caller to voicemail"
+                            )
+                            self.pbx_core.call_router._handle_no_answer(call_id)
+                            return
                         if call.caller_addr and call.original_invite:
                             error_response = SIPMessageBuilder.build_response(
                                 message.status_code,
