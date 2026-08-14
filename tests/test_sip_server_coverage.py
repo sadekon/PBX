@@ -695,6 +695,7 @@ class TestHandleBye:
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
         mock_call.transfer_session_id = None
+        mock_call.queue_ctx = None  # not a queued call
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
         mock_call.state = "CONNECTED"
@@ -719,6 +720,7 @@ class TestHandleBye:
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
         mock_call.transfer_session_id = None
+        mock_call.queue_ctx = None  # not a queued call
         mock_call.caller_addr = ("10.0.0.1", 5060)
         mock_call.callee_addr = callee_addr
         mock_call.state = "CONNECTED"
@@ -755,6 +757,7 @@ class TestHandleBye:
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
         mock_call.transfer_session_id = None
+        mock_call.queue_ctx = None  # not a queued call
         mock_call.caller_addr = ADDR
         mock_call.callee_addr = ("10.0.0.2", 5060)
         mock_call.state = "CONNECTED"
@@ -788,6 +791,7 @@ class TestHandleBye:
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
         mock_call.transfer_session_id = None
+        mock_call.queue_ctx = None  # not a queued call
         mock_call.voicemail_access = True
         mock_call.voicemail_extension = "1001"
         mock_call.caller_addr = ADDR

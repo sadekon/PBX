@@ -230,6 +230,7 @@ class TestByeNotForwardedToCancelledCallee:
         call = MagicMock()
         call.bridged_peer_call_id = None
         call.transfer_session_id = None
+        call.queue_ctx = None  # not a queued call
         call.routed_to_voicemail = True
         call.voicemail_access = False
         call.caller_addr = caller_addr
