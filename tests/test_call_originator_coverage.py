@@ -470,6 +470,42 @@ class TestMidBridgeTeardown:
 
         pbx.moh_system.stop_moh.assert_called_once_with(leg_a_call.call_id)
 
+    def test_declined_directory_call_records_into_the_dialled_mailbox(self) -> None:
+        # The whole point of the directory button: 1001 presses Call, 1002
+        # declines, and 1001 gets 1002's mailbox rather than a dead line.
+        from pbx.sip.server import SIPServer
+
+        pbx = _make_pbx_core()
+        originator = CallOriginator(pbx)
+        leg_a_call, leg_b_call = _bridge_to_ringing_leg_b(pbx, originator)
+        leg_a_call.state = CallState.CONNECTED
+        leg_a_call.callee_rtp = {"address": "10.0.0.2", "port": 40000}
+        pbx.voicemail_handler.record_into_mailbox.return_value = True
+        pbx.config.get.side_effect = lambda key, default=None: (
+            True if key == "voicemail.on_reject" else default
+        )
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_message = MagicMock()
+        server._send_ack_to_callee = MagicMock()
+        pbx.sip_server = server
+
+        busy = MagicMock()
+        busy.status_code = 486
+        busy.status_text = "Busy Here"
+        busy.method = None
+        busy.is_request.return_value = False
+        busy.body = ""
+        busy.get_header.side_effect = {
+            "Call-ID": leg_b_call.call_id,
+            "CSeq": "1 INVITE",
+        }.get
+        server._handle_response(busy, ("10.0.0.3", 5060))
+
+        args = pbx.voicemail_handler.record_into_mailbox.call_args[0]
+        assert args[0] is leg_a_call, "the party still on the line records the message"
+        assert args[2] == leg_b_call.to_extension, "into the mailbox of who declined"
+
     def test_ringing_leg_failure_ends_the_answered_leg(self) -> None:
         # Nobody picks up the destination, so the party who answered first
         # must not be left connected to a dead relay.

@@ -1222,6 +1222,52 @@ class SIPServer:
         self.logger.info(f"  Sent 200 OK response to {addr}")
         self.logger.info("")
 
+    def _record_peer_into_mailbox(self, call: Any) -> bool:
+        """
+        Offer the mailbox to the party waiting on `call`'s bridged peer.
+
+        A leg the PBX placed has no caller on its own record -- click-to-dial
+        rings you on one Call and the person you dialled on another -- so when
+        the dialled party rejects, the one who should hear the mailbox is on
+        the peer record, already answered and already on the relay. That is
+        exactly the shape ``record_into_mailbox`` exists for, and what the
+        queue's overflow and a transfer's no-answer both use it for.
+
+        The mailbox is keyed by the *rejecting* leg's extension, and the
+        message is stamped with that leg's From identity: the peer's own
+        ``from_extension`` is the synthetic origination context ("originator"),
+        which would arrive as a voicemail from nobody.
+
+        Returns:
+            True if the peer is being recorded, so the caller should stop
+            tearing the call down; False to fall back to hanging up.
+        """
+        from pbx.core.call import CallState
+
+        if self.pbx_core is None:
+            return False
+        peer = self.pbx_core.call_manager.get_call(call.bridged_peer_call_id)
+        if peer is None or peer.state != CallState.CONNECTED:
+            return False
+
+        # The pair is dissolved: this leg is ending, and the peer is being
+        # handed to the mailbox rather than to it.
+        peer.bridged_peer_call_id = None
+        call.bridged_peer_call_id = None
+        self.pbx_core.moh_system.stop_moh(peer.call_id)
+        peer.from_extension = call.from_extension
+
+        return bool(
+            self.pbx_core.voicemail_handler.record_into_mailbox(
+                peer,
+                peer.call_id,
+                call.to_extension,
+                peer.callee_rtp,
+                peer.rtp_ports,
+                hangup_cause="rejected",
+            )
+        )
+
     def end_bridged_peer(self, call: Any) -> None:
         """
         End the leg bridged to `call`, if there is one, on its own dialog.
@@ -2572,6 +2618,23 @@ class SIPServer:
                                 "routing caller to voicemail"
                             )
                             self.pbx_core.call_router._handle_no_answer(call_id)
+                            return
+                        # Same intent for a PBX-placed leg, reached a different
+                        # way: it has no caller of its own to answer into the
+                        # mailbox, because the waiting party is on the bridged
+                        # peer -- a separate Call record.
+                        if (
+                            message.status_code in VOICEMAIL_ON_REJECT_STATUSES
+                            and not call.original_invite
+                            and call.bridged_peer_call_id
+                            and self.pbx_core.config.get("voicemail.on_reject", True)
+                            and self._record_peer_into_mailbox(call)
+                        ):
+                            self.logger.info(
+                                f"Placed call {call_id} rejected with {message.status_code}; "
+                                f"recording the waiting party into {call.to_extension}'s mailbox"
+                            )
+                            self.pbx_core.end_call(call_id)
                             return
                         if call.caller_addr and call.original_invite:
                             error_response = SIPMessageBuilder.build_response(

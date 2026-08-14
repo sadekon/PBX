@@ -548,7 +548,7 @@ mixer:
 #   drop (default): hang up on them, matching prior behavior.
 #   voicemail: record a message into the transfer destination's mailbox.
 transfer:
-  atxfer_no_answer_action: drop
+  atxfer_no_answer_action: voicemail
 # Call queues (ACD). SEED ONLY: this section populates the database the
 # first time the PBX starts with an empty call_queues table; after that the
 # database (admin UI / REST API) is authoritative and edits here are ignored.
