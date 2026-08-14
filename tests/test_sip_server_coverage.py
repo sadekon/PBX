@@ -874,6 +874,79 @@ class TestCancelLeg:
 
 
 @pytest.mark.unit
+class TestRecordPeerIntoMailbox:
+    """Tests for _record_peer_into_mailbox() -- the click-to-dial reject path."""
+
+    @staticmethod
+    def _placed_pair(
+        peer_state: CallState = CallState.CONNECTED,
+    ) -> tuple[SIPServer, MagicMock, MagicMock]:
+        """A directory call: leg B was placed to 1002, leg A holds 1001."""
+        pbx = MagicMock()
+        leg_b = MagicMock()
+        leg_b.call_id = "leg-b"
+        leg_b.to_extension = "1002"
+        leg_b.from_extension = "1001"  # From identity of the placed leg
+        leg_b.original_invite = None  # PBX-placed: no caller of its own
+        leg_b.bridged_peer_call_id = "leg-a"
+
+        leg_a = MagicMock()
+        leg_a.call_id = "leg-a"
+        leg_a.state = peer_state
+        leg_a.from_extension = "originator"  # synthetic origination context
+        leg_a.callee_rtp = {"address": "10.0.0.5", "port": 40000}
+        leg_a.rtp_ports = (20000, 20001)
+        pbx.call_manager.get_call.return_value = leg_a
+
+        server = SIPServer(pbx_core=pbx)
+        return server, leg_b, leg_a
+
+    @patch("pbx.sip.server.get_logger")
+    def test_records_the_waiting_party_into_the_dialled_mailbox(
+        self, mock_get_logger: MagicMock
+    ) -> None:
+        server, leg_b, leg_a = self._placed_pair()
+        server.pbx_core.voicemail_handler.record_into_mailbox.return_value = True
+
+        assert server._record_peer_into_mailbox(leg_b) is True
+
+        args = server.pbx_core.voicemail_handler.record_into_mailbox.call_args[0]
+        assert args[0] is leg_a, "the connected party is the one who records"
+        assert args[2] == "1002", "the mailbox belongs to the party who declined"
+        assert args[3] == leg_a.callee_rtp
+        # Hold music must stop or it is recorded over the greeting.
+        server.pbx_core.moh_system.stop_moh.assert_called_once_with("leg-a")
+
+    @patch("pbx.sip.server.get_logger")
+    def test_message_is_stamped_with_the_real_caller_not_originator(
+        self, mock_get_logger: MagicMock
+    ) -> None:
+        # A saved voicemail takes its caller id from the recorded call's
+        # from_extension, which on a placed leg is the synthetic "originator".
+        server, leg_b, leg_a = self._placed_pair()
+        server.pbx_core.voicemail_handler.record_into_mailbox.return_value = True
+
+        server._record_peer_into_mailbox(leg_b)
+
+        assert leg_a.from_extension == "1001", "voicemail would be 'from originator'"
+
+    @patch("pbx.sip.server.get_logger")
+    def test_declines_when_the_peer_never_answered(self, mock_get_logger: MagicMock) -> None:
+        # Nobody is on the line to leave a message; fall back to hanging up.
+        server, leg_b, _leg_a = self._placed_pair(peer_state=CallState.CALLING)
+
+        assert server._record_peer_into_mailbox(leg_b) is False
+        server.pbx_core.voicemail_handler.record_into_mailbox.assert_not_called()
+
+    @patch("pbx.sip.server.get_logger")
+    def test_declines_when_the_peer_is_gone(self, mock_get_logger: MagicMock) -> None:
+        server, leg_b, _leg_a = self._placed_pair()
+        server.pbx_core.call_manager.get_call.return_value = None
+
+        assert server._record_peer_into_mailbox(leg_b) is False
+
+
+@pytest.mark.unit
 class TestEndBridgedPeer:
     """Tests for end_bridged_peer()."""
 
