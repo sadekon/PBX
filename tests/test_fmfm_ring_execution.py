@@ -287,10 +287,28 @@ class TestPlanFor:
 
     def test_desk_joins_a_simultaneous_burst(self) -> None:
         """Not a separate first stage -- everything rings at once, desk included."""
-        h = _Harness(_simultaneous(("1003", 30)), initial_ring_time=None)
+        h = _Harness(_simultaneous(("1003", 10)), initial_ring_time=None)
         plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
         assert plan is not None
         assert [d["destination"] for d in plan.destinations] == [EXTENSION, "1003"]
+        assert plan.destinations[0]["ring_time"] == 20  # the floor
+
+    def test_desk_outlasts_the_longest_destination_in_a_burst(self) -> None:
+        """
+        Otherwise the desk falls silent while the call is still ringing
+        elsewhere -- walk back to your desk mid-call and it is not ringing.
+        """
+        h = _Harness(_simultaneous(("1003", 45), ("1004", 30)), initial_ring_time=None)
+        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
+        assert plan is not None
+        assert plan.destinations[0]["destination"] == EXTENSION
+        assert plan.destinations[0]["ring_time"] == 45
+
+    def test_sequential_desk_ring_is_not_stretched(self) -> None:
+        """There the desk's time is additive, so it stays short."""
+        h = _Harness(_sequential(("1003", 45)), initial_ring_time=None)
+        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
+        assert plan is not None
         assert plan.destinations[0]["ring_time"] == 20
 
 

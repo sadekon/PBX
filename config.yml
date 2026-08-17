@@ -432,14 +432,24 @@ features:
   find_me_follow_me:
     enabled: true                      # Enable Find Me/Follow Me feature
 
-    # How long the dialled extension's own phone rings before the call moves on
-    # to that extension's configured destinations. Callers expect to reach
+    # How long the dialled extension's own phone rings. Callers expect to reach
     # someone at their desk before the call starts chasing them, so this stop is
-    # implicit -- a config listing only a mobile still rings the desk first.
+    # implicit in both modes -- a config listing only a mobile still rings the
+    # desk.
     #
-    # 0 sends calls straight into the destination list without ringing the desk.
-    # To control where the extension rings instead (say, second, after the
-    # mobile), list it in its own destination list and this stop is skipped.
+    # Sequential: the desk rings for exactly this long, before the configured
+    # destinations. Keep it modest -- the time is additive, and total ring time
+    # before voicemail is the sum of every destination's.
+    #
+    # Simultaneous: everything rings at once, so this is only a floor. The desk
+    # rings for at least this long and never less than the longest configured
+    # destination, so it is never the first phone to fall silent while the call
+    # is still ringing elsewhere.
+    #
+    # 0 disables the implicit stop entirely, sending calls straight into the
+    # destination list. To control where the extension rings instead (say,
+    # second, after the mobile), list it in its own destination list and this
+    # stop is skipped.
     initial_ring_time: 20
 recording:
   # Recordings are always PCM16 at 8 kHz, one channel per participant -- the two legs can

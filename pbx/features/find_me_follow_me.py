@@ -34,13 +34,20 @@ a ``Call`` whose relay is already allocated, which is what lets FMFM re-target a
 live call without disturbing the caller's side. ``SIPServer`` owns CANCEL.
 Nothing here formats SIP.
 
-The dialled extension's own phone rings first, for
-``features.find_me_follow_me.initial_ring_time`` seconds, before the configured
-destinations -- the way FreePBX Follow-Me's "Initial Ring Time" behaves. Nobody
-lists their own desk in their follow-me list, they expect the call to reach them
-there before it goes chasing, so a config of just "my mobile" reads and behaves
-the same way. Set that to 0 to go straight to the list, or place the extension
-in the list explicitly to control where and how long it rings.
+The dialled extension's own phone is added to the list implicitly, in both
+modes -- the way FreePBX Follow-Me's "Initial Ring Time" behaves. Nobody lists
+their own desk in their follow-me list, they expect the call to reach them there
+before it goes chasing, so a config of just "my mobile" reads and behaves the
+same way. Set ``features.find_me_follow_me.initial_ring_time`` to 0 to go
+straight to the list, or place the extension in the list explicitly to control
+where and how long it rings.
+
+How long it rings differs by mode, because the time means different things.
+Sequentially it is additive -- every second delays every destination behind it
+-- so it rings for ``initial_ring_time`` and no longer. In a burst it delays
+nothing and only decides when the desk falls silent, so it rings for at least as
+long as the longest configured destination: a desk that stopped ringing first
+would be quiet while the call was still being chased elsewhere.
 
 Ringing the extension is an ordinary leg, not a loop: it is INVITEd straight to
 the phone's registered contact and never re-enters ``route_call()``. (The one
@@ -684,6 +691,13 @@ class FindMeFollowMe:
         # ring time included), and when initial_ring_time is 0.
         initial_ring = self._initial_ring_time()
         if initial_ring and not any(d["destination"] == extension for d in destinations):
+            if mode == "simultaneous":
+                # Everything rings together here, so the desk's own time no
+                # longer delays anything -- it only decides when the desk falls
+                # silent. Ringing it for less than the longest destination would
+                # leave the desk quiet while the call is still being chased
+                # elsewhere, so it rings for at least as long as anything else.
+                initial_ring = max(initial_ring, *(int(d["ring_time"]) for d in destinations))
             destinations.insert(0, {"destination": extension, "ring_time": initial_ring})
 
         # One implicit stop plus a long list must still not ring forever.
