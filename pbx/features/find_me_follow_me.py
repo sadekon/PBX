@@ -51,14 +51,21 @@ Two guards keep a bad config from trapping a caller: a destination naming the
 caller is dropped rather than ringing them back on their own call, and the list
 is capped at ``MAX_DESTINATIONS``.
 
-Sequential mode only
---------------------
-A simultaneous config is executed *sequentially*, with a warning. Ringing
-several destinations at once needs several legs in flight on one call, and
-``Call`` holds exactly one callee leg -- the same limitation that leaves the call
-queue's ``ring_all`` strategy deferred. Degrading to sequential reaches the same
-destinations in the same order and still connects the call, which is a better
-answer than the silence the feature produced before it was wired up at all.
+Two modes
+---------
+*Sequential* walks the list, one destination at a time, each for its own ring
+time. The single live leg sits on the ``Call`` itself, exactly like an ordinary
+call.
+
+*Simultaneous* rings every destination at once. ``Call`` has room for one callee
+leg, so a burst cannot live there: each leg is lifted off the call into an
+:class:`FMFMLeg` as it is dialled, and the first one to answer is put back and
+becomes *the* callee while the rest are cancelled. Each leg keeps its own ring
+time, so a destination drops out of the burst when its own time is up and the
+others carry on; the caller reaches voicemail only when the last one gives up.
+From the moment a leg wins, the call is indistinguishable from any other
+single-leg call, so answer handling, hold, transfer and teardown need to know
+nothing about the race.
 """
 
 import json
@@ -99,6 +106,31 @@ def _top_via_branch(via: str | None) -> str | None:
 
 
 @dataclass
+class FMFMLeg:
+    """
+    One outbound leg of a simultaneous burst.
+
+    ``Call`` has room for exactly one callee leg, so a burst cannot live there.
+    Each leg's wire state is lifted off the call as soon as it is dialled and
+    held here; whichever leg answers is put back onto the call and becomes *the*
+    callee, and the rest are cancelled. From that moment the call looks exactly
+    like any other single-leg call to the rest of the system.
+    """
+
+    destination: str
+    # Via branch of this leg's INVITE, which is how a response arriving on the
+    # shared Call-ID is matched back to the leg that provoked it.
+    branch: str | None
+    addr: tuple[str, int] | None
+    invite: Any
+    transaction: Any
+    timer: Any
+    # Trunk channel this leg holds, for an external destination. Released when
+    # the leg is torn down, kept by the winner so call teardown releases it.
+    trunk: Any = None
+
+
+@dataclass
 class FMFMState:
     """
     Where a call stands in its extension's Find Me/Follow Me destination list.
@@ -127,8 +159,11 @@ class FMFMState:
     # True once ringing has resolved -- answered, or handed to voicemail. No
     # further advancing, and late responses from abandoned legs are swallowed.
     finished: bool = False
-    # Set once, so a simultaneous config only warns on the first dial.
-    warned_simultaneous: bool = False
+    # Ring every destination at once instead of walking the list.
+    simultaneous: bool = False
+    # Legs currently ringing in a simultaneous burst, keyed by destination.
+    # Empty in sequential mode, where the one live leg sits on the Call itself.
+    legs: dict[str, FMFMLeg] = field(default_factory=dict)
 
     def current(self) -> str:
         """The destination currently being rung."""
@@ -647,7 +682,7 @@ class FindMeFollowMe:
         state = FMFMState(
             extension=extension,
             destinations=destinations,
-            warned_simultaneous=(mode != "simultaneous"),
+            simultaneous=(mode == "simultaneous"),
         )
         self.logger.info(
             f"FMFM plan for {extension}: {mode} mode, "
@@ -819,7 +854,12 @@ class FindMeFollowMe:
             self._prune_locked()
             self._plans[call.call_id] = state
 
-        if self._dial_from_index(call, state, state.generation):
+        started = (
+            self._dial_burst(call, state)
+            if state.simultaneous
+            else self._dial_from_index(call, state, state.generation)
+        )
+        if started:
             return True
 
         # Every destination refused to dial on the first attempt (all offline,
@@ -860,19 +900,10 @@ class FindMeFollowMe:
         Returns:
             True if the INVITE went out.
         """
-        router = self.pbx_core.call_router
         entry = state.destinations[state.index]
         number = str(entry["destination"])
         ring_time = int(entry["ring_time"])
         call_id = call.call_id
-
-        if not state.warned_simultaneous:
-            state.warned_simultaneous = True
-            self.logger.warning(
-                f"FMFM config for {state.extension} asks for simultaneous ring, which "
-                "needs several legs on one call and is not supported yet; ringing the "
-                "destinations sequentially instead"
-            )
 
         def _gave_up() -> None:
             self._on_leg_gave_up(call_id, generation)
@@ -882,21 +913,15 @@ class FindMeFollowMe:
             f"{state.index + 1}/{len(state.destinations)} ({number}) for {ring_time}s"
         )
 
-        if router.EXTERNAL_NUMBER_PATTERN.match(number):
-            dialled = router._dial_trunk_leg(
-                call, call_id, number, ring_timeout=ring_time, on_no_answer=_gave_up
-            )
-        else:
-            leg_to_header = _TO_USER_RE.sub(f"sip:{number}@", state.to_header, count=1)
-            dialled = router._dial_extension_leg(
-                call,
-                call_id,
-                number,
-                state.from_header,
-                leg_to_header,
-                ring_timeout=ring_time,
-                on_no_answer=_gave_up,
-            )
+        dialled = self.pbx_core.call_router.dial_destination(
+            call,
+            call_id,
+            number,
+            from_header=state.from_header,
+            to_header=state.to_header,
+            ring_timeout=ring_time,
+            on_no_answer=_gave_up,
+        )
 
         if not dialled:
             self.logger.info(
@@ -908,6 +933,265 @@ class FindMeFollowMe:
             call.callee_invite.get_header("Via") if call.callee_invite else None
         )
         return True
+
+    # ------------------------------------------------------------------
+    # Simultaneous mode: a burst of legs racing to answer
+    # ------------------------------------------------------------------
+
+    def _dial_burst(self, call: Any, state: FMFMState) -> bool:
+        """
+        Ring every destination at once, each on its own ring time.
+
+        A destination that cannot be dialled is simply left out of the burst --
+        the others still ring, which is the whole point of the mode.
+
+        Returns:
+            True if at least one leg is ringing.
+        """
+        self.logger.info(
+            f"FMFM {state.extension}: ringing {len(state.destinations)} destinations "
+            f"simultaneously ({', '.join(str(d['destination']) for d in state.destinations)})"
+        )
+
+        for entry in state.destinations:
+            number = str(entry["destination"])
+            ring_time = int(entry["ring_time"])
+
+            def _gave_up(dest: str = number) -> None:
+                self._on_burst_leg_gave_up(call.call_id, dest)
+
+            dialled = self.pbx_core.call_router.dial_destination(
+                call,
+                call.call_id,
+                number,
+                from_header=state.from_header,
+                to_header=state.to_header,
+                ring_timeout=ring_time,
+                on_no_answer=_gave_up,
+            )
+            if not dialled:
+                self.logger.info(
+                    f"FMFM {state.extension}: destination {number} could not be dialled, "
+                    "leaving it out of the burst"
+                )
+                continue
+
+            leg = self._capture_leg(call, number)
+            state.legs[number] = leg
+            self.logger.info(
+                f"FMFM {state.extension}: {number} ringing for {ring_time}s (burst leg)"
+            )
+
+        return bool(state.legs)
+
+    def _capture_leg(self, call: Any, destination: str) -> FMFMLeg:
+        """
+        Lift the leg just dialled off the call and hold it as a burst leg.
+
+        ``dial_destination()`` leaves its leg in the Call's single callee slot,
+        which the next leg of the burst would overwrite -- losing the address to
+        CANCEL, and the transaction that is still retransmitting. Moving it here
+        keeps every leg individually addressable and leaves the slot free for
+        whichever one eventually answers.
+        """
+        leg = FMFMLeg(
+            destination=destination,
+            branch=_top_via_branch(
+                call.callee_invite.get_header("Via") if call.callee_invite else None
+            ),
+            addr=call.callee_addr,
+            invite=call.callee_invite,
+            transaction=call.invite_transaction,
+            timer=call.no_answer_timer,
+            trunk=getattr(call, "trunk", None),
+        )
+        call.callee_addr = None
+        call.callee_invite = None
+        call.invite_transaction = None
+        call.no_answer_timer = None
+        call.trunk = None
+        return leg
+
+    def _leg_for_branch(self, state: FMFMState, branch: str | None) -> FMFMLeg | None:
+        """The burst leg a response belongs to, matched on its Via branch."""
+        if branch is None:
+            return None
+        return next((leg for leg in state.legs.values() if leg.branch == branch), None)
+
+    def _tear_down_leg(self, call: Any, leg: FMFMLeg) -> None:
+        """
+        Stop one burst leg: its ring timer, its INVITE retransmissions, a CANCEL
+        so the phone stops ringing, and its trunk channel if it held one.
+        """
+        if leg.timer:
+            leg.timer.cancel()
+        if leg.transaction:
+            leg.transaction.cancel()
+        if leg.addr and leg.invite:
+            self.pbx_core.sip_server.cancel_leg(call, invite=leg.invite, addr=leg.addr)
+        if leg.trunk:
+            leg.trunk.release_channel()
+            leg.trunk.record_failed_call(reason="no answer")
+            leg.trunk = None
+
+    def on_leg_answered(self, call: Any, message: Any) -> bool:
+        """
+        One leg of a burst picked up: it becomes the call's callee and every
+        other leg is cancelled.
+
+        Called by SIPServer before it ACKs a 200 OK, because the ACK is built
+        from the winning leg's INVITE -- which is only on the call once this has
+        promoted it.
+
+        Args:
+            call: The Call the 200 OK belongs to.
+            message: The 200 OK.
+
+        Returns:
+            True if a burst leg won and the call is now pointed at it. False for
+            any call this feature is not racing legs on, which is every call in
+            sequential mode too -- there the single leg already sits on the call.
+        """
+        branch = _top_via_branch(message.get_header("Via"))
+
+        with self._lock:
+            state = self._plans.get(call.call_id)
+            if state is None or not state.simultaneous or state.finished:
+                return False
+            winner = self._leg_for_branch(state, branch)
+            if winner is None:
+                return False
+            state.finished = True
+            losers = [leg for leg in state.legs.values() if leg is not winner]
+            state.legs = {winner.destination: winner}
+
+        # The winner becomes the one callee leg the rest of the system knows how
+        # to talk to: answer handling, hold, DTMF, transfer and teardown all
+        # read these and none of them need to know a race happened.
+        call.callee_addr = winner.addr
+        call.callee_invite = winner.invite
+        call.invite_transaction = winner.transaction
+        if winner.trunk:
+            call.trunk = winner.trunk
+        if winner.timer:
+            winner.timer.cancel()
+        call.no_answer_timer = None
+
+        for leg in losers:
+            self._tear_down_leg(call, leg)
+
+        self.logger.info(
+            f"FMFM {state.extension}: {winner.destination} answered first; "
+            f"cancelled {len(losers)} other ringing destination(s)"
+        )
+        return True
+
+    def _burst_leg_failed(self, call: Any, message: Any, branch: str | None) -> bool:
+        """
+        A destination in a burst refused the call -- busy, DND, declined, or its
+        phone forwarding itself. Drop that leg only; the rest keep ringing.
+
+        Returns:
+            True if this response belonged to a burst leg and has been dealt
+            with, so nothing of it should reach the caller.
+        """
+        with self._lock:
+            state = self._plans.get(call.call_id)
+            if state is None or not state.simultaneous or state.finished:
+                return False
+            leg = self._leg_for_branch(state, branch)
+            if leg is None:
+                # A burst is in flight but this is not one of its live legs --
+                # typically a leg already cancelled answering with 487. Swallow
+                # it either way: nothing about a losing leg concerns the caller.
+                return True
+            del state.legs[leg.destination]
+            exhausted = not state.legs
+            if exhausted:
+                state.finished = True
+
+        self._tear_down_leg(call, leg)
+        self.logger.info(
+            f"FMFM {state.extension}: {leg.destination} returned {message.status_code}"
+            + ("" if exhausted else f"; {len(state.legs)} still ringing")
+        )
+        if exhausted:
+            self.logger.info(
+                f"FMFM {state.extension}: every destination refused; no destinations left"
+            )
+            self._start_voicemail_timer(call)
+        return True
+
+    def _on_burst_leg_gave_up(self, call_id: str, destination: str) -> None:
+        """
+        One destination in a burst rang out. Drop just that leg; the others keep
+        ringing. Voicemail only once the last of them gives up.
+        """
+        with self._lock:
+            state = self._plans.get(call_id)
+            if state is None or state.finished:
+                return
+            leg = state.legs.pop(destination, None)
+            if leg is None:
+                return
+            exhausted = not state.legs
+            if exhausted:
+                state.finished = True
+
+        call = self.pbx_core.call_manager.get_call(call_id)
+        if call is None:
+            return
+
+        self._tear_down_leg(call, leg)
+        self.logger.info(
+            f"FMFM {state.extension}: {destination} gave up (no answer)"
+            + ("" if exhausted else f"; {len(state.legs)} still ringing")
+        )
+        if exhausted:
+            self.logger.info(
+                f"FMFM {state.extension}: every destination gave up; no destinations left"
+            )
+            self._start_voicemail_timer(call)
+
+    def on_call_ended(self, call: Any) -> None:
+        """
+        The call is being torn down -- most often the caller hung up mid-ring.
+
+        A burst's legs are not on the Call, so the ordinary teardown cannot see
+        them and every destination would go on ringing with nothing behind it.
+        Cancel them all here. A no-op for a call with no burst in flight.
+        """
+        with self._lock:
+            state = self._plans.pop(call.call_id, None)
+            if state is None or not state.legs or state.finished:
+                return
+            legs = list(state.legs.values())
+            state.legs = {}
+            state.finished = True
+
+        self.logger.info(
+            f"FMFM {state.extension}: call ended while ringing; "
+            f"cancelling {len(legs)} destination(s)"
+        )
+        for leg in legs:
+            self._tear_down_leg(call, leg)
+
+    def note_leg_response(self, call: Any, message: Any) -> None:
+        """
+        Stop retransmitting a burst leg's INVITE once that leg has responded.
+
+        The generic path does this through ``call.invite_transaction``, which is
+        empty during a burst because each leg keeps its own. A no-op for calls
+        without one.
+        """
+        with self._lock:
+            state = self._plans.get(call.call_id)
+            if state is None or not state.legs:
+                return
+            leg = self._leg_for_branch(state, _top_via_branch(message.get_header("Via")))
+
+        if leg is not None and leg.transaction:
+            leg.transaction.on_response_received()
 
     def _on_leg_gave_up(self, call_id: str, generation: int) -> None:
         """
@@ -947,6 +1231,9 @@ class FindMeFollowMe:
             nothing of it. False to let the normal error handling run.
         """
         branch = _top_via_branch(message.get_header("Via"))
+
+        if self._burst_leg_failed(call, message, branch):
+            return True
 
         with self._lock:
             state = self._plans.get(call.call_id)
@@ -1067,7 +1354,15 @@ class FindMeFollowMe:
         """
         with self._lock:
             state.finished = True
+        self._start_voicemail_timer(call)
 
+    def _start_voicemail_timer(self, call: Any) -> None:
+        """
+        Hand the caller off to the mailbox, just off the SIP receive thread.
+
+        Shared by both modes: the sequential list running out, and the last leg
+        of a burst giving up.
+        """
         # to_extension is still the dialled extension -- FMFM never retargets
         # it, precisely so the mailbox is the right person's.
         timer = threading.Timer(

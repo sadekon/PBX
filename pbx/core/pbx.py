@@ -748,6 +748,11 @@ class PBXCore:
         if call:
             self.logger.info(f"Ending call {call_id}")
 
+            # Destinations of a Find Me/Follow Me burst ring on legs the Call
+            # itself does not hold, so nothing below would stop them. Must come
+            # first: the caller hanging up mid-ring is exactly when this matters.
+            self.find_me_follow_me.on_call_ended(call)
+
             # Cancel INVITE retransmission if still running
             if hasattr(call, "invite_transaction") and call.invite_transaction:
                 call.invite_transaction.cancel()

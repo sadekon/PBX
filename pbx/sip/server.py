@@ -1294,7 +1294,12 @@ class SIPServer:
             self.logger.info(f"Cancelled still-ringing bridged leg {peer.call_id}")
         self.pbx_core.end_call(peer.call_id)
 
-    def cancel_leg(self, call: Any) -> None:
+    def cancel_leg(
+        self,
+        call: Any,
+        invite: Any | None = None,
+        addr: AddrTuple | None = None,
+    ) -> None:
         """
         CANCEL the INVITE this call has outstanding toward its callee, so the
         destination stops ringing.
@@ -1303,11 +1308,21 @@ class SIPServer:
         the PBX sends on a leg it INVITEd, and which one applies is decided by
         whether that INVITE has had a final response yet. A no-op on a leg
         with no INVITE in flight.
-        """
-        if self.pbx_core is None or not (call.callee_addr and call.callee_invite):
-            return
 
-        invite = call.callee_invite
+        Args:
+            call: The call the leg belongs to (for its Call-ID and logging).
+            invite: The INVITE to cancel, and `addr` where it went. Both default
+                to the call's own callee leg. A caller ringing several
+                destinations at once (Find Me/Follow Me) passes them explicitly,
+                since only one of its legs can occupy the call's callee slot.
+            addr: Where to send the CANCEL. Paired with `invite`.
+        """
+        if self.pbx_core is None:
+            return
+        if invite is None or addr is None:
+            invite, addr = call.callee_invite, call.callee_addr
+        if not (addr and invite):
+            return
         cancel = SIPMessageBuilder.build_request(
             method="CANCEL",
             uri=invite.uri,
@@ -1319,8 +1334,8 @@ class SIPServer:
             cseq=self._parse_cseq_number(invite.get_header("CSeq")),
         )
         cancel.set_header("Via", invite.get_header("Via"))
-        self._send_message(cancel.build(), call.callee_addr)
-        self.logger.info(f"Sent CANCEL to callee {call.to_extension} to stop ringing")
+        self._send_message(cancel.build(), addr)
+        self.logger.info(f"Sent CANCEL to {addr} to stop it ringing (call {call.call_id})")
 
     def _send_leg_bye(self, call: Any, side: str | None = None) -> None:
         """
@@ -2435,6 +2450,10 @@ class SIPServer:
                 call = self.pbx_core.call_manager.get_call(call_id)
                 if call and hasattr(call, "invite_transaction") and call.invite_transaction:
                     call.invite_transaction.on_response_received()
+                # Legs of a Find Me/Follow Me burst keep their own transactions,
+                # since only one leg at a time can sit on the call.
+                if call:
+                    self.pbx_core.find_me_follow_me.note_leg_response(call, message)
                     call.invite_transaction = None
 
             if message.status_code == 180:
@@ -2495,6 +2514,14 @@ class SIPServer:
                 # (200 OK is also sent for BYE, CANCEL, OPTIONS, etc.)
                 if call_id and "INVITE" in cseq_header:
                     self.logger.info(f"Callee answered call {call_id}")
+
+                    # First answer wins a Find Me/Follow Me burst: this promotes
+                    # the winning leg onto the call and cancels the rest. It has
+                    # to run before the ACK, which is built from that leg's own
+                    # INVITE.
+                    answered_call = self.pbx_core.call_manager.get_call(call_id)
+                    if answered_call:
+                        self.pbx_core.find_me_follow_me.on_leg_answered(answered_call, message)
 
                     # Per RFC 3261 Section 13.2.2.4, the UAC (PBX acting as
                     # B2BUA) MUST send an ACK to the callee after receiving

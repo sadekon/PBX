@@ -86,35 +86,40 @@ class _Harness:
         self.legs: list[dict[str, Any]] = []
         self.dial_result = True
 
-        def _record(kind: str) -> Any:
-            def dial(
-                c: Any,
-                _cid: str,
-                number: str,
-                *args: Any,
-                ring_timeout: int | None = None,
-                on_no_answer: Any = None,
-                **_kw: Any,
-            ) -> bool:
-                if not self.dial_result:
-                    return False
-                branch = f"z9hG4bKleg{len(self.legs)}"
-                c.callee_invite = _FakeInvite(branch)
-                self.legs.append(
-                    {
-                        "kind": kind,
-                        "number": number,
-                        "ring_timeout": ring_timeout,
-                        "on_no_answer": on_no_answer,
-                        "branch": branch,
-                    }
-                )
-                return True
+        def dial(
+            c: Any,
+            _cid: str,
+            number: str,
+            *,
+            ring_timeout: int | None = None,
+            on_no_answer: Any = None,
+            **_kw: Any,
+        ) -> bool:
+            """Stand in for CallRouter.dial_destination, leaving a leg on the call."""
+            if not self.dial_result:
+                return False
+            branch = f"z9hG4bKleg{len(self.legs)}"
+            # Whatever a real dial leaves behind, which _capture_leg lifts off.
+            c.callee_invite = _FakeInvite(branch)
+            c.callee_addr = ("10.0.0.9", 5060 + len(self.legs))
+            c.invite_transaction = MagicMock()
+            c.no_answer_timer = MagicMock()
+            c.trunk = None
+            self.legs.append(
+                {
+                    "kind": (
+                        "trunk" if CallRouter.EXTERNAL_NUMBER_PATTERN.match(number) else "extension"
+                    ),
+                    "number": number,
+                    "ring_timeout": ring_timeout,
+                    "on_no_answer": on_no_answer,
+                    "branch": branch,
+                    "addr": c.callee_addr,
+                }
+            )
+            return True
 
-            return dial
-
-        pbx.call_router._dial_extension_leg.side_effect = _record("extension")
-        pbx.call_router._dial_trunk_leg.side_effect = _record("trunk")
+        pbx.call_router.dial_destination.side_effect = dial
 
         # The real feature object, with only the config lookup stubbed so each
         # test states its ring plan directly instead of building stored configs.
@@ -155,6 +160,15 @@ def _sequential(*destinations: tuple[str, int], no_answer: str | None = None) ->
     if no_answer:
         strategy["no_answer_destination"] = no_answer
     return strategy
+
+
+def _simultaneous(*destinations: tuple[str, int]) -> dict[str, Any]:
+    return {
+        "strategy": "simultaneous",
+        "destinations": [{"destination": n, "ring_time": t} for n, t in destinations],
+        "max_ring_time": max((t for _, t in destinations), default=0),
+        "call_id": CALL_ID,
+    }
 
 
 # ===========================================================================
@@ -265,21 +279,19 @@ class TestPlanFor:
         assert plan is not None
         assert [d["destination"] for d in plan.destinations] == ["1003"]
 
-    def test_simultaneous_config_is_planned_and_warns(self) -> None:
-        """Not supported yet, so it degrades to sequential rather than doing nothing."""
-        h = _Harness(
-            {
-                "strategy": "simultaneous",
-                "destinations": [
-                    {"destination": "1003", "ring_time": 30},
-                    {"destination": "1004", "ring_time": 30},
-                ],
-                "max_ring_time": 30,
-            }
-        )
-        assert h.start() is True
-        assert [leg["number"] for leg in h.legs] == ["1003"]
-        assert any("simultaneous" in str(c) for c in h.handler.logger.warning.call_args_list)
+    def test_simultaneous_config_is_marked_on_the_plan(self) -> None:
+        h = _Harness(_simultaneous(("1003", 30), ("1004", 30)))
+        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
+        assert plan is not None
+        assert plan.simultaneous is True
+
+    def test_desk_joins_a_simultaneous_burst(self) -> None:
+        """Not a separate first stage -- everything rings at once, desk included."""
+        h = _Harness(_simultaneous(("1003", 30)), initial_ring_time=None)
+        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
+        assert plan is not None
+        assert [d["destination"] for d in plan.destinations] == [EXTENSION, "1003"]
+        assert plan.destinations[0]["ring_time"] == 20
 
 
 # ===========================================================================
@@ -332,7 +344,7 @@ class TestSequentialRinging:
             h.legs.append({"number": number, "on_no_answer": kw.get("on_no_answer")})
             return True
 
-        h.pbx.call_router._dial_extension_leg.side_effect = _dial
+        h.pbx.call_router.dial_destination.side_effect = _dial
         h.ring_out(0)
 
         assert calls == ["1004", "1005"]
@@ -418,6 +430,141 @@ class TestLegFailures:
         h.handler.on_answered(h.call)
 
         assert h.handler.on_leg_failure(h.call, _make_response(487, branch)) is True
+
+
+@pytest.mark.unit
+class TestSimultaneousRinging:
+    """Every destination rings at once and the first to answer takes the call."""
+
+    def test_all_destinations_ring_at_once_each_on_its_own_time(self) -> None:
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25), ("5551234567", 30)))
+        assert h.start() is True
+
+        assert [leg["number"] for leg in h.legs] == ["1003", "1004", "5551234567"]
+        assert [leg["ring_timeout"] for leg in h.legs] == [15, 25, 30]
+        # Internal and external go out through the one common interface.
+        assert [leg["kind"] for leg in h.legs] == ["extension", "extension", "trunk"]
+
+    def test_legs_are_lifted_off_the_call_so_they_do_not_overwrite_each_other(self) -> None:
+        """Call has room for one callee; a burst cannot live there."""
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25)))
+        h.start()
+
+        state = h.handler.state_for(CALL_ID)
+        assert state is not None
+        assert sorted(state.legs) == ["1003", "1004"]
+        assert len({leg.branch for leg in state.legs.values()}) == 2, "legs must be distinguishable"
+        # The call's single slot is left free for whichever leg answers.
+        assert h.call.callee_invite is None
+        assert h.call.callee_addr is None
+
+    def test_first_answer_wins_and_the_others_are_cancelled(self) -> None:
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25), ("1005", 25)))
+        h.start()
+        winner = h.legs[1]  # 1004 picks up first
+
+        claimed = h.handler.on_leg_answered(h.call, _make_response(200, winner["branch"]))
+
+        assert claimed is True
+        # The winner becomes the call's callee, so everything downstream works.
+        assert h.call.callee_addr == winner["addr"]
+        assert h.call.callee_invite.branch == winner["branch"]
+        # Both losers get a CANCEL, addressed individually.
+        cancelled = {
+            c.kwargs["addr"] for c in h.pbx.sip_server.cancel_leg.call_args_list if c.kwargs
+        }
+        assert cancelled == {h.legs[0]["addr"], h.legs[2]["addr"]}
+
+    def test_a_leg_ringing_out_leaves_the_others_ringing(self) -> None:
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25)))
+        h.start()
+
+        with patch("pbx.features.find_me_follow_me.threading.Timer") as timer_cls:
+            h.ring_out(0)  # 1003 gives up
+
+        state = h.handler.state_for(CALL_ID)
+        assert state is not None
+        assert sorted(state.legs) == ["1004"], "1004 must still be ringing"
+        timer_cls.assert_not_called(), "voicemail must wait for the last leg"
+
+    def test_voicemail_only_once_the_last_leg_gives_up(self) -> None:
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25)))
+        h.start()
+        h.ring_out(0)
+
+        with patch("pbx.features.find_me_follow_me.threading.Timer") as timer_cls:
+            h.ring_out(1)
+
+        timer_cls.assert_called_once()
+        assert timer_cls.call_args.args[1] is h.pbx.call_router._handle_no_answer
+
+    def test_a_declining_leg_does_not_end_the_call(self) -> None:
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25)))
+        h.start()
+
+        handled = h.handler.on_leg_failure(h.call, _make_response(486, h.legs[0]["branch"]))
+
+        assert handled is True, "the caller must not see one destination's busy"
+        state = h.handler.state_for(CALL_ID)
+        assert state is not None
+        assert sorted(state.legs) == ["1004"]
+
+    def test_every_leg_declining_reaches_voicemail(self) -> None:
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25)))
+        h.start()
+        h.handler.on_leg_failure(h.call, _make_response(486, h.legs[0]["branch"]))
+
+        with patch("pbx.features.find_me_follow_me.threading.Timer") as timer_cls:
+            h.handler.on_leg_failure(h.call, _make_response(603, h.legs[1]["branch"]))
+
+        timer_cls.assert_called_once()
+
+    def test_caller_hanging_up_stops_every_ringing_destination(self) -> None:
+        """Burst legs are not on the Call, so ordinary teardown cannot see them."""
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25), ("1005", 25)))
+        h.start()
+
+        h.handler.on_call_ended(h.call)
+
+        cancelled = {
+            c.kwargs["addr"] for c in h.pbx.sip_server.cancel_leg.call_args_list if c.kwargs
+        }
+        assert cancelled == {leg["addr"] for leg in h.legs}
+        assert h.handler.state_for(CALL_ID) is None
+
+    def test_an_undialable_destination_does_not_stop_the_burst(self) -> None:
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25)))
+
+        calls: list[str] = []
+
+        def _dial(c: Any, _cid: str, number: str, **kw: Any) -> bool:
+            calls.append(number)
+            if number == "1003":
+                return False
+            c.callee_invite = _FakeInvite("z9hG4bKok")
+            c.callee_addr = ("10.0.0.9", 6000)
+            c.invite_transaction = MagicMock()
+            c.no_answer_timer = MagicMock()
+            c.trunk = None
+            return True
+
+        h.pbx.call_router.dial_destination.side_effect = _dial
+        assert h.start() is True
+
+        assert calls == ["1003", "1004"]
+        state = h.handler.state_for(CALL_ID)
+        assert state is not None
+        assert sorted(state.legs) == ["1004"]
+
+    def test_answer_after_the_burst_resolved_is_not_claimed(self) -> None:
+        """A second destination answering the instant we cancelled it."""
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25)))
+        h.start()
+        h.handler.on_leg_answered(h.call, _make_response(200, h.legs[0]["branch"]))
+
+        late = h.handler.on_leg_answered(h.call, _make_response(200, h.legs[1]["branch"]))
+
+        assert late is False, "the call is already bridged to the first answerer"
 
 
 @pytest.mark.unit

@@ -1201,6 +1201,64 @@ class CallRouter:
 
         return True
 
+    def dial_destination(
+        self,
+        call: Any,
+        call_id: str,
+        destination: str,
+        *,
+        from_header: str,
+        to_header: str,
+        ring_timeout: int | None = None,
+        on_no_answer: Callable[[], None] | None = None,
+    ) -> bool:
+        """
+        Dial one destination on an already-set-up `call`, whatever kind it is.
+
+        The single entry point for "ring this number on this call": an internal
+        extension and an external number differ only in how the leg is put on
+        the wire, and that difference is resolved here rather than by every
+        caller. Both paths reuse the call's existing relay, take the same ring
+        timeout, and report the same way, so a caller driving a list of mixed
+        destinations treats every entry identically.
+
+        Args:
+            call: The Call being routed, with its RTP relay already allocated.
+            call_id: Call identifier.
+            destination: Extension number or external number, classified by
+                ``EXTERNAL_NUMBER_PATTERN`` -- the same test ``route_call()``
+                and ``CallOriginator`` use.
+            from_header: Raw From header of the caller's original INVITE.
+            to_header: Raw To header of the caller's original INVITE. Rewritten
+                to name `destination` for an extension leg; a trunk leg builds
+                its own To from the dialled number.
+            ring_timeout: Seconds this leg may ring.
+            on_no_answer: Called when it rings out or its INVITE transaction
+                gives up.
+
+        Returns:
+            True if the INVITE went out.
+        """
+        if self.EXTERNAL_NUMBER_PATTERN.match(destination):
+            return self._dial_trunk_leg(
+                call,
+                call_id,
+                destination,
+                ring_timeout=ring_timeout,
+                on_no_answer=on_no_answer,
+            )
+
+        leg_to_header = re.sub(r"sip:(\*?[^@]+)@", f"sip:{destination}@", to_header, count=1)
+        return self._dial_extension_leg(
+            call,
+            call_id,
+            destination,
+            from_header,
+            leg_to_header,
+            ring_timeout=ring_timeout,
+            on_no_answer=on_no_answer,
+        )
+
     def _build_trunk_invite(
         self,
         call: Any,
