@@ -193,6 +193,9 @@ class FindMeFollowMe:
             mode VARCHAR(20) NOT NULL CHECK (mode IN ('sequential', 'simultaneous')),
             enabled BOOLEAN DEFAULT TRUE,
             destinations TEXT NOT NULL,
+            -- Legacy, no longer read or written. An exhausted list always goes
+            -- to the dialled extension's own mailbox, so there is nothing for a
+            -- separate no-answer destination to do. Kept so existing rows load.
             no_answer_destination VARCHAR(50),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -230,13 +233,13 @@ class FindMeFollowMe:
             cursor = self.database.connection.cursor()
             try:
                 cursor.execute("""
-                    SELECT extension, mode, enabled, destinations, no_answer_destination, updated_at
+                    SELECT extension, mode, enabled, destinations, updated_at
                     FROM fmfm_configs
                 """)
 
                 rows = cursor.fetchall()
                 for row in rows:
-                    extension, mode, enabled, destinations_json, no_answer, updated_at = row
+                    extension, mode, enabled, destinations_json, updated_at = row
 
                     # Parse destinations from JSON
                     try:
@@ -254,9 +257,6 @@ class FindMeFollowMe:
                         "destinations": destinations,
                         "updated_at": updated_at,
                     }
-
-                    if no_answer:
-                        config["no_answer_destination"] = no_answer
 
                     self.user_configs[extension] = config
 
@@ -287,26 +287,33 @@ class FindMeFollowMe:
             # Convert destinations to JSON
             destinations_json = json.dumps(config.get("destinations", []))
 
-            # Upsert (insert or update)
+            # Upsert (insert or update). RETURNING hands back the timestamp the
+            # database just generated, which is then mirrored into the
+            # in-memory config below -- without it, a config written since the
+            # last restart has no updated_at until the process reloads from the
+            # database, and the admin page shows "N/A" for it.
             cursor.execute(
                 """
-                INSERT INTO fmfm_configs (extension, mode, enabled, destinations, no_answer_destination, updated_at)
-                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                INSERT INTO fmfm_configs (extension, mode, enabled, destinations, updated_at)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
                 ON CONFLICT (extension) DO UPDATE SET
                     mode = EXCLUDED.mode,
                     enabled = EXCLUDED.enabled,
                     destinations = EXCLUDED.destinations,
-                    no_answer_destination = EXCLUDED.no_answer_destination,
                     updated_at = CURRENT_TIMESTAMP
+                RETURNING updated_at
             """,
                 (
                     extension,
                     config.get("mode", "sequential"),
                     config.get("enabled", True),
                     destinations_json,
-                    config.get("no_answer_destination"),
                 ),
             )
+
+            row = cursor.fetchone()
+            if row:
+                config["updated_at"] = row[0]
 
             self.database.connection.commit()
             cursor.close()
@@ -341,7 +348,13 @@ class FindMeFollowMe:
             config: FMFM configuration
                 Required: mode ('sequential' or 'simultaneous')
                 Required: destinations (list of numbers with ring_time)
-                Optional: enabled, no_answer_destination
+                Optional: enabled
+
+                A `no_answer_destination` is accepted but dropped: an exhausted
+                destination list always reaches the dialled extension's own
+                mailbox, so there is nothing left for one to do. Ignored rather
+                than rejected so an old client or a stored row does not start
+                failing.
 
         Returns:
             True if successful
@@ -361,9 +374,12 @@ class FindMeFollowMe:
             self.logger.error(f"Invalid FMFM mode: {config['mode']}")
             return False
 
-        self.user_configs[extension] = {**config, "extension": extension}
+        stored = {**config, "extension": extension}
+        stored.pop("no_answer_destination", None)
+        self.user_configs[extension] = stored
 
-        # Add timestamp only if no database (otherwise database generates it)
+        # With a database, _save_to_database() mirrors back the timestamp the
+        # database itself generated, so the value here always matches the row.
         if not (self.database and self.database.enabled):
             self.user_configs[extension]["updated_at"] = datetime.now(UTC)
 
@@ -420,7 +436,6 @@ class FindMeFollowMe:
             return {
                 "strategy": "sequential",
                 "destinations": ring_plan,
-                "no_answer_destination": config.get("no_answer_destination"),
                 "call_id": call_id,
             }
 
@@ -437,7 +452,6 @@ class FindMeFollowMe:
                 "strategy": "simultaneous",
                 "destinations": ring_plan,
                 "max_ring_time": max_ring_time,
-                "no_answer_destination": config.get("no_answer_destination"),
                 "call_id": call_id,
             }
 
@@ -626,22 +640,6 @@ class FindMeFollowMe:
         initial_ring = self._initial_ring_time()
         if initial_ring and not any(d["destination"] == extension for d in destinations):
             destinations.insert(0, {"destination": extension, "ring_time": initial_ring})
-
-        # The no-answer destination is simply the last place to try, so it joins
-        # the list instead of needing a branch of its own. It rings for the
-        # standard no-answer timeout, since the config carries no ring time for
-        # it.
-        no_answer = strategy.get("no_answer_destination")
-        if no_answer:
-            fallback_ring = self.pbx_core.config.get("voicemail.no_answer_timeout", 30)
-            destinations.extend(
-                self._sanitize(
-                    [{"destination": no_answer, "ring_time": fallback_ring}],
-                    extension,
-                    from_ext,
-                    exclude={d["destination"] for d in destinations},
-                )
-            )
 
         # One implicit stop plus a long list must still not ring forever.
         del destinations[MAX_DESTINATIONS:]

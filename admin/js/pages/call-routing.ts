@@ -22,7 +22,6 @@ interface FMFMConfig {
     mode: string;
     enabled?: boolean;
     destinations?: FMFMDestination[];
-    no_answer_destination?: string;
     updated_at?: string;
 }
 
@@ -248,9 +247,6 @@ export function showAddFMFMModal(): void {
     const enabledCheck = document.getElementById('fmfm-enabled') as HTMLInputElement | null;
     if (enabledCheck) enabledCheck.checked = true;
 
-    const noAnswerInput = document.getElementById('fmfm-no-answer') as HTMLInputElement | null;
-    if (noAnswerInput) noAnswerInput.value = '';
-
     const destContainer = document.getElementById('fmfm-destinations-list') as HTMLElement | null;
     if (destContainer) destContainer.innerHTML = '';
 
@@ -287,7 +283,6 @@ export async function saveFMFMConfig(event: Event): Promise<void> {
     const extension = (document.getElementById('fmfm-extension') as HTMLInputElement).value;
     const mode = (document.getElementById('fmfm-mode') as HTMLSelectElement).value;
     const enabled = (document.getElementById('fmfm-enabled') as HTMLInputElement).checked;
-    const noAnswer = (document.getElementById('fmfm-no-answer') as HTMLInputElement).value;
 
     // Collect destinations
     const destNumbers = Array.from(document.querySelectorAll<HTMLInputElement>('.fmfm-dest-number'));
@@ -309,10 +304,6 @@ export async function saveFMFMConfig(event: Event): Promise<void> {
         enabled: enabled,
         destinations: destinations
     };
-
-    if (noAnswer) {
-        configData.no_answer_destination = noAnswer;
-    }
 
     try {
         const API_BASE = getApiBaseUrl();
@@ -350,9 +341,6 @@ export function editFMFMConfig(config: FMFMConfig): void {
 
     const enabledCheck = document.getElementById('fmfm-enabled') as HTMLInputElement | null;
     if (enabledCheck) enabledCheck.checked = config.enabled !== false;
-
-    const noAnswerInput = document.getElementById('fmfm-no-answer') as HTMLInputElement | null;
-    if (noAnswerInput) noAnswerInput.value = config.no_answer_destination || '';
 
     // Clear and add destination rows
     const container = document.getElementById('fmfm-destinations-list') as HTMLElement | null;

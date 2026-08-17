@@ -254,16 +254,13 @@ class TestPlanFor:
         assert plan is not None
         assert len(plan.destinations) == MAX_DESTINATIONS
 
-    def test_no_answer_destination_becomes_the_last_stop(self) -> None:
+    def test_legacy_no_answer_destination_is_ignored(self) -> None:
+        """
+        Dropped as a concept: an exhausted list always reaches the dialled
+        extension's own mailbox, so a stored row from before that decision must
+        not add a surprise extra leg.
+        """
         h = _Harness(_sequential(("1003", 20), no_answer="1009"))
-        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
-        assert plan is not None
-        assert [d["destination"] for d in plan.destinations] == ["1003", "1009"]
-        # It carries the standard no-answer timeout, not a per-destination one.
-        assert plan.destinations[-1]["ring_time"] == 30
-
-    def test_no_answer_destination_already_listed_is_not_duplicated(self) -> None:
-        h = _Harness(_sequential(("1003", 20), no_answer="1003"))
         plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
         assert plan is not None
         assert [d["destination"] for d in plan.destinations] == ["1003"]
