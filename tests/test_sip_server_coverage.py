@@ -1816,6 +1816,9 @@ class TestHandleResponse:
         mock_call.routed_to_voicemail = False
         mock_call.bridged_peer_call_id = None  # nothing bridged to take down
         pbx.call_manager.get_call.return_value = mock_call
+        # Not a Find Me/Follow Me call, so the error is ours to handle. A
+        # MagicMock would be truthy and swallow it.
+        pbx.find_me_follow_me.on_leg_failure.return_value = False
 
         server = SIPServer(pbx_core=pbx)
         server._retry_trunk_invite_with_auth = MagicMock()
@@ -1837,6 +1840,7 @@ class TestHandleResponse:
         mock_call.routed_to_voicemail = False
         mock_call.bridged_peer_call_id = None
         pbx.call_manager.get_call.return_value = mock_call
+        pbx.find_me_follow_me.on_leg_failure.return_value = False
 
         server = SIPServer(pbx_core=pbx)
         server._retry_trunk_invite_with_auth = MagicMock()
@@ -1862,6 +1866,7 @@ class TestHandleResponse:
         mock_call.state = CallState.CALLING
         mock_call.bridged_peer_call_id = "leg-a-call-id"
         pbx.call_manager.get_call.return_value = mock_call
+        pbx.find_me_follow_me.on_leg_failure.return_value = False
 
         server = SIPServer(pbx_core=pbx)
         server._send_ack_to_callee = MagicMock()

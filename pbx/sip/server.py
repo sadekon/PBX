@@ -2606,6 +2606,16 @@ class SIPServer:
                         cseq_header = message.get_header("CSeq") or ""
                         if "INVITE" in cseq_header:
                             self._send_ack_to_callee(message, addr, call_id, use_invite_branch=True)
+                        # A Find Me/Follow Me destination that is busy, on DND,
+                        # or declines has not ended the call -- there are more
+                        # places to try. FMFM decides for a call it is ringing;
+                        # every other call, and anything it declines to handle,
+                        # falls through to the mailbox below.
+                        if (
+                            "INVITE" in cseq_header
+                            and self.pbx_core.find_me_follow_me.on_leg_failure(call, message)
+                        ):
+                            return
                         if (
                             message.status_code in VOICEMAIL_ON_REJECT_STATUSES
                             and call.caller_addr

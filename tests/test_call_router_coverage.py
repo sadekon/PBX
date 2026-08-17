@@ -152,6 +152,10 @@ def _make_pbx_core(
     # Queue handler: no queues configured, never divert
     pbx.queue_handler.is_queue_destination.return_value = False
 
+    # Find Me/Follow Me: no extension has a plan, so never divert. A MagicMock
+    # would be truthy here and hand every call to FMFM.
+    pbx.find_me_follow_me.plan_for.return_value = None
+
     return pbx
 
 
@@ -813,6 +817,114 @@ class TestRouteCallWebRTC:
 # ===========================================================================
 # CallRouter.route_call - SIP INVITE forwarding
 # ===========================================================================
+
+
+@pytest.mark.unit
+class TestFindMeFollowMeWiring:
+    """
+    The router must actually consult the feature, not merely be able to.
+
+    These drive route_call() with a real FindMeFollowMe rather than the stubbed
+    one the rest of this module uses, so a regression that leaves the feature
+    installed but never called is caught here.
+    """
+
+    @staticmethod
+    def _install_fmfm(pbx: MagicMock, destinations: list[dict[str, Any]]) -> Any:
+        """Give extension 1002 a live FMFM config on this mock PBX."""
+        from pbx.features.find_me_follow_me import FindMeFollowMe
+
+        fmfm = FindMeFollowMe(
+            config={"features": {"find_me_follow_me": {"enabled": True}}},
+            pbx_core=pbx,
+        )
+        fmfm.user_configs["1002"] = {
+            "extension": "1002",
+            "mode": "sequential",
+            "enabled": True,
+            "destinations": destinations,
+        }
+        pbx.find_me_follow_me = fmfm
+        return fmfm
+
+    @staticmethod
+    def _router(pbx: MagicMock) -> CallRouter:
+        """
+        A real router, reachable the way the feature reaches it.
+
+        FMFM dials through `pbx_core.call_router`, so leaving that as the
+        fixture's MagicMock would mean the feature never touches real routing
+        and the test proves nothing.
+        """
+        router = CallRouter(pbx)
+        pbx.call_router = router
+        return router
+
+    def test_call_to_fmfm_extension_rings_the_configured_destination(self) -> None:
+        pbx = _make_pbx_core()
+        self._install_fmfm(pbx, [{"number": "1005", "ring_time": 15}])
+        router = self._router(pbx)
+
+        result = router.route_call(
+            "<sip:1001@pbx.local>",
+            "<sip:1002@pbx.local>",
+            "call-fmfm-1",
+            _make_invite_message(body=""),
+            CALLER_ADDR,
+        )
+
+        assert result is True
+        call = pbx.call_manager.get_call("call-fmfm-1")
+        # The INVITE went to the FMFM destination, not the dialled extension.
+        assert "sip:1005@" in call.callee_invite.uri
+        assert pbx.find_me_follow_me.state_for(call.call_id) is not None
+        call.no_answer_timer.cancel()
+
+    def test_fmfm_extension_is_rung_even_when_unregistered(self) -> None:
+        """The old failure mode: an offline desk phone 404'd instead of following."""
+        pbx = _make_pbx_core()
+        # 1002's desk phone is offline; the mobile it follows to is not.
+        offline = MagicMock()
+        offline.registered = False
+        offline.address = None
+        offline.is_expired.return_value = False
+        reachable = pbx.extension_registry.get.return_value
+        pbx.extension_registry.get.side_effect = lambda ext: offline if ext == "1002" else reachable
+        self._install_fmfm(pbx, [{"number": "1005", "ring_time": 15}])
+        router = self._router(pbx)
+
+        result = router.route_call(
+            "<sip:1001@pbx.local>",
+            "<sip:1002@pbx.local>",
+            "call-fmfm-2",
+            _make_invite_message(body=""),
+            CALLER_ADDR,
+        )
+
+        assert result is True, "an unregistered FMFM extension must not 404"
+        call = pbx.call_manager.get_call("call-fmfm-2")
+        assert "sip:1005@" in call.callee_invite.uri
+        call.no_answer_timer.cancel()
+
+    def test_extension_without_a_config_still_routes_normally(self) -> None:
+        pbx = _make_pbx_core()
+        self._install_fmfm(pbx, [{"number": "1005", "ring_time": 15}])
+        router = self._router(pbx)
+
+        # 1003 has no FMFM config, so it is dialled directly.
+        result = router.route_call(
+            "<sip:1001@pbx.local>",
+            "<sip:1003@pbx.local>",
+            "call-fmfm-3",
+            _make_invite_message(to_ext="1003", body=""),
+            CALLER_ADDR,
+        )
+
+        assert result is True
+        call = pbx.call_manager.get_call("call-fmfm-3")
+        assert "sip:1003@" in call.callee_invite.uri
+        assert pbx.find_me_follow_me.state_for(call.call_id) is None
+        call.no_answer_timer.cancel()
 
 
 @pytest.mark.unit
