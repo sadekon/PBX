@@ -2521,6 +2521,18 @@ class SIPServer:
                     # never completes and keeps retransmitting the 3xx.
                     self._send_ack_to_callee(message, addr, call_id, use_invite_branch=True)
 
+                    # A call ringing through a Find Me/Follow Me list is already
+                    # being steered by that list, and the list is the operator's
+                    # explicit configuration. A destination's own phone-side
+                    # "forward on no answer" must not hijack it: following the
+                    # redirect would replace the destination's configured ring
+                    # time with the default no-answer timeout and silently drop
+                    # every remaining destination. Treat it as this destination
+                    # not taking the call and move to the next one.
+                    call = self.pbx_core.call_manager.get_call(call_id)
+                    if call and self.pbx_core.find_me_follow_me.on_leg_failure(call, message):
+                        return
+
                     contact_header = message.get_header("Contact")
                     self.pbx_core.call_router.handle_redirect(call_id, contact_header)
 
@@ -2590,9 +2602,6 @@ class SIPServer:
                                 "(callee leg cancelled)"
                             )
                             return
-                        # Cancel no-answer timer since the callee already responded
-                        if call.no_answer_timer:
-                            call.no_answer_timer.cancel()
                         # Per RFC 3261 Section 17.1.1.3, ACK the non-2xx final
                         # response (e.g. 487 Request Terminated after our
                         # CANCEL) so the callee's transaction completes
@@ -2605,11 +2614,21 @@ class SIPServer:
                         # places to try. FMFM decides for a call it is ringing;
                         # every other call, and anything it declines to handle,
                         # falls through to the mailbox below.
+                        #
+                        # Must come before the no-answer timer is touched. A leg
+                        # FMFM abandoned answers our CANCEL with a 487 that lands
+                        # *after* the next destination is already ringing, so
+                        # cancelling here would kill the new leg's ring timer and
+                        # leave that destination ringing forever. FMFM cancels
+                        # the timer itself for a leg it really is giving up on.
                         if (
                             "INVITE" in cseq_header
                             and self.pbx_core.find_me_follow_me.on_leg_failure(call, message)
                         ):
                             return
+                        # Cancel no-answer timer since the callee already responded
+                        if call.no_answer_timer:
+                            call.no_answer_timer.cancel()
                         if (
                             message.status_code in VOICEMAIL_ON_REJECT_STATUSES
                             and call.caller_addr

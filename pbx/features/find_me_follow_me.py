@@ -929,12 +929,14 @@ class FindMeFollowMe:
 
     def on_leg_failure(self, call: Any, message: Any) -> bool:
         """
-        A destination answered our INVITE with a 4xx/5xx/6xx. Move to the next
-        destination instead of letting the error reach the caller.
+        A destination answered our INVITE with a final response that is not a
+        200 -- a 4xx/5xx/6xx, or a 3xx redirect from a phone forwarding itself.
+        Move to the next destination instead of letting it reach the caller or
+        take the call over.
 
-        Called by SIPServer for every error response on an INVITE, after it has
-        ACKed it. Calls with no FMFM plan fall straight back to the normal error
-        handling.
+        Called by SIPServer for every such response on an INVITE, after it has
+        ACKed it. Calls with no FMFM plan fall straight back to the normal
+        handling (the error path, or following the redirect).
 
         Args:
             call: The Call the response belongs to.

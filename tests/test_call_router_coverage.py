@@ -913,6 +913,72 @@ class TestFindMeFollowMeWiring:
         assert "sip:1005@" in call.callee_invite.uri
         call.no_answer_timer.cancel()
 
+    def test_stale_487_does_not_kill_the_next_destinations_ring_timer(self) -> None:
+        """
+        The abandoned leg's 487 must not disarm the leg that replaced it.
+
+        Advancing sends a CANCEL, and the destination answers it with a 487
+        that arrives *after* the next destination is already ringing. Cancelling
+        the no-answer timer on that response kills the new leg's ring timer, so
+        the last destination rings forever and the caller never reaches
+        voicemail.
+        """
+        from pbx.sip.server import SIPServer
+
+        sdp = (
+            "v=0\r\no=- 1 1 IN IP4 10.0.0.9\r\ns=-\r\nc=IN IP4 10.0.0.9\r\n"
+            "t=0 0\r\nm=audio 40000 RTP/AVP 0\r\n"
+        )
+        pbx = _make_pbx_core()
+        self._install_fmfm(pbx, [{"number": "1005", "ring_time": 10}])
+        router = self._router(pbx)
+
+        call = pbx.call_manager.create_call.return_value
+        call.call_id = "call-fmfm-487"
+        call.queue_ctx = None
+        call.bridged_peer_call_id = None
+        call.transfer_session_id = None
+        call.routed_to_voicemail = False
+        call.state = None  # not CONNECTED
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_message = MagicMock()
+        server._send_ack_to_callee = MagicMock()
+        pbx.sip_server = server
+
+        assert router.route_call(
+            "<sip:1001@pbx.local>",
+            "<sip:1002@pbx.local>",
+            "call-fmfm-487",
+            _make_invite_message(body=sdp),
+            CALLER_ADDR,
+        )
+        desk_via = call.callee_invite.get_header("Via")
+
+        # Desk rings out; 1005 is now ringing on its own 10s timer.
+        timer = call.no_answer_timer
+        timer.cancel()
+        timer.function()
+        assert "sip:1005@" in call.callee_invite.uri
+        live_timer = call.no_answer_timer
+        assert live_timer.interval == 10
+
+        # Now the desk's 487 lands, carrying the *abandoned* leg's Via branch.
+        stale = MagicMock()
+        stale.status_code = 487
+        stale.method = None
+        stale.is_request.return_value = False
+        stale.get_header.side_effect = {
+            "Call-ID": "call-fmfm-487",
+            "CSeq": "1 INVITE",
+            "Via": desk_via,
+        }.get
+        server._handle_response(stale, ("10.0.0.9", 5060))
+
+        assert call.no_answer_timer is live_timer, "the live leg's timer was replaced"
+        assert not live_timer.finished.is_set(), "1005's ring timer was cancelled by a stale 487"
+        live_timer.cancel()
+
     def test_destination_hangup_tears_down_the_caller(self) -> None:
         """
         The answered destination hangs up and the caller's phone must be told

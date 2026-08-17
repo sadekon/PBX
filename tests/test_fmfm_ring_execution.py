@@ -376,6 +376,21 @@ class TestLegFailures:
         assert h.handler.on_leg_failure(h.call, _make_response(603, h.legs[0]["branch"])) is True
         assert len(h.legs) == 2
 
+    def test_redirect_advances_the_plan_with_the_configured_ring_time(self) -> None:
+        """
+        A destination whose phone forwards itself (3xx) is just a destination
+        not taking the call. Following the redirect instead would re-target
+        with the router's default timeout and abandon the rest of the list.
+        """
+        h = _Harness(_sequential(("1003", 15), ("1004", 10)))
+        h.start()
+
+        handled = h.handler.on_leg_failure(h.call, _make_response(302, h.legs[0]["branch"]))
+
+        assert handled is True
+        assert [leg["number"] for leg in h.legs] == ["1003", "1004"]
+        assert h.legs[1]["ring_timeout"] == 10, "must use the configured ring time, not a default"
+
     def test_late_487_from_an_abandoned_leg_is_swallowed(self) -> None:
         """The CANCEL we sent to move on comes back as a 487; it must not skip a destination."""
         h = _Harness(_sequential(("1003", 15), ("1004", 20), ("1005", 20)))
