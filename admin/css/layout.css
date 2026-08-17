@@ -4,6 +4,9 @@
    ========================================================================== */
 
 /* Header */
+/* No backdrop-filter: the gradient is opaque, so it blurred nothing visible
+   while making the banner re-sample the document on every repaint behind it.
+   See the matching note in admin.css, which is the sheet index.html loads. */
 header {
     background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-light) 100%);
     color: var(--color-text-inverse);
@@ -13,7 +16,6 @@ header {
     position: sticky;
     top: 0;
     z-index: var(--z-header);
-    backdrop-filter: blur(10px);
     animation: slideDown 0.4s ease-out;
 }
 

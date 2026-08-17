@@ -120,6 +120,12 @@ body {
 }
 
 /* Header */
+/* No backdrop-filter here. The gradient above is fully opaque, so blurring
+   what sits behind it was never visible — but it did make the banner a
+   backdrop-filter element whose backdrop root is the document, so it had to
+   re-blur the page underneath it whenever anything there repainted. That is
+   how a repaint storm on one tab's content became a flicker of the blue
+   banner. An opaque bar just repaints; it does not need to resample. */
 header {
     background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-light) 100%);
     color: var(--color-text-inverse);
@@ -129,7 +135,6 @@ header {
     position: sticky;
     top: 0;
     z-index: 100;
-    backdrop-filter: blur(10px);
     animation: slideDown 0.4s ease-out;
 }
 
@@ -183,6 +188,11 @@ header h1 {
     align-items: center;
 }
 
+/* Same reasoning as `header`: every background this badge can wear is opaque,
+   so the blur showed nothing and only added a second backdrop-filter element
+   inside the banner. `transition: all` is narrowed to the two properties the
+   hover actually changes, so hovering the badge cannot animate anything else
+   it happens to inherit. */
 .status-badge {
     padding: 8px 16px;
     border-radius: 20px;
@@ -190,8 +200,7 @@ header h1 {
     font-size: 0.85rem;
     font-weight: 500;
     border: 1px solid var(--color-border);
-    backdrop-filter: blur(10px);
-    transition: all 0.3s ease;
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
     color: var(--color-text);
 }
 

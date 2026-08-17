@@ -62,14 +62,29 @@
 /* Padding and radius are deliberately not set here: the host container already
    has its own (`.tab-content` is 30px), that rule sits later in the cascade at
    equal specificity, and it would win anyway. Spacing belongs to the layout
-   that places the page, not to the material. */
+   that places the page, not to the material.
+
+   NOT `background-attachment: fixed`. It was, and it is what made the whole
+   window flicker. This element lives inside `.main-content`, which is the
+   scroller (`overflow-y: auto`); a viewport-anchored background inside a
+   non-root scroller takes Chrome off the compositor and repaints the scroller
+   from scratch on every scroll frame. Everything with a backdrop-filter then
+   has to re-sample a backdrop that is mid-repaint, and since the backdrop root
+   here is the document, that is every pane on this page *and* the sticky
+   header. The sidebar has its own scroller, hence its own layer, which is why
+   it was the one part of the window that stayed still.
+
+   The glow is pinned to the first viewport-height instead, so it still reads as
+   a light source above the page rather than a wash stretched over the full
+   scroll height. The 22px lattice now scrolls with the content, which at that
+   size is not a difference anyone can see. */
 .glass-page {
     background-color: var(--color-bg);
-    background-attachment: fixed;
     background-image:
         radial-gradient(110% 80% at 12% 0%, rgba(93, 173, 226, 0.18), transparent 60%),
         radial-gradient(rgba(255, 255, 255, 0.10) 1px, transparent 1px);
-    background-size: auto, 22px 22px;
+    background-size: 100% 100vh, 22px 22px;
+    background-repeat: no-repeat, repeat;
 }
 
 /* A solid wrapper between the page and the panes is what they would frost, so
@@ -233,17 +248,26 @@
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
     backdrop-filter: blur(10px) saturate(150%);
     -webkit-backdrop-filter: blur(10px) saturate(150%);
+    /* backdrop-filter is deliberately not in this list. A directory of fifty
+       rows carries two of these buttons per row, and transitioning a
+       backdrop-filter invalidates the backdrop root — the document — for every
+       frame of the 0.16s. Reading down the list with a mouse in it meant
+       re-rendering the page once per row crossed. */
     transition:
         background 0.16s ease,
         border-color 0.16s ease,
         color 0.16s ease,
         box-shadow 0.16s ease,
-        backdrop-filter 0.16s ease,
         transform 0.1s ease;
 }
 
-/* Hover thickens the material: the fill rises, the bevel highlight strengthens
-   as though light were gathering on it, and saturation climbs. Nothing moves. */
+/* Hover thickens the material: the fill rises and the bevel highlight
+   strengthens as though light were gathering on it. Nothing moves.
+
+   The blur itself is held at its resting value rather than climbing with the
+   rest, for the reason given above. The fill and the bevel carry the state
+   change; on a button this small the extra 4px of blur was the least legible
+   part of it and by far the most expensive. */
 .glass-page .btn-ghost:hover {
     background: rgba(255, 255, 255, 0.13);
     border-color: rgba(255, 255, 255, 0.34);
@@ -251,8 +275,6 @@
     box-shadow:
         inset 0 1px 0 rgba(255, 255, 255, 0.34),
         inset 0 -6px 12px -8px rgba(255, 255, 255, 0.16);
-    backdrop-filter: blur(14px) saturate(190%);
-    -webkit-backdrop-filter: blur(14px) saturate(190%);
 }
 
 /* The press inverts the light to come from below and adds an inner shadow at
