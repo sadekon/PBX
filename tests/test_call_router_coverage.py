@@ -860,7 +860,7 @@ class TestFindMeFollowMeWiring:
         pbx.call_router = router
         return router
 
-    def test_call_to_fmfm_extension_rings_the_configured_destination(self) -> None:
+    def test_call_to_fmfm_extension_rings_the_desk_then_the_destination(self) -> None:
         pbx = _make_pbx_core()
         self._install_fmfm(pbx, [{"number": "1005", "ring_time": 15}])
         router = self._router(pbx)
@@ -875,13 +875,20 @@ class TestFindMeFollowMeWiring:
 
         assert result is True
         call = pbx.call_manager.get_call("call-fmfm-1")
-        # The INVITE went to the FMFM destination, not the dialled extension.
-        assert "sip:1005@" in call.callee_invite.uri
-        assert pbx.find_me_follow_me.state_for(call.call_id) is not None
+        state = pbx.find_me_follow_me.state_for(call.call_id)
+        assert state is not None
+        # The desk rings first, then the configured destination.
+        assert [d["destination"] for d in state.destinations] == ["1002", "1005"]
+        assert "sip:1002@" in call.callee_invite.uri
         call.no_answer_timer.cancel()
 
     def test_fmfm_extension_is_rung_even_when_unregistered(self) -> None:
-        """The old failure mode: an offline desk phone 404'd instead of following."""
+        """
+        The old failure mode: an offline desk phone 404'd instead of following.
+
+        The implicit desk stop simply fails to dial and the call moves on, so
+        the caller reaches the mobile rather than an error.
+        """
         pbx = _make_pbx_core()
         # 1002's desk phone is offline; the mobile it follows to is not.
         offline = MagicMock()

@@ -431,6 +431,16 @@ features:
   # Find Me/Follow Me - Ring multiple destinations sequentially or simultaneously
   find_me_follow_me:
     enabled: true                      # Enable Find Me/Follow Me feature
+
+    # How long the dialled extension's own phone rings before the call moves on
+    # to that extension's configured destinations. Callers expect to reach
+    # someone at their desk before the call starts chasing them, so this stop is
+    # implicit -- a config listing only a mobile still rings the desk first.
+    #
+    # 0 sends calls straight into the destination list without ringing the desk.
+    # To control where the extension rings instead (say, second, after the
+    # mobile), list it in its own destination list and this stop is skipped.
+    initial_ring_time: 20
 recording:
   # Recordings are always PCM16 at 8 kHz, one channel per participant -- the two legs can
   # negotiate different codecs, so there is no single wire format to preserve.

@@ -50,7 +50,16 @@ def _make_response(status: int, branch: str) -> MagicMock:
 class _Harness:
     """A handler wired to a mocked PBX, with the dialled legs recorded."""
 
-    def __init__(self, strategy: dict[str, Any]) -> None:
+    def __init__(self, strategy: dict[str, Any], *, initial_ring_time: int | None = 0) -> None:
+        """
+        Args:
+            strategy: The ring strategy `get_ring_strategy` should return.
+            initial_ring_time: Value for
+                `features.find_me_follow_me.initial_ring_time`. Defaults to 0 so
+                the ring-mechanics tests see exactly the destinations they
+                configure; pass None to omit the key and exercise the shipped
+                default instead.
+        """
         pbx = MagicMock()
         pbx.logger = MagicMock()
         pbx.config.get.side_effect = lambda key, default=None: (
@@ -109,8 +118,11 @@ class _Harness:
 
         # The real feature object, with only the config lookup stubbed so each
         # test states its ring plan directly instead of building stored configs.
+        feature_config: dict[str, Any] = {"enabled": True}
+        if initial_ring_time is not None:
+            feature_config["initial_ring_time"] = initial_ring_time
         fmfm = FindMeFollowMe(
-            config={"features": {"find_me_follow_me": {"enabled": True}}},
+            config={"features": {"find_me_follow_me": feature_config}},
             pbx_core=pbx,
         )
         fmfm.get_ring_strategy = MagicMock(return_value=strategy)  # type: ignore[method-assign]
@@ -170,11 +182,48 @@ class TestPlanFor:
         h = _Harness({"strategy": "normal", "destinations": [EXTENSION]})
         assert h.handler.plan_for(EXTENSION, CALLER, CALL_ID) is None
 
-    def test_self_referencing_destination_is_dropped(self) -> None:
-        h = _Harness(_sequential((EXTENSION, 20), ("1003", 20)))
+    def test_extension_rings_first_without_being_configured(self) -> None:
+        """
+        The expectation the feature is named for: reach me at my desk, then
+        chase me. A config of just "my mobile" must still ring the desk.
+        """
+        h = _Harness(_sequential(("1003", 25)), initial_ring_time=None)
+        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
+        assert plan is not None
+        assert [d["destination"] for d in plan.destinations] == [EXTENSION, "1003"]
+        assert plan.destinations[0]["ring_time"] == 20  # initial_ring_time default
+
+    def test_implicit_first_stop_actually_rings_before_the_next_hop(self) -> None:
+        h = _Harness(_sequential(("1003", 25)), initial_ring_time=None)
+        h.start()
+        assert h.legs[0]["number"] == EXTENSION
+        assert h.legs[0]["ring_timeout"] == 20
+        h.ring_out()
+        assert [leg["number"] for leg in h.legs] == [EXTENSION, "1003"]
+
+    def test_explicit_placement_of_the_extension_wins(self) -> None:
+        """Listing it yourself controls where and how long it rings."""
+        h = _Harness(_sequential(("1003", 25), (EXTENSION, 45)), initial_ring_time=None)
+        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
+        assert plan is not None
+        assert [d["destination"] for d in plan.destinations] == ["1003", EXTENSION]
+        assert plan.destinations[1]["ring_time"] == 45
+
+    def test_initial_ring_time_zero_skips_the_desk(self) -> None:
+        h = _Harness(_sequential(("1003", 25)), initial_ring_time=0)
         plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
         assert plan is not None
         assert [d["destination"] for d in plan.destinations] == ["1003"]
+
+    def test_implicit_stop_does_not_push_past_the_cap(self) -> None:
+        h = _Harness(
+            _sequential(*[(f"20{i:02d}", 20) for i in range(MAX_DESTINATIONS)]),
+            initial_ring_time=None,
+        )
+        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
+        assert plan is not None
+        assert len(plan.destinations) == MAX_DESTINATIONS
+        assert plan.destinations[0]["destination"] == EXTENSION
 
     def test_destination_naming_the_caller_is_dropped(self) -> None:
         h = _Harness(_sequential((CALLER, 20), ("1003", 20)))
@@ -184,7 +233,7 @@ class TestPlanFor:
 
     def test_config_of_only_bad_destinations_routes_normally(self) -> None:
         """Degrade to ordinary routing rather than trap the caller."""
-        h = _Harness(_sequential((EXTENSION, 20)))
+        h = _Harness(_sequential((CALLER, 20), ("", 20)))
         assert h.handler.plan_for(EXTENSION, CALLER, CALL_ID) is None
 
     def test_duplicate_destinations_are_collapsed(self) -> None:

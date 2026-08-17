@@ -34,9 +34,22 @@ a ``Call`` whose relay is already allocated, which is what lets FMFM re-target a
 live call without disturbing the caller's side. ``SIPServer`` owns CANCEL.
 Nothing here formats SIP.
 
-Two guards keep a bad config from trapping a caller: a destination equal to the
-dialled extension or to the caller is dropped (it would ring in a loop), and the
-list is capped at ``MAX_DESTINATIONS``.
+The dialled extension's own phone rings first, for
+``features.find_me_follow_me.initial_ring_time`` seconds, before the configured
+destinations -- the way FreePBX Follow-Me's "Initial Ring Time" behaves. Nobody
+lists their own desk in their follow-me list, they expect the call to reach them
+there before it goes chasing, so a config of just "my mobile" reads and behaves
+the same way. Set that to 0 to go straight to the list, or place the extension
+in the list explicitly to control where and how long it rings.
+
+Ringing the extension is an ordinary leg, not a loop: it is INVITEd straight to
+the phone's registered contact and never re-enters ``route_call()``. (The one
+real loop, a registration pointing back at the PBX's own address, is caught in
+``_dial_extension_leg()``.)
+
+Two guards keep a bad config from trapping a caller: a destination naming the
+caller is dropped rather than ringing them back on their own call, and the list
+is capped at ``MAX_DESTINATIONS``.
 
 Sequential mode only
 --------------------
@@ -598,6 +611,22 @@ class FindMeFollowMe:
 
         destinations = self._sanitize(strategy.get("destinations"), extension, from_ext)
 
+        if not destinations:
+            self.logger.warning(
+                f"FMFM config for {extension} has no usable destinations; routing the call normally"
+            )
+            return None
+
+        # Ring the extension's own phone first. Nobody lists their desk in their
+        # own follow-me list -- they expect the call to reach them there before
+        # it goes chasing, so an implicit first stop is what makes a config of
+        # just "my mobile" behave the way it reads. Skipped when the config
+        # already places the extension somewhere itself (that placement wins,
+        # ring time included), and when initial_ring_time is 0.
+        initial_ring = self._initial_ring_time()
+        if initial_ring and not any(d["destination"] == extension for d in destinations):
+            destinations.insert(0, {"destination": extension, "ring_time": initial_ring})
+
         # The no-answer destination is simply the last place to try, so it joins
         # the list instead of needing a branch of its own. It rings for the
         # standard no-answer timeout, since the config carries no ring time for
@@ -614,11 +643,8 @@ class FindMeFollowMe:
                 )
             )
 
-        if not destinations:
-            self.logger.warning(
-                f"FMFM config for {extension} has no usable destinations; routing the call normally"
-            )
-            return None
+        # One implicit stop plus a long list must still not ring forever.
+        del destinations[MAX_DESTINATIONS:]
 
         state = FMFMState(
             extension=extension,
@@ -631,6 +657,34 @@ class FindMeFollowMe:
             f"({', '.join(str(d['destination']) for d in destinations)})"
         )
         return state
+
+    def _initial_ring_time(self) -> int:
+        """
+        How long the dialled extension's own phone rings before the configured
+        destinations, from ``features.find_me_follow_me.initial_ring_time``.
+
+        Mirrors FreePBX Follow-Me's "Initial Ring Time". Set it to 0 to send
+        calls straight into the destination list without ringing the desk
+        first; an out-of-range value is clamped like any other ring time.
+
+        Returns:
+            Seconds to ring the extension, or 0 to skip that stop entirely.
+        """
+        raw = (
+            self.config.get("features", {})
+            .get("find_me_follow_me", {})
+            .get("initial_ring_time", DEFAULT_RING_TIME)
+        )
+        try:
+            seconds = int(raw)
+        except (TypeError, ValueError):
+            self.logger.warning(
+                f"FMFM initial_ring_time is not a number ({raw!r}); using {DEFAULT_RING_TIME}s"
+            )
+            return DEFAULT_RING_TIME
+        if seconds <= 0:
+            return 0
+        return max(MIN_RING_TIME, min(MAX_RING_TIME, seconds))
 
     def _sanitize(
         self,
@@ -646,8 +700,10 @@ class FindMeFollowMe:
 
         Args:
             raw: The `destinations` value from a ring strategy.
-            extension: The dialled extension, excluded to break ring loops.
-            from_ext: The caller, excluded for the same reason.
+            extension: The dialled extension, for logging. Deliberately *not*
+                excluded -- listing it is how a config rings the desk phone
+                before moving on.
+            from_ext: The caller, excluded so a config cannot ring them back.
             exclude: Additional destinations already claimed.
 
         Returns:
@@ -662,11 +718,10 @@ class FindMeFollowMe:
             number = str(entry.get("destination") or "").strip()
             if not number:
                 continue
-            if number in (extension, from_ext):
+            if number == from_ext:
                 self.logger.warning(
-                    f"FMFM destination {number} for extension {extension} points at "
-                    f"{'the extension itself' if number == extension else 'the caller'}; "
-                    "skipping it to avoid a ring loop"
+                    f"FMFM destination {number} for extension {extension} points at the "
+                    "caller; skipping it rather than ringing them back on their own call"
                 )
                 continue
             if number in seen:
