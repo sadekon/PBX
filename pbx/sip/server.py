@@ -1299,6 +1299,8 @@ class SIPServer:
         call: Any,
         invite: Any | None = None,
         addr: AddrTuple | None = None,
+        *,
+        answered_elsewhere: bool = False,
     ) -> None:
         """
         CANCEL the INVITE this call has outstanding toward its callee, so the
@@ -1316,6 +1318,11 @@ class SIPServer:
                 destinations at once (Find Me/Follow Me) passes them explicitly,
                 since only one of its legs can occupy the call's callee slot.
             addr: Where to send the CANCEL. Paired with `invite`.
+            answered_elsewhere: This destination is being cancelled because
+                somebody else took the call, not because it was missed. Adds the
+                RFC 3326 Reason header that tells the phone so; without it a
+                phone that merely stopped ringing logs a missed call, which is
+                wrong for every losing leg of a simultaneous ring.
         """
         if self.pbx_core is None:
             return
@@ -1334,8 +1341,18 @@ class SIPServer:
             cseq=self._parse_cseq_number(invite.get_header("CSeq")),
         )
         cancel.set_header("Via", invite.get_header("Via"))
+        if answered_elsewhere:
+            # RFC 3326. Phones that understand it (Cisco, Polycom, Yealink,
+            # Snom, Grandstream and others) drop the call from their missed
+            # list rather than logging it, which is what "somebody else picked
+            # it up" should look like on a desk that was only ever one of
+            # several ringing.
+            cancel.set_header("Reason", 'SIP;cause=200;text="Call completed elsewhere"')
         self._send_message(cancel.build(), addr)
-        self.logger.info(f"Sent CANCEL to {addr} to stop it ringing (call {call.call_id})")
+        self.logger.info(
+            f"Sent CANCEL to {addr} to stop it ringing (call {call.call_id})"
+            + (" - answered elsewhere" if answered_elsewhere else "")
+        )
 
     def _send_leg_bye(self, call: Any, side: str | None = None) -> None:
         """

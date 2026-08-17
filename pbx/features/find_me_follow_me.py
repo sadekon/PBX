@@ -1028,17 +1028,28 @@ class FindMeFollowMe:
             return None
         return next((leg for leg in state.legs.values() if leg.branch == branch), None)
 
-    def _tear_down_leg(self, call: Any, leg: FMFMLeg) -> None:
+    def _tear_down_leg(self, call: Any, leg: FMFMLeg, *, answered_elsewhere: bool = False) -> None:
         """
         Stop one burst leg: its ring timer, its INVITE retransmissions, a CANCEL
         so the phone stops ringing, and its trunk channel if it held one.
+
+        Args:
+            call: The call the leg belongs to.
+            leg: The leg to stop.
+            answered_elsewhere: True when this leg lost the race rather than
+                being missed, so the phone is told not to log a missed call.
         """
         if leg.timer:
             leg.timer.cancel()
         if leg.transaction:
             leg.transaction.cancel()
         if leg.addr and leg.invite:
-            self.pbx_core.sip_server.cancel_leg(call, invite=leg.invite, addr=leg.addr)
+            self.pbx_core.sip_server.cancel_leg(
+                call,
+                invite=leg.invite,
+                addr=leg.addr,
+                answered_elsewhere=answered_elsewhere,
+            )
         if leg.trunk:
             leg.trunk.release_channel()
             leg.trunk.record_failed_call(reason="no answer")
@@ -1087,12 +1098,14 @@ class FindMeFollowMe:
             winner.timer.cancel()
         call.no_answer_timer = None
 
+        # These destinations did not miss the call, they lost the race for it,
+        # so their phones are told as much and log nothing.
         for leg in losers:
-            self._tear_down_leg(call, leg)
+            self._tear_down_leg(call, leg, answered_elsewhere=True)
 
         self.logger.info(
             f"FMFM {state.extension}: {winner.destination} answered first; "
-            f"cancelled {len(losers)} other ringing destination(s)"
+            f"cancelled {len(losers)} other ringing destination(s) as answered elsewhere"
         )
         return True
 

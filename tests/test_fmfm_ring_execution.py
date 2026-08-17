@@ -475,6 +475,31 @@ class TestSimultaneousRinging:
         }
         assert cancelled == {h.legs[0]["addr"], h.legs[2]["addr"]}
 
+    def test_losing_destinations_are_not_logged_as_missed_calls(self) -> None:
+        """
+        They lost the race, they did not miss the call. Without this the phones
+        that were merely beaten to it all show a missed call.
+        """
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25)))
+        h.start()
+
+        h.handler.on_leg_answered(h.call, _make_response(200, h.legs[1]["branch"]))
+
+        losers = [c for c in h.pbx.sip_server.cancel_leg.call_args_list if c.kwargs]
+        assert losers, "the losing destination was never cancelled"
+        assert all(c.kwargs.get("answered_elsewhere") for c in losers)
+
+    def test_a_destination_that_rang_out_is_still_a_missed_call(self) -> None:
+        """Nobody took that call, so the phone should log it as normal."""
+        h = _Harness(_simultaneous(("1003", 15), ("1004", 25)))
+        h.start()
+
+        h.ring_out(0)
+
+        cancelled = [c for c in h.pbx.sip_server.cancel_leg.call_args_list if c.kwargs]
+        assert cancelled
+        assert not any(c.kwargs.get("answered_elsewhere") for c in cancelled)
+
     def test_a_leg_ringing_out_leaves_the_others_ringing(self) -> None:
         h = _Harness(_simultaneous(("1003", 15), ("1004", 25)))
         h.start()
