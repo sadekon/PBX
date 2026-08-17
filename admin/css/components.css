@@ -276,6 +276,9 @@
 }
 
 /* ---- Status Indicators ---- */
+/* Every background this badge can wear is opaque, so the blur it used to carry
+   showed nothing and only put a second backdrop-filter element inside the
+   banner. See the matching note in admin.css. */
 .status-badge {
     padding: var(--space-sm) var(--space-md);
     border-radius: var(--radius-pill);
@@ -283,8 +286,7 @@
     font-size: var(--font-size-sm);
     font-weight: var(--font-weight-medium);
     border: 1px solid var(--color-border);
-    backdrop-filter: blur(10px);
-    transition: all var(--transition-base);
+    transition: transform var(--transition-base), box-shadow var(--transition-base);
     color: var(--color-text);
 }
 
