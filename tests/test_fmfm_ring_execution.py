@@ -622,6 +622,29 @@ class TestExhaustion:
 
 
 @pytest.mark.unit
+class TestAdminListing:
+    """What the admin page is allowed to see."""
+
+    def test_disabled_configs_are_still_listed(self) -> None:
+        """
+        Hiding them makes them unreachable: the row stays in the database, off
+        the page, with no way to switch it back on.
+        """
+        h = _Harness(_sequential(("1003", 20)))
+        h.handler.user_configs["1001"] = {"extension": "1001", "enabled": True}
+        h.handler.user_configs["1002"] = {"extension": "1002", "enabled": False}
+
+        assert h.handler.list_extensions_with_fmfm() == ["1001", "1002"]
+
+    def test_a_disabled_config_still_does_not_ring(self) -> None:
+        """Listing it must not make it active again."""
+        h = _Harness({"strategy": "normal", "destinations": [EXTENSION]})
+        h.handler.user_configs[EXTENSION] = {"extension": EXTENSION, "enabled": False}
+
+        assert h.handler.plan_for(EXTENSION, CALLER, CALL_ID) is None
+
+
+@pytest.mark.unit
 class TestPlanRegistry:
     """Plans live in the handler, not on the Call."""
 

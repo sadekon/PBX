@@ -602,8 +602,18 @@ class FindMeFollowMe:
         return False
 
     def list_extensions_with_fmfm(self) -> list[str]:
-        """list extensions with FMFM configured"""
-        return [ext for ext, cfg in self.user_configs.items() if cfg.get("enabled", True)]
+        """
+        Every extension that has a configuration, enabled or not.
+
+        Deliberately unfiltered: this backs the admin listing, and hiding a
+        disabled config makes it unreachable -- it stays in the database, off
+        the page, with no way to switch it back on. Whether a config is active
+        is carried on the config itself, which the page renders as a badge.
+
+        Nothing routes off this list; ringing is gated by `plan_for()`, which
+        reads the enabled flag through `get_ring_strategy()` independently.
+        """
+        return sorted(self.user_configs)
 
     def get_statistics(self) -> dict:
         """Get FMFM statistics"""
