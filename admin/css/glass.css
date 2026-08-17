@@ -109,8 +109,15 @@
 /* The rim. A plain `border` cannot hold a gradient, so this is a pseudo
    element filled with one and masked down to a 1px ring. It is what reads as a
    bevelled edge catching light, and it is the reason a flat 1px border looks
-   pasted on next to it. */
-.glass-page .g::before {
+   pasted on next to it.
+
+   Deliberately NOT applied to .g3. A masked pseudo-element costs an offscreen
+   render pass, which is affordable on the five panes that frame the page and
+   ruinous on one-per-person. Rows get a plain inset hairline instead — see
+   the .g3 rule below. */
+.glass-page .g1::before,
+.glass-page .g2::before,
+.glass-page .g4::before {
     content: '';
     position: absolute;
     inset: 0;
@@ -162,21 +169,30 @@
         rgba(255, 255, 255, 0.32));
 }
 
-/* ---- tier 3: content ---- */
-.glass-page .g3 {
-    background: rgba(255, 255, 255, 0.05);
-    backdrop-filter: blur(14px) saturate(160%);
-    -webkit-backdrop-filter: blur(14px) saturate(160%);
-    box-shadow:
-        inset 0 1px 0 0 rgba(255, 255, 255, 0.12),
-        0 3px 12px rgba(0, 0, 0, 0.18);
-}
+/* ---- tier 3: content ----
 
-.glass-page .g3::before {
-    background: linear-gradient(145deg,
-        rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.05) 34%,
-        rgba(255, 255, 255, 0.01) 60%, rgba(255, 255, 255, 0.08) 84%,
-        rgba(255, 255, 255, 0.22));
+   The one tier with no backdrop-filter, because it is the one tier that
+   repeats. A directory of fifty people put fifty of these on screen, each
+   snapshotting and blurring the page behind it, and that — not the chrome —
+   is what made the content area churn.
+
+   It costs less than it sounds. A row is ~60px of a 22px dot lattice; there
+   is almost nothing behind it for a blur to resolve, which is why the frost
+   was doing far less work here than on the big panes above. What actually
+   reads as glass at this size is the translucent fill and the lit top edge,
+   and both are kept. The fill is lifted a little to make up for the dropped
+   saturate.
+
+   The first inset shadow is the rim the masked pseudo-element used to draw.
+   A hairline cannot hold a gradient the way that pseudo could, so it takes
+   the average of it — at 1px, on a row, that difference is not visible, and
+   it is free. */
+.glass-page .g3 {
+    background: rgba(255, 255, 255, 0.06);
+    box-shadow:
+        inset 0 0 0 1px rgba(255, 255, 255, 0.10),
+        inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
+        0 3px 12px rgba(0, 0, 0, 0.18);
 }
 
 /* ---- tier 4: footnote ---- */
@@ -208,18 +224,17 @@
         box-shadow 0.2s ease;
 }
 
+/* .g-hover is only ever on a .g3 row, which no longer has the masked rim
+   pseudo-element, so the gathering light is drawn by brightening the inset
+   hairline instead. Same idea, same 1px, no extra render pass — and because
+   nothing here is a backdrop-filter any more, running the mouse down a long
+   list no longer re-renders the page once per row crossed. */
 .glass-page .g-hover:hover {
-    background: rgba(255, 255, 255, 0.062);
+    background: rgba(255, 255, 255, 0.085);
     box-shadow:
-        inset 0 1px 0 0 rgba(255, 255, 255, 0.18),
+        inset 0 0 0 1px rgba(255, 255, 255, 0.24),
+        inset 0 1px 0 0 rgba(255, 255, 255, 0.30),
         0 4px 14px rgba(0, 0, 0, 0.22);
-}
-
-.glass-page .g-hover:hover::before {
-    background: linear-gradient(145deg,
-        rgba(255, 255, 255, 0.85), rgba(255, 255, 255, 0.22) 30%,
-        rgba(255, 255, 255, 0.06) 58%, rgba(255, 255, 255, 0.26) 84%,
-        rgba(255, 255, 255, 0.60));
 }
 
 /* Nothing in admin.css sets a link colour, so an <a> inside a pane falls back
@@ -246,13 +261,11 @@
     border-color: rgba(255, 255, 255, 0.15);
     background: rgba(255, 255, 255, 0.05);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
-    backdrop-filter: blur(10px) saturate(150%);
-    -webkit-backdrop-filter: blur(10px) saturate(150%);
-    /* backdrop-filter is deliberately not in this list. A directory of fifty
-       rows carries two of these buttons per row, and transitioning a
-       backdrop-filter invalidates the backdrop root — the document — for every
-       frame of the 0.16s. Reading down the list with a mouse in it meant
-       re-rendering the page once per row crossed. */
+    /* No backdrop-filter. There are two of these per row, so they were the
+       single largest population of blurred elements on the page — more than
+       the rows themselves. A button is ~27px tall and sits on a translucent
+       row that is already lifted off the lattice, so its own frost resolved
+       almost nothing; the fill, the bevel and the rim do the work. */
     transition:
         background 0.16s ease,
         border-color 0.16s ease,
@@ -371,13 +384,14 @@
    semantics and changes the material.
    -------------------------------------------------------------------------- */
 
+/* Also unblurred, and for the same reason as the buttons: one per
+   do-not-disturb row, on a surface that is already lifted. A 6px blur behind
+   a 20px pill was never going to resolve anything the eye could name. */
 .glass-page .pill {
     border-radius: 9px;
     padding: 3px 10px;
     border-color: rgba(255, 255, 255, 0.12);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16);
-    backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
 }
 
 .glass-page .pill-warn {
