@@ -1183,33 +1183,27 @@ class SIPServer:
                 self.logger.info(f"  Call State: {call.state}")
                 if hasattr(call, "voicemail_extension"):
                     self.logger.info(f"  Voicemail Extension: {call.voicemail_extension}")
-                # Determine which party sent BYE and forward to the other
-                other_party_addr: AddrTuple | None = None
-
+                # Determine which party sent BYE and end the other one.
+                #
+                # The BYE is re-originated on the surviving party's own dialog
+                # rather than relayed as-is. The PBX is a B2BUA: each side
+                # negotiated its own To/From tags, and on a call that was
+                # re-targeted -- a Find Me/Follow Me destination, a 3xx
+                # forward -- the two sides do not even share a To URI. A
+                # relayed BYE therefore names a dialog the receiving phone
+                # never had, so a strict UA answers 481 and holds its leg open
+                # while the PBX has already torn the call down. Same reason
+                # transfer teardown has always used _send_leg_bye().
                 if call.caller_addr and call.caller_addr == addr:
-                    # Caller sent BYE, forward to callee -- unless the call
-                    # was routed to voicemail, in which case the callee leg
-                    # was already cancelled: the callee has no dialog for
-                    # this Call-ID and would just answer 481.
+                    # Caller hung up, end the callee -- unless the call was
+                    # routed to voicemail, in which case the callee leg was
+                    # already cancelled and has no dialog for this Call-ID.
                     if not call.routed_to_voicemail:
-                        other_party_addr = call.callee_addr
-                        self.logger.debug(
-                            f"BYE from caller, forwarding to callee at {other_party_addr}"
-                        )
+                        self.logger.debug("BYE from caller, ending the callee leg")
+                        self._send_leg_bye(call, side="callee")
                 elif call.callee_addr and call.callee_addr == addr:
-                    # Callee sent BYE, forward to caller
-                    other_party_addr = call.caller_addr
-                    self.logger.debug(
-                        f"BYE from callee, forwarding to caller at {other_party_addr}"
-                    )
-
-                # Forward BYE to the other party if they exist
-                if other_party_addr:
-                    try:
-                        self._send_message(message.build(), other_party_addr)
-                        self.logger.info(f"Forwarded BYE to other party at {other_party_addr}")
-                    except Exception as e:
-                        self.logger.error(f"Failed to forward BYE to other party: {e}")
+                    self.logger.debug("BYE from callee, ending the caller leg")
+                    self._send_leg_bye(call, side="caller")
 
             # End the call internally
             self.logger.info(f"  Processing BYE - ending call {call_id}")

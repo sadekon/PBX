@@ -690,7 +690,7 @@ class TestHandleBye:
     """Tests for _handle_bye()."""
 
     @patch("pbx.sip.server.get_logger")
-    def test_bye_from_caller_forwards_to_callee(self, mock_get_logger: MagicMock) -> None:
+    def test_bye_from_caller_ends_the_callee_leg(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         mock_call = MagicMock()
         mock_call.bridged_peer_call_id = None
@@ -709,12 +709,19 @@ class TestHandleBye:
         msg = _make_request_message("BYE")
         server._handle_bye(msg, ADDR)
 
-        server._send_message.assert_called_once_with(msg.build(), ("10.0.0.2", 5060))
+        # Re-originated on the callee's own dialog, not relayed: each side of a
+        # B2BUA negotiated its own tags, so a relayed BYE names a dialog the
+        # receiving phone never had and gets a 481.
+        server._send_message.assert_called_once()
+        payload, target = server._send_message.call_args.args
+        assert target == ("10.0.0.2", 5060)
+        assert payload.startswith("BYE ")
+        assert payload != msg.build()
         pbx.end_call.assert_called_once_with("test-call-id-123")
         server._send_response.assert_called_once_with(200, "OK", msg, ADDR)
 
     @patch("pbx.sip.server.get_logger")
-    def test_bye_from_callee_forwards_to_caller(self, mock_get_logger: MagicMock) -> None:
+    def test_bye_from_callee_ends_the_caller_leg(self, mock_get_logger: MagicMock) -> None:
         pbx = MagicMock()
         callee_addr = ("10.0.0.2", 5060)
         mock_call = MagicMock()
@@ -733,7 +740,11 @@ class TestHandleBye:
         msg = _make_request_message("BYE")
         server._handle_bye(msg, callee_addr)
 
-        server._send_message.assert_called_once_with(msg.build(), ("10.0.0.1", 5060))
+        server._send_message.assert_called_once()
+        payload, target = server._send_message.call_args.args
+        assert target == ("10.0.0.1", 5060)
+        assert payload.startswith("BYE ")
+        assert payload != msg.build()
 
     @patch("pbx.sip.server.get_logger")
     def test_bye_call_not_found(self, mock_get_logger: MagicMock) -> None:

@@ -913,6 +913,77 @@ class TestFindMeFollowMeWiring:
         assert "sip:1005@" in call.callee_invite.uri
         call.no_answer_timer.cancel()
 
+    def test_destination_hangup_tears_down_the_caller(self) -> None:
+        """
+        The answered destination hangs up and the caller's phone must be told
+        on *its own* dialog.
+
+        Relaying the destination's BYE verbatim names a dialog the caller never
+        had -- on a follow-me call the two sides do not even share a To URI --
+        so the caller answers 481 and sits there with a dead call up.
+        """
+        from pbx.core.call import CallState
+        from pbx.sip.server import SIPServer
+
+        sdp = (
+            "v=0\r\no=- 1 1 IN IP4 10.0.0.9\r\ns=-\r\nc=IN IP4 10.0.0.9\r\n"
+            "t=0 0\r\nm=audio 40000 RTP/AVP 0\r\n"
+        )
+        pbx = _make_pbx_core()
+        self._install_fmfm(pbx, [{"number": "1005", "ring_time": 15}])
+        router = self._router(pbx)
+
+        call = pbx.call_manager.create_call.return_value
+        call.call_id = "call-fmfm-bye"
+        call.pbx_leg_cseq = 1
+        call.state = CallState.RINGING
+        call.caller_dialog_to = None
+        call.webrtc_session_id = None
+        call.queue_ctx = None
+        call.bridged_peer_call_id = None
+        call.transfer_session_id = None
+        call.routed_to_voicemail = False
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_message = MagicMock()
+        pbx.sip_server = server
+
+        assert router.route_call(
+            "<sip:1001@pbx.local>",
+            "<sip:1002@pbx.local>",
+            "call-fmfm-bye",
+            _make_invite_message(body=sdp),
+            CALLER_ADDR,
+        )
+
+        # Desk rings out, the call follows to 1005, and 1005 answers.
+        timer = call.no_answer_timer
+        timer.cancel()
+        timer.function()
+        assert "sip:1005@" in call.callee_invite.uri
+        answer = MagicMock()
+        answer.body = sdp
+        answer.get_header.side_effect = {"To": "<sip:1005@pbx.local>;tag=callee"}.get
+        router.handle_callee_answer("call-fmfm-bye", answer, call.callee_addr)
+        assert isinstance(call.caller_dialog_to, str), "caller's dialog identity not captured"
+
+        # 1005 hangs up.
+        server._send_message.reset_mock()
+        bye = MagicMock()
+        bye.get_header.side_effect = {"Call-ID": "call-fmfm-bye"}.get
+        server._handle_bye(bye, call.callee_addr)
+
+        to_caller = [
+            c.args[0] for c in server._send_message.call_args_list if c.args[1] == CALLER_ADDR
+        ]
+        assert to_caller, "caller was never told the call ended"
+        sent = to_caller[0]
+        assert sent.startswith("BYE sip:1001@")
+        # Built on the caller's dialog, not relayed from the destination's.
+        assert f"From: {call.caller_dialog_to}" in sent
+        assert "To: <sip:1001@pbx.local>;tag=abc123" in sent
+        assert "1005" not in sent.split("\r\n\r\n")[0]
+
     def test_extension_without_a_config_still_routes_normally(self) -> None:
         pbx = _make_pbx_core()
         self._install_fmfm(pbx, [{"number": "1005", "ring_time": 15}])
