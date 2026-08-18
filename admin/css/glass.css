@@ -724,6 +724,24 @@
     max-height: 100vh;
 }
 
+/* A dialog sits denser than a page pane.
+
+   A pane on a page frosts a backdrop the reader is not trying to read; a dialog
+   frosts one they were reading a moment ago, and 20px of blur does not reliably
+   stop a line of text behind it from interfering with the sentence in front.
+   Legibility wins over material here: an opaque base carries the fill and the
+   white film sits on top, so the rim, the inset highlight and the remaining
+   blur still read as glass while nothing shows through the words.
+
+   Scoped to `.modal` so page panes are untouched. */
+.modal .glass-page .g1 {
+    background:
+        linear-gradient(rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.06)),
+        rgba(22, 29, 40, 0.92);
+    backdrop-filter: blur(26px) saturate(180%);
+    -webkit-backdrop-filter: blur(26px) saturate(180%);
+}
+
 .glass-page .dialog-head,
 .glass-page .dialog-foot {
     border-color: rgba(255, 255, 255, 0.08);
@@ -1233,6 +1251,15 @@
     }
 
     /* ---- the dialog ---- */
+
+    /* Denser than a page pane, for the reason given on the dark rule above. */
+    .modal .glass-page .g1 {
+        background:
+            linear-gradient(rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0.55)),
+            rgba(255, 255, 255, 0.88);
+        backdrop-filter: blur(26px) saturate(150%);
+        -webkit-backdrop-filter: blur(26px) saturate(150%);
+    }
 
     .glass-page .dialog-head,
     .glass-page .dialog-foot {
