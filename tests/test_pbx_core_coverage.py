@@ -63,6 +63,7 @@ def _make_pbx_core_shell() -> Any:
     obj.dnd_scheduler = MagicMock()
     obj.qos_monitor = MagicMock()
     obj.phone_book = MagicMock()
+    obj.find_me_follow_me = MagicMock()
 
     # Handlers (public: no facade delegators on PBXCore, callers use these directly)
     obj.call_router = MagicMock()

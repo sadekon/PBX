@@ -152,6 +152,10 @@ def _make_pbx_core(
     # Queue handler: no queues configured, never divert
     pbx.queue_handler.is_queue_destination.return_value = False
 
+    # Find Me/Follow Me: no extension has a plan, so never divert. A MagicMock
+    # would be truthy here and hand every call to FMFM.
+    pbx.find_me_follow_me.plan_for.return_value = None
+
     return pbx
 
 
@@ -813,6 +817,258 @@ class TestRouteCallWebRTC:
 # ===========================================================================
 # CallRouter.route_call - SIP INVITE forwarding
 # ===========================================================================
+
+
+@pytest.mark.unit
+class TestFindMeFollowMeWiring:
+    """
+    The router must actually consult the feature, not merely be able to.
+
+    These drive route_call() with a real FindMeFollowMe rather than the stubbed
+    one the rest of this module uses, so a regression that leaves the feature
+    installed but never called is caught here.
+    """
+
+    @staticmethod
+    def _install_fmfm(pbx: MagicMock, destinations: list[dict[str, Any]]) -> Any:
+        """Give extension 1002 a live FMFM config on this mock PBX."""
+        from pbx.features.find_me_follow_me import FindMeFollowMe
+
+        fmfm = FindMeFollowMe(
+            config={"features": {"find_me_follow_me": {"enabled": True}}},
+            pbx_core=pbx,
+        )
+        fmfm.user_configs["1002"] = {
+            "extension": "1002",
+            "mode": "sequential",
+            "enabled": True,
+            "destinations": destinations,
+        }
+        pbx.find_me_follow_me = fmfm
+        return fmfm
+
+    @staticmethod
+    def _router(pbx: MagicMock) -> CallRouter:
+        """
+        A real router, reachable the way the feature reaches it.
+
+        FMFM dials through `pbx_core.call_router`, so leaving that as the
+        fixture's MagicMock would mean the feature never touches real routing
+        and the test proves nothing.
+        """
+        router = CallRouter(pbx)
+        pbx.call_router = router
+        return router
+
+    def test_call_to_fmfm_extension_rings_the_desk_then_the_destination(self) -> None:
+        pbx = _make_pbx_core()
+        self._install_fmfm(pbx, [{"number": "1005", "ring_time": 15}])
+        router = self._router(pbx)
+
+        result = router.route_call(
+            "<sip:1001@pbx.local>",
+            "<sip:1002@pbx.local>",
+            "call-fmfm-1",
+            _make_invite_message(body=""),
+            CALLER_ADDR,
+        )
+
+        assert result is True
+        call = pbx.call_manager.get_call("call-fmfm-1")
+        state = pbx.find_me_follow_me.state_for(call.call_id)
+        assert state is not None
+        # The desk rings first, then the configured destination.
+        assert [d["destination"] for d in state.destinations] == ["1002", "1005"]
+        assert "sip:1002@" in call.callee_invite.uri
+        call.no_answer_timer.cancel()
+
+    def test_fmfm_extension_is_rung_even_when_unregistered(self) -> None:
+        """
+        The old failure mode: an offline desk phone 404'd instead of following.
+
+        The implicit desk stop simply fails to dial and the call moves on, so
+        the caller reaches the mobile rather than an error.
+        """
+        pbx = _make_pbx_core()
+        # 1002's desk phone is offline; the mobile it follows to is not.
+        offline = MagicMock()
+        offline.registered = False
+        offline.address = None
+        offline.is_expired.return_value = False
+        reachable = pbx.extension_registry.get.return_value
+        pbx.extension_registry.get.side_effect = lambda ext: offline if ext == "1002" else reachable
+        self._install_fmfm(pbx, [{"number": "1005", "ring_time": 15}])
+        router = self._router(pbx)
+
+        result = router.route_call(
+            "<sip:1001@pbx.local>",
+            "<sip:1002@pbx.local>",
+            "call-fmfm-2",
+            _make_invite_message(body=""),
+            CALLER_ADDR,
+        )
+
+        assert result is True, "an unregistered FMFM extension must not 404"
+        call = pbx.call_manager.get_call("call-fmfm-2")
+        assert "sip:1005@" in call.callee_invite.uri
+        call.no_answer_timer.cancel()
+
+    def test_stale_487_does_not_kill_the_next_destinations_ring_timer(self) -> None:
+        """
+        The abandoned leg's 487 must not disarm the leg that replaced it.
+
+        Advancing sends a CANCEL, and the destination answers it with a 487
+        that arrives *after* the next destination is already ringing. Cancelling
+        the no-answer timer on that response kills the new leg's ring timer, so
+        the last destination rings forever and the caller never reaches
+        voicemail.
+        """
+        from pbx.sip.server import SIPServer
+
+        sdp = (
+            "v=0\r\no=- 1 1 IN IP4 10.0.0.9\r\ns=-\r\nc=IN IP4 10.0.0.9\r\n"
+            "t=0 0\r\nm=audio 40000 RTP/AVP 0\r\n"
+        )
+        pbx = _make_pbx_core()
+        self._install_fmfm(pbx, [{"number": "1005", "ring_time": 10}])
+        router = self._router(pbx)
+
+        call = pbx.call_manager.create_call.return_value
+        call.call_id = "call-fmfm-487"
+        call.queue_ctx = None
+        call.bridged_peer_call_id = None
+        call.transfer_session_id = None
+        call.routed_to_voicemail = False
+        call.state = None  # not CONNECTED
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_message = MagicMock()
+        server._send_ack_to_callee = MagicMock()
+        pbx.sip_server = server
+
+        assert router.route_call(
+            "<sip:1001@pbx.local>",
+            "<sip:1002@pbx.local>",
+            "call-fmfm-487",
+            _make_invite_message(body=sdp),
+            CALLER_ADDR,
+        )
+        desk_via = call.callee_invite.get_header("Via")
+
+        # Desk rings out; 1005 is now ringing on its own 10s timer.
+        timer = call.no_answer_timer
+        timer.cancel()
+        timer.function()
+        assert "sip:1005@" in call.callee_invite.uri
+        live_timer = call.no_answer_timer
+        assert live_timer.interval == 10
+
+        # Now the desk's 487 lands, carrying the *abandoned* leg's Via branch.
+        stale = MagicMock()
+        stale.status_code = 487
+        stale.method = None
+        stale.is_request.return_value = False
+        stale.get_header.side_effect = {
+            "Call-ID": "call-fmfm-487",
+            "CSeq": "1 INVITE",
+            "Via": desk_via,
+        }.get
+        server._handle_response(stale, ("10.0.0.9", 5060))
+
+        assert call.no_answer_timer is live_timer, "the live leg's timer was replaced"
+        assert not live_timer.finished.is_set(), "1005's ring timer was cancelled by a stale 487"
+        live_timer.cancel()
+
+    def test_destination_hangup_tears_down_the_caller(self) -> None:
+        """
+        The answered destination hangs up and the caller's phone must be told
+        on *its own* dialog.
+
+        Relaying the destination's BYE verbatim names a dialog the caller never
+        had -- on a follow-me call the two sides do not even share a To URI --
+        so the caller answers 481 and sits there with a dead call up.
+        """
+        from pbx.core.call import CallState
+        from pbx.sip.server import SIPServer
+
+        sdp = (
+            "v=0\r\no=- 1 1 IN IP4 10.0.0.9\r\ns=-\r\nc=IN IP4 10.0.0.9\r\n"
+            "t=0 0\r\nm=audio 40000 RTP/AVP 0\r\n"
+        )
+        pbx = _make_pbx_core()
+        self._install_fmfm(pbx, [{"number": "1005", "ring_time": 15}])
+        router = self._router(pbx)
+
+        call = pbx.call_manager.create_call.return_value
+        call.call_id = "call-fmfm-bye"
+        call.pbx_leg_cseq = 1
+        call.state = CallState.RINGING
+        call.caller_dialog_to = None
+        call.webrtc_session_id = None
+        call.queue_ctx = None
+        call.bridged_peer_call_id = None
+        call.transfer_session_id = None
+        call.routed_to_voicemail = False
+
+        server = SIPServer(pbx_core=pbx)
+        server._send_message = MagicMock()
+        pbx.sip_server = server
+
+        assert router.route_call(
+            "<sip:1001@pbx.local>",
+            "<sip:1002@pbx.local>",
+            "call-fmfm-bye",
+            _make_invite_message(body=sdp),
+            CALLER_ADDR,
+        )
+
+        # Desk rings out, the call follows to 1005, and 1005 answers.
+        timer = call.no_answer_timer
+        timer.cancel()
+        timer.function()
+        assert "sip:1005@" in call.callee_invite.uri
+        answer = MagicMock()
+        answer.body = sdp
+        answer.get_header.side_effect = {"To": "<sip:1005@pbx.local>;tag=callee"}.get
+        router.handle_callee_answer("call-fmfm-bye", answer, call.callee_addr)
+        assert isinstance(call.caller_dialog_to, str), "caller's dialog identity not captured"
+
+        # 1005 hangs up.
+        server._send_message.reset_mock()
+        bye = MagicMock()
+        bye.get_header.side_effect = {"Call-ID": "call-fmfm-bye"}.get
+        server._handle_bye(bye, call.callee_addr)
+
+        to_caller = [
+            c.args[0] for c in server._send_message.call_args_list if c.args[1] == CALLER_ADDR
+        ]
+        assert to_caller, "caller was never told the call ended"
+        sent = to_caller[0]
+        assert sent.startswith("BYE sip:1001@")
+        # Built on the caller's dialog, not relayed from the destination's.
+        assert f"From: {call.caller_dialog_to}" in sent
+        assert "To: <sip:1001@pbx.local>;tag=abc123" in sent
+        assert "1005" not in sent.split("\r\n\r\n")[0]
+
+    def test_extension_without_a_config_still_routes_normally(self) -> None:
+        pbx = _make_pbx_core()
+        self._install_fmfm(pbx, [{"number": "1005", "ring_time": 15}])
+        router = self._router(pbx)
+
+        # 1003 has no FMFM config, so it is dialled directly.
+        result = router.route_call(
+            "<sip:1001@pbx.local>",
+            "<sip:1003@pbx.local>",
+            "call-fmfm-3",
+            _make_invite_message(to_ext="1003", body=""),
+            CALLER_ADDR,
+        )
+
+        assert result is True
+        call = pbx.call_manager.get_call("call-fmfm-3")
+        assert "sip:1003@" in call.callee_invite.uri
+        assert pbx.find_me_follow_me.state_for(call.call_id) is None
+        call.no_answer_timer.cancel()
 
 
 @pytest.mark.unit

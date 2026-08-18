@@ -1,29 +1,224 @@
 """
 Find Me/Follow Me Call Routing
 Ring multiple devices sequentially or simultaneously
+
+Two halves, both owned here so the feature is self-contained:
+
+*Configuration* -- which destinations an extension has, in what order, with what
+ring times, and where to send the call when none of them answer. Stored in
+``fmfm_configs``, edited through ``/api/fmfm/*``, and turned into a ring plan by
+``get_ring_strategy()``.
+
+*Execution* -- the interpreter for that plan, from ``plan_for()`` down. It keeps
+the position in the destination list, arms one timer per destination, and moves
+on for every way a destination can fail to take the call: ring timeout, INVITE
+transaction timeout, 486 Busy, 603 Decline, or a destination that cannot be
+dialled at all. When the list runs out the caller goes to the *original*
+extension's mailbox, not the last destination tried, because every FMFM
+destination is the same person.
+
+Where the ring state lives
+--------------------------
+Here, keyed by Call-ID, for the duration of the ringing phase. A ringing plan is
+this feature's business and nothing else needs to see it, so it is not on
+``Call``. CallRouter and SIPServer hand every candidate event over and let the
+lookup here decide whether there is a plan to apply. Entries are pruned when a
+new plan starts, so a call torn down mid-ring (the caller hangs up) leaves
+nothing behind.
+
+Layering
+--------
+``CallRouter`` owns the leg mechanics this drives: ``_dial_extension_leg()`` for
+an internal destination, ``_dial_trunk_leg()`` for an external one. Both dial on
+a ``Call`` whose relay is already allocated, which is what lets FMFM re-target a
+live call without disturbing the caller's side. ``SIPServer`` owns CANCEL.
+Nothing here formats SIP.
+
+The dialled extension's own phone is added to the list implicitly, in both
+modes -- the way FreePBX Follow-Me's "Initial Ring Time" behaves. Nobody lists
+their own desk in their follow-me list, they expect the call to reach them there
+before it goes chasing, so a config of just "my mobile" reads and behaves the
+same way. Set ``features.find_me_follow_me.initial_ring_time`` to 0 to go
+straight to the list, or place the extension in the list explicitly to control
+where and how long it rings.
+
+How long it rings differs by mode, because the time means different things.
+Sequentially it is additive -- every second delays every destination behind it
+-- so it rings for ``initial_ring_time`` and no longer. In a burst it delays
+nothing and only decides when the desk falls silent, so it rings for at least as
+long as the longest configured destination: a desk that stopped ringing first
+would be quiet while the call was still being chased elsewhere.
+
+Ringing the extension is an ordinary leg, not a loop: it is INVITEd straight to
+the phone's registered contact and never re-enters ``route_call()``. (The one
+real loop, a registration pointing back at the PBX's own address, is caught in
+``_dial_extension_leg()``.)
+
+Two guards keep a bad config from trapping a caller: a destination naming the
+caller is dropped rather than ringing them back on their own call, and the list
+is capped at ``MAX_DESTINATIONS``.
+
+Two modes
+---------
+*Sequential* walks the list, one destination at a time, each for its own ring
+time. The single live leg sits on the ``Call`` itself, exactly like an ordinary
+call.
+
+*Simultaneous* rings every destination at once. ``Call`` has room for one callee
+leg, so a burst cannot live there: each leg is lifted off the call into an
+:class:`FMFMLeg` as it is dialled, and the first one to answer is put back and
+becomes *the* callee while the rest are cancelled. Each leg keeps its own ring
+time, so a destination drops out of the burst when its own time is up and the
+others carry on; the caller reaches voicemail only when the last one gives up.
+From the moment a leg wins, the call is indistinguishable from any other
+single-leg call, so answer handling, hold, transfer and teardown need to know
+nothing about the race.
 """
 
 import json
+import re
+import threading
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from pbx.utils.logger import get_logger
 
+# Top Via branch of a request or response. Multiple Via headers are joined into
+# one comma-separated value by SIPMessage.parse(), and the top Via comes first,
+# so the first match is the branch of the transaction we care about.
+_BRANCH_RE = re.compile(r"branch=(z9hG4bK[^;,\s]+)", re.IGNORECASE)
+
+# Rewrites the user part of a To header, so each leg's To names the destination
+# it is actually being sent to.
+_TO_USER_RE = re.compile(r"sip:(\*?[^@]+)@")
+
+# A config must not be able to keep a caller ringing indefinitely.
+MAX_DESTINATIONS = 10
+
+# Bounds on a per-destination ring time, matching the admin UI's min/max. A
+# stored value outside this range is clamped rather than rejected -- the call
+# still needs somewhere to go.
+#
+# The ceiling is mode-dependent, so see _max_ring_time(): this is the
+# sequential one, where each leg is only a slice of the caller's wait and a
+# long stop merely delays the next. Simultaneous is capped lower, at the
+# voicemail timeout, because there the longest leg *is* the whole wait.
+MIN_RING_TIME = 5
+MAX_RING_TIME = 60
+DEFAULT_RING_TIME = 20
+
+
+def _top_via_branch(via: str | None) -> str | None:
+    """Branch parameter of the topmost Via header, or None if there isn't one."""
+    if not via:
+        return None
+    match = _BRANCH_RE.search(via)
+    return match.group(1) if match else None
+
+
+@dataclass
+class FMFMLeg:
+    """
+    One outbound leg of a simultaneous burst.
+
+    ``Call`` has room for exactly one callee leg, so a burst cannot live there.
+    Each leg's wire state is lifted off the call as soon as it is dialled and
+    held here; whichever leg answers is put back onto the call and becomes *the*
+    callee, and the rest are cancelled. From that moment the call looks exactly
+    like any other single-leg call to the rest of the system.
+    """
+
+    destination: str
+    # Via branch of this leg's INVITE, which is how a response arriving on the
+    # shared Call-ID is matched back to the leg that provoked it.
+    branch: str | None
+    addr: tuple[str, int] | None
+    invite: Any
+    transaction: Any
+    timer: Any
+    # Trunk channel this leg holds, for an external destination. Released when
+    # the leg is torn down, kept by the winner so call teardown releases it.
+    trunk: Any = None
+
+
+@dataclass
+class FMFMState:
+    """
+    Where a call stands in its extension's Find Me/Follow Me destination list.
+
+    Held by :class:`FindMeFollowMe`, keyed by Call-ID, for the life of the
+    ringing phase.
+    """
+
+    # The dialled extension, i.e. whose FMFM config this is and whose mailbox
+    # the call falls back to. Deliberately distinct from the destination
+    # currently ringing.
+    extension: str
+    destinations: list[dict[str, Any]] = field(default_factory=list)
+    # From/To headers of the caller's original INVITE, reused to build each leg.
+    from_header: str = ""
+    to_header: str = ""
+    index: int = 0
+    # Bumped every time something claims the right to move the call on. A timer
+    # or transaction callback captures the value it was armed with and is ignored
+    # once it no longer matches, so a ring timeout and an INVITE timeout racing
+    # on the same leg advance exactly once between them.
+    generation: int = 0
+    # Via branch of the leg currently in flight, used to tell a response for
+    # this leg from a late 487 belonging to one already abandoned.
+    leg_branch: str | None = None
+    # True once ringing has resolved -- answered, or handed to voicemail. No
+    # further advancing, and late responses from abandoned legs are swallowed.
+    finished: bool = False
+    # Ring every destination at once instead of walking the list.
+    simultaneous: bool = False
+    # Legs currently ringing in a simultaneous burst, keyed by destination.
+    # Empty in sequential mode, where the one live leg sits on the Call itself.
+    legs: dict[str, FMFMLeg] = field(default_factory=dict)
+
+    def current(self) -> str:
+        """The destination currently being rung."""
+        return str(self.destinations[self.index]["destination"])
+
 
 class FindMeFollowMe:
     """Find Me/Follow Me call routing system"""
 
-    def __init__(self, config: Any | None = None, database: Any | None = None) -> None:
-        """Initialize Find Me/Follow Me"""
+    def __init__(
+        self,
+        config: Any | None = None,
+        database: Any | None = None,
+        pbx_core: Any | None = None,
+    ) -> None:
+        """
+        Initialize Find Me/Follow Me.
+
+        Args:
+            config: PBX configuration.
+            database: Database backend for persisted configs, if enabled.
+            pbx_core: The PBXCore instance, needed to actually ring anything.
+                Without it this is a config store only -- every call still gets
+                planned and stored, but `plan_for()` declines to take calls, so
+                a partially constructed PBX routes normally instead of failing.
+        """
         self.logger = get_logger()
         self.config = config or {}
         self.database = database
+        self.pbx_core = pbx_core
         self.enabled = (
             self.config.get("features", {}).get("find_me_follow_me", {}).get("enabled", False)
         )
 
         # User configurations
         self.user_configs = {}  # extension -> FMFM config
+
+        # Call-ID -> plan, for calls currently ringing through their FMFM list.
+        self._plans: dict[str, FMFMState] = {}
+        # Guards _plans and every decision to move a call on. Held only long
+        # enough to decide, never across dialling -- the same discipline
+        # QueueCallHandler uses for its offer claims.
+        self._lock = threading.Lock()
 
         # Initialize database schema if database is available
         if self.database and self.database.enabled:
@@ -45,6 +240,9 @@ class FindMeFollowMe:
             mode VARCHAR(20) NOT NULL CHECK (mode IN ('sequential', 'simultaneous')),
             enabled BOOLEAN DEFAULT TRUE,
             destinations TEXT NOT NULL,
+            -- Legacy, no longer read or written. An exhausted list always goes
+            -- to the dialled extension's own mailbox, so there is nothing for a
+            -- separate no-answer destination to do. Kept so existing rows load.
             no_answer_destination VARCHAR(50),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -82,13 +280,13 @@ class FindMeFollowMe:
             cursor = self.database.connection.cursor()
             try:
                 cursor.execute("""
-                    SELECT extension, mode, enabled, destinations, no_answer_destination, updated_at
+                    SELECT extension, mode, enabled, destinations, updated_at
                     FROM fmfm_configs
                 """)
 
                 rows = cursor.fetchall()
                 for row in rows:
-                    extension, mode, enabled, destinations_json, no_answer, updated_at = row
+                    extension, mode, enabled, destinations_json, updated_at = row
 
                     # Parse destinations from JSON
                     try:
@@ -106,9 +304,6 @@ class FindMeFollowMe:
                         "destinations": destinations,
                         "updated_at": updated_at,
                     }
-
-                    if no_answer:
-                        config["no_answer_destination"] = no_answer
 
                     self.user_configs[extension] = config
 
@@ -139,26 +334,33 @@ class FindMeFollowMe:
             # Convert destinations to JSON
             destinations_json = json.dumps(config.get("destinations", []))
 
-            # Upsert (insert or update)
+            # Upsert (insert or update). RETURNING hands back the timestamp the
+            # database just generated, which is then mirrored into the
+            # in-memory config below -- without it, a config written since the
+            # last restart has no updated_at until the process reloads from the
+            # database, and the admin page shows "N/A" for it.
             cursor.execute(
                 """
-                INSERT INTO fmfm_configs (extension, mode, enabled, destinations, no_answer_destination, updated_at)
-                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                INSERT INTO fmfm_configs (extension, mode, enabled, destinations, updated_at)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
                 ON CONFLICT (extension) DO UPDATE SET
                     mode = EXCLUDED.mode,
                     enabled = EXCLUDED.enabled,
                     destinations = EXCLUDED.destinations,
-                    no_answer_destination = EXCLUDED.no_answer_destination,
                     updated_at = CURRENT_TIMESTAMP
+                RETURNING updated_at
             """,
                 (
                     extension,
                     config.get("mode", "sequential"),
                     config.get("enabled", True),
                     destinations_json,
-                    config.get("no_answer_destination"),
                 ),
             )
+
+            row = cursor.fetchone()
+            if row:
+                config["updated_at"] = row[0]
 
             self.database.connection.commit()
             cursor.close()
@@ -193,7 +395,13 @@ class FindMeFollowMe:
             config: FMFM configuration
                 Required: mode ('sequential' or 'simultaneous')
                 Required: destinations (list of numbers with ring_time)
-                Optional: enabled, no_answer_destination
+                Optional: enabled
+
+                A `no_answer_destination` is accepted but dropped: an exhausted
+                destination list always reaches the dialled extension's own
+                mailbox, so there is nothing left for one to do. Ignored rather
+                than rejected so an old client or a stored row does not start
+                failing.
 
         Returns:
             True if successful
@@ -213,9 +421,12 @@ class FindMeFollowMe:
             self.logger.error(f"Invalid FMFM mode: {config['mode']}")
             return False
 
-        self.user_configs[extension] = {**config, "extension": extension}
+        stored = {**config, "extension": extension}
+        stored.pop("no_answer_destination", None)
+        self.user_configs[extension] = stored
 
-        # Add timestamp only if no database (otherwise database generates it)
+        # With a database, _save_to_database() mirrors back the timestamp the
+        # database itself generated, so the value here always matches the row.
         if not (self.database and self.database.enabled):
             self.user_configs[extension]["updated_at"] = datetime.now(UTC)
 
@@ -272,7 +483,6 @@ class FindMeFollowMe:
             return {
                 "strategy": "sequential",
                 "destinations": ring_plan,
-                "no_answer_destination": config.get("no_answer_destination"),
                 "call_id": call_id,
             }
 
@@ -289,7 +499,6 @@ class FindMeFollowMe:
                 "strategy": "simultaneous",
                 "destinations": ring_plan,
                 "max_ring_time": max_ring_time,
-                "no_answer_destination": config.get("no_answer_destination"),
                 "call_id": call_id,
             }
 
@@ -405,8 +614,18 @@ class FindMeFollowMe:
         return False
 
     def list_extensions_with_fmfm(self) -> list[str]:
-        """list extensions with FMFM configured"""
-        return [ext for ext, cfg in self.user_configs.items() if cfg.get("enabled", True)]
+        """
+        Every extension that has a configuration, enabled or not.
+
+        Deliberately unfiltered: this backs the admin listing, and hiding a
+        disabled config makes it unreachable -- it stays in the database, off
+        the page, with no way to switch it back on. Whether a config is active
+        is carried on the config itself, which the page renders as a badge.
+
+        Nothing routes off this list; ringing is gated by `plan_for()`, which
+        reads the enabled flag through `get_ring_strategy()` independently.
+        """
+        return sorted(self.user_configs)
 
     def get_statistics(self) -> dict:
         """Get FMFM statistics"""
@@ -426,4 +645,822 @@ class FindMeFollowMe:
             "total_configs": len(self.user_configs),
             "sequential_configs": sequential_count,
             "simultaneous_configs": simultaneous_count,
+            # The admin UI draws the ring plan a config will actually produce,
+            # which includes the implicit desk leg -- so it needs the same
+            # number plan_for() uses, already clamped. Without it the UI would
+            # have to assume DEFAULT_RING_TIME and would silently misreport
+            # every plan on a deployment that tuned this.
+            "initial_ring_time": self._initial_ring_time(),
+            # The editor refuses to save a ring time outside these, so they
+            # have to be the real ones. The simultaneous ceiling is derived
+            # from voicemail.no_answer_timeout, which the UI cannot see.
+            "min_ring_time": MIN_RING_TIME,
+            "max_ring_time_sequential": self._max_ring_time("sequential"),
+            "max_ring_time_simultaneous": self._max_ring_time("simultaneous"),
+            "max_destinations": MAX_DESTINATIONS,
         }
+
+    # ==================================================================
+    # Execution: turning a stored config into destinations that ring
+    # ==================================================================
+
+    def plan_for(self, extension: str, from_ext: str, call_id: str) -> FMFMState | None:
+        """
+        Build the ring plan for a call to `extension`, or None if Find
+        Me/Follow Me should not take this call.
+
+        Returning None is the "route normally" signal -- the feature being
+        disabled, no PBX to ring with, the extension having no enabled config,
+        and a config whose destinations are all unusable all reach it, so a
+        broken config degrades to ordinary single-extension routing rather than
+        trapping the caller.
+
+        Args:
+            extension: The dialled extension, whose config is consulted.
+            from_ext: The caller, excluded from the destination list so a
+                config naming the caller cannot ring them back.
+            call_id: SIP Call-ID.
+
+        Returns:
+            An FMFMState positioned at the first destination, or None.
+        """
+        if not self.enabled or self.pbx_core is None:
+            return None
+
+        strategy = self.get_ring_strategy(extension, call_id)
+        mode = strategy.get("strategy")
+        if mode not in ("sequential", "simultaneous"):
+            # "normal" -- no config, or the config is disabled.
+            return None
+
+        max_ring = self._max_ring_time(mode)
+        destinations = self._sanitize(
+            strategy.get("destinations"), extension, from_ext, max_ring=max_ring
+        )
+
+        if not destinations:
+            self.logger.warning(
+                f"FMFM config for {extension} has no usable destinations; routing the call normally"
+            )
+            return None
+
+        # Ring the extension's own phone first. Nobody lists their desk in their
+        # own follow-me list -- they expect the call to reach them there before
+        # it goes chasing, so an implicit first stop is what makes a config of
+        # just "my mobile" behave the way it reads. Skipped when the config
+        # already places the extension somewhere itself (that placement wins,
+        # ring time included), and when initial_ring_time is 0.
+        initial_ring = self._initial_ring_time(max_ring)
+        if initial_ring and not any(d["destination"] == extension for d in destinations):
+            if mode == "simultaneous":
+                # Everything rings together here, so the desk's own time no
+                # longer delays anything -- it only decides when the desk falls
+                # silent. Ringing it for less than the longest destination would
+                # leave the desk quiet while the call is still being chased
+                # elsewhere, so it rings for at least as long as anything else.
+                initial_ring = max(initial_ring, *(int(d["ring_time"]) for d in destinations))
+            destinations.insert(0, {"destination": extension, "ring_time": initial_ring})
+
+        # One implicit stop plus a long list must still not ring forever.
+        del destinations[MAX_DESTINATIONS:]
+
+        state = FMFMState(
+            extension=extension,
+            destinations=destinations,
+            simultaneous=(mode == "simultaneous"),
+        )
+        self.logger.info(
+            f"FMFM plan for {extension}: {mode} mode, "
+            f"{len(destinations)} destination(s) "
+            f"({', '.join(str(d['destination']) for d in destinations)})"
+        )
+        return state
+
+    def _max_ring_time(self, mode: str) -> int:
+        """
+        The longest a single destination may ring in `mode`.
+
+        The two modes spend the caller's patience differently, so one ceiling
+        cannot suit both. In sequential mode a destination's ring time is a
+        slice of the total: a long stop delays the ones behind it but the
+        caller is still making progress through the list, so the ceiling is
+        just a sanity bound. In simultaneous mode every leg starts at zero and
+        the longest one *is* the caller's entire wait, which makes it exactly
+        the thing ``voicemail.no_answer_timeout`` already governs for an
+        ordinary call -- so that is the ceiling, and a burst can never leave a
+        caller ringing longer than dialling the extension without FMFM would.
+
+        Args:
+            mode: "sequential" or "simultaneous".
+
+        Returns:
+            Seconds, never below MIN_RING_TIME.
+        """
+        if mode != "simultaneous":
+            return MAX_RING_TIME
+        if self.pbx_core is None:
+            return MAX_RING_TIME
+        try:
+            timeout = int(self.pbx_core.config.get("voicemail.no_answer_timeout", 30))
+        except (TypeError, ValueError):
+            timeout = 30
+        # A deployment that sets a very long voicemail timeout still does not
+        # get to exceed the absolute ceiling, and one that sets a very short
+        # one must still leave room for a ring time to exist at all.
+        return max(MIN_RING_TIME, min(MAX_RING_TIME, timeout))
+
+    def _initial_ring_time(self, max_ring: int = MAX_RING_TIME) -> int:
+        """
+        How long the dialled extension's own phone rings before the configured
+        destinations, from ``features.find_me_follow_me.initial_ring_time``.
+
+        Mirrors FreePBX Follow-Me's "Initial Ring Time". Set it to 0 to send
+        calls straight into the destination list without ringing the desk
+        first; an out-of-range value is clamped like any other ring time.
+
+        Returns:
+            Seconds to ring the extension, or 0 to skip that stop entirely.
+        """
+        raw = (
+            self.config.get("features", {})
+            .get("find_me_follow_me", {})
+            .get("initial_ring_time", DEFAULT_RING_TIME)
+        )
+        try:
+            seconds = int(raw)
+        except (TypeError, ValueError):
+            self.logger.warning(
+                f"FMFM initial_ring_time is not a number ({raw!r}); using {DEFAULT_RING_TIME}s"
+            )
+            return DEFAULT_RING_TIME
+        if seconds <= 0:
+            return 0
+        return max(MIN_RING_TIME, min(max_ring, seconds))
+
+    def _sanitize(
+        self,
+        raw: Any,
+        extension: str,
+        from_ext: str,
+        exclude: set[str] | None = None,
+        max_ring: int = MAX_RING_TIME,
+    ) -> list[dict[str, Any]]:
+        """
+        Turn a ring strategy's destination list into one that is safe to dial:
+        well-formed entries only, no self-reference, no duplicates, ring times
+        clamped, and no more than MAX_DESTINATIONS of them.
+
+        Args:
+            raw: The `destinations` value from a ring strategy.
+            extension: The dialled extension, for logging. Deliberately *not*
+                excluded -- listing it is how a config rings the desk phone
+                before moving on.
+            from_ext: The caller, excluded so a config cannot ring them back.
+            exclude: Additional destinations already claimed.
+            max_ring: Ceiling for a ring time, from _max_ring_time().
+
+        Returns:
+            Cleaned destination dicts, each with `destination` and `ring_time`.
+        """
+        seen: set[str] = set(exclude or ())
+        cleaned: list[dict[str, Any]] = []
+
+        for entry in raw or []:
+            if not isinstance(entry, dict):
+                continue
+            number = str(entry.get("destination") or "").strip()
+            if not number:
+                continue
+            if number == from_ext:
+                self.logger.warning(
+                    f"FMFM destination {number} for extension {extension} points at the "
+                    "caller; skipping it rather than ringing them back on their own call"
+                )
+                continue
+            if number in seen:
+                continue
+            seen.add(number)
+
+            try:
+                ring_time = int(entry.get("ring_time") or DEFAULT_RING_TIME)
+            except (TypeError, ValueError):
+                ring_time = DEFAULT_RING_TIME
+            ring_time = max(MIN_RING_TIME, min(max_ring, ring_time))
+
+            cleaned.append({"destination": number, "ring_time": ring_time})
+            if len(cleaned) >= MAX_DESTINATIONS:
+                self.logger.warning(
+                    f"FMFM config for {extension} exceeds {MAX_DESTINATIONS} "
+                    "destinations; the rest are ignored"
+                )
+                break
+
+        return cleaned
+
+    # ------------------------------------------------------------------
+    # Plan registry
+    # ------------------------------------------------------------------
+
+    def state_for(self, call_id: str) -> FMFMState | None:
+        """The plan ringing on `call_id`, or None if it has no plan."""
+        with self._lock:
+            return self._plans.get(call_id)
+
+    def _prune_locked(self) -> None:
+        """
+        Drop plans whose call is gone.
+
+        Caller must hold the lock. A call torn down while still ringing -- the
+        caller hung up -- never resolves its plan, so this is what keeps the
+        registry from growing for the life of the process.
+        """
+        active = self.pbx_core.call_manager.active_calls
+        for call_id in [cid for cid in self._plans if cid not in active]:
+            del self._plans[call_id]
+
+    def _claim(self, call_id: str, expected_generation: int | None = None) -> FMFMState | None:
+        """
+        Claim the right to move `call_id` on to its next destination.
+
+        Bumping the generation under the lock is what makes the claim
+        exclusive: whichever of a ring timeout, an INVITE timeout and an error
+        response gets here first invalidates the others.
+
+        Args:
+            call_id: Call identifier.
+            expected_generation: The generation the caller was armed with, or
+                None for a caller that has already established it is looking at
+                the current leg.
+
+        Returns:
+            The plan, with its generation advanced, or None if the call has no
+            plan, has already resolved, or has already moved on.
+        """
+        with self._lock:
+            state = self._plans.get(call_id)
+            if state is None or state.finished:
+                return None
+            if expected_generation is not None and expected_generation != state.generation:
+                return None
+            state.generation += 1
+            return state
+
+    # ------------------------------------------------------------------
+    # Ringing
+    # ------------------------------------------------------------------
+
+    def begin(self, call: Any, state: FMFMState, from_header: str, to_header: str) -> bool:
+        """
+        Start ringing `state`'s destinations on `call`, which must already have
+        its RTP relay allocated and its caller side recorded.
+
+        Args:
+            call: The Call being routed, freshly set up by CallRouter.
+            state: The plan from `plan_for()`.
+            from_header: Raw From header of the caller's original INVITE.
+            to_header: Raw To header of the caller's original INVITE.
+
+        Returns:
+            True if the call has been taken care of -- a leg is ringing, or
+            nobody was reachable and the caller has been handed to voicemail.
+            False only if the call could not be progressed at all, in which case
+            the caller tears it down.
+        """
+        state.from_header = from_header
+        state.to_header = to_header
+        state.generation = 1
+
+        with self._lock:
+            self._prune_locked()
+            self._plans[call.call_id] = state
+
+        started = (
+            self._dial_burst(call, state)
+            if state.simultaneous
+            else self._dial_from_index(call, state, state.generation)
+        )
+        if started:
+            return True
+
+        # Every destination refused to dial on the first attempt (all offline,
+        # no trunk route). The extension is unreachable, which is a voicemail
+        # answer, not a 404 -- and voicemail is exactly what the caller would
+        # have got had the desk phone simply not picked up.
+        self.logger.info(
+            f"FMFM for {state.extension}: no destination could be dialled; "
+            "sending the caller to voicemail"
+        )
+        self._to_voicemail(call, state)
+        return True
+
+    def _dial_from_index(self, call: Any, state: FMFMState, generation: int) -> bool:
+        """
+        Dial destinations from the current index onward, skipping any that
+        cannot be reached, until one leg is in flight.
+
+        Returns:
+            True if a leg is ringing. False if the list ran out.
+        """
+        while state.index < len(state.destinations):
+            if self._dial_one(call, state, generation):
+                return True
+            state.index += 1
+        return False
+
+    def _dial_one(self, call: Any, state: FMFMState, generation: int) -> bool:
+        """
+        Dial the destination at the current index and arm its ring timer.
+
+        Args:
+            call: The Call being rung.
+            state: The plan.
+            generation: Claim generation this leg belongs to; its timers carry
+                it so a stale expiry can be recognised and dropped.
+
+        Returns:
+            True if the INVITE went out.
+        """
+        entry = state.destinations[state.index]
+        number = str(entry["destination"])
+        ring_time = int(entry["ring_time"])
+        call_id = call.call_id
+
+        def _gave_up() -> None:
+            self._on_leg_gave_up(call_id, generation)
+
+        self.logger.info(
+            f"FMFM {state.extension}: ringing destination "
+            f"{state.index + 1}/{len(state.destinations)} ({number}) for {ring_time}s"
+        )
+
+        dialled = self.pbx_core.call_router.dial_destination(
+            call,
+            call_id,
+            number,
+            from_header=state.from_header,
+            to_header=state.to_header,
+            ring_timeout=ring_time,
+            on_no_answer=_gave_up,
+        )
+
+        if not dialled:
+            self.logger.info(
+                f"FMFM {state.extension}: destination {number} could not be dialled, skipping"
+            )
+            return False
+
+        state.leg_branch = _top_via_branch(
+            call.callee_invite.get_header("Via") if call.callee_invite else None
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # Simultaneous mode: a burst of legs racing to answer
+    # ------------------------------------------------------------------
+
+    def _dial_burst(self, call: Any, state: FMFMState) -> bool:
+        """
+        Ring every destination at once, each on its own ring time.
+
+        A destination that cannot be dialled is simply left out of the burst --
+        the others still ring, which is the whole point of the mode.
+
+        Returns:
+            True if at least one leg is ringing.
+        """
+        self.logger.info(
+            f"FMFM {state.extension}: ringing {len(state.destinations)} destinations "
+            f"simultaneously ({', '.join(str(d['destination']) for d in state.destinations)})"
+        )
+
+        for entry in state.destinations:
+            number = str(entry["destination"])
+            ring_time = int(entry["ring_time"])
+
+            def _gave_up(dest: str = number) -> None:
+                self._on_burst_leg_gave_up(call.call_id, dest)
+
+            dialled = self.pbx_core.call_router.dial_destination(
+                call,
+                call.call_id,
+                number,
+                from_header=state.from_header,
+                to_header=state.to_header,
+                ring_timeout=ring_time,
+                on_no_answer=_gave_up,
+            )
+            if not dialled:
+                self.logger.info(
+                    f"FMFM {state.extension}: destination {number} could not be dialled, "
+                    "leaving it out of the burst"
+                )
+                continue
+
+            leg = self._capture_leg(call, number)
+            state.legs[number] = leg
+            self.logger.info(
+                f"FMFM {state.extension}: {number} ringing for {ring_time}s (burst leg)"
+            )
+
+        return bool(state.legs)
+
+    def _capture_leg(self, call: Any, destination: str) -> FMFMLeg:
+        """
+        Lift the leg just dialled off the call and hold it as a burst leg.
+
+        ``dial_destination()`` leaves its leg in the Call's single callee slot,
+        which the next leg of the burst would overwrite -- losing the address to
+        CANCEL, and the transaction that is still retransmitting. Moving it here
+        keeps every leg individually addressable and leaves the slot free for
+        whichever one eventually answers.
+        """
+        leg = FMFMLeg(
+            destination=destination,
+            branch=_top_via_branch(
+                call.callee_invite.get_header("Via") if call.callee_invite else None
+            ),
+            addr=call.callee_addr,
+            invite=call.callee_invite,
+            transaction=call.invite_transaction,
+            timer=call.no_answer_timer,
+            trunk=getattr(call, "trunk", None),
+        )
+        call.callee_addr = None
+        call.callee_invite = None
+        call.invite_transaction = None
+        call.no_answer_timer = None
+        call.trunk = None
+        return leg
+
+    def _leg_for_branch(self, state: FMFMState, branch: str | None) -> FMFMLeg | None:
+        """The burst leg a response belongs to, matched on its Via branch."""
+        if branch is None:
+            return None
+        return next((leg for leg in state.legs.values() if leg.branch == branch), None)
+
+    def _tear_down_leg(self, call: Any, leg: FMFMLeg, *, answered_elsewhere: bool = False) -> None:
+        """
+        Stop one burst leg: its ring timer, its INVITE retransmissions, a CANCEL
+        so the phone stops ringing, and its trunk channel if it held one.
+
+        Args:
+            call: The call the leg belongs to.
+            leg: The leg to stop.
+            answered_elsewhere: True when this leg lost the race rather than
+                being missed, so the phone is told not to log a missed call.
+        """
+        if leg.timer:
+            leg.timer.cancel()
+        if leg.transaction:
+            leg.transaction.cancel()
+        if leg.addr and leg.invite:
+            self.pbx_core.sip_server.cancel_leg(
+                call,
+                invite=leg.invite,
+                addr=leg.addr,
+                answered_elsewhere=answered_elsewhere,
+            )
+        if leg.trunk:
+            leg.trunk.release_channel()
+            leg.trunk.record_failed_call(reason="no answer")
+            leg.trunk = None
+
+    def on_leg_answered(self, call: Any, message: Any) -> bool:
+        """
+        One leg of a burst picked up: it becomes the call's callee and every
+        other leg is cancelled.
+
+        Called by SIPServer before it ACKs a 200 OK, because the ACK is built
+        from the winning leg's INVITE -- which is only on the call once this has
+        promoted it.
+
+        Args:
+            call: The Call the 200 OK belongs to.
+            message: The 200 OK.
+
+        Returns:
+            True if a burst leg won and the call is now pointed at it. False for
+            any call this feature is not racing legs on, which is every call in
+            sequential mode too -- there the single leg already sits on the call.
+        """
+        branch = _top_via_branch(message.get_header("Via"))
+
+        with self._lock:
+            state = self._plans.get(call.call_id)
+            if state is None or not state.simultaneous or state.finished:
+                return False
+            winner = self._leg_for_branch(state, branch)
+            if winner is None:
+                return False
+            state.finished = True
+            losers = [leg for leg in state.legs.values() if leg is not winner]
+            state.legs = {winner.destination: winner}
+
+        # The winner becomes the one callee leg the rest of the system knows how
+        # to talk to: answer handling, hold, DTMF, transfer and teardown all
+        # read these and none of them need to know a race happened.
+        call.callee_addr = winner.addr
+        call.callee_invite = winner.invite
+        call.invite_transaction = winner.transaction
+        if winner.trunk:
+            call.trunk = winner.trunk
+        if winner.timer:
+            winner.timer.cancel()
+        call.no_answer_timer = None
+
+        # These destinations did not miss the call, they lost the race for it,
+        # so their phones are told as much and log nothing.
+        for leg in losers:
+            self._tear_down_leg(call, leg, answered_elsewhere=True)
+
+        self.logger.info(
+            f"FMFM {state.extension}: {winner.destination} answered first; "
+            f"cancelled {len(losers)} other ringing destination(s) as answered elsewhere"
+        )
+        return True
+
+    def _burst_leg_failed(self, call: Any, message: Any, branch: str | None) -> bool:
+        """
+        A destination in a burst refused the call -- busy, DND, declined, or its
+        phone forwarding itself. Drop that leg only; the rest keep ringing.
+
+        Returns:
+            True if this response belonged to a burst leg and has been dealt
+            with, so nothing of it should reach the caller.
+        """
+        with self._lock:
+            state = self._plans.get(call.call_id)
+            if state is None or not state.simultaneous or state.finished:
+                return False
+            leg = self._leg_for_branch(state, branch)
+            if leg is None:
+                # A burst is in flight but this is not one of its live legs --
+                # typically a leg already cancelled answering with 487. Swallow
+                # it either way: nothing about a losing leg concerns the caller.
+                return True
+            del state.legs[leg.destination]
+            exhausted = not state.legs
+            if exhausted:
+                state.finished = True
+
+        self._tear_down_leg(call, leg)
+        self.logger.info(
+            f"FMFM {state.extension}: {leg.destination} returned {message.status_code}"
+            + ("" if exhausted else f"; {len(state.legs)} still ringing")
+        )
+        if exhausted:
+            self.logger.info(
+                f"FMFM {state.extension}: every destination refused; no destinations left"
+            )
+            self._start_voicemail_timer(call)
+        return True
+
+    def _on_burst_leg_gave_up(self, call_id: str, destination: str) -> None:
+        """
+        One destination in a burst rang out. Drop just that leg; the others keep
+        ringing. Voicemail only once the last of them gives up.
+        """
+        with self._lock:
+            state = self._plans.get(call_id)
+            if state is None or state.finished:
+                return
+            leg = state.legs.pop(destination, None)
+            if leg is None:
+                return
+            exhausted = not state.legs
+            if exhausted:
+                state.finished = True
+
+        call = self.pbx_core.call_manager.get_call(call_id)
+        if call is None:
+            return
+
+        self._tear_down_leg(call, leg)
+        self.logger.info(
+            f"FMFM {state.extension}: {destination} gave up (no answer)"
+            + ("" if exhausted else f"; {len(state.legs)} still ringing")
+        )
+        if exhausted:
+            self.logger.info(
+                f"FMFM {state.extension}: every destination gave up; no destinations left"
+            )
+            self._start_voicemail_timer(call)
+
+    def on_call_ended(self, call: Any) -> None:
+        """
+        The call is being torn down -- most often the caller hung up mid-ring.
+
+        A burst's legs are not on the Call, so the ordinary teardown cannot see
+        them and every destination would go on ringing with nothing behind it.
+        Cancel them all here. A no-op for a call with no burst in flight.
+        """
+        with self._lock:
+            state = self._plans.pop(call.call_id, None)
+            if state is None or not state.legs or state.finished:
+                return
+            legs = list(state.legs.values())
+            state.legs = {}
+            state.finished = True
+
+        self.logger.info(
+            f"FMFM {state.extension}: call ended while ringing; "
+            f"cancelling {len(legs)} destination(s)"
+        )
+        for leg in legs:
+            self._tear_down_leg(call, leg)
+
+    def note_leg_response(self, call: Any, message: Any) -> None:
+        """
+        Stop retransmitting a burst leg's INVITE once that leg has responded.
+
+        The generic path does this through ``call.invite_transaction``, which is
+        empty during a burst because each leg keeps its own. A no-op for calls
+        without one.
+        """
+        with self._lock:
+            state = self._plans.get(call.call_id)
+            if state is None or not state.legs:
+                return
+            leg = self._leg_for_branch(state, _top_via_branch(message.get_header("Via")))
+
+        if leg is not None and leg.transaction:
+            leg.transaction.on_response_received()
+
+    def _on_leg_gave_up(self, call_id: str, generation: int) -> None:
+        """
+        The destination currently ringing ran out of time -- either its ring
+        timer expired or its INVITE transaction gave up without any response.
+
+        Args:
+            call_id: Call identifier.
+            generation: The claim this callback was armed for. A mismatch means
+                the call already moved on and this is a late duplicate.
+        """
+        state = self._claim(call_id, generation)
+        if state is None:
+            return
+        call = self.pbx_core.call_manager.get_call(call_id)
+        if call is None:
+            return
+        self._advance(call, state, "no answer")
+
+    def on_leg_failure(self, call: Any, message: Any) -> bool:
+        """
+        A destination answered our INVITE with a final response that is not a
+        200 -- a 4xx/5xx/6xx, or a 3xx redirect from a phone forwarding itself.
+        Move to the next destination instead of letting it reach the caller or
+        take the call over.
+
+        Called by SIPServer for every such response on an INVITE, after it has
+        ACKed it. Calls with no FMFM plan fall straight back to the normal
+        handling (the error path, or following the redirect).
+
+        Args:
+            call: The Call the response belongs to.
+            message: The error response.
+
+        Returns:
+            True if this response has been dealt with and the caller should see
+            nothing of it. False to let the normal error handling run.
+        """
+        branch = _top_via_branch(message.get_header("Via"))
+
+        if self._burst_leg_failed(call, message, branch):
+            return True
+
+        with self._lock:
+            state = self._plans.get(call.call_id)
+            if state is None:
+                return False
+            if state.finished:
+                # The outcome is already decided (answered, or on its way to
+                # voicemail). A dying leg's 487 must not reach the caller.
+                return True
+            if state.leg_branch is None or branch is None or branch != state.leg_branch:
+                # Not the leg we are waiting on -- typically a 487 from one
+                # already abandoned, arriving after the next destination started
+                # ringing. Swallow it; the ring timer still guarantees progress.
+                self.logger.debug(
+                    f"FMFM {state.extension}: ignoring {message.status_code} that does "
+                    "not belong to the leg currently ringing"
+                )
+                return True
+            state.generation += 1
+            failed = state.current()
+
+        self.logger.info(
+            f"FMFM {state.extension}: destination {failed} returned "
+            f"{message.status_code}, trying the next one"
+        )
+        self._advance(call, state, f"status {message.status_code}")
+        return True
+
+    def on_answered(self, call: Any) -> None:
+        """
+        A destination picked up. Close the plan so no in-flight timer moves the
+        call on from under a live conversation.
+
+        Safe to call for any answered call; one with no plan is ignored.
+        """
+        with self._lock:
+            state = self._plans.get(call.call_id)
+            if state is None or state.finished:
+                return
+            state.finished = True
+            answered = state.current()
+            self._prune_locked()
+
+        self.logger.info(f"FMFM {state.extension}: destination {answered} answered")
+
+    def _advance(self, call: Any, state: FMFMState, reason: str) -> None:
+        """
+        Give up on the destination currently ringing and start the next one,
+        falling through to voicemail once the list is exhausted.
+
+        The caller must already have claimed the right to do this via
+        :meth:`_claim` or the equivalent check under the lock.
+
+        Args:
+            call: The Call being rung.
+            state: The claimed plan.
+            reason: Why this destination was abandoned, for the log.
+        """
+        abandoned = state.current()
+        self._abandon_leg(call, state)
+        state.index += 1
+
+        if self._dial_from_index(call, state, state.generation):
+            return
+
+        self.logger.info(
+            f"FMFM {state.extension}: last destination {abandoned} gave up ({reason}); "
+            "no destinations left"
+        )
+        self._to_voicemail(call, state)
+
+    def _abandon_leg(self, call: Any, state: FMFMState) -> None:
+        """
+        Stop the leg currently in flight and clear it off the call, so the next
+        destination starts from a clean callee side.
+
+        CANCEL goes out before the leg's INVITE is dropped -- SIPServer builds
+        the CANCEL from it, reusing its Via branch to match the transaction.
+        """
+        if call.no_answer_timer:
+            call.no_answer_timer.cancel()
+            call.no_answer_timer = None
+        if call.invite_transaction:
+            call.invite_transaction.cancel()
+            call.invite_transaction = None
+
+        self.pbx_core.sip_server.cancel_leg(call)
+
+        # An external destination held a trunk channel for the duration of its
+        # ring. Release it here or the trunk leaks a channel per destination
+        # tried -- and leave call.trunk cleared, so a later fall-through to
+        # voicemail is not mistaken for an unanswered outbound trunk call.
+        trunk = getattr(call, "trunk", None)
+        if trunk:
+            trunk.release_channel()
+            trunk.record_failed_call(reason="no answer")
+            call.trunk = None
+
+        call.callee_addr = None
+        call.callee_invite = None
+        call.callee_rtp = None
+        call.callee_dialog_to = None
+        state.leg_branch = None
+
+    def _to_voicemail(self, call: Any, state: FMFMState) -> None:
+        """
+        Hand the caller to the dialled extension's mailbox, the same way an
+        ordinary unanswered call gets there.
+
+        Dispatched on a timer rather than called inline: CallRouter's no-answer
+        path plays a greeting and starts a recorder, which is a second or so of
+        blocking work that has no business running on the SIP receive thread.
+        Going through a timer also matches how that path is normally reached.
+
+        The plan stays registered, marked finished, so a late response from the
+        last abandoned leg is still recognised and swallowed rather than being
+        forwarded to a caller who is now listening to a greeting.
+        """
+        with self._lock:
+            state.finished = True
+        self._start_voicemail_timer(call)
+
+    def _start_voicemail_timer(self, call: Any) -> None:
+        """
+        Hand the caller off to the mailbox, just off the SIP receive thread.
+
+        Shared by both modes: the sequential list running out, and the last leg
+        of a burst giving up.
+        """
+        # to_extension is still the dialled extension -- FMFM never retargets
+        # it, precisely so the mailbox is the right person's.
+        timer = threading.Timer(
+            0.1, self.pbx_core.call_router._handle_no_answer, args=(call.call_id,)
+        )
+        timer.daemon = True
+        timer.start()
+        call.no_answer_timer = timer

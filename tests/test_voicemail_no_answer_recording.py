@@ -161,6 +161,9 @@ class TestCalleeErrorAfterVoicemailAnswer:
         call.state = CallState.RINGING
         call.caller_addr = None  # skip error forwarding, assert teardown only
         pbx.call_manager.get_call.return_value = call
+        # Not a Find Me/Follow Me call, so the 486 is ours to handle. A MagicMock
+        # would be truthy and swallow it.
+        pbx.find_me_follow_me.on_leg_failure.return_value = False
 
         server = SIPServer(pbx_core=pbx)
         server._send_message = MagicMock()

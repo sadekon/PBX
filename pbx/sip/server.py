@@ -1183,33 +1183,27 @@ class SIPServer:
                 self.logger.info(f"  Call State: {call.state}")
                 if hasattr(call, "voicemail_extension"):
                     self.logger.info(f"  Voicemail Extension: {call.voicemail_extension}")
-                # Determine which party sent BYE and forward to the other
-                other_party_addr: AddrTuple | None = None
-
+                # Determine which party sent BYE and end the other one.
+                #
+                # The BYE is re-originated on the surviving party's own dialog
+                # rather than relayed as-is. The PBX is a B2BUA: each side
+                # negotiated its own To/From tags, and on a call that was
+                # re-targeted -- a Find Me/Follow Me destination, a 3xx
+                # forward -- the two sides do not even share a To URI. A
+                # relayed BYE therefore names a dialog the receiving phone
+                # never had, so a strict UA answers 481 and holds its leg open
+                # while the PBX has already torn the call down. Same reason
+                # transfer teardown has always used _send_leg_bye().
                 if call.caller_addr and call.caller_addr == addr:
-                    # Caller sent BYE, forward to callee -- unless the call
-                    # was routed to voicemail, in which case the callee leg
-                    # was already cancelled: the callee has no dialog for
-                    # this Call-ID and would just answer 481.
+                    # Caller hung up, end the callee -- unless the call was
+                    # routed to voicemail, in which case the callee leg was
+                    # already cancelled and has no dialog for this Call-ID.
                     if not call.routed_to_voicemail:
-                        other_party_addr = call.callee_addr
-                        self.logger.debug(
-                            f"BYE from caller, forwarding to callee at {other_party_addr}"
-                        )
+                        self.logger.debug("BYE from caller, ending the callee leg")
+                        self._send_leg_bye(call, side="callee")
                 elif call.callee_addr and call.callee_addr == addr:
-                    # Callee sent BYE, forward to caller
-                    other_party_addr = call.caller_addr
-                    self.logger.debug(
-                        f"BYE from callee, forwarding to caller at {other_party_addr}"
-                    )
-
-                # Forward BYE to the other party if they exist
-                if other_party_addr:
-                    try:
-                        self._send_message(message.build(), other_party_addr)
-                        self.logger.info(f"Forwarded BYE to other party at {other_party_addr}")
-                    except Exception as e:
-                        self.logger.error(f"Failed to forward BYE to other party: {e}")
+                    self.logger.debug("BYE from callee, ending the caller leg")
+                    self._send_leg_bye(call, side="caller")
 
             # End the call internally
             self.logger.info(f"  Processing BYE - ending call {call_id}")
@@ -1300,7 +1294,14 @@ class SIPServer:
             self.logger.info(f"Cancelled still-ringing bridged leg {peer.call_id}")
         self.pbx_core.end_call(peer.call_id)
 
-    def cancel_leg(self, call: Any) -> None:
+    def cancel_leg(
+        self,
+        call: Any,
+        invite: Any | None = None,
+        addr: AddrTuple | None = None,
+        *,
+        answered_elsewhere: bool = False,
+    ) -> None:
         """
         CANCEL the INVITE this call has outstanding toward its callee, so the
         destination stops ringing.
@@ -1309,11 +1310,26 @@ class SIPServer:
         the PBX sends on a leg it INVITEd, and which one applies is decided by
         whether that INVITE has had a final response yet. A no-op on a leg
         with no INVITE in flight.
-        """
-        if self.pbx_core is None or not (call.callee_addr and call.callee_invite):
-            return
 
-        invite = call.callee_invite
+        Args:
+            call: The call the leg belongs to (for its Call-ID and logging).
+            invite: The INVITE to cancel, and `addr` where it went. Both default
+                to the call's own callee leg. A caller ringing several
+                destinations at once (Find Me/Follow Me) passes them explicitly,
+                since only one of its legs can occupy the call's callee slot.
+            addr: Where to send the CANCEL. Paired with `invite`.
+            answered_elsewhere: This destination is being cancelled because
+                somebody else took the call, not because it was missed. Adds the
+                RFC 3326 Reason header that tells the phone so; without it a
+                phone that merely stopped ringing logs a missed call, which is
+                wrong for every losing leg of a simultaneous ring.
+        """
+        if self.pbx_core is None:
+            return
+        if invite is None or addr is None:
+            invite, addr = call.callee_invite, call.callee_addr
+        if not (addr and invite):
+            return
         cancel = SIPMessageBuilder.build_request(
             method="CANCEL",
             uri=invite.uri,
@@ -1325,8 +1341,18 @@ class SIPServer:
             cseq=self._parse_cseq_number(invite.get_header("CSeq")),
         )
         cancel.set_header("Via", invite.get_header("Via"))
-        self._send_message(cancel.build(), call.callee_addr)
-        self.logger.info(f"Sent CANCEL to callee {call.to_extension} to stop ringing")
+        if answered_elsewhere:
+            # RFC 3326. Phones that understand it (Cisco, Polycom, Yealink,
+            # Snom, Grandstream and others) drop the call from their missed
+            # list rather than logging it, which is what "somebody else picked
+            # it up" should look like on a desk that was only ever one of
+            # several ringing.
+            cancel.set_header("Reason", 'SIP;cause=200;text="Call completed elsewhere"')
+        self._send_message(cancel.build(), addr)
+        self.logger.info(
+            f"Sent CANCEL to {addr} to stop it ringing (call {call.call_id})"
+            + (" - answered elsewhere" if answered_elsewhere else "")
+        )
 
     def _send_leg_bye(self, call: Any, side: str | None = None) -> None:
         """
@@ -2441,6 +2467,10 @@ class SIPServer:
                 call = self.pbx_core.call_manager.get_call(call_id)
                 if call and hasattr(call, "invite_transaction") and call.invite_transaction:
                     call.invite_transaction.on_response_received()
+                # Legs of a Find Me/Follow Me burst keep their own transactions,
+                # since only one leg at a time can sit on the call.
+                if call:
+                    self.pbx_core.find_me_follow_me.note_leg_response(call, message)
                     call.invite_transaction = None
 
             if message.status_code == 180:
@@ -2502,6 +2532,14 @@ class SIPServer:
                 if call_id and "INVITE" in cseq_header:
                     self.logger.info(f"Callee answered call {call_id}")
 
+                    # First answer wins a Find Me/Follow Me burst: this promotes
+                    # the winning leg onto the call and cancels the rest. It has
+                    # to run before the ACK, which is built from that leg's own
+                    # INVITE.
+                    answered_call = self.pbx_core.call_manager.get_call(call_id)
+                    if answered_call:
+                        self.pbx_core.find_me_follow_me.on_leg_answered(answered_call, message)
+
                     # Per RFC 3261 Section 13.2.2.4, the UAC (PBX acting as
                     # B2BUA) MUST send an ACK to the callee after receiving
                     # their 200 OK.  Without this ACK, the callee retransmits
@@ -2526,6 +2564,18 @@ class SIPServer:
                     # branch.  Without this ACK, the callee's UAS transaction
                     # never completes and keeps retransmitting the 3xx.
                     self._send_ack_to_callee(message, addr, call_id, use_invite_branch=True)
+
+                    # A call ringing through a Find Me/Follow Me list is already
+                    # being steered by that list, and the list is the operator's
+                    # explicit configuration. A destination's own phone-side
+                    # "forward on no answer" must not hijack it: following the
+                    # redirect would replace the destination's configured ring
+                    # time with the default no-answer timeout and silently drop
+                    # every remaining destination. Treat it as this destination
+                    # not taking the call and move to the next one.
+                    call = self.pbx_core.call_manager.get_call(call_id)
+                    if call and self.pbx_core.find_me_follow_me.on_leg_failure(call, message):
+                        return
 
                     contact_header = message.get_header("Contact")
                     self.pbx_core.call_router.handle_redirect(call_id, contact_header)
@@ -2596,9 +2646,6 @@ class SIPServer:
                                 "(callee leg cancelled)"
                             )
                             return
-                        # Cancel no-answer timer since the callee already responded
-                        if call.no_answer_timer:
-                            call.no_answer_timer.cancel()
                         # Per RFC 3261 Section 17.1.1.3, ACK the non-2xx final
                         # response (e.g. 487 Request Terminated after our
                         # CANCEL) so the callee's transaction completes
@@ -2606,6 +2653,26 @@ class SIPServer:
                         cseq_header = message.get_header("CSeq") or ""
                         if "INVITE" in cseq_header:
                             self._send_ack_to_callee(message, addr, call_id, use_invite_branch=True)
+                        # A Find Me/Follow Me destination that is busy, on DND,
+                        # or declines has not ended the call -- there are more
+                        # places to try. FMFM decides for a call it is ringing;
+                        # every other call, and anything it declines to handle,
+                        # falls through to the mailbox below.
+                        #
+                        # Must come before the no-answer timer is touched. A leg
+                        # FMFM abandoned answers our CANCEL with a 487 that lands
+                        # *after* the next destination is already ringing, so
+                        # cancelling here would kill the new leg's ring timer and
+                        # leave that destination ringing forever. FMFM cancels
+                        # the timer itself for a leg it really is giving up on.
+                        if (
+                            "INVITE" in cseq_header
+                            and self.pbx_core.find_me_follow_me.on_leg_failure(call, message)
+                        ):
+                            return
+                        # Cancel no-answer timer since the callee already responded
+                        if call.no_answer_timer:
+                            call.no_answer_timer.cancel()
                         if (
                             message.status_code in VOICEMAIL_ON_REJECT_STATUSES
                             and call.caller_addr

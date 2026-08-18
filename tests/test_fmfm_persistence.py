@@ -48,11 +48,22 @@ class TestFMFMPersistence:
                 {"number": "1002", "ring_time": 15},
             ],
             "enabled": True,
+            # Accepted for compatibility with older clients and stored rows,
+            # but dropped: an exhausted list always reaches the dialled
+            # extension's own mailbox.
             "no_answer_destination": "2000",
         }
 
         success = fmfm1.set_config("1000", config)
         assert success, "Config should be saved successfully"
+
+        # The *writing* instance must know the timestamp, not only one that
+        # reloads from the database later. Without this the admin page shows
+        # "N/A" for every config created or edited since the process started.
+        written = fmfm1.get_config("1000")
+        assert written is not None
+        assert written.get("updated_at") is not None, "updated_at not mirrored back from the DB"
+
         # Create second instance to verify persistence
         fmfm2 = FindMeFollowMe(config=self.config, database=self.database)
 
@@ -61,7 +72,7 @@ class TestFMFMPersistence:
         assert loaded_config["mode"] == "sequential"
         assert len(loaded_config["destinations"]) == 2
         assert loaded_config["destinations"][0]["number"] == "1001"
-        assert loaded_config["no_answer_destination"] == "2000"
+        assert "no_answer_destination" not in loaded_config
 
     def test_add_destination_persistence(self) -> None:
         """Test that adding destinations persists to database"""

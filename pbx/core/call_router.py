@@ -182,14 +182,21 @@ class CallRouter:
                 pbx.queue_handler.handle_queue_entry(from_ext, to_ext, call_id, message, from_addr)
             )
 
-        # Check if destination extension is registered and not expired,
-        # recovering its registration from the database if necessary.
-        if not self.resolve_extension(to_ext):
-            return False
-
         # Check dialplan
         if not self._check_dialplan(to_ext):
             pbx.logger.warning(f"Extension {to_ext} not allowed by dialplan")
+            return False
+
+        # Find Me/Follow Me? Its destination list replaces the single dialed
+        # extension, so the registration check below is skipped -- reaching
+        # someone whose desk phone is offline is the whole point of the feature,
+        # and requiring it to be registered would 404 exactly the calls FMFM
+        # exists to catch. A None plan means route normally.
+        fmfm_plan = pbx.find_me_follow_me.plan_for(to_ext, from_ext, call_id)
+
+        # Check if destination extension is registered and not expired,
+        # recovering its registration from the database if necessary.
+        if fmfm_plan is None and not self.resolve_extension(to_ext):
             return False
 
         # Parse SDP from caller's INVITE
@@ -263,17 +270,25 @@ class CallRouter:
                     f"caller endpoint set to {caller_endpoint}"
                 )
 
-        # Get destination extension's address
-        dest_ext_obj = pbx.extension_registry.get(to_ext)
-        if not dest_ext_obj or not dest_ext_obj.address:
-            pbx.logger.error(f"Cannot get address for extension {to_ext}")
-            # Release allocated RTP relay and clean up call to prevent resource leaks
-            pbx.rtp_relay.release_relay(call_id)
-            pbx.cdr_system.end_record(call_id, hangup_cause="resource_unavailable")
-            pbx.call_manager.end_call(call_id)
-            return False
+        if fmfm_plan is not None:
+            # FMFM owns the callee side from here: it dials its own
+            # destinations, times each one, and decides when the call has run
+            # out of places to go.
+            dispatched = pbx.find_me_follow_me.begin(call, fmfm_plan, from_header, to_header)
+        else:
+            # Get destination extension's address
+            dest_ext_obj = pbx.extension_registry.get(to_ext)
+            if not dest_ext_obj or not dest_ext_obj.address:
+                pbx.logger.error(f"Cannot get address for extension {to_ext}")
+                # Release allocated RTP relay and clean up call to prevent resource leaks
+                pbx.rtp_relay.release_relay(call_id)
+                pbx.cdr_system.end_record(call_id, hangup_cause="resource_unavailable")
+                pbx.call_manager.end_call(call_id)
+                return False
 
-        if not self._dial_extension_leg(call, call_id, to_ext, from_header, to_header):
+            dispatched = self._dial_extension_leg(call, call_id, to_ext, from_header, to_header)
+
+        if not dispatched:
             pbx.rtp_relay.release_relay(call_id)
             pbx.cdr_system.end_record(call_id, hangup_cause="resource_unavailable")
             pbx.call_manager.end_call(call_id)
@@ -448,6 +463,11 @@ class CallRouter:
         if call is not None and call.no_answer_timer:
             call.no_answer_timer.cancel()
             pbx.logger.info(f"Cancelled no-answer timer for call {call_id}")
+
+        # If one of an FMFM plan's destinations picked up, close the plan so no
+        # in-flight timer moves the call on from under a live conversation.
+        # A no-op for a call with no plan.
+        pbx.find_me_follow_me.on_answered(call)
 
         # If this is a transfer target leg, the transfer session decides what
         # its answer means -- bridging now if the transferor already committed
@@ -749,13 +769,17 @@ class CallRouter:
         to_ext: str,
         from_header: str,
         to_header: str,
+        *,
+        ring_timeout: int | None = None,
+        on_no_answer: Callable[[], None] | None = None,
     ) -> bool:
         """
         Build and send an INVITE for `to_ext` on behalf of `call`, reusing
         its already-allocated RTP relay, and arm the no-answer timer.
 
-        Used both for the initial destination in route_call() and for
-        redirect targets (SIP 3xx Contact-header forwarding).
+        Used for the initial destination in route_call(), for redirect targets
+        (SIP 3xx Contact-header forwarding), and for each internal destination
+        of a Find Me/Follow Me plan.
 
         Args:
             call: The Call being routed.
@@ -764,6 +788,13 @@ class CallRouter:
             from_header: Raw From header of the caller's original INVITE.
             to_header: Raw To header to use for the leg (may name a
                 different extension than the original INVITE, for redirects).
+            ring_timeout: How long this leg may ring before it is treated as
+                unanswered. Defaults to ``voicemail.no_answer_timeout``; FMFM
+                passes the destination's own ring time.
+            on_no_answer: Called instead of the voicemail fallback when the leg
+                rings out or its INVITE transaction gives up, so a caller
+                driving several destinations (FMFM) decides what "no answer"
+                means rather than dropping straight to a mailbox.
 
         Returns:
             True if the leg was dispatched (INVITE sent, or a WebRTC call
@@ -994,7 +1025,10 @@ class CallRouter:
             invite_to_callee,
             dest_ext_obj.address,
             server_ip,
-            on_timeout=lambda: self._handle_invite_timeout(call_id),
+            # An INVITE transaction that gives up without any response means
+            # this destination is unreachable -- the same outcome as ringing
+            # out, so both are reported the same way.
+            on_timeout=on_no_answer or (lambda: self._handle_invite_timeout(call_id)),
         )
 
         pbx.logger.info(f"Forwarded INVITE to {to_ext} at {dest_ext_obj.address}")
@@ -1004,16 +1038,44 @@ class CallRouter:
         # Fabricating a 180 before the callee responds masks delivery
         # failures and causes duplicate ringing indicators.
 
-        # Start no-answer timer to route to voicemail if not answered
-        no_answer_timeout: int = pbx.config.get("voicemail.no_answer_timeout", 30)
-        call.no_answer_timer = threading.Timer(
-            no_answer_timeout, self._handle_no_answer, args=(call_id,)
-        )
-        call.no_answer_timer.daemon = True
-        call.no_answer_timer.start()
-        pbx.logger.info(f"Started no-answer timer ({no_answer_timeout}s) for call {call_id}")
+        self._arm_no_answer_timer(call, call_id, ring_timeout, on_no_answer)
 
         return True
+
+    def _arm_no_answer_timer(
+        self,
+        call: Any,
+        call_id: str,
+        ring_timeout: int | None,
+        on_no_answer: Callable[[], None] | None,
+    ) -> None:
+        """
+        Arm the timer that decides an outbound leg has rung long enough.
+
+        By default it expires into ``_handle_no_answer()`` (voicemail for an
+        internal call, a clean teardown for a trunk one). A caller that owns a
+        sequence of destinations passes ``on_no_answer`` to take that decision
+        itself.
+
+        Args:
+            call: The Call whose leg is ringing.
+            call_id: Call identifier.
+            ring_timeout: Seconds to ring, or None for the configured default.
+            on_no_answer: Replacement expiry action, or None for the default.
+        """
+        pbx = self.pbx_core
+        timeout = (
+            ring_timeout
+            if ring_timeout is not None
+            else pbx.config.get("voicemail.no_answer_timeout", 30)
+        )
+        if on_no_answer is not None:
+            call.no_answer_timer = threading.Timer(timeout, on_no_answer)
+        else:
+            call.no_answer_timer = threading.Timer(timeout, self._handle_no_answer, args=(call_id,))
+        call.no_answer_timer.daemon = True
+        call.no_answer_timer.start()
+        pbx.logger.info(f"Started no-answer timer ({timeout}s) for call {call_id}")
 
     def _route_to_trunk(
         self,
@@ -1042,9 +1104,6 @@ class CallRouter:
         Returns:
             True if the call was routed to a trunk successfully.
         """
-        from pbx.sip.message import SIPMessageBuilder
-        from pbx.sip.sdp import SDPBuilder
-
         pbx = self.pbx_core
 
         trunk, transformed_number = pbx.trunk_system.route_outbound_with_failover(to_ext)
@@ -1107,75 +1166,9 @@ class CallRouter:
                 relay_info["handler"].set_endpoints(caller_endpoint, None)
 
         server_ip = pbx._get_server_ip()
-        dtmf_payload_type = pbx._get_dtmf_payload_type()
-        ilbc_mode = pbx._get_ilbc_mode()
-
-        caller_protocol = "RTP/AVP"
-        caller_crypto: list[str] | None = None
-        caller_codecs: list[str] | None = None
-        if caller_sdp:
-            caller_protocol = caller_sdp.get("protocol", "RTP/AVP")
-            caller_crypto = caller_sdp.get("crypto") or None
-            caller_codecs = caller_sdp.get("formats", None)
-
-        # Only offer the trunk codecs the caller actually offered, so we never
-        # negotiate a codec on this leg that the caller-side leg can't produce
-        # (the RTP relay does not transcode between legs).
-        trunk_codecs = pbx._get_compatible_trunk_codecs(trunk.codec_preferences, caller_codecs)
-
-        trunk_sdp_body = SDPBuilder.build_audio_sdp(
-            server_ip,
-            rtp_ports[0],
-            session_id=call_id,
-            codecs=trunk_codecs,
-            dtmf_payload_type=dtmf_payload_type,
-            ilbc_mode=ilbc_mode,
-            protocol=caller_protocol,
-            crypto=caller_crypto,
-        )
-
-        # Resolve the calling extension's own DID as the outbound caller ID.
-        # The carrier needs a real E.164 number here, not the internal
-        # extension number -- carriers commonly reject or mangle a From/PAI
-        # user part that isn't dialable, and sending a number the account
-        # doesn't actually own conflicts with Truth-in-Caller-ID. Falls back
-        # to from_ext (previous behavior) if the extension has no DID set.
-        caller_ext_obj = pbx.extension_registry.get(from_ext)
-        caller_id_number = from_ext
-        caller_id_name = from_ext
-        if caller_ext_obj:
-            did_number = caller_ext_obj.config.get("did_number")
-            if did_number:
-                caller_id_number = did_number
-            name = getattr(caller_ext_obj, "name", None)
-            if name:
-                caller_id_name = name
-
         trunk_addr = (trunk.host, trunk.port)
-        invite_to_trunk = SIPMessageBuilder.build_request(
-            method="INVITE",
-            uri=f"sip:{transformed_number}@{trunk.host}:{trunk.port}",
-            from_addr=f"<sip:{caller_id_number}@{server_ip}>",
-            to_addr=f"<sip:{transformed_number}@{trunk.host}>",
-            call_id=call_id,
-            cseq=int((message.get_header("CSeq") or "1 INVITE").split()[0]),
-            body=trunk_sdp_body,
-        )
-
-        # Add Contact header identifying the dialed number, per carrier
-        # convention. Via, Content-type, and Max-Forwards are attached by
-        # send_leg_invite() below.
-        sip_port = pbx.config.get("server.sip_port", 5060)
-        invite_to_trunk.set_header("Contact", f"<sip:{transformed_number}@{server_ip}:{sip_port}>")
-
-        # If the trunk challenges this INVITE with a 401/407 (some providers
-        # require Digest auth on INVITE in addition to REGISTER),
-        # SIPServer._handle_response retries once with credentials via
-        # _retry_trunk_invite_with_auth() -- this initial INVITE is
-        # deliberately sent unauthenticated.
-
-        SIPMessageBuilder.add_caller_id_headers(
-            invite_to_trunk, caller_id_number, caller_id_name, server_ip
+        invite_to_trunk = self._build_trunk_invite(
+            call, call_id, trunk, transformed_number, from_ext
         )
 
         self.send_leg_invite(
@@ -1205,6 +1198,254 @@ class CallRouter:
         # to the INVITE at all -- when InviteClientTransaction's own
         # RFC 3261 retry timeout fires via _handle_invite_timeout(), which
         # still routes through _end_unanswered_trunk_call() below.
+
+        return True
+
+    def dial_destination(
+        self,
+        call: Any,
+        call_id: str,
+        destination: str,
+        *,
+        from_header: str,
+        to_header: str,
+        ring_timeout: int | None = None,
+        on_no_answer: Callable[[], None] | None = None,
+    ) -> bool:
+        """
+        Dial one destination on an already-set-up `call`, whatever kind it is.
+
+        The single entry point for "ring this number on this call": an internal
+        extension and an external number differ only in how the leg is put on
+        the wire, and that difference is resolved here rather than by every
+        caller. Both paths reuse the call's existing relay, take the same ring
+        timeout, and report the same way, so a caller driving a list of mixed
+        destinations treats every entry identically.
+
+        Args:
+            call: The Call being routed, with its RTP relay already allocated.
+            call_id: Call identifier.
+            destination: Extension number or external number, classified by
+                ``EXTERNAL_NUMBER_PATTERN`` -- the same test ``route_call()``
+                and ``CallOriginator`` use.
+            from_header: Raw From header of the caller's original INVITE.
+            to_header: Raw To header of the caller's original INVITE. Rewritten
+                to name `destination` for an extension leg; a trunk leg builds
+                its own To from the dialled number.
+            ring_timeout: Seconds this leg may ring.
+            on_no_answer: Called when it rings out or its INVITE transaction
+                gives up.
+
+        Returns:
+            True if the INVITE went out.
+        """
+        if self.EXTERNAL_NUMBER_PATTERN.match(destination):
+            return self._dial_trunk_leg(
+                call,
+                call_id,
+                destination,
+                ring_timeout=ring_timeout,
+                on_no_answer=on_no_answer,
+            )
+
+        leg_to_header = re.sub(r"sip:(\*?[^@]+)@", f"sip:{destination}@", to_header, count=1)
+        return self._dial_extension_leg(
+            call,
+            call_id,
+            destination,
+            from_header,
+            leg_to_header,
+            ring_timeout=ring_timeout,
+            on_no_answer=on_no_answer,
+        )
+
+    def _build_trunk_invite(
+        self,
+        call: Any,
+        call_id: str,
+        trunk: Any,
+        transformed_number: str,
+        from_ext: str,
+    ) -> Any:
+        """
+        Build the INVITE for an outbound leg toward `trunk`, advertising
+        `call`'s already-allocated relay port.
+
+        Shared by ``_route_to_trunk()`` (a caller dialing out) and
+        ``_dial_trunk_leg()`` (an FMFM destination on the PSTN), so both present
+        the same caller ID, negotiate codecs the same way, and reuse the
+        caller's media protocol identically. Via, Content-type and Max-Forwards
+        are attached later by ``send_leg_invite()``.
+
+        Args:
+            call: The Call this leg belongs to, with ``rtp_ports`` allocated and
+                ``caller_rtp`` recorded if the caller offered SDP.
+            call_id: Call identifier, also the SDP session id.
+            trunk: The SIPTrunk the leg is addressed to.
+            transformed_number: Dialed number after the trunk's own digit
+                manipulation.
+            from_ext: Whoever the call is from, for caller-ID resolution.
+
+        Returns:
+            The INVITE message, ready to hand to ``send_leg_invite()``.
+        """
+        from pbx.sip.message import SIPMessageBuilder
+        from pbx.sip.sdp import SDPBuilder
+
+        pbx = self.pbx_core
+        server_ip = pbx._get_server_ip()
+
+        caller_rtp = call.caller_rtp
+        caller_protocol = "RTP/AVP"
+        caller_crypto: list[str] | None = None
+        caller_codecs: list[str] | None = None
+        if caller_rtp:
+            caller_protocol = caller_rtp.get("protocol", "RTP/AVP")
+            caller_crypto = caller_rtp.get("crypto") or None
+            caller_codecs = caller_rtp.get("formats", None)
+
+        # Only offer the trunk codecs the caller actually offered, so we never
+        # negotiate a codec on this leg that the caller-side leg can't produce
+        # (the RTP relay does not transcode between legs).
+        trunk_codecs = pbx._get_compatible_trunk_codecs(trunk.codec_preferences, caller_codecs)
+
+        trunk_sdp_body = SDPBuilder.build_audio_sdp(
+            server_ip,
+            call.rtp_ports[0],
+            session_id=call_id,
+            codecs=trunk_codecs,
+            dtmf_payload_type=pbx._get_dtmf_payload_type(),
+            ilbc_mode=pbx._get_ilbc_mode(),
+            protocol=caller_protocol,
+            crypto=caller_crypto,
+        )
+
+        # Resolve the calling extension's own DID as the outbound caller ID.
+        # The carrier needs a real E.164 number here, not the internal
+        # extension number -- carriers commonly reject or mangle a From/PAI
+        # user part that isn't dialable, and sending a number the account
+        # doesn't actually own conflicts with Truth-in-Caller-ID. Falls back
+        # to from_ext if the extension has no DID set, which is also what an
+        # inbound PSTN caller reaching an FMFM destination wants: from_ext is
+        # then the carrier's caller ID, exactly what should show on the mobile.
+        caller_ext_obj = pbx.extension_registry.get(from_ext)
+        caller_id_number = from_ext
+        caller_id_name = from_ext
+        if caller_ext_obj:
+            did_number = caller_ext_obj.config.get("did_number")
+            if did_number:
+                caller_id_number = did_number
+            name = getattr(caller_ext_obj, "name", None)
+            if name:
+                caller_id_name = name
+
+        cseq_source = call.original_invite.get_header("CSeq") if call.original_invite else None
+        invite_to_trunk = SIPMessageBuilder.build_request(
+            method="INVITE",
+            uri=f"sip:{transformed_number}@{trunk.host}:{trunk.port}",
+            from_addr=f"<sip:{caller_id_number}@{server_ip}>",
+            to_addr=f"<sip:{transformed_number}@{trunk.host}>",
+            call_id=call_id,
+            cseq=int((cseq_source or "1 INVITE").split()[0]),
+            body=trunk_sdp_body,
+        )
+
+        # Add Contact header identifying the dialed number, per carrier
+        # convention.
+        sip_port = pbx.config.get("server.sip_port", 5060)
+        invite_to_trunk.set_header("Contact", f"<sip:{transformed_number}@{server_ip}:{sip_port}>")
+
+        # If the trunk challenges this INVITE with a 401/407 (some providers
+        # require Digest auth on INVITE in addition to REGISTER),
+        # SIPServer._handle_response retries once with credentials via
+        # _retry_trunk_invite_with_auth() -- this initial INVITE is
+        # deliberately sent unauthenticated.
+
+        SIPMessageBuilder.add_caller_id_headers(
+            invite_to_trunk, caller_id_number, caller_id_name, server_ip
+        )
+
+        return invite_to_trunk
+
+    def _dial_trunk_leg(
+        self,
+        call: Any,
+        call_id: str,
+        number: str,
+        *,
+        ring_timeout: int | None = None,
+        on_no_answer: Callable[[], None] | None = None,
+    ) -> bool:
+        """
+        Send an external leg for `call` out a trunk, reusing its
+        already-allocated RTP relay, and arm the ring timer.
+
+        The trunk counterpart of ``_dial_extension_leg()``: it re-targets a call
+        that is already set up, rather than establishing one like
+        ``_route_to_trunk()`` does. That is what lets Find Me/Follow Me ring a
+        mobile on a call whose caller leg is already live.
+
+        Unlike ``_route_to_trunk()``, this *does* arm a ring timer. An FMFM
+        destination has to give up so the next one can be tried -- the reasoning
+        that lets a plain outbound call ring indefinitely does not apply when
+        another destination is waiting behind it.
+
+        Args:
+            call: The Call being routed, with a relay already allocated.
+            call_id: Call identifier.
+            number: External number to dial, before trunk digit manipulation.
+            ring_timeout: Seconds this leg may ring.
+            on_no_answer: Called when it rings out or the INVITE transaction
+                gives up.
+
+        Returns:
+            True if the INVITE was sent. False if no trunk could carry it, in
+            which case nothing was allocated and the caller may try elsewhere.
+        """
+        pbx = self.pbx_core
+
+        if not pbx.trunk_system:
+            pbx.logger.warning(f"No trunk system available to dial {number} for call {call_id}")
+            return False
+
+        if not call.rtp_ports:
+            pbx.logger.error(f"No RTP relay allocated for call {call_id}, cannot dial {number}")
+            return False
+
+        trunk, transformed_number = pbx.trunk_system.route_outbound_with_failover(number)
+        if not trunk:
+            pbx.logger.warning(f"No outbound trunk route found for {number}")
+            return False
+
+        if not trunk.allocate_channel():
+            pbx.logger.warning(f"Trunk {trunk.name} has no free channels for {number}")
+            return False
+
+        # Recorded on the call so a teardown releases the channel. Whoever
+        # abandons this leg is responsible for clearing it again.
+        call.trunk = trunk
+
+        server_ip = pbx._get_server_ip()
+        trunk_addr = (trunk.host, trunk.port)
+        invite_to_trunk = self._build_trunk_invite(
+            call, call_id, trunk, transformed_number, call.from_extension
+        )
+
+        self.send_leg_invite(
+            call,
+            call_id,
+            invite_to_trunk,
+            trunk_addr,
+            server_ip,
+            on_timeout=on_no_answer or (lambda: self._handle_invite_timeout(call_id)),
+        )
+
+        pbx.logger.info(
+            f"Dialed external leg for call {call_id}: -> {transformed_number} via trunk "
+            f"{trunk.name} ({trunk_addr[0]}:{trunk_addr[1]})"
+        )
+
+        self._arm_no_answer_timer(call, call_id, ring_timeout, on_no_answer)
 
         return True
 

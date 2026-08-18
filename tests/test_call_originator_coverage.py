@@ -484,6 +484,9 @@ class TestMidBridgeTeardown:
         pbx.config.get.side_effect = lambda key, default=None: (
             True if key == "voicemail.on_reject" else default
         )
+        # Not a Find Me/Follow Me call, so the decline is the mailbox's to
+        # handle. A MagicMock would be truthy and swallow it.
+        pbx.find_me_follow_me.on_leg_failure.return_value = False
 
         server = SIPServer(pbx_core=pbx)
         server._send_message = MagicMock()

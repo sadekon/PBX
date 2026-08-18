@@ -6,6 +6,7 @@
 
 import { fetchWithTimeout, getAuthHeaders, getApiBaseUrl } from '../api/client.ts';
 import { showNotification } from '../ui/notifications.ts';
+import { confirmDelete } from '../ui/confirm.ts';
 import { escapeHtml } from '../utils/html.ts';
 
 // ---------------------------------------------------------------------------
@@ -22,7 +23,6 @@ interface FMFMConfig {
     mode: string;
     enabled?: boolean;
     destinations?: FMFMDestination[];
-    no_answer_destination?: string;
     updated_at?: string;
 }
 
@@ -151,152 +151,1192 @@ let fmfmDestinationCounter = 0;
 
 // ---------------------------------------------------------------------------
 // Find Me / Follow Me
+//
+// The page draws each configuration as the ring plan it will actually produce,
+// rather than as the fields it was stored with. That is the whole point of the
+// view -- a config is an ordered plan, and "3 destinations" says nothing about
+// what the caller hears -- but it means mirroring three rules from
+// pbx/features/find_me_follow_me.py:
+//
+//   * plan_for() inserts the dialled extension's own phone as an implicit
+//     first leg, unless initial_ring_time is 0 or the config lists the
+//     extension itself somewhere (that placement wins, ring time included).
+//   * _sanitize() drops blanks and duplicates and keeps at most
+//     MAX_DESTINATIONS; plan_for() then truncates again *after* inserting the
+//     desk leg, so the implicit leg consumes one of the ten.
+//   * A simultaneous burst's total is its longest leg, not the sum: each leg
+//     keeps its own ring time and drops out when that expires.
+//
+// Everything below marked "mirrors" is a duplication of that module and goes
+// stale if it changes. It is duplicated rather than fetched because the plan is
+// per-config and drawing it server-side would mean a request per row.
 // ---------------------------------------------------------------------------
 
-export async function loadFMFMExtensions(): Promise<void> {
-    try {
-        const API_BASE = getApiBaseUrl();
-        const response = await fetchWithTimeout(`${API_BASE}/api/fmfm/extensions`, {
-            headers: getAuthHeaders()
-        });
+const FMFM_DEFAULT_RING_TIME = 20;
 
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+/**
+ * The ring time a blank box stands for, which depends on the mode.
+ *
+ * Sequentially a ring time is a delay charged to every destination below it, so
+ * the default is kept short. In a burst it delays nothing and only decides how
+ * long that leg keeps trying, so there is no reason to offer less than the
+ * ceiling -- and taking the ceiling from `fmfmBounds` rather than repeating its
+ * number here means a deployment that raises `max_ring_time_simultaneous` moves
+ * the default with it instead of silently diverging from it.
+ *
+ * This is a UI default, not a backend one: the resolved value is always sent
+ * explicitly, so find_me_follow_me.py's DEFAULT_RING_TIME still governs a config
+ * created through the API without a ring time.
+ */
+function defaultRingFor(mode: string): number {
+    return mode === 'simultaneous' ? maxRingFor(mode) : FMFM_DEFAULT_RING_TIME;
+}
+
+const FMFM_LOAD_TIMEOUT = 10000;
+
+/**
+ * Mirrors MAX_DESTINATIONS and the ring-time bounds in find_me_follow_me.py.
+ *
+ * These are fetched rather than hardcoded because the simultaneous ceiling is
+ * derived from `voicemail.no_answer_timeout`, which is deployment-specific and
+ * invisible from here. The literals below are only the fallback for a failed
+ * statistics call -- keep them in step with the module's own defaults.
+ */
+interface FMFMBounds {
+    min: number;
+    maxSequential: number;
+    maxSimultaneous: number;
+    maxDestinations: number;
+}
+
+const FMFM_FALLBACK_BOUNDS: FMFMBounds = {
+    min: 5,
+    maxSequential: 60,
+    maxSimultaneous: 30,
+    maxDestinations: 10,
+};
+
+let fmfmBounds: FMFMBounds = { ...FMFM_FALLBACK_BOUNDS };
+
+/** A bound from the server, falling back when it is missing or nonsensical. */
+const bound = (raw: unknown, fallback: number): number =>
+    typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+
+/** The ceiling that applies in `mode`. */
+const maxRingFor = (mode: string): number =>
+    mode === 'simultaneous' ? fmfmBounds.maxSimultaneous : fmfmBounds.maxSequential;
+
+interface FMFMStatistics {
+    initial_ring_time?: number;
+    min_ring_time?: number;
+    max_ring_time_sequential?: number;
+    max_ring_time_simultaneous?: number;
+    max_destinations?: number;
+}
+
+interface RingLeg {
+    number: string;
+    ring: number;
+    /** True for the desk leg the backend inserts, false for a stored destination. */
+    derived: boolean;
+    /** Seconds from the start of ringing that this leg occupies. */
+    from: number;
+    to: number;
+}
+
+/** One row of operator input, and what the backend will do with it. */
+interface PlanRow {
+    number: string;
+    ring: number;
+    /** null when the row survives; otherwise why it will be discarded. */
+    drop: null | 'empty' | 'duplicate' | 'over-cap';
+}
+
+interface RingPlan {
+    /** Input rows, in the order given. Only the editor needs these. */
+    rows: PlanRow[];
+    legs: RingLeg[];
+    total: number;
+    /** The desk leg could not be drawn because initial_ring_time is unknown. */
+    deskUnknown: boolean;
+    /** The list places the extension itself, so no implicit leg is added. */
+    listsSelf: boolean;
+}
+
+/** Full unfiltered list, held so filtering never needs the network. */
+let fmfmConfigs: FMFMConfig[] = [];
+
+/** null when the statistics call failed, which is not the same as 0. */
+let fmfmInitialRing: number | null = null;
+
+let fmfmListenersAttached = false;
+
+/** Extensions whose card body is open. Survives re-renders from filtering. */
+const fmfmExpanded = new Set<string>();
+
+const fmfmEl = (id: string): HTMLElement | null => document.getElementById(id);
+
+const clampRing = (seconds: number, mode: string): number =>
+    Math.max(fmfmBounds.min, Math.min(maxRingFor(mode), seconds));
+
+/**
+ * The number a ring-time field holds, or null if it does not hold one.
+ *
+ * The editor keeps the field's text verbatim rather than a parsed number, so
+ * that a half-typed value is never rewritten under the operator -- rewriting
+ * it was what made a two-digit entry so hard to complete. Everything that
+ * needs a number goes through here, and null is what blocks the save.
+ */
+const parseRing = (raw: string): number | null => {
+    const text = raw.trim();
+    if (!/^\d{1,4}$/.test(text)) return null;
+    return parseInt(text, 10);
+};
+
+/** Why a ring-time field cannot be saved, or null if it can. */
+function ringError(raw: string, mode: string): string | null {
+    const value = parseRing(raw);
+    // A blank box is not a mistake: it stands for the mode's default, which the
+    // field shows as a placeholder and which is what gets saved.
+    if (value === null) return raw.trim() ? 'is not a whole number of seconds' : null;
+    if (value < fmfmBounds.min) return `is below the ${fmfmBounds.min} s minimum`;
+    if (value > maxRingFor(mode)) return `is above the ${maxRingFor(mode)} s maximum`;
+    return null;
+}
+
+/**
+ * The ring plan a set of destinations will actually produce. Mirrors
+ * _sanitize() followed by plan_for(); see the note at the top of this section.
+ *
+ * Takes loose parts rather than an FMFMConfig so the configure dialog can call
+ * it against an unsaved draft. One implementation for both, because two would
+ * mean the read-only view and the editor could disagree about the same config
+ * -- which is exactly the confusion the plan display exists to remove.
+ */
+function computePlan(
+    extension: string,
+    mode: string,
+    destinations: { number: string; ring: number }[]
+): RingPlan {
+    const simultaneous = mode === 'simultaneous';
+
+    // _sanitize(): well-formed, no duplicates, ring times clamped, capped. The
+    // caller-self-reference guard is deliberately not mirrored -- it depends on
+    // who is calling, so there is nothing to show ahead of a call.
+    const seen = new Set<string>();
+    const rows: PlanRow[] = [];
+    for (const dest of destinations) {
+        const number = dest.number.trim();
+        const ring = clampRing(dest.ring, mode);
+        if (!number) {
+            rows.push({ number, ring, drop: 'empty' });
+        } else if (seen.has(number)) {
+            rows.push({ number, ring, drop: 'duplicate' });
+        } else if (seen.size >= fmfmBounds.maxDestinations) {
+            rows.push({ number, ring, drop: 'over-cap' });
+        } else {
+            seen.add(number);
+            rows.push({ number, ring, drop: null });
+        }
+    }
+
+    const kept = rows.filter((row) => !row.drop);
+    const listsSelf = kept.some((row) => row.number === extension);
+
+    // plan_for(): no destinations means the call routes normally, so there is
+    // no plan at all -- not a plan consisting of just the desk.
+    let legs: RingLeg[] = kept.map((row) => ({
+        number: row.number, ring: row.ring, derived: false, from: 0, to: 0,
+    }));
+    let deskUnknown = false;
+
+    if (kept.length > 0) {
+        if (fmfmInitialRing === null) {
+            deskUnknown = true;
+        } else if (fmfmInitialRing > 0 && !listsSelf) {
+            // In a burst the desk rings for at least as long as the longest
+            // destination, so it is not silent while the call is still being
+            // chased elsewhere.
+            const ring = simultaneous
+                ? clampRing(Math.max(fmfmInitialRing, ...legs.map((leg) => leg.ring)), mode)
+                : fmfmInitialRing;
+            legs = [{ number: extension, ring, derived: true, from: 0, to: 0 }, ...legs];
         }
 
-        const data: FMFMExtensionsResponse = await response.json();
-        if (data.extensions) {
-            // Update stats
-            const totalEl = document.getElementById('fmfm-total-extensions') as HTMLElement | null;
-            if (totalEl) totalEl.textContent = String(data.count || 0);
-
-            const sequentialCount = data.extensions.filter(e => e.mode === 'sequential').length;
-            const simultaneousCount = data.extensions.filter(e => e.mode === 'simultaneous').length;
-            const enabledCount = data.extensions.filter(e => e.enabled !== false).length;
-
-            const seqEl = document.getElementById('fmfm-sequential') as HTMLElement | null;
-            if (seqEl) seqEl.textContent = String(sequentialCount);
-
-            const simEl = document.getElementById('fmfm-simultaneous') as HTMLElement | null;
-            if (simEl) simEl.textContent = String(simultaneousCount);
-
-            const activeEl = document.getElementById('fmfm-active-count') as HTMLElement | null;
-            if (activeEl) activeEl.textContent = String(enabledCount);
-
-            // Update table
-            const tbody = document.getElementById('fmfm-list') as HTMLElement | null;
-            if (!tbody) return;
-
-            if (data.extensions.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center;">No Find Me/Follow Me configurations</td></tr>';
-            } else {
-                tbody.innerHTML = data.extensions.map(config => {
-                    const enabled = config.enabled !== false;
-                    const modeBadge = config.mode === 'sequential'
-                        ? '<span class="badge" style="background: #3b82f6;">Sequential</span>'
-                        : '<span class="badge" style="background: #10b981;">Simultaneous</span>';
-                    const statusBadge = enabled
-                        ? '<span class="badge" style="background: #10b981;">Active</span>'
-                        : '<span class="badge" style="background: #6b7280;">Disabled</span>';
-
-                    const destinations = config.destinations || [];
-                    const destList = destinations.map(d =>
-                        `${escapeHtml(d.number)}${d.ring_time ? ` (${d.ring_time}s)` : ''}`
-                    ).join(', ');
-
-                    const updated = config.updated_at ? new Date(config.updated_at).toLocaleString() : 'N/A';
-
-                    return `
-                        <tr>
-                            <td><strong>${escapeHtml(config.extension)}</strong></td>
-                            <td>${modeBadge}</td>
-                            <td>
-                                <div style="max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(destList)}">
-                                    ${destinations.length} destination(s): ${escapeHtml(destList) || 'None'}
-                                </div>
-                            </td>
-                            <td>${statusBadge}</td>
-                            <td><small>${updated}</small></td>
-                            <td>
-                                <button class="btn-small btn-primary" data-config='${escapeHtml(JSON.stringify(config))}' onclick="editFMFMConfig(JSON.parse(this.getAttribute('data-config')))">Edit</button>
-                                <button class="btn-small btn-danger" onclick="deleteFMFMConfig('${escapeHtml(config.extension)}')">Delete</button>
-                            </td>
-                        </tr>
-                    `;
-                }).join('');
+        // The truncation happens *after* the desk leg is inserted, so the
+        // implicit leg consumes one of the ten and the last stored destination
+        // silently stops ringing. Marked on the input row so the editor can say
+        // so rather than letting it be discovered on a live call.
+        if (legs.length > fmfmBounds.maxDestinations) {
+            const dropped = new Set(legs.slice(fmfmBounds.maxDestinations).map((leg) => leg.number));
+            legs = legs.slice(0, fmfmBounds.maxDestinations);
+            for (const row of rows) {
+                if (!row.drop && dropped.has(row.number)) row.drop = 'over-cap';
             }
         }
+    }
+
+    let elapsed = 0;
+    for (const leg of legs) {
+        if (simultaneous) {
+            leg.from = 0;
+            leg.to = leg.ring;
+        } else {
+            leg.from = elapsed;
+            leg.to = elapsed + leg.ring;
+            elapsed = leg.to;
+        }
+    }
+
+    const total = legs.length === 0
+        ? 0
+        : simultaneous
+            ? Math.max(...legs.map((leg) => leg.ring))
+            : legs.reduce((sum, leg) => sum + leg.ring, 0);
+
+    return { rows, legs, total, deskUnknown, listsSelf };
+}
+
+/** The plan for a stored configuration. */
+function ringPlan(config: FMFMConfig): RingPlan {
+    return computePlan(
+        config.extension,
+        config.mode,
+        (config.destinations ?? []).map((dest) => ({
+            number: String(dest.number ?? ''),
+            ring: dest.ring_time == null ? defaultRingFor(config.mode) : Number(dest.ring_time),
+        }))
+    );
+}
+
+/** What kind of thing a leg points at, for the line under the number. */
+function legKind(leg: RingLeg, config: FMFMConfig): string {
+    if (leg.derived) return "this extension's own phone, rung automatically";
+    if (leg.number === config.extension) return 'this extension';
+    return /^\d{1,6}$/.test(leg.number) ? 'extension' : 'external';
+}
+
+/**
+ * Absolute local time rather than "2 days ago".
+ *
+ * updated_at comes from a PostgreSQL TIMESTAMP, which isoformat() serialises
+ * without an offset, and JavaScript reads an offset-less ISO string as local
+ * time. On a UTC server viewed from a browser behind UTC, a row saved a moment
+ * ago therefore parses as being in the future, and a relative rendering would
+ * say so. Showing the wall-clock value cannot be wrong in that way.
+ */
+function fmfmUpdated(raw: string | undefined): { text: string; title: string } {
+    if (!raw) return { text: 'Never', title: 'No recorded change' };
+    const when = new Date(raw);
+    if (Number.isNaN(when.getTime())) return { text: '—', title: String(raw) };
+    return {
+        text: when.toLocaleString(undefined, {
+            day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+        }),
+        title: when.toLocaleString(),
+    };
+}
+
+function ringPlanHtml(config: FMFMConfig): string {
+    const plan = ringPlan(config);
+    const simultaneous = config.mode === 'simultaneous';
+
+    if (plan.legs.length === 0) {
+        return `<div class="muted-note" style="padding: 4px 16px 12px;">
+                    No destinations, so this configuration does nothing — the call
+                    routes normally and reaches the extension's own voicemail.
+                </div>`;
+    }
+
+    const lead = simultaneous
+        ? `Ring plan — all at once, for ${plan.total} s`
+        : 'Ring plan — one at a time';
+
+    let position = 0;
+    const steps = plan.legs.map((leg) => {
+        position += 1;
+        const mark = simultaneous
+            ? '<span class="ring-index ring-index-all" aria-hidden="true">≡</span>'
+            : `<span class="ring-index">${position}</span>`;
+        const when = simultaneous ? `0 – ${leg.to} s` : `${leg.from} – ${leg.to} s`;
+        return `
+            <div class="ring-step">
+                ${mark}
+                <span class="ring-number">${escapeHtml(leg.number)}</span>
+                <span class="ring-kind">${legKind(leg, config)}</span>
+                <span class="ring-when">${when}</span>
+            </div>`;
+    }).join('');
+
+    // Stated even though it is always the dialled extension's own mailbox,
+    // because "where does this end up" is the question a plan raises and
+    // leaving it unanswered invites the assumption that it is the last
+    // destination tried.
+    const tail = `
+        <div class="ring-tail">
+            <span class="ring-index" aria-hidden="true">↳</span>
+            <span>No answer after ${plan.total} s → voicemail for ${escapeHtml(config.extension)}</span>
+        </div>`;
+
+    const unknown = plan.deskUnknown
+        ? `<div class="muted-note" style="padding: 8px 0 0;">
+               The extension's own phone also rings, before this list. Its length
+               could not be read from the server, so it is not shown above and the
+               total excludes it.
+           </div>`
+        : '';
+
+    return `<div class="ring-plan">
+                <div class="ring-lead">${lead}</div>
+                ${steps}
+                ${tail}
+                ${unknown}
+            </div>`;
+}
+
+function fmfmCardHtml(config: FMFMConfig): string {
+    const ext = escapeHtml(config.extension);
+    const open = fmfmExpanded.has(config.extension);
+    const plan = ringPlan(config);
+    const updated = fmfmUpdated(config.updated_at);
+
+    // Only a genuine exception earns a pill. Active is the norm, and the mode
+    // is a property rather than a status, so it sits with the other stats.
+    const pill = config.enabled === false
+        ? '<span class="pill pill-warn">Disabled</span>'
+        : '';
+
+    const mode = config.mode === 'simultaneous' ? 'Simultaneous' : 'Sequential';
+
+    return `
+        <div class="card-shell g g3 g-hover">
+            <div class="card-head">
+                <span class="card-title" role="button" tabindex="0"
+                      aria-expanded="${open}" data-fmfm-toggle="${ext}">
+                    <span class="card-chevron${open ? ' open' : ''}" aria-hidden="true">&#9654;</span>
+                    <strong>Extension ${ext}</strong>
+                </span>
+                ${pill}
+                <span class="meta-stats">
+                    <span class="meta-stat"><span class="k">Mode</span><span class="v">${mode}</span></span>
+                    <span class="meta-stat"><span class="k">Destinations</span><span class="v">${plan.legs.length}</span></span>
+                    <span class="meta-stat"><span class="k">Total ring</span><span class="v">${plan.total} s</span></span>
+                    <span class="meta-stat"><span class="k">Updated</span><span class="v" title="${escapeHtml(updated.title)}">${escapeHtml(updated.text)}</span></span>
+                </span>
+                <span class="card-actions">
+                    <button type="button" class="btn-ghost" data-fmfm-edit="${ext}">Edit</button>
+                    <button type="button" class="btn-ghost btn-ghost-danger" data-fmfm-delete="${ext}">Delete</button>
+                </span>
+            </div>
+            <div class="card-body${open ? '' : ' collapsed'}" data-fmfm-body="${ext}">
+                ${open ? ringPlanHtml(config) : ''}
+            </div>
+        </div>`;
+}
+
+/** Placeholder rows shown while the list loads. */
+function fmfmSkeletonHtml(): string {
+    const widths = [116, 132, 104, 124];
+    const rows = widths.map((width) => `
+        <div class="card-shell g g3 skeleton" aria-hidden="true">
+            <div class="card-head">
+                <span class="card-title">
+                    <span class="sk-bar" style="width: ${width}px; height: 12px;"></span>
+                </span>
+                <span class="meta-stats">
+                    <span class="meta-stat">
+                        <span class="sk-bar" style="width: 30px; height: 8px;"></span>
+                        <span class="sk-bar" style="width: 72px; height: 10px;"></span>
+                    </span>
+                    <span class="meta-stat">
+                        <span class="sk-bar" style="width: 30px; height: 8px;"></span>
+                        <span class="sk-bar" style="width: 20px; height: 10px;"></span>
+                    </span>
+                    <span class="meta-stat">
+                        <span class="sk-bar" style="width: 30px; height: 8px;"></span>
+                        <span class="sk-bar" style="width: 36px; height: 10px;"></span>
+                    </span>
+                </span>
+                <span class="card-actions">
+                    <span class="sk-bar" style="width: 46px; height: 27px; border-radius: 9px;"></span>
+                    <span class="sk-bar" style="width: 58px; height: 27px; border-radius: 9px;"></span>
+                </span>
+            </div>
+        </div>`).join('');
+
+    return `<div class="card-stack">${rows}</div>
+            <span class="sr-only" role="status">Loading Find Me/Follow Me configurations</span>`;
+}
+
+/** A mark, a headline, the likely cause, and the action that resolves it. */
+function fmfmEmptyStateHtml(mark: string, heading: string, detail: string, action = ''): string {
+    return `
+        <div class="card-shell g g3 empty-state">
+            <div class="empty-mark${mark === '⚠️' ? ' empty-mark-warn' : ''}" aria-hidden="true">${mark}</div>
+            <h3>${heading}</h3>
+            <p>${detail}</p>
+            ${action ? `<div class="empty-actions">${action}</div>` : ''}
+        </div>`;
+}
+
+function fmfmNeedle(): string {
+    return ((fmfmEl('fmfm-search') as HTMLInputElement | null)?.value ?? '').trim().toLowerCase();
+}
+
+function fmfmModeFilter(): string {
+    return (fmfmEl('fmfm-mode-filter') as HTMLSelectElement | null)?.value ?? 'all';
+}
+
+function fmfmActiveOnly(): boolean {
+    return (fmfmEl('fmfm-active-only') as HTMLInputElement | null)?.checked ?? false;
+}
+
+/** Extension or any destination number contains the needle. */
+function fmfmMatches(config: FMFMConfig, needle: string): boolean {
+    if (config.extension.toLowerCase().includes(needle)) return true;
+    return (config.destinations ?? []).some((dest) =>
+        String(dest.number ?? '').toLowerCase().includes(needle));
+}
+
+function fmfmClearFilters(): void {
+    const search = fmfmEl('fmfm-search') as HTMLInputElement | null;
+    if (search) search.value = '';
+    const mode = fmfmEl('fmfm-mode-filter') as HTMLSelectElement | null;
+    if (mode) mode.value = 'all';
+    const active = fmfmEl('fmfm-active-only') as HTMLInputElement | null;
+    if (active) active.checked = false;
+    renderFMFM();
+}
+
+function updateFMFMStats(): void {
+    const active = fmfmConfigs.filter((cfg) => cfg.enabled !== false).length;
+    // The plan's leg count, not the stored list's: it is what will actually
+    // ring, and it is the number the expanded row shows.
+    const destinations = fmfmConfigs.reduce((sum, cfg) => sum + ringPlan(cfg).legs.length, 0);
+
+    const total = fmfmEl('fmfm-total-extensions');
+    if (total) total.textContent = String(fmfmConfigs.length);
+    const activeEl = fmfmEl('fmfm-active-count');
+    if (activeEl) activeEl.textContent = String(active);
+    const destEl = fmfmEl('fmfm-destinations');
+    if (destEl) destEl.textContent = String(destinations);
+}
+
+/** Applies the current filters to the cached list and repaints. */
+function renderFMFM(): void {
+    const container = fmfmEl('fmfm-list');
+    if (!container) return;
+
+    const needle = fmfmNeedle();
+    const mode = fmfmModeFilter();
+    const activeOnly = fmfmActiveOnly();
+
+    const visible = fmfmConfigs.filter((cfg) => {
+        if (needle && !fmfmMatches(cfg, needle)) return false;
+        if (mode !== 'all' && cfg.mode !== mode) return false;
+        return !(activeOnly && cfg.enabled === false);
+    });
+
+    const filtering = Boolean(needle) || mode !== 'all' || activeOnly;
+
+    const clearButton = fmfmEl('fmfm-clear-filter');
+    if (clearButton) clearButton.hidden = !filtering;
+
+    const countLabel = fmfmEl('fmfm-count');
+    if (countLabel) {
+        if (fmfmConfigs.length === 0) {
+            countLabel.textContent = '';
+        } else if (filtering) {
+            countLabel.textContent = `${visible.length} of ${fmfmConfigs.length} shown`;
+        } else {
+            const plural = fmfmConfigs.length === 1 ? 'extension' : 'extensions';
+            countLabel.textContent = `${fmfmConfigs.length} ${plural}`;
+        }
+    }
+
+    if (visible.length === 0) {
+        // Filtered-to-nothing has an obvious next action; a genuinely empty
+        // list has a likely cause. They are not the same situation.
+        container.innerHTML = filtering
+            ? fmfmEmptyStateHtml(
+                '🔍',
+                'Nothing matches those filters',
+                'No configured extension or destination number matches. Check the spelling, or widen the filters.',
+                '<button type="button" class="btn-ghost" data-fmfm-clear>Clear filters</button>')
+            : fmfmEmptyStateHtml(
+                '🔀',
+                'No extensions are using Find Me / Follow Me',
+                "Nothing is configured, so every extension rings its own phone and falls through to its own voicemail. Add a configuration to start forwarding an extension to a mobile or a group of desks.",
+                '<button type="button" class="btn-ghost btn-ghost-accent" data-fmfm-new>Configure extension</button>');
+        return;
+    }
+
+    // Numeric so 999 sorts before 1000, which a plain string compare reverses.
+    const sorted = [...visible].sort((a, b) =>
+        a.extension.localeCompare(b.extension, undefined, { numeric: true }));
+
+    container.innerHTML = `<div class="card-stack">${sorted.map(fmfmCardHtml).join('')}</div>`;
+}
+
+/** Opens or closes one card, without repainting the rest of the list. */
+function toggleFMFMCard(extension: string): void {
+    const config = fmfmConfigs.find((candidate) => candidate.extension === extension);
+    if (!config) return;
+
+    const body = findFMFMByAttribute('data-fmfm-body', extension);
+    const title = findFMFMByAttribute('data-fmfm-toggle', extension);
+    if (!body || !title) return;
+
+    const open = fmfmExpanded.has(extension);
+    if (open) {
+        fmfmExpanded.delete(extension);
+        body.classList.add('collapsed');
+        body.innerHTML = '';
+    } else {
+        fmfmExpanded.add(extension);
+        body.innerHTML = ringPlanHtml(config);
+        body.classList.remove('collapsed');
+    }
+    title.setAttribute('aria-expanded', String(!open));
+    title.querySelector('.card-chevron')?.classList.toggle('open', !open);
+}
+
+/**
+ * Finds the element carrying `attribute="value"`.
+ *
+ * Matched in JS rather than as an attribute selector: an extension is
+ * operator-supplied, so interpolating it needs CSS.escape, which jsdom does not
+ * implement. Comparing the attribute directly cannot be broken by a value
+ * containing selector syntax.
+ */
+function findFMFMByAttribute(attribute: string, value: string): Element | null {
+    const candidates = document.querySelectorAll(`[${attribute}]`);
+    for (const candidate of candidates) {
+        if (candidate.getAttribute(attribute) === value) return candidate;
+    }
+    return null;
+}
+
+function attachFMFMListeners(): void {
+    if (fmfmListenersAttached) return;
+
+    const search = fmfmEl('fmfm-search') as HTMLInputElement | null;
+    const container = fmfmEl('fmfm-list');
+    if (!search || !container) return;
+
+    // Filtering is local, so render on every keystroke rather than debouncing.
+    search.addEventListener('input', renderFMFM);
+    search.addEventListener('keydown', (event: KeyboardEvent) => {
+        if (event.key === 'Escape') {
+            search.value = '';
+            renderFMFM();
+        }
+    });
+
+    fmfmEl('fmfm-mode-filter')?.addEventListener('change', renderFMFM);
+    fmfmEl('fmfm-active-only')?.addEventListener('change', renderFMFM);
+    fmfmEl('fmfm-clear-filter')?.addEventListener('click', fmfmClearFilters);
+    fmfmEl('fmfm-refresh')?.addEventListener('click', () => {
+        void loadFMFMExtensions();
+    });
+    fmfmEl('fmfm-add')?.addEventListener('click', () => {
+        showAddFMFMModal();
+    });
+
+    container.addEventListener('click', (event: Event) => {
+        const target = event.target as HTMLElement;
+
+        // These live inside the list container because an empty state replaces
+        // the rows rather than sitting beside them.
+        if (target.closest('[data-fmfm-clear]')) {
+            fmfmClearFilters();
+            return;
+        }
+        if (target.closest('[data-fmfm-retry]')) {
+            void loadFMFMExtensions();
+            return;
+        }
+        if (target.closest('[data-fmfm-new]')) {
+            showAddFMFMModal();
+            return;
+        }
+
+        const edit = target.closest('[data-fmfm-edit]');
+        if (edit) {
+            const extension = edit.getAttribute('data-fmfm-edit');
+            const config = fmfmConfigs.find((candidate) => candidate.extension === extension);
+            if (config) editFMFMConfig(config);
+            return;
+        }
+
+        const remove = target.closest('[data-fmfm-delete]');
+        if (remove) {
+            const extension = remove.getAttribute('data-fmfm-delete');
+            if (extension) void deleteFMFMConfig(extension);
+            return;
+        }
+
+        const toggle = target.closest('[data-fmfm-toggle]');
+        if (toggle) {
+            const extension = toggle.getAttribute('data-fmfm-toggle');
+            if (extension) toggleFMFMCard(extension);
+        }
+    });
+
+    // The card title is a span with role="button", so it gets no key handling
+    // for free the way a real button would.
+    container.addEventListener('keydown', (event: KeyboardEvent) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        const toggle = (event.target as HTMLElement).closest('[data-fmfm-toggle]');
+        if (!toggle) return;
+        event.preventDefault();
+        const extension = toggle.getAttribute('data-fmfm-toggle');
+        if (extension) toggleFMFMCard(extension);
+    });
+
+    fmfmListenersAttached = true;
+}
+
+export async function loadFMFMExtensions(): Promise<void> {
+    const container = fmfmEl('fmfm-list');
+    if (!container) return;
+
+    attachFMFMListeners();
+    container.innerHTML = fmfmSkeletonHtml();
+
+    const API_BASE = getApiBaseUrl();
+
+    // Two requests, in parallel. The configurations are the page; the
+    // statistics call is only for initial_ring_time, which is deployment-wide
+    // rather than per-config, and the plan cannot show the implicit desk leg
+    // without it. A failure there degrades the plan rather than the page, so it
+    // is handled separately from the one that matters.
+    const statistics = fetchWithTimeout(`${API_BASE}/api/fmfm/statistics`, {
+        headers: getAuthHeaders(),
+    }, FMFM_LOAD_TIMEOUT)
+        .then((response) => (response.ok ? response.json() : null))
+        .then((data: FMFMStatistics | null) => {
+            const raw = data?.initial_ring_time;
+            fmfmInitialRing = typeof raw === 'number' && Number.isFinite(raw) ? raw : null;
+            fmfmBounds = {
+                min: bound(data?.min_ring_time, FMFM_FALLBACK_BOUNDS.min),
+                maxSequential: bound(
+                    data?.max_ring_time_sequential, FMFM_FALLBACK_BOUNDS.maxSequential),
+                maxSimultaneous: bound(
+                    data?.max_ring_time_simultaneous, FMFM_FALLBACK_BOUNDS.maxSimultaneous),
+                maxDestinations: bound(
+                    data?.max_destinations, FMFM_FALLBACK_BOUNDS.maxDestinations),
+            };
+        })
+        .catch(() => {
+            fmfmInitialRing = null;
+            fmfmBounds = { ...FMFM_FALLBACK_BOUNDS };
+        });
+
+    try {
+        const response = await fetchWithTimeout(`${API_BASE}/api/fmfm/extensions`, {
+            headers: getAuthHeaders(),
+        }, FMFM_LOAD_TIMEOUT);
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+
+        const data: FMFMExtensionsResponse = await response.json();
+        await statistics;
+
+        fmfmConfigs = data.extensions ?? [];
+        // A configuration that has gone away must not keep a stale open row.
+        for (const extension of [...fmfmExpanded]) {
+            if (!fmfmConfigs.some((cfg) => cfg.extension === extension)) {
+                fmfmExpanded.delete(extension);
+            }
+        }
+
+        updateFMFMStats();
+        renderFMFM();
     } catch (error: unknown) {
         console.error('Error loading FMFM extensions:', error);
+        const message = error instanceof Error ? error.message : String(error);
+        // This used to render through the same path as "no results", which told
+        // the operator nothing was configured when in fact nothing was asked.
+        const detail = message === 'Request timed out'
+            ? `The request timed out after ${FMFM_LOAD_TIMEOUT / 1000} seconds. The PBX may still be starting up.`
+            : 'The configurations could not be reached. It may be a temporary network problem.';
+        container.innerHTML = fmfmEmptyStateHtml(
+            '⚠️',
+            'Could not load the configurations',
+            detail,
+            '<button type="button" class="btn-ghost btn-ghost-accent" data-fmfm-retry>Try again</button>');
         showNotification('Error loading FMFM configurations', 'error');
     }
 }
 
-export function showAddFMFMModal(): void {
-    const modal = document.getElementById('add-fmfm-modal') as HTMLElement | null;
-    if (modal) modal.style.display = 'block';
+// ---------------------------------------------------------------------------
+// The configure dialog
+//
+// The editor and the plan are one list rather than a form with a preview beside
+// it. A ring time only means something in the company of the rows above it, so
+// the window a leg will occupy sits on the row being edited: "20" is legible as
+// "rings from 0:20 to 0:45" while it is being chosen. The rows the backend will
+// discard stay visible and editable, dimmed and flagged, because deleting them
+// on the operator's behalf would hide why they vanished.
+// ---------------------------------------------------------------------------
 
-    const extInput = document.getElementById('fmfm-extension') as HTMLInputElement | null;
+interface FMFMDraft {
+    /** A new configuration rather than an edit; decides whether Extension is editable. */
+    creating: boolean;
+    extension: string;
+    mode: string;
+    enabled: boolean;
+    /**
+     * `ring` is the field's text, not a number. Holding the parsed value meant
+     * re-rendering the input with it on every keystroke, which rewrote a
+     * half-typed entry -- clearing the box produced "0", and the next digit
+     * landed beside it. The text is now left exactly as typed and validated on
+     * the way out, so an out-of-range value is reported and blocks the save
+     * rather than being silently corrected mid-keystroke.
+     */
+    destinations: { number: string; ring: string }[];
+}
+
+let fmfmDraft: FMFMDraft | null = null;
+let fmfmDialogListenersAttached = false;
+
+const fmfmDialog = (): HTMLElement | null => document.getElementById('add-fmfm-modal');
+
+function openFMFMDialog(draft: FMFMDraft): void {
+    fmfmDraft = draft;
+    attachFMFMDialogListeners();
+
+    const extInput = fmfmEl('fmfm-extension') as HTMLInputElement | null;
     if (extInput) {
-        extInput.value = '';
-        extInput.readOnly = false;
+        extInput.value = draft.extension;
+        // An extension is the identity of the configuration, not a field of it:
+        // the store is keyed by it, so changing it would create a second
+        // configuration rather than move this one.
+        extInput.readOnly = !draft.creating;
     }
 
-    const modeSelect = document.getElementById('fmfm-mode') as HTMLSelectElement | null;
-    if (modeSelect) modeSelect.value = 'sequential';
+    const note = fmfmEl('fmfm-extension-note');
+    if (note) {
+        note.textContent = draft.creating
+            ? 'The extension a call must arrive on for these rules to apply. It cannot be changed afterwards.'
+            : 'Fixed once the configuration exists. Delete and recreate it to move these rules to another extension.';
+    }
 
-    const enabledCheck = document.getElementById('fmfm-enabled') as HTMLInputElement | null;
-    if (enabledCheck) enabledCheck.checked = true;
+    const enabled = fmfmEl('fmfm-enabled') as HTMLInputElement | null;
+    if (enabled) enabled.checked = draft.enabled;
 
-    const noAnswerInput = document.getElementById('fmfm-no-answer') as HTMLInputElement | null;
-    if (noAnswerInput) noAnswerInput.value = '';
+    for (const radio of document.querySelectorAll<HTMLInputElement>('input[name="fmfm-mode"]')) {
+        radio.checked = radio.value === draft.mode;
+    }
 
-    const destContainer = document.getElementById('fmfm-destinations-list') as HTMLElement | null;
-    if (destContainer) destContainer.innerHTML = '';
+    const title = fmfmEl('fmfm-dialog-title');
+    if (title) {
+        title.textContent = draft.creating
+            ? 'Configure Find Me / Follow Me'
+            : `Find Me / Follow Me — extension ${draft.extension}`;
+    }
+    const sub = fmfmEl('fmfm-dialog-sub');
+    if (sub) {
+        sub.textContent = draft.creating
+            ? 'Pick an extension, then the numbers a call to it should chase'
+            : 'Ring a chain of numbers when this extension is called';
+    }
 
-    addFMFMDestinationRow();
+    const remove = fmfmEl('fmfm-dialog-delete');
+    if (remove) remove.hidden = draft.creating;
+
+    const save = fmfmEl('fmfm-dialog-save');
+    if (save) save.textContent = draft.creating ? 'Create configuration' : 'Save configuration';
+
+    // `.active` rather than an inline display, so the shared Escape handler in
+    // ui/tabs.ts closes this like every other modal. The previous version set
+    // style.display directly, which that handler does not match -- so Escape
+    // did nothing here.
+    fmfmDialog()?.classList.add('active');
+    renderFMFMDialog();
+
+    // Focus the first thing that is actually editable.
+    if (draft.creating) extInput?.focus();
+    else (document.querySelector('#fmfm-destinations-list [data-fmfm-dest]') as HTMLElement | null)?.focus();
+}
+
+export function showAddFMFMModal(): void {
+    openFMFMDialog({
+        creating: true,
+        extension: '',
+        mode: 'sequential',
+        enabled: true,
+        destinations: [{ number: '', ring: '' }],
+    });
 }
 
 export function closeAddFMFMModal(): void {
-    const modal = document.getElementById('add-fmfm-modal') as HTMLElement | null;
-    if (modal) modal.style.display = 'none';
-    const form = document.getElementById('add-fmfm-form') as HTMLFormElement | null;
-    if (form) form.reset();
+    fmfmDialog()?.classList.remove('active');
+    fmfmDraft = null;
 }
 
+export function editFMFMConfig(config: FMFMConfig): void {
+    openFMFMDialog({
+        creating: false,
+        extension: config.extension,
+        mode: config.mode === 'simultaneous' ? 'simultaneous' : 'sequential',
+        enabled: config.enabled !== false,
+        destinations: (config.destinations ?? []).map((dest) => ({
+            number: String(dest.number ?? ''),
+            // Shown as stored, not as clamped. A config saved before the
+            // ceiling came down still opens with its own number visible and
+            // flagged, so the operator sees what has to change.
+            ring: String(Number(dest.ring_time) || FMFM_DEFAULT_RING_TIME),
+        })),
+    });
+}
+
+/**
+ * Appends an empty destination row.
+ *
+ * Kept exported because it is registered on window and the markup used to call
+ * it directly; the dialog itself goes through the draft.
+ */
 export function addFMFMDestinationRow(): void {
-    const container = document.getElementById('fmfm-destinations-list') as HTMLElement | null;
-    if (!container) return;
+    if (!fmfmDraft) return;
+    fmfmDraft.destinations.push({ number: '', ring: '' });
+    fmfmDestinationCounter += 1;
+    renderFMFMDialog();
+    const inputs = document.querySelectorAll<HTMLElement>('#fmfm-destinations-list [data-fmfm-dest]');
+    inputs[inputs.length - 1]?.focus();
+}
 
-    const rowId = `fmfm-dest-${fmfmDestinationCounter++}`;
+/** Repaints the plan list and the warnings under it from the current draft. */
+function renderFMFMDialog(): void {
+    const container = fmfmEl('fmfm-destinations-list');
+    const warnings = fmfmEl('fmfm-dialog-warnings');
+    if (!container || !fmfmDraft) return;
 
-    const row = document.createElement('div');
-    row.id = rowId;
-    row.style.cssText = 'display: flex; gap: 10px; margin-bottom: 10px; align-items: center;';
-    row.innerHTML = `
-        <input type="text" class="fmfm-dest-number" placeholder="Phone number or extension" required style="flex: 2;">
-        <input type="number" class="fmfm-dest-ringtime" placeholder="Ring time (s)" value="20" min="5" max="120" style="flex: 1;">
-        <button type="button" class="btn-small btn-danger" onclick="document.getElementById('${rowId}').remove()">Remove</button>
-    `;
-    container.appendChild(row);
+    const draft = fmfmDraft;
+    const simultaneous = draft.mode === 'simultaneous';
+    // The plan needs numbers; the fields hold text. A field that does not hold
+    // a usable number is drawn at the default so the plan stays readable while
+    // it is being fixed -- the warning below says the save is blocked.
+    const plan = computePlan(draft.extension, draft.mode, draft.destinations.map((dest) => ({
+        number: dest.number,
+        ring: parseRing(dest.ring) ?? defaultRingFor(draft.mode),
+    })));
+
+    for (const option of document.querySelectorAll<HTMLElement>('.mode-opt')) {
+        option.classList.toggle('selected', option.dataset.fmfmMode === draft.mode);
+    }
+
+    const indexClass = simultaneous ? 'ring-index ring-index-all' : 'ring-index';
+    const mark = (position: number): string => simultaneous
+        ? `<span class="${indexClass}" aria-hidden="true">≡</span>`
+        : `<span class="${indexClass}">${position}</span>`;
+    const window_ = (leg: RingLeg): string =>
+        simultaneous ? `0 – ${leg.to} s` : `${leg.from} – ${leg.to} s`;
+
+    let html = '';
+    let position = 0;
+
+    const desk = plan.legs.find((leg) => leg.derived);
+    if (desk) {
+        position += 1;
+        html += `
+            <div class="plan-row plan-row-derived">
+                <span class="plan-grip" style="visibility: hidden;" aria-hidden="true">⠿</span>
+                ${mark(position)}
+                <span class="plan-static"><strong>${escapeHtml(draft.extension)}</strong> — this extension's own phone, rung automatically</span>
+                <span class="plan-fixed">${desk.ring} s</span>
+                <span class="ring-when">${window_(desk)}</span>
+                <span style="flex: 0 0 74px;"></span>
+            </div>`;
+    }
+
+    plan.rows.forEach((row, index) => {
+        if (!row.drop) position += 1;
+        // Straight off the draft, not off the plan: the plan holds the clamped
+        // number, and echoing that back into the box is what used to overwrite
+        // what was being typed.
+        const rawRing = draft.destinations[index]?.ring ?? '';
+        const badRing = ringError(rawRing, draft.mode) !== null;
+        const leg = row.drop
+            ? undefined
+            : plan.legs.find((candidate) => !candidate.derived && candidate.number === row.number);
+        const flag = row.drop === 'duplicate' ? 'duplicate'
+            : row.drop === 'over-cap' ? 'over cap'
+            : '';
+        const trailing = row.drop
+            ? `<span class="plan-drop-flag">${flag}</span>`
+            : `<span class="ring-when">${leg ? window_(leg) : ''}</span>`;
+
+        html += `
+            <div class="plan-row${row.drop ? ' plan-row-dropped' : ''}">
+                <button type="button" class="plan-grip" data-fmfm-grip="${index}"
+                        aria-label="Reorder destination ${index + 1}. Use the arrow keys to move it.">⠿</button>
+                ${row.drop ? `<span class="${indexClass}">–</span>` : mark(position)}
+                <span class="plan-number">
+                    <input type="text" value="${escapeHtml(row.number)}" data-fmfm-dest="${index}"
+                           placeholder="Phone number or extension" autocomplete="off"
+                           aria-label="Destination ${index + 1} number">
+                </span>
+                <span class="plan-ring${badRing ? ' plan-ring-invalid' : ''}">
+                    <input type="text" inputmode="numeric" value="${escapeHtml(rawRing)}"
+                           placeholder="${defaultRingFor(draft.mode)}"
+                           data-fmfm-ring="${index}" autocomplete="off" size="4"
+                           aria-invalid="${badRing ? 'true' : 'false'}"
+                           aria-label="Destination ${index + 1} ring time in seconds, default ${defaultRingFor(draft.mode)}">
+                    <span class="unit">s</span>
+                </span>
+                ${trailing}
+                <button type="button" class="btn-ghost btn-ghost-danger" data-fmfm-remove="${index}"
+                        aria-label="Remove destination ${index + 1}">Remove</button>
+            </div>`;
+    });
+
+    if (plan.rows.length === 0) {
+        html += `<div class="form-empty">No destinations yet. Without at least one, the call routes
+                 normally — the extension rings its own phone and reaches its own voicemail.</div>`;
+    }
+
+    if (plan.legs.length > 0) {
+        html += `
+            <div class="plan-tail">
+                <span class="ring-index" aria-hidden="true">↳</span>
+                <span>No answer → voicemail for ${escapeHtml(draft.extension)}</span>
+                <span class="grand">${plan.total} s</span>
+            </div>`;
+    }
+
+    // The implicit desk leg consumes one of the ten, so the point at which
+    // adding another becomes pointless is nine, not ten.
+    const keptRows = plan.rows.filter((row) => !row.drop).length;
+    const legRoom = plan.legs.length >= fmfmBounds.maxDestinations
+        || keptRows >= fmfmBounds.maxDestinations;
+
+    html += `
+        <div class="plan-add">
+            <button type="button" class="btn-ghost" id="fmfm-add-destination"${legRoom ? ' disabled' : ''}>Add destination</button>
+            <span class="count">${plan.legs.length} of ${fmfmBounds.maxDestinations} legs</span>
+        </div>`;
+
+    container.innerHTML = html;
+
+    if (!warnings) return;
+    const notes: string[] = [];
+    if (plan.rows.some((row) => row.drop === 'duplicate')) {
+        notes.push('A destination is listed twice. Only the first occurrence is dialled — the duplicate is dropped when the call is placed.');
+    }
+    if (plan.rows.some((row) => row.drop === 'over-cap')) {
+        notes.push(`Over the ${fmfmBounds.maxDestinations}-leg cap. The extension's own phone counts toward it, so the last destination will never be dialled.`);
+    }
+    if (plan.listsSelf) {
+        notes.push(`This lists extension ${escapeHtml(draft.extension)} itself, so it is not also rung automatically first — your placement is used instead, including its ring time and its position in the order.`);
+    }
+    if (plan.deskUnknown) {
+        notes.push("The extension's own phone also rings, before this list. Its length could not be read from the server, so the plan above omits it and the total is short by that much.");
+    }
+    // Reported per row and blocking, rather than clamped on the operator's
+    // behalf. A silently corrected ring time is a config that does not do what
+    // the screen said it would.
+    const badRings = draft.destinations
+        .map((dest, index) => ({ index, why: ringError(dest.ring, draft.mode) }))
+        .filter((entry) => entry.why !== null);
+    for (const entry of badRings) {
+        notes.push(`Ring time for destination ${entry.index + 1} ${entry.why} — allowed range is
+                    ${fmfmBounds.min}–${maxRingFor(draft.mode)} s${simultaneous
+                        ? ', because in simultaneous mode the longest destination is the whole time the caller waits'
+                        : ''}. Fix it to save.`);
+    }
+    if (!simultaneous && plan.total > 120) {
+        notes.push(`The caller waits ${plan.total} s before reaching voicemail. Most hang up well before two minutes.`);
+    }
+
+    warnings.innerHTML = notes
+        .map((note) => `<div class="form-warn"><span aria-hidden="true">⚠</span><span>${note}</span></div>`)
+        .join('');
+
+    // Only a bad ring time blocks the save. The other notes describe things the
+    // backend handles deliberately (a duplicate is dropped, an over-cap row is
+    // never dialled), so they warn without standing in the way.
+    const save = fmfmEl('fmfm-dialog-save') as HTMLButtonElement | null;
+    if (save) {
+        save.disabled = badRings.length > 0;
+        save.title = badRings.length > 0
+            ? 'A ring time is out of range. Fix it to save.'
+            : '';
+    }
+}
+
+/** Moves a destination, keeping the moved row focused. */
+function moveFMFMDestination(from: number, to: number): void {
+    if (!fmfmDraft) return;
+    if (to < 0 || to >= fmfmDraft.destinations.length || from === to) return;
+    const [moved] = fmfmDraft.destinations.splice(from, 1);
+    if (!moved) return;
+    fmfmDraft.destinations.splice(to, 0, moved);
+    renderFMFMDialog();
+    (document.querySelector(`[data-fmfm-grip="${to}"]`) as HTMLElement | null)?.focus();
+}
+
+function attachFMFMDialogListeners(): void {
+    if (fmfmDialogListenersAttached) return;
+    const modal = fmfmDialog();
+    const container = fmfmEl('fmfm-destinations-list');
+    if (!modal || !container) return;
+
+    fmfmEl('fmfm-dialog-close')?.addEventListener('click', closeAddFMFMModal);
+    fmfmEl('fmfm-dialog-cancel')?.addEventListener('click', closeAddFMFMModal);
+
+    // Clicking the scrim dismisses; clicking anywhere in the dialog must not.
+    modal.addEventListener('click', (event: Event) => {
+        if (event.target === modal) closeAddFMFMModal();
+    });
+
+    fmfmEl('fmfm-dialog-delete')?.addEventListener('click', () => {
+        if (fmfmDraft) void deleteFMFMConfig(fmfmDraft.extension);
+    });
+
+    (fmfmEl('add-fmfm-form') as HTMLFormElement | null)
+        ?.addEventListener('submit', (event: Event) => { void saveFMFMConfig(event); });
+
+    const extInput = fmfmEl('fmfm-extension') as HTMLInputElement | null;
+    extInput?.addEventListener('input', () => {
+        // The plan names this extension in its desk leg and its voicemail line,
+        // so both follow what is being typed.
+        if (fmfmDraft) fmfmDraft.extension = extInput.value.trim();
+        renderFMFMDialog();
+    });
+
+    fmfmEl('fmfm-enabled')?.addEventListener('change', (event: Event) => {
+        if (fmfmDraft) fmfmDraft.enabled = (event.target as HTMLInputElement).checked;
+    });
+
+    for (const radio of document.querySelectorAll<HTMLInputElement>('input[name="fmfm-mode"]')) {
+        radio.addEventListener('change', () => {
+            // Switching mode re-times every leg, so the plan is redrawn rather
+            // than relabelled: sequential windows chain, simultaneous all start
+            // at zero, and the total changes from a sum to a maximum.
+            if (fmfmDraft && radio.checked) fmfmDraft.mode = radio.value;
+            renderFMFMDialog();
+        });
+    }
+
+    container.addEventListener('input', (event: Event) => {
+        if (!fmfmDraft) return;
+        const target = event.target as HTMLInputElement;
+        const dest = target.dataset.fmfmDest;
+        const ring = target.dataset.fmfmRing;
+        const row = fmfmDraft.destinations[Number(dest ?? ring)];
+        if (!row) return;
+        if (dest !== undefined) {
+            row.number = target.value;
+        } else if (ring !== undefined) {
+            row.ring = target.value;
+        } else {
+            return;
+        }
+        // Repainting would move focus and drop the caret, so the row being typed
+        // in is left alone and only the derived parts are refreshed around it.
+        const caret = target.selectionStart;
+        renderFMFMDialog();
+        const restored = document.querySelector<HTMLInputElement>(
+            dest !== undefined ? `[data-fmfm-dest="${dest}"]` : `[data-fmfm-ring="${ring}"]`);
+        if (restored) {
+            restored.focus();
+            if (caret !== null && restored.type === 'text') restored.setSelectionRange(caret, caret);
+        }
+    });
+
+    container.addEventListener('click', (event: Event) => {
+        const target = event.target as HTMLElement;
+        if (target.closest('#fmfm-add-destination')) {
+            addFMFMDestinationRow();
+            return;
+        }
+        const remove = target.closest('[data-fmfm-remove]');
+        if (remove && fmfmDraft) {
+            fmfmDraft.destinations.splice(Number(remove.getAttribute('data-fmfm-remove')), 1);
+            renderFMFMDialog();
+        }
+    });
+
+    // Reordering by keyboard as well as by pointer: order is the whole meaning
+    // of a sequential plan, and drag alone would put it out of reach.
+    container.addEventListener('keydown', (event: KeyboardEvent) => {
+        const grip = (event.target as HTMLElement).closest('[data-fmfm-grip]');
+        if (!grip) return;
+        const from = Number(grip.getAttribute('data-fmfm-grip'));
+        if (event.key === 'ArrowUp') {
+            event.preventDefault();
+            moveFMFMDestination(from, from - 1);
+        } else if (event.key === 'ArrowDown') {
+            event.preventDefault();
+            moveFMFMDestination(from, from + 1);
+        }
+    });
+
+    container.addEventListener('pointerdown', (event: PointerEvent) => {
+        const grip = (event.target as HTMLElement).closest('[data-fmfm-grip]');
+        if (!grip) return;
+        event.preventDefault();
+        let from = Number(grip.getAttribute('data-fmfm-grip'));
+
+        const onMove = (move: PointerEvent): void => {
+            const rows = [...document.querySelectorAll('.plan-row:not(.plan-row-derived)')];
+            const over = rows.findIndex((row) => {
+                const box = row.getBoundingClientRect();
+                return move.clientY >= box.top && move.clientY <= box.bottom;
+            });
+            if (over >= 0 && over !== from) {
+                moveFMFMDestination(from, over);
+                from = over;
+            }
+        };
+        const onUp = (): void => {
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+    });
+
+    fmfmDialogListenersAttached = true;
 }
 
 export async function saveFMFMConfig(event: Event): Promise<void> {
     event.preventDefault();
+    if (!fmfmDraft) return;
 
-    const extension = (document.getElementById('fmfm-extension') as HTMLInputElement).value;
-    const mode = (document.getElementById('fmfm-mode') as HTMLSelectElement).value;
-    const enabled = (document.getElementById('fmfm-enabled') as HTMLInputElement).checked;
-    const noAnswer = (document.getElementById('fmfm-no-answer') as HTMLInputElement).value;
+    const extension = fmfmDraft.extension.trim();
+    if (!extension) {
+        showNotification('An extension is required', 'error');
+        (fmfmEl('fmfm-extension') as HTMLInputElement | null)?.focus();
+        return;
+    }
 
-    // Collect destinations
-    const destNumbers = Array.from(document.querySelectorAll<HTMLInputElement>('.fmfm-dest-number'));
-    const destRingTimes = Array.from(document.querySelectorAll<HTMLInputElement>('.fmfm-dest-ringtime'));
+    // Sent as typed, not as the plan shows it. The backend sanitises on the way
+    // in, and storing only the surviving rows would silently discard input the
+    // operator can still see on screen -- the warnings already say what will be
+    // dropped, and reopening shows the same rows and the same warnings.
+    // Enforced here rather than only on the button, because pressing Enter in a
+    // text field submits the form without going near it.
+    const bad = fmfmDraft.destinations.findIndex(
+        (dest) => ringError(dest.ring, fmfmDraft?.mode ?? 'sequential') !== null);
+    if (bad !== -1) {
+        const why = ringError(fmfmDraft.destinations[bad]?.ring ?? '', fmfmDraft.mode);
+        showNotification(`Ring time for destination ${bad + 1} ${why}`, 'error');
+        (document.querySelector(`[data-fmfm-ring="${bad}"]`) as HTMLElement | null)?.focus();
+        return;
+    }
 
-    const destinations: FMFMDestination[] = destNumbers.map((input, idx) => ({
-        number: input.value,
-        ring_time: parseInt(destRingTimes[idx]?.value ?? "20") || 20
-    })).filter(d => d.number);
+    // Captured because the closure below cannot narrow the module-level draft.
+    const draftMode = fmfmDraft.mode;
+    const destinations: FMFMDestination[] = fmfmDraft.destinations
+        .filter((dest) => dest.number.trim())
+        .map((dest) => ({
+            number: dest.number.trim(),
+            // A blank box promised the placeholder's value, so that is what is
+            // stored -- not the backend's own default, which is mode-blind.
+            ring_time: parseRing(dest.ring) ?? defaultRingFor(draftMode),
+        }));
 
     if (destinations.length === 0) {
         showNotification('At least one destination is required', 'error');
@@ -304,15 +1344,11 @@ export async function saveFMFMConfig(event: Event): Promise<void> {
     }
 
     const configData: Record<string, unknown> = {
-        extension: extension,
-        mode: mode,
-        enabled: enabled,
-        destinations: destinations
+        extension,
+        mode: fmfmDraft.mode,
+        enabled: fmfmDraft.enabled,
+        destinations,
     };
-
-    if (noAnswer) {
-        configData.no_answer_destination = noAnswer;
-    }
 
     try {
         const API_BASE = getApiBaseUrl();
@@ -326,7 +1362,7 @@ export async function saveFMFMConfig(event: Event): Promise<void> {
         if (data.success) {
             showNotification(`FMFM configured for extension ${extension}`, 'success');
             closeAddFMFMModal();
-            loadFMFMExtensions();
+            void loadFMFMExtensions();
         } else {
             showNotification(data.error || 'Error configuring FMFM', 'error');
         }
@@ -336,48 +1372,8 @@ export async function saveFMFMConfig(event: Event): Promise<void> {
     }
 }
 
-export function editFMFMConfig(config: FMFMConfig): void {
-    showAddFMFMModal();
-
-    const extInput = document.getElementById('fmfm-extension') as HTMLInputElement | null;
-    if (extInput) {
-        extInput.value = config.extension;
-        extInput.readOnly = true;  // Don't allow changing extension
-    }
-
-    const modeSelect = document.getElementById('fmfm-mode') as HTMLSelectElement | null;
-    if (modeSelect) modeSelect.value = config.mode;
-
-    const enabledCheck = document.getElementById('fmfm-enabled') as HTMLInputElement | null;
-    if (enabledCheck) enabledCheck.checked = config.enabled !== false;
-
-    const noAnswerInput = document.getElementById('fmfm-no-answer') as HTMLInputElement | null;
-    if (noAnswerInput) noAnswerInput.value = config.no_answer_destination || '';
-
-    // Clear and add destination rows
-    const container = document.getElementById('fmfm-destinations-list') as HTMLElement | null;
-    if (!container) return;
-    container.innerHTML = '';
-
-    if (config.destinations && config.destinations.length > 0) {
-        for (const dest of config.destinations) {
-            addFMFMDestinationRow();
-            const rows = container.children;
-            const lastRow = rows[rows.length - 1] as HTMLElement;
-            const numberInput = lastRow.querySelector('.fmfm-dest-number') as HTMLInputElement | null;
-            if (numberInput) numberInput.value = dest.number;
-            const ringInput = lastRow.querySelector('.fmfm-dest-ringtime') as HTMLInputElement | null;
-            if (ringInput) ringInput.value = String(dest.ring_time ?? 20);
-        }
-    } else {
-        addFMFMDestinationRow();
-    }
-}
-
 export async function deleteFMFMConfig(extension: string): Promise<void> {
-    if (!confirm(`Are you sure you want to delete FMFM configuration for extension ${extension}?`)) {
-        return;
-    }
+    if (!await confirmDelete(`Find Me / Follow Me for extension ${extension}`)) return;
 
     try {
         const API_BASE = getApiBaseUrl();
@@ -389,7 +1385,10 @@ export async function deleteFMFMConfig(extension: string): Promise<void> {
         const data: ApiSuccessResponse = await response.json();
         if (data.success) {
             showNotification(`FMFM configuration deleted for ${extension}`, 'success');
-            loadFMFMExtensions();
+            // Harmless when the delete came from the list rather than the
+            // dialog; the dialog cannot be left open over a config that is gone.
+            if (fmfmDraft?.extension === extension) closeAddFMFMModal();
+            void loadFMFMExtensions();
         } else {
             showNotification(data.error || 'Error deleting FMFM configuration', 'error');
         }

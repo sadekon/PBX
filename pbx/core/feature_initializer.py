@@ -252,8 +252,13 @@ class FeatureInitializer:
             pbx_core.hot_desking = None
 
         # Initialize Find Me/Follow Me
+        # pbx_core is what lets the feature actually ring its destinations, not
+        # just store them: it reaches CallRouter to dial each leg and SIPServer
+        # to cancel one.
         pbx_core.find_me_follow_me = FindMeFollowMe(
-            config=config, database=database if database.enabled else None
+            config=config,
+            database=database if database.enabled else None,
+            pbx_core=pbx_core,
         )
         if pbx_core.find_me_follow_me.enabled:
             logger.info("Find Me/Follow Me initialized")
