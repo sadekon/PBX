@@ -64,6 +64,21 @@ RFC2833_EVENT_TO_DTMF: dict[str, str] = {
 #: behind a mailbox greeting.
 VOICEMAIL_ON_REJECT_STATUSES: frozenset[int] = frozenset({408, 480, 486, 600, 603})
 
+#: SIP status -> the reason string CallOriginator documents for on_failure.
+#: Anything not listed is reported as "unreachable", which covers the media and
+#: server errors (488, 5xx) as well as the genuinely unroutable ones.
+_ORIGINATE_FAILURE_REASONS: dict[int, str] = {
+    408: "no_answer",
+    480: "no_answer",
+    486: "busy",
+    600: "busy",
+    603: "busy",
+    404: "no_route",
+    410: "no_route",
+    484: "no_route",
+    604: "no_route",
+}
+
 
 class SIPServer:
     """SIP server for handling registration and calls."""
@@ -2703,6 +2718,36 @@ class SIPServer:
                             )
                             self.pbx_core.end_call(call_id)
                             return
+                        # A PBX-placed leg reports its outcome through callbacks rather than
+                        # a response to a caller, because it has no caller: CallOriginator
+                        # promises on_failure for a leg that never connects, and until this
+                        # existed the promise was only kept for a pre-flight failure or the
+                        # no-answer timer. A leg rejected outright -- 486 from a busy phone,
+                        # 488 from one that would not take the media -- resolved silently,
+                        # so whatever placed it went on believing the leg was still ringing.
+                        # A page kept relaying to an amplifier that had refused the call.
+                        #
+                        # Placed after the transfer, FMFM and voicemail branches, all of
+                        # which return, so this only sees legs none of them claimed. The
+                        # callbacks are cleared first: on_failure may end the call, which
+                        # re-enters here, and the caller should hear about the failure once.
+                        callbacks = getattr(call, "originate_callbacks", None)
+                        if callbacks and callbacks.get("on_failure"):
+                            call.originate_callbacks = None
+                            reason = _ORIGINATE_FAILURE_REASONS.get(
+                                message.status_code, "unreachable"
+                            )
+                            self.logger.info(
+                                f"Originated leg {call_id} failed with "
+                                f"{message.status_code}: {reason}"
+                            )
+                            try:
+                                callbacks["on_failure"](call, reason)
+                            except Exception as e:
+                                self.logger.error(
+                                    f"on_failure callback raised for leg {call_id}: {e}"
+                                )
+
                         if call.caller_addr and call.original_invite:
                             error_response = SIPMessageBuilder.build_response(
                                 message.status_code,
