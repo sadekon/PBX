@@ -292,7 +292,19 @@ class PagingHandler:
                 rtp_ports_override=(session.rtp_port, session.rtp_port + 1),
                 extra_headers=extra_headers,
                 codecs=[PCMU_PAYLOAD_TYPE],
-                sdp_direction="sendonly",
+                # sendrecv, not sendonly, even though a page is strictly one-way.
+                #
+                # A Cisco ATA 191 answers `a=sendonly` on an FXS port with 488 Not
+                # Acceptable Here: there is a handset on that port, and the firmware will
+                # not set up a call it is forbidden to talk on. Other paging adapters are
+                # likely to be as strict, since one-way media is unusual for an endpoint
+                # that thinks it is a telephone.
+                #
+                # Nothing is lost by negotiating normally. One-way is enforced in the media
+                # path, not in the SDP: PagingMediaSession drops every packet that does not
+                # come from the pager, so an amplifier that sends audio back is ignored
+                # whatever the direction attribute said.
+                sdp_direction="sendrecv",
                 on_answer=lambda leg_call, d=destination: self._on_leg_answered(
                     session, d, leg_call
                 ),

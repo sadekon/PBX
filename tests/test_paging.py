@@ -631,3 +631,86 @@ class TestDestinationReachability:
         pbx.call_router.resolve_extension.side_effect = RuntimeError("registry down")
         handler = PagingHandler(pbx)
         assert not handler._destination_is_reachable(_destination(), "192.168.1.14", 5060)
+
+
+# --------------------------------------------------------------------------- leg failures
+
+
+@pytest.mark.unit
+class TestOriginatedLegFailureReasons:
+    """
+    A rejected leg has to reach whatever placed it.
+
+    CallOriginator documents on_failure for a leg that never connects, but until the SIP
+    layer learned to dispatch it, only a pre-flight failure or the no-answer timer ever fired
+    it. A 486 from a busy FXS port, or a 488 from an ATA refusing the media, resolved
+    silently -- so a page went on relaying to an amplifier that had declined the call.
+    """
+
+    def test_busy_statuses_map_to_busy(self):
+        from pbx.sip.server import _ORIGINATE_FAILURE_REASONS
+
+        for status in (486, 600, 603):
+            assert _ORIGINATE_FAILURE_REASONS[status] == "busy"
+
+    def test_timeout_statuses_map_to_no_answer(self):
+        from pbx.sip.server import _ORIGINATE_FAILURE_REASONS
+
+        for status in (408, 480):
+            assert _ORIGINATE_FAILURE_REASONS[status] == "no_answer"
+
+    def test_unknown_destination_maps_to_no_route(self):
+        from pbx.sip.server import _ORIGINATE_FAILURE_REASONS
+
+        for status in (404, 410, 484, 604):
+            assert _ORIGINATE_FAILURE_REASONS[status] == "no_route"
+
+    def test_media_rejection_falls_through_to_unreachable(self):
+        """
+        488 is the one a Cisco ATA returned for `a=sendonly` on an FXS port. It has no
+        dedicated reason -- what matters is that it is reported at all.
+        """
+        from pbx.sip.server import _ORIGINATE_FAILURE_REASONS
+
+        assert _ORIGINATE_FAILURE_REASONS.get(488, "unreachable") == "unreachable"
+        assert _ORIGINATE_FAILURE_REASONS.get(500, "unreachable") == "unreachable"
+
+
+@pytest.mark.unit
+class TestPageFailureHandling:
+    """What the pager is told when a zone's only destination refuses the call."""
+
+    def _session_with_one_destination(self):
+        from pbx.core.paging_handler import PagingHandler, _PageSession
+
+        pbx = MagicMock()
+        handler = PagingHandler(pbx)
+        destination = _destination(destination_id=1)
+        page = ActivePage(
+            page_id="p1",
+            from_extension="1513",
+            zone_id=1,
+            zone_extension="799",
+            zone_name="Test Page",
+            destinations=[destination],
+            started_at=datetime.now(UTC),
+            call_id="c1",
+        )
+        session = _PageSession(page=page, media=MagicMock(), rtp_port=10000, call_id="c1")
+        return handler, session, destination, pbx
+
+    def test_a_rejected_only_destination_ends_the_page(self):
+        handler, session, destination, pbx = self._session_with_one_destination()
+        handler._on_leg_failed(session, destination, "unreachable")
+        # The failure tone is played on its own thread and hangs the pager up afterwards.
+        assert destination.destination_id in session.failed
+        pbx.paging_system.set_destination_state.assert_called_with(
+            "p1", destination.destination_id, "failed"
+        )
+
+    def test_a_failure_after_teardown_is_ignored(self):
+        """The duration timer and a late 486 can both arrive after the pager hung up."""
+        handler, session, destination, _ = self._session_with_one_destination()
+        session.torn_down = True
+        handler._on_leg_failed(session, destination, "busy")
+        assert destination.destination_id not in session.failed
