@@ -44,6 +44,16 @@ def main() -> int:
         default=None,
         help="Extension of the ATA FXS port to use with --create-demo",
     )
+    parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help="With --create-demo, delete zone 799 first and build it again from scratch",
+    )
+    parser.add_argument(
+        "--zone",
+        default="799",
+        help="Zone number to create or recreate (default: 799)",
+    )
     args = parser.parse_args()
 
     config = Config()
@@ -78,14 +88,27 @@ def main() -> int:
             print(f"{BAD} --create-demo needs --ata <extension>")
             return 1
 
-        if zones_db.get_by_extension("799"):
-            print(f"{WARN} Zone 799 already exists, leaving it alone")
-        else:
-            conflict = zones_db.extension_conflict("799")
-            if conflict:
-                print(f"{BAD} 799 is already taken by a {conflict}")
+        existing = zones_db.get_by_extension(args.zone)
+
+        if existing and args.recreate:
+            # Destinations cascade with the zone, so this clears both.
+            if not zones_db.delete(existing["id"]):
+                print(f"{BAD} Could not delete the existing zone {args.zone}")
                 return 1
-            zone_id = zones_db.create("799", "Test Page", description="Created by this script")
+            print(f"{OK} Deleted the old zone {args.zone}")
+            existing = None
+
+        if existing:
+            print(
+                f"{WARN} Zone {args.zone} already exists, leaving it alone "
+                f"(pass --recreate to rebuild it)"
+            )
+        else:
+            conflict = zones_db.extension_conflict(args.zone)
+            if conflict:
+                print(f"{BAD} {args.zone} is already taken by a {conflict}")
+                return 1
+            zone_id = zones_db.create(args.zone, "Test Page", description="Created by this script")
             if not zone_id:
                 print(f"{BAD} Could not create the zone")
                 return 1
@@ -98,7 +121,7 @@ def main() -> int:
                     f"The foreign key requires a row in `extensions`."
                 )
                 return 1
-            print(f"{OK} Created zone 799 -> {args.ata}")
+            print(f"{OK} Created zone {args.zone} -> {args.ata}")
 
     # --- what is configured -----------------------------------------------------
     zones = zones_db.list_all() or []
