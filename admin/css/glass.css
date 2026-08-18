@@ -10,8 +10,8 @@
    Applying it is a per-page decision, not a global one. A page opts in by
    putting a textured background behind its content and adding `.glass-page`;
    pages that have not opted in are untouched, because every rule here is
-   scoped under that class. The Directory is the first page migrated. Nothing
-   below knows what a directory is.
+   scoped under that class. The Directory and Find Me/Follow Me are on it.
+   Nothing below knows what either of them is.
 
    HOW A PAGE OPTS IN
        1. give the page container a background with some detail in it
@@ -40,13 +40,14 @@
    The exception is an icon that depicts direction (a chevron), where motion is
    the meaning rather than decoration.
 
-   DARK MODE ONLY, FOR NOW
-   Every rim here is built from rgba(255,255,255,...), which is invisible on a
-   light background. variables.css switches on `prefers-color-scheme`, so the
-   light theme is what a viewer sees by default unless their OS is set to dark.
-   A light-mode rim needs to be a different construction (white highlight on
-   the lit edge, a dark shade on the shaded one) rather than an inversion, and
-   is not written yet. Do not roll this out to a second page until it is.
+   BOTH THEMES
+   Everything above is the dark construction: every rim is built from
+   rgba(255,255,255,...), which reads as a bevel against a dark face and as
+   nothing at all against a light one. The light construction is at the foot of
+   this file under a `prefers-color-scheme` query, and is deliberately not an
+   inversion of this one -- the note there says why. Both are needed, because
+   variables.css switches on the same query, so the light theme is what a
+   viewer sees unless their OS is set to dark.
    ========================================================================== */
 
 /* --------------------------------------------------------------------------
@@ -671,6 +672,149 @@
 }
 
 /* --------------------------------------------------------------------------
+   Ring plan — restated as glass.
+
+   patterns.css owns the geometry; this owns what it is made of. The hairlines
+   between steps are the same white the panes are built from rather than
+   --color-border-light, which is an opaque line and shows as a bar laid across
+   a translucent face.
+   -------------------------------------------------------------------------- */
+
+.glass-page .ring-step {
+    border-top-color: rgba(255, 255, 255, 0.06);
+}
+
+.glass-page .ring-tail {
+    border-top-color: rgba(255, 255, 255, 0.10);
+}
+
+.glass-page .ring-index {
+    background: rgba(255, 255, 255, 0.07);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16);
+}
+
+.glass-page .ring-index-all {
+    color: #8fcdf0;
+    background: rgba(93, 173, 226, 0.16);
+}
+
+.glass-page .ring-tail .ring-index {
+    background: none;
+    box-shadow: none;
+}
+
+/* --------------------------------------------------------------------------
+   Dialog — restated as glass.
+
+   The host `.modal` already paints a scrim over the page, and that scrim is
+   what the dialog's panes frost. So the `.glass-page` wrapper inside a modal
+   must not paint the page backdrop itself: it is a positioning box, not a
+   surface, and painting it would put an opaque rectangle between the panes and
+   the thing they are supposed to refract.
+   -------------------------------------------------------------------------- */
+
+.modal .glass-page {
+    background: none;
+    width: 100%;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 4vh 20px;
+    overflow-y: auto;
+    max-height: 100vh;
+}
+
+.glass-page .dialog-head,
+.glass-page .dialog-foot {
+    border-color: rgba(255, 255, 255, 0.08);
+}
+
+.glass-page .dialog-close {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.glass-page .dialog-close:hover {
+    background: rgba(255, 255, 255, 0.13);
+}
+
+.glass-page .field input[type="text"],
+.glass-page .plan-row input[type="text"],
+.glass-page .plan-row input[type="number"] {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.14);
+    transition:
+        background 0.15s ease,
+        border-color 0.15s ease,
+        box-shadow 0.15s ease;
+}
+
+.glass-page .field input[type="text"]:focus,
+.glass-page .plan-row input:focus {
+    outline: none;
+    background: rgba(255, 255, 255, 0.11);
+    border-color: rgba(124, 196, 234, 0.65);
+    box-shadow: 0 0 0 3px rgba(93, 173, 226, 0.15);
+}
+
+/* Readonly states a fact rather than disabling a control, so it loses the fill
+   and reads as text that happens to sit where a field would. */
+.glass-page .field input[readonly] {
+    background: rgba(255, 255, 255, 0.025);
+    border-color: rgba(255, 255, 255, 0.07);
+    color: var(--color-text-secondary);
+}
+
+.glass-page .field-note code,
+.glass-page .form-warn code {
+    background: rgba(255, 255, 255, 0.10);
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: var(--color-text);
+}
+
+.glass-page .mode-opt {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.12);
+}
+
+.glass-page .mode-opt:hover {
+    background: rgba(255, 255, 255, 0.09);
+    border-color: rgba(255, 255, 255, 0.22);
+}
+
+.glass-page .mode-opt.selected {
+    background: rgba(93, 173, 226, 0.16);
+    border-color: rgba(124, 196, 234, 0.55);
+}
+
+.glass-page .plan-row,
+.glass-page .plan-list .plan-row:first-child {
+    border-top-color: rgba(255, 255, 255, 0.06);
+}
+
+.glass-page .plan-tail {
+    border-top-color: rgba(255, 255, 255, 0.10);
+}
+
+.glass-page .plan-grip:hover {
+    color: var(--color-text-secondary);
+}
+
+.glass-page .plan-row-dropped .plan-number input {
+    border-color: rgba(240, 180, 94, 0.35);
+}
+
+.glass-page .plan-drop-flag {
+    color: #f0b45e;
+}
+
+.glass-page .form-warn {
+    color: #f0b45e;
+    background: rgba(217, 119, 6, 0.14);
+    border-color: rgba(240, 180, 94, 0.26);
+}
+
+/* --------------------------------------------------------------------------
    Motion
    -------------------------------------------------------------------------- */
 
@@ -691,5 +835,535 @@
     .glass-page .sk-circle::after {
         animation: none;
         opacity: 0.5;
+    }
+}
+
+/* ==========================================================================
+   The light construction
+
+   WHY THIS IS NOT AN INVERSION
+   The header of glass.css says a light rim "needs to be a different
+   construction (white highlight on the lit edge, a dark shade on the shaded
+   one) rather than an inversion". This is that construction, and the reason is
+   physical: the light source does not move. It comes from the top-left in both
+   themes, so the lit edge is white in both. What changes is which edge carries
+   the definition.
+
+       dark   the pane is darker than nothing, so the *lit* edge does the work:
+              a bright white rim against a dark face reads as a bevel.
+       light  the pane is near-white on a near-white page, so a white rim says
+              nothing. The *shaded* edge does the work instead, as a real dark
+              line — the underside of a bevel, not a dimmer highlight.
+
+   Inverting the dark gradient would put white where the shadow belongs and
+   produce a pane that appears lit from below, which reads as a hole.
+
+   THE SHADE COLOUR IS NOT BLACK
+   Every dark value here is built from 26, 54, 93 — the same navy as
+   --color-primary. Neutral black over a blue-tinted page turns the shadows
+   grey and makes the panes look dirty rather than recessed. A shadow carries
+   the colour of what surrounds it.
+
+   THE RAMP SURVIVES, INVERTED IN OPACITY
+   In dark, a higher tier is *more* white and therefore brighter. In light, a
+   higher tier is *more* white and therefore cleaner — less of the tinted page
+   showing through. So the same "brightest at the top of the page" ordering
+   holds, and the content tier stays the quietest, without reordering anything.
+   ========================================================================== */
+
+@media (prefers-color-scheme: light) {
+
+    /* ----------------------------------------------------------------------
+       The page surface
+
+       Carries more tint than the dark backdrop does. backdrop-filter needs
+       detail to refract, and in light mode the panes are near-white — so with
+       the dark theme's faint lattice they would frost a white page into a
+       white pane and disappear. The dots are navy at low alpha rather than
+       white, for the same reason.
+       ---------------------------------------------------------------------- */
+    .glass-page {
+        /* Secondary text, darkened for this treatment only.
+           The app-wide --color-text-secondary (#6c757d) was chosen against the
+           opaque #ffffff card the rest of the admin uses. A glass pane is
+           lighter than that card in places and tinted in others, and the token
+           measures 4.06:1 on the bare page and 4.35:1 on a g3 pane — under the
+           4.5:1 that small text needs, and most of the text this treatment
+           puts in secondary is small (ring windows at 0.76rem, meta-stat keys
+           at 0.63rem). #5c656e is the same hue two steps down and measures
+           5.13:1 at worst across all four tiers, the page, and a white input.
+           Scoped here rather than changed globally, for the same reason the
+           link colour above is: retoning every secondary string in the admin
+           is a separate decision. */
+        --color-text-secondary: #5c656e;
+
+        background-color: #eaeff6;
+        background-image:
+            radial-gradient(110% 80% at 12% 0%, rgba(52, 152, 219, 0.20), transparent 62%),
+            radial-gradient(rgba(26, 54, 93, 0.075) 1px, transparent 1px);
+        background-size: auto, 22px 22px;
+    }
+
+    /* ---- tier 1: page identity ---- */
+    .glass-page .g1 {
+        background: rgba(255, 255, 255, 0.74);
+        box-shadow:
+            inset 0 1px 0 0 rgba(255, 255, 255, 0.95),
+            inset 0 -1px 0 0 rgba(26, 54, 93, 0.05),
+            0 10px 30px rgba(26, 54, 93, 0.13);
+    }
+
+    .glass-page .g1::before {
+        background: linear-gradient(145deg,
+            rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0.34) 30%,
+            rgba(26, 54, 93, 0.05) 56%, rgba(26, 54, 93, 0.13) 82%,
+            rgba(26, 54, 93, 0.20));
+    }
+
+    /* ---- tier 2: summary ---- */
+    .glass-page .g2 {
+        background: rgba(255, 255, 255, 0.60);
+        box-shadow:
+            inset 0 1px 0 0 rgba(255, 255, 255, 0.85),
+            0 6px 18px rgba(26, 54, 93, 0.10);
+    }
+
+    .glass-page .g2::before {
+        background: linear-gradient(145deg,
+            rgba(255, 255, 255, 0.85), rgba(255, 255, 255, 0.26) 30%,
+            rgba(26, 54, 93, 0.04) 56%, rgba(26, 54, 93, 0.10) 82%,
+            rgba(26, 54, 93, 0.16));
+    }
+
+    /* ---- tier 3: content ---- */
+    .glass-page .g3 {
+        background: rgba(255, 255, 255, 0.48);
+        box-shadow:
+            inset 0 1px 0 0 rgba(255, 255, 255, 0.75),
+            0 3px 12px rgba(26, 54, 93, 0.07);
+    }
+
+    .glass-page .g3::before {
+        background: linear-gradient(145deg,
+            rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.20) 32%,
+            rgba(26, 54, 93, 0.03) 58%, rgba(26, 54, 93, 0.075) 84%,
+            rgba(26, 54, 93, 0.12));
+    }
+
+    /* ---- tier 4: footnote ---- */
+    .glass-page .g4 {
+        background: rgba(255, 255, 255, 0.34);
+        box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.65);
+    }
+
+    .glass-page .g4::before {
+        background: linear-gradient(145deg,
+            rgba(255, 255, 255, 0.60), rgba(26, 54, 93, 0.02) 40%,
+            rgba(26, 54, 93, 0.08));
+    }
+
+    /* ----------------------------------------------------------------------
+       Edge lensing
+
+       Same idea as the dark hover — only the rim answers — but the mechanism
+       flips with the construction. In dark the highlight gathers; here the
+       shaded edge deepens and the pane lifts a little further off the page.
+       ---------------------------------------------------------------------- */
+    .glass-page .g-hover:hover {
+        background: rgba(255, 255, 255, 0.74);
+        box-shadow:
+            inset 0 1px 0 0 rgba(255, 255, 255, 0.95),
+            0 5px 16px rgba(26, 54, 93, 0.13);
+    }
+
+    .glass-page .g-hover:hover::before {
+        background: linear-gradient(145deg,
+            rgba(255, 255, 255, 1), rgba(255, 255, 255, 0.40) 28%,
+            rgba(26, 54, 93, 0.07) 56%, rgba(26, 54, 93, 0.17) 82%,
+            rgba(26, 54, 93, 0.28));
+    }
+
+    /* ----------------------------------------------------------------------
+       Controls
+       ---------------------------------------------------------------------- */
+
+    .glass-page .btn-ghost {
+        color: var(--color-text-secondary);
+        border-color: rgba(26, 54, 93, 0.16);
+        background: rgba(255, 255, 255, 0.78);
+        box-shadow:
+            inset 0 1px 0 rgba(255, 255, 255, 0.95),
+            0 1px 2px rgba(26, 54, 93, 0.06);
+    }
+
+    .glass-page .btn-ghost:hover {
+        background: rgba(255, 255, 255, 0.98);
+        border-color: rgba(26, 54, 93, 0.30);
+        color: var(--color-text);
+        box-shadow:
+            inset 0 1px 0 rgba(255, 255, 255, 1),
+            0 2px 6px rgba(26, 54, 93, 0.11);
+    }
+
+    /* The press: light now comes from below and the face takes an inner
+       shadow at the top, exactly as in dark — the values change, the claim
+       does not. */
+    .glass-page .btn-ghost:active {
+        background: rgba(26, 54, 93, 0.05);
+        border-color: rgba(26, 54, 93, 0.22);
+        box-shadow:
+            inset 0 2px 5px rgba(26, 54, 93, 0.14),
+            inset 0 -1px 0 rgba(255, 255, 255, 0.85);
+    }
+
+    .glass-page .btn-ghost-accent {
+        background: rgba(52, 152, 219, 0.15);
+        border-color: rgba(41, 128, 185, 0.45);
+        color: #1a5f88;
+    }
+
+    .glass-page .btn-ghost-accent:hover {
+        background: rgba(52, 152, 219, 0.26);
+        border-color: rgba(41, 128, 185, 0.72);
+        color: #14496a;
+    }
+
+    .glass-page .btn-ghost-accent:active {
+        background: rgba(52, 152, 219, 0.17);
+    }
+
+    /* No resting state: patterns.css keeps destructive actions neutral until
+       hover so a list of rows is not a wall of red, and a per-row Delete makes
+       that the common case here. Only the hover is retinted. */
+    .glass-page .btn-ghost-danger:hover {
+        color: #8a1f1a;
+        background: rgba(231, 76, 60, 0.14);
+        border-color: rgba(192, 57, 43, 0.52);
+    }
+
+    /* Solid white, not translucent. A field sits *on* a pane that is already
+       near-white, so a translucent fill leaves it the same tone as its
+       surroundings and the input stops reading as somewhere you can type. An
+       opaque well plus a slightly stronger rim is what separates the two, and
+       the inset shadow gives it the depth the dark theme gets for free from
+       being lighter than its pane. */
+    .glass-page .filter-bar input[type="text"],
+    .glass-page .filter-bar input[type="search"],
+    .glass-page .filter-bar select,
+    .glass-page .field input[type="text"],
+    .glass-page .plan-row input[type="text"],
+    .glass-page .plan-row input[type="number"] {
+        background: #ffffff;
+        border-color: rgba(26, 54, 93, 0.22);
+        box-shadow: inset 0 1px 2px rgba(26, 54, 93, 0.06);
+        color: var(--color-text);
+    }
+
+    .glass-page .filter-bar input[type="text"]:hover,
+    .glass-page .filter-bar input[type="search"]:hover,
+    .glass-page .filter-bar select:hover {
+        border-color: rgba(26, 54, 93, 0.36);
+    }
+
+    .glass-page .filter-bar input[type="text"]:focus,
+    .glass-page .filter-bar input[type="search"]:focus,
+    .glass-page .filter-bar select:focus,
+    .glass-page .field input:focus,
+    .glass-page .plan-row input:focus {
+        background: #ffffff;
+        border-color: rgba(41, 128, 185, 0.70);
+        box-shadow:
+            inset 0 1px 2px rgba(26, 54, 93, 0.05),
+            0 0 0 3px rgba(52, 152, 219, 0.17);
+    }
+
+    .glass-page .field input[readonly] {
+        background: rgba(26, 54, 93, 0.04);
+        border-color: rgba(26, 54, 93, 0.09);
+        color: var(--color-text-secondary);
+    }
+
+    /* ----------------------------------------------------------------------
+       Clickable things that are not buttons
+       ---------------------------------------------------------------------- */
+
+    .glass-page .card-title:hover,
+    .glass-page .filter-check:hover {
+        background: rgba(26, 54, 93, 0.07);
+    }
+
+    /* ----------------------------------------------------------------------
+       Pills
+
+       Retinted rather than recoloured: same hue, but the fill drops and the
+       text darkens, because a pale tint carrying pale text fails contrast on
+       white. Each text colour here clears 4.5:1 on its own fill.
+       ---------------------------------------------------------------------- */
+
+    .glass-page .pill {
+        border-color: rgba(26, 54, 93, 0.12);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
+    }
+
+    .glass-page .pill-warn {
+        color: #8a5200;
+        background: rgba(217, 119, 6, 0.14);
+        border-color: rgba(217, 119, 6, 0.32);
+    }
+
+    .glass-page .pill-info {
+        color: #1a5f88;
+        background: rgba(52, 152, 219, 0.14);
+        border-color: rgba(41, 128, 185, 0.32);
+    }
+
+    .glass-page .pill-danger {
+        color: #a32620;
+        background: rgba(231, 76, 60, 0.13);
+        border-color: rgba(192, 57, 43, 0.30);
+    }
+
+    .glass-page .pill-ok {
+        color: #15703c;
+        background: rgba(39, 174, 96, 0.14);
+        border-color: rgba(39, 174, 96, 0.32);
+    }
+
+    .glass-page .pill-muted {
+        color: var(--color-text-secondary);
+        background: rgba(26, 54, 93, 0.07);
+    }
+
+    /* ----------------------------------------------------------------------
+       Group heading, skeletons, empty
+       ---------------------------------------------------------------------- */
+
+    .glass-page .group-label::after {
+        background: linear-gradient(90deg, rgba(26, 54, 93, 0.16), transparent);
+    }
+
+    .glass-page .sk-bar,
+    .glass-page .sk-circle {
+        background: rgba(26, 54, 93, 0.09);
+    }
+
+    /* The sweep is a light source crossing the pane in both themes. On a dark
+       skeleton it is a white pass; on a light one a white pass is invisible,
+       so it is the *absence* of the fill that travels instead. */
+    .glass-page .sk-bar::after,
+    .glass-page .sk-circle::after {
+        background: linear-gradient(90deg,
+            transparent, rgba(255, 255, 255, 0.85) 50%, transparent);
+    }
+
+    .glass-page .empty-mark {
+        background: rgba(26, 54, 93, 0.07);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95);
+    }
+
+    .glass-page .empty-mark-warn {
+        background: rgba(217, 119, 6, 0.15);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
+    }
+
+    .glass-page .empty-state code,
+    .glass-page .field-note code,
+    .glass-page .form-warn code {
+        background: rgba(26, 54, 93, 0.08);
+        color: var(--color-text);
+    }
+
+    /* ----------------------------------------------------------------------
+       Legacy components
+       ---------------------------------------------------------------------- */
+
+    .glass-page .stat-card:hover {
+        box-shadow:
+            inset 0 1px 0 0 rgba(255, 255, 255, 0.85),
+            0 6px 18px rgba(26, 54, 93, 0.10);
+    }
+
+    /* Ringed in the page colour so the dot reads as attached to the avatar. */
+    .glass-page .avatar-dot {
+        border-color: #ffffff;
+    }
+
+    .glass-page .avatar {
+        background: rgba(26, 54, 93, 0.08);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    }
+
+    .glass-page .g-hover:hover .avatar {
+        background: rgba(26, 54, 93, 0.12);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 1);
+    }
+
+    /* ----------------------------------------------------------------------
+       FMFM: page head, ring plan, dialog
+
+       These classes arrive with the FMFM port; their light values live here so
+       the theme is defined in one place rather than trailing the feature.
+       ---------------------------------------------------------------------- */
+
+    .glass-page .page-mark {
+        background: rgba(52, 152, 219, 0.16);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95);
+    }
+
+    .glass-page .ring-step,
+    .glass-page .plan-row,
+    .glass-page .dest-row {
+        border-top-color: rgba(26, 54, 93, 0.10);
+    }
+
+    .glass-page .ring-tail,
+    .glass-page .plan-tail {
+        border-top-color: rgba(26, 54, 93, 0.14);
+    }
+
+    .glass-page .ring-index {
+        color: var(--color-text-secondary);
+        background: rgba(26, 54, 93, 0.08);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    }
+
+    .glass-page .ring-index-all {
+        color: #1a5f88;
+        background: rgba(52, 152, 219, 0.16);
+    }
+
+    /* ---- the dialog ---- */
+
+    .glass-page .dialog-head,
+    .glass-page .dialog-foot {
+        border-color: rgba(26, 54, 93, 0.12);
+    }
+
+    .glass-page .dialog-close {
+        background: rgba(26, 54, 93, 0.06);
+    }
+
+    .glass-page .dialog-close:hover {
+        background: rgba(26, 54, 93, 0.13);
+    }
+
+    .glass-page .mode-opt {
+        background: rgba(255, 255, 255, 0.70);
+        border-color: rgba(26, 54, 93, 0.14);
+    }
+
+    .glass-page .mode-opt:hover {
+        background: rgba(255, 255, 255, 0.95);
+        border-color: rgba(26, 54, 93, 0.26);
+    }
+
+    .glass-page .mode-opt.selected {
+        background: rgba(52, 152, 219, 0.15);
+        border-color: rgba(41, 128, 185, 0.55);
+    }
+
+    .glass-page .plan-row,
+    .glass-page .plan-list .plan-row:first-child {
+        border-top-color: rgba(26, 54, 93, 0.10);
+    }
+
+    .glass-page .plan-tail {
+        border-top-color: rgba(26, 54, 93, 0.14);
+    }
+
+    .glass-page .plan-grip {
+        color: #9aa5b1;
+    }
+
+    .glass-page .plan-grip:hover {
+        color: var(--color-text-secondary);
+    }
+
+    .glass-page .plan-row-dropped .plan-number input {
+        border-color: rgba(217, 119, 6, 0.45);
+    }
+
+    .glass-page .plan-drop-flag {
+        color: #8a5200;
+    }
+
+    .glass-page .form-warn {
+        color: #7a4900;
+        background: rgba(217, 119, 6, 0.11);
+        border-color: rgba(217, 119, 6, 0.30);
+    }
+
+    .glass-page .data-table thead {
+        background: rgba(26, 54, 93, 0.045);
+    }
+
+    .glass-page .data-table th {
+        border-bottom-color: rgba(26, 54, 93, 0.14);
+    }
+
+    .glass-page .data-table td {
+        border-bottom-color: rgba(26, 54, 93, 0.08);
+    }
+
+    .glass-page .data-table tbody tr:hover {
+        background: rgba(26, 54, 93, 0.045);
+    }
+
+    /* ---- the dialog ---- */
+
+    /* The scrim darkens rather than lightens even in light mode: a scrim says
+       "the page behind is out of reach", and only a darkening reads that way. */
+    .fmfm-scrim {
+        background: rgba(26, 54, 93, 0.28);
+    }
+
+    .glass-page .dialog-head,
+    .glass-page .dialog-foot {
+        border-color: rgba(26, 54, 93, 0.12);
+    }
+
+    .glass-page .dialog-close {
+        background: rgba(26, 54, 93, 0.06);
+    }
+
+    .glass-page .dialog-close:hover {
+        background: rgba(26, 54, 93, 0.13);
+    }
+
+    .glass-page .mode-opt {
+        background: rgba(255, 255, 255, 0.70);
+        border-color: rgba(26, 54, 93, 0.14);
+    }
+
+    .glass-page .mode-opt:hover {
+        background: rgba(255, 255, 255, 0.95);
+        border-color: rgba(26, 54, 93, 0.26);
+    }
+
+    .glass-page .mode-opt.selected {
+        background: rgba(52, 152, 219, 0.15);
+        border-color: rgba(41, 128, 185, 0.55);
+    }
+
+    .glass-page .plan-grip {
+        color: #9aa5b1;
+    }
+
+    .glass-page .plan-grip:hover {
+        color: var(--color-text-secondary);
+    }
+
+    .glass-page .plan-drop-flag {
+        color: #8a5200;
+    }
+
+    .glass-page .plan-row-dropped .plan-number input {
+        border-color: rgba(217, 119, 6, 0.45);
+    }
+
+    .glass-page .form-warn {
+        color: #7a4900;
+        background: rgba(217, 119, 6, 0.11);
+        border-color: rgba(217, 119, 6, 0.30);
     }
 }

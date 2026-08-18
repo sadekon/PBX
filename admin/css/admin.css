@@ -652,33 +652,37 @@ header h1 {
     height: 11px;
 }
 
-#phone-book.glass-page .card-stack {
+.glass-page .card-stack {
     gap: 7px;
 }
 
-/* The page header and its caption. Directory-named for now: the shape is
-   general, but nothing else is on glass yet, so generalising it would be
-   guessing at what the second page needs. */
-#phone-book .directory-head {
+/* The page header and its caption.
+
+   Generalised from the Directory-named originals when Find Me/Follow Me became
+   the second page on glass. The shape turned out to be exactly general: a mark,
+   a title, a line of explanation, and the page-level actions pushed to the far
+   edge. Scoped to .glass-page rather than to an id so a third page needs no
+   further work here. */
+.glass-page .page-head {
     display: flex;
     align-items: center;
     gap: 18px;
     padding: 20px 24px;
 }
 
-#phone-book .directory-head h2 {
+.glass-page .page-head h2 {
     margin: 0;
     font-size: 1.5rem;
     letter-spacing: -0.015em;
 }
 
-#phone-book .directory-head .directory-sub {
+.glass-page .page-head .page-sub {
     margin: 4px 0 0;
     font-size: 0.85rem;
     color: var(--color-text-secondary);
 }
 
-#phone-book .directory-mark {
+.glass-page .page-mark {
     width: 46px;
     height: 46px;
     border-radius: 13px;
@@ -691,7 +695,7 @@ header h1 {
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26);
 }
 
-#phone-book .directory-head-actions {
+.glass-page .page-head-actions {
     margin-left: auto;
     display: flex;
     gap: 8px;
@@ -699,7 +703,7 @@ header h1 {
 
 /* Names the list zone, so the toolbar is not the first thing in an unlabelled
    region. */
-#phone-book .directory-caption {
+.glass-page .list-caption {
     display: flex;
     align-items: baseline;
     gap: 10px;
@@ -714,7 +718,7 @@ header h1 {
 
 /* The count is a sentence ("6 people"), not a label, so it opts out of the
    caption's uppercase rather than inheriting it. */
-#phone-book .directory-caption .filter-summary {
+.glass-page .list-caption .filter-summary {
     text-transform: none;
     letter-spacing: 0;
     font-weight: 500;

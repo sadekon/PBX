@@ -439,3 +439,455 @@
     color: var(--color-text-secondary);
     padding: 4px 0 10px;
 }
+
+/* --------------------------------------------------------------------------
+   Ring plan — an ordered list of timed steps.
+
+   Written for Find Me/Follow Me, where a configuration is a plan rather than a
+   set of fields: destinations ring in an order, each for its own length, and
+   what the reader is actually checking is when the caller hears what. A list
+   of numbers cannot say that, so every step carries the window it occupies and
+   the list carries where the call goes when it runs out.
+
+   Geometry only. The surface treatment is in glass.css, the same split the
+   pill and the card shell already use.
+   -------------------------------------------------------------------------- */
+
+.ring-plan {
+    padding: 2px 16px 14px;
+}
+
+.ring-lead {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 700;
+    color: var(--color-text-secondary);
+    padding: 6px 0 2px;
+}
+
+.ring-step {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 0;
+    border-top: 1px solid var(--color-border-light);
+}
+
+.ring-step:first-of-type {
+    border-top: none;
+}
+
+/* The step's position. Square rather than round: nothing else in the system has
+   a fully round corner, so a circular chip reads as a badge borrowed from
+   somewhere else. Tabular figures so a two-digit step does not shift the
+   column beside it. */
+.ring-index {
+    width: 21px;
+    height: 21px;
+    flex-shrink: 0;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.7rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--color-text-secondary);
+    background: var(--color-bg-hover);
+}
+
+/* A simultaneous burst has no order, so every leg carries the same mark rather
+   than a rank that would imply one. */
+.ring-index-all {
+    color: var(--color-accent);
+}
+
+.ring-number {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.ring-kind {
+    font-size: 0.78rem;
+    color: var(--color-text-secondary);
+}
+
+/* The window this leg rings in. Right-aligned and tabular so the times form a
+   column that can be read down, which is what makes the plan legible as a
+   timeline rather than a list of durations. */
+.ring-when {
+    margin-left: auto;
+    font-size: 0.76rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--color-text-secondary);
+    white-space: nowrap;
+}
+
+/* Where the call goes when the list runs out. Separated by a heavier rule than
+   the steps use, because it is not another destination. */
+.ring-tail {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 9px 0 2px;
+    margin-top: 2px;
+    border-top: 1px solid var(--color-border);
+    font-size: 0.8rem;
+    color: var(--color-text-secondary);
+}
+
+.ring-tail .ring-index {
+    background: none;
+}
+
+/* --------------------------------------------------------------------------
+   Dialog — a modal's inner shell.
+
+   Sits inside the existing `.modal` (which owns the fixed positioning, the
+   scrim and the z-index) and replaces `.modal-content` where a page wants the
+   surface treatment instead of an opaque card. Head and foot are fixed bands
+   with the body scrolling between them, so the actions stay reachable on a
+   long form rather than being pushed below the fold.
+
+   Geometry only; the surface is in glass.css.
+   -------------------------------------------------------------------------- */
+
+.dialog {
+    width: 100%;
+    max-width: 680px;
+    display: flex;
+    flex-direction: column;
+    max-height: 90vh;
+}
+
+.dialog-head {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    padding: 15px 20px;
+    border-bottom: 1px solid var(--color-border);
+    flex-shrink: 0;
+}
+
+.dialog-head h3 {
+    margin: 0;
+    font-size: 1.02rem;
+    letter-spacing: -0.01em;
+}
+
+.dialog-head .dialog-sub {
+    margin: 2px 0 0;
+    font-size: 0.78rem;
+    color: var(--color-text-secondary);
+}
+
+.dialog-close {
+    margin-left: auto;
+    width: 30px;
+    height: 30px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 1.1rem;
+    line-height: 1;
+    color: var(--color-text-secondary);
+    background: var(--color-bg-hover);
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.dialog-close:hover {
+    color: var(--color-text);
+}
+
+.dialog-body {
+    padding: 16px 20px;
+    overflow-y: auto;
+    flex: 1 1 auto;
+}
+
+.dialog-foot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 13px 20px;
+    border-top: 1px solid var(--color-border);
+    flex-shrink: 0;
+}
+
+/* Pushes the confirming actions to the trailing edge, leaving anything before
+   it (a destructive action) on the leading edge and well away from them. */
+.dialog-foot .spacer {
+    margin-left: auto;
+}
+
+/* --------------------------------------------------------------------------
+   Fields
+   -------------------------------------------------------------------------- */
+
+.field {
+    margin-bottom: 16px;
+}
+
+.field > label,
+.field-label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 700;
+    color: var(--color-text-secondary);
+}
+
+.field input[type="text"] {
+    width: 100%;
+    padding: 8px 11px;
+    font: inherit;
+    font-size: 0.88rem;
+    color: var(--color-text);
+    background: var(--color-bg-input);
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+}
+
+.field-note {
+    display: block;
+    margin-top: 6px;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    color: var(--color-text-secondary);
+}
+
+/* --------------------------------------------------------------------------
+   Mode choice — a small set of mutually exclusive options, each needing a
+   sentence to distinguish it.
+
+   A <select> of two words hides the difference behind a click; these are two
+   words plus the consequence, side by side, which is what lets someone choose
+   without already knowing the system.
+   -------------------------------------------------------------------------- */
+
+.mode-choice {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 9px;
+}
+
+@media (max-width: 520px) {
+    .mode-choice {
+        grid-template-columns: 1fr;
+    }
+}
+
+.mode-opt {
+    display: block;
+    padding: 11px 13px;
+    border-radius: 11px;
+    cursor: pointer;
+    border: 1px solid var(--color-border);
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+/* The radio itself is hidden but still focusable and still the thing that
+   carries the state, so the label reflects focus rather than replacing it. */
+.mode-opt input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.mode-opt:focus-within {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 1px;
+}
+
+.mode-opt strong {
+    display: block;
+    font-size: 0.86rem;
+    margin-bottom: 3px;
+}
+
+.mode-opt span {
+    font-size: 0.74rem;
+    line-height: 1.45;
+    color: var(--color-text-secondary);
+}
+
+/* --------------------------------------------------------------------------
+   Plan editor — the editable twin of the ring plan.
+
+   Deliberately the same geometry as .ring-step: the editor and the read-only
+   plan are the same object, so a row being edited shows the window it will
+   occupy rather than deferring that to a preview elsewhere. A ring time only
+   means something in the company of the rows above it.
+   -------------------------------------------------------------------------- */
+
+.plan-list {
+    padding: 3px 13px 11px;
+}
+
+.plan-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 0;
+    border-top: 1px solid var(--color-border-light);
+}
+
+.plan-row:first-child {
+    border-top: none;
+}
+
+.plan-grip {
+    flex: 0 0 auto;
+    padding: 2px 3px;
+    cursor: grab;
+    color: var(--color-text-muted);
+    font-size: 0.85rem;
+    line-height: 1;
+    background: none;
+    border: none;
+    border-radius: 5px;
+    touch-action: none;
+}
+
+.plan-grip:focus-visible {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 1px;
+}
+
+.plan-number {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.plan-row input[type="text"],
+.plan-row input[type="number"] {
+    width: 100%;
+    padding: 7px 10px;
+    font: inherit;
+    font-size: 0.85rem;
+    color: var(--color-text);
+    background: var(--color-bg-input);
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+}
+
+/* The unit is a label, not something to type, so it sits beside the field
+   rather than inside the value. */
+.plan-ring {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.plan-ring input {
+    width: 58px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.plan-ring .unit {
+    font-size: 0.76rem;
+    color: var(--color-text-secondary);
+}
+
+/* The derived row states what the backend will do, so it carries no controls:
+   a disabled input invites an attempt to change it. */
+.plan-row-derived .plan-static {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 0.85rem;
+    color: var(--color-text-secondary);
+}
+
+.plan-row-derived .plan-static strong {
+    color: var(--color-text);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.plan-row-derived .plan-fixed {
+    flex: 0 0 auto;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--color-text-secondary);
+}
+
+/* A row the backend will discard. Dimmed rather than deleted: it is still the
+   operator's input and still editable, and removing it for them hides why. */
+.plan-row-dropped .plan-ring {
+    opacity: 0.45;
+}
+
+.plan-drop-flag {
+    flex: 0 0 86px;
+    text-align: right;
+    font-size: 0.71rem;
+    font-weight: 600;
+    color: var(--color-warning);
+}
+
+.plan-tail {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 10px 0 2px;
+    margin-top: 2px;
+    border-top: 1px solid var(--color-border);
+    font-size: 0.8rem;
+    color: var(--color-text-secondary);
+}
+
+.plan-tail .grand {
+    margin-left: auto;
+    flex: 0 0 86px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    color: var(--color-text);
+}
+
+.plan-add {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 0 2px;
+}
+
+.plan-add .count {
+    margin-left: auto;
+    font-size: 0.73rem;
+    color: var(--color-text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+/* An inline consequence of what is currently typed. Not an error -- the save
+   succeeds either way -- but it changes what the PBX will do, so it is stated
+   where the input is rather than raised after the fact. */
+.form-warn {
+    display: flex;
+    gap: 9px;
+    align-items: flex-start;
+    margin-top: 9px;
+    padding: 9px 12px;
+    border-radius: 10px;
+    font-size: 0.78rem;
+    line-height: 1.5;
+    color: var(--color-warning);
+    background: var(--color-warning-bg);
+    border: 1px solid var(--color-warning);
+}
+
+.form-empty {
+    padding: 16px 4px;
+    text-align: center;
+    font-size: 0.8rem;
+    color: var(--color-text-secondary);
+}

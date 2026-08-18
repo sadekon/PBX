@@ -466,13 +466,13 @@
 
         <!-- Company Directory Tab -->
         <div id="phone-book" class="tab-content glass-page">
-            <div class="g g1 directory-head">
-                <span class="directory-mark" aria-hidden="true">📇</span>
+            <div class="g g1 page-head">
+                <span class="page-mark" aria-hidden="true">📇</span>
                 <div>
                     <h2>Company Directory</h2>
-                    <p class="directory-sub">Every extension on the system, visible to all signed-in users</p>
+                    <p class="page-sub">Every extension on the system, visible to all signed-in users</p>
                 </div>
-                <span class="directory-head-actions">
+                <span class="page-head-actions">
                     <button type="button" class="btn-ghost btn-ghost-accent" id="directory-refresh">Refresh</button>
                 </span>
             </div>
@@ -493,7 +493,7 @@
             </div>
 
             <div class="config-section">
-                <p class="directory-caption">All extensions
+                <p class="list-caption">All extensions
                     <span class="filter-summary" id="directory-count" aria-live="polite"></span>
                 </p>
                 <div class="g g2 filter-bar">
@@ -1867,70 +1867,76 @@ Content-Type: application/json
 
         <!-- Codecs Tab -->
         <!-- Find Me/Follow Me Tab -->
-        <div id="find-me-follow-me" class="tab-content">
-            <h2>🔄 Find Me/Follow Me</h2>
-
-            <div class="action-buttons" style="margin-bottom: 20px;">
-                <button class="btn btn-primary" onclick="loadFMFMExtensions()">🔄 Refresh</button>
-                <button class="btn btn-success" onclick="showAddFMFMModal()">➕ Configure Extension</button>
+        <div id="find-me-follow-me" class="tab-content glass-page">
+            <div class="g g1 page-head">
+                <span class="page-mark" aria-hidden="true">🔀</span>
+                <div>
+                    <h2>Find Me / Follow Me</h2>
+                    <p class="page-sub">Ring a chain of numbers so a call reaches someone wherever they are</p>
+                </div>
+                <span class="page-head-actions">
+                    <button type="button" class="btn-ghost" id="fmfm-refresh">Refresh</button>
+                    <button type="button" class="btn-ghost btn-ghost-accent" id="fmfm-add">Configure extension</button>
+                </span>
             </div>
 
-            <!-- FMFM Statistics -->
-            <div class="stats-grid" style="margin-bottom: 20px;">
-                <div class="stat-card">
+            <div class="stats-grid" style="margin-bottom: 30px;">
+                <div class="g g2 stat-card">
                     <div class="stat-value" id="fmfm-total-extensions">-</div>
-                    <div class="stat-label">Extensions with FMFM</div>
+                    <div class="stat-label">Configured Extensions</div>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="fmfm-sequential">-</div>
-                    <div class="stat-label">Sequential Mode</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="fmfm-simultaneous">-</div>
-                    <div class="stat-label">Simultaneous Mode</div>
-                </div>
-                <div class="stat-card">
+                <div class="g g2 stat-card">
                     <div class="stat-value" id="fmfm-active-count">-</div>
-                    <div class="stat-label">Active Configurations</div>
+                    <div class="stat-label">Active</div>
+                </div>
+                <div class="g g2 stat-card">
+                    <div class="stat-value" id="fmfm-destinations">-</div>
+                    <div class="stat-label">Destinations</div>
                 </div>
             </div>
 
-            <!-- FMFM Configurations List -->
             <div class="config-section">
-                <h3>📋 Configured Extensions</h3>
-                <div class="table-container">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th>Extension</th>
-                                <th>Mode</th>
-                                <th>Destinations</th>
-                                <th>Status</th>
-                                <th>Updated</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="fmfm-list">
-                            <tr>
-                                <td colspan="6" style="text-align: center;">Loading configurations...</td>
-                            </tr>
-                        </tbody>
-                    </table>
+                <p class="list-caption">Configured extensions
+                    <span class="filter-summary" id="fmfm-count" aria-live="polite"></span>
+                </p>
+
+                <div class="g g2 filter-bar">
+                    <span class="filter-field">
+                        <label class="filter-label" for="fmfm-search">Search</label>
+                        <input type="search" id="fmfm-search" autocomplete="off"
+                               placeholder="Extension or destination number">
+                    </span>
+                    <span class="filter-field">
+                        <label class="filter-label" for="fmfm-mode-filter">Mode</label>
+                        <select id="fmfm-mode-filter">
+                            <option value="all">All modes</option>
+                            <option value="sequential">Sequential</option>
+                            <option value="simultaneous">Simultaneous</option>
+                        </select>
+                    </span>
+                    <label class="filter-check" for="fmfm-active-only">
+                        <input type="checkbox" id="fmfm-active-only">
+                        Active only
+                    </label>
+                    <button type="button" class="btn-ghost" id="fmfm-clear-filter" hidden>Clear filters</button>
                 </div>
+
+                <div id="fmfm-list"></div>
             </div>
 
-            <!-- Info Box -->
-            <div class="info-box">
-                <h3>ℹ️ About Find Me/Follow Me</h3>
-                <p><strong>Find Me/Follow Me (FMFM)</strong> allows calls to ring multiple numbers to ensure you never miss important calls.</p>
+            <div class="g g4 info-box">
+                <h3>ℹ️ About Find Me / Follow Me</h3>
+                <p>Find Me / Follow Me rings a list of numbers on an extension's behalf, so a call reaches the person rather than the desk.</p>
                 <ul>
-                    <li><strong>Sequential Mode:</strong> Rings destinations one at a time in order</li>
-                    <li><strong>Simultaneous Mode:</strong> Rings all destinations at the same time</li>
-                    <li><strong>Ring Time:</strong> How long to ring each destination before moving to the next (sequential mode)</li>
-                    <li><strong>Use Cases:</strong> Mobile forwarding, team hunt groups, executive assistants</li>
+                    <li><strong>Sequential</strong> rings each destination in turn, moving on when its ring time runs out.</li>
+                    <li><strong>Simultaneous</strong> rings every destination at once; each drops out when its own ring time is up, and the first to pick up takes the call.</li>
+                    <li><strong>The extension's own phone rings first</strong> in both modes, without being listed. Listing the extension explicitly overrides that, including where in the order it sits.</li>
+                    <li><strong>Total ring</strong> is how long the caller waits before falling through to voicemail — the sum of the steps in sequential mode, the longest single step in simultaneous.</li>
+                    <li>A disabled configuration is kept but not consulted; the extension rings normally.</li>
                 </ul>
             </div>
         </div>
+
 
         <!-- Time-Based Routing Tab -->
         <div id="time-routing" class="tab-content">
@@ -5463,46 +5469,65 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
 
     <!-- Add/Edit FMFM Configuration Modal -->
     <div id="add-fmfm-modal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3>🔄 Configure Find Me/Follow Me</h3>
-                <span class="close" onclick="closeAddFMFMModal()">&times;</span>
+        <div class="glass-page">
+            <div class="g g1 dialog" role="dialog" aria-modal="true"
+                 aria-labelledby="fmfm-dialog-title">
+                <div class="dialog-head">
+                    <span class="page-mark" aria-hidden="true">🔀</span>
+                    <div>
+                        <h3 id="fmfm-dialog-title">Find Me / Follow Me</h3>
+                        <p class="dialog-sub" id="fmfm-dialog-sub">Ring a chain of numbers when this extension is called</p>
+                    </div>
+                    <button type="button" class="dialog-close" id="fmfm-dialog-close"
+                            aria-label="Close">&times;</button>
+                </div>
+
+                <form id="add-fmfm-form" class="dialog-body">
+                    <div class="field">
+                        <label for="fmfm-extension">Extension</label>
+                        <input type="text" id="fmfm-extension" required pattern="[0-9]+"
+                               placeholder="1001" autocomplete="off" inputmode="numeric">
+                        <span class="field-note" id="fmfm-extension-note"></span>
+                    </div>
+
+                    <div class="field">
+                        <span class="field-label" id="fmfm-mode-label">Mode</span>
+                        <div class="mode-choice" role="radiogroup" aria-labelledby="fmfm-mode-label">
+                            <label class="mode-opt" data-fmfm-mode="sequential">
+                                <input type="radio" name="fmfm-mode" value="sequential" checked>
+                                <strong>Sequential</strong>
+                                <span>One at a time, in order. Each ring time delays everything below it.</span>
+                            </label>
+                            <label class="mode-opt" data-fmfm-mode="simultaneous">
+                                <input type="radio" name="fmfm-mode" value="simultaneous">
+                                <strong>Simultaneous</strong>
+                                <span>All at once. Each drops out when its own time is up; first to answer wins.</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="field">
+                        <span class="field-label">Destinations, and what the caller hears</span>
+                        <div class="g g3 plan-list" id="fmfm-destinations-list"></div>
+                        <div id="fmfm-dialog-warnings"></div>
+                        <span class="field-note">Ring time is 5–120 seconds. A value outside that is clamped when the call is placed, not rejected on save.</span>
+                    </div>
+
+                    <label class="filter-check" for="fmfm-enabled">
+                        <input type="checkbox" id="fmfm-enabled" checked>
+                        Enabled — uncheck to keep this configuration but stop consulting it
+                    </label>
+                </form>
+
+                <div class="dialog-foot">
+                    <button type="button" class="btn-ghost btn-ghost-danger"
+                            id="fmfm-dialog-delete">Delete configuration</button>
+                    <span class="spacer"></span>
+                    <button type="button" class="btn-ghost" id="fmfm-dialog-cancel">Cancel</button>
+                    <button type="submit" form="add-fmfm-form"
+                            class="btn-ghost btn-ghost-accent" id="fmfm-dialog-save">Save configuration</button>
+                </div>
             </div>
-            <form id="add-fmfm-form" onsubmit="saveFMFMConfig(event)">
-                <div class="form-group">
-                    <label for="fmfm-extension">Extension:</label>
-                    <input type="text" id="fmfm-extension" required pattern="[0-9]+" placeholder="1001">
-                    <small>Extension number to configure FMFM for</small>
-                </div>
-                <div class="form-group">
-                    <label for="fmfm-mode">Mode:</label>
-                    <select id="fmfm-mode" required>
-                        <option value="sequential">Sequential - Ring one at a time</option>
-                        <option value="simultaneous">Simultaneous - Ring all at once</option>
-                    </select>
-                    <small>How destinations should ring</small>
-                </div>
-                <div class="form-group">
-                    <label for="fmfm-enabled">Enabled:</label>
-                    <input type="checkbox" id="fmfm-enabled" checked style="width: auto; margin-left: 10px;">
-                    <small style="display: block; margin-top: 5px;">Enable FMFM for this extension</small>
-                </div>
-
-                <div class="config-section">
-                    <h4>Destinations</h4>
-                    <div id="fmfm-destinations-list"></div>
-                    <button type="button" class="btn btn-secondary" onclick="addFMFMDestinationRow()">➕ Add Destination</button>
-                </div>
-
-                <div class="form-group">
-                    <small>If no destination answers, the caller is sent to this extension's own voicemail.</small>
-                </div>
-
-                <div class="modal-actions">
-                    <button type="button" class="btn btn-secondary" onclick="closeAddFMFMModal()">Cancel</button>
-                    <button type="submit" class="btn btn-success">Save Configuration</button>
-                </div>
-            </form>
         </div>
     </div>
 

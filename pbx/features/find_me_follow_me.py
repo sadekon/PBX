@@ -640,6 +640,12 @@ class FindMeFollowMe:
             "total_configs": len(self.user_configs),
             "sequential_configs": sequential_count,
             "simultaneous_configs": simultaneous_count,
+            # The admin UI draws the ring plan a config will actually produce,
+            # which includes the implicit desk leg -- so it needs the same
+            # number plan_for() uses, already clamped. Without it the UI would
+            # have to assume DEFAULT_RING_TIME and would silently misreport
+            # every plan on a deployment that tuned this.
+            "initial_ring_time": self._initial_ring_time(),
         }
 
     # ==================================================================
