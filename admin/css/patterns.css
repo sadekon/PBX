@@ -798,6 +798,18 @@
     color: var(--color-text-secondary);
 }
 
+/* Out of range. The value is left exactly as typed and the save is blocked, so
+   the field has to carry the error itself -- the warning below the list says
+   which row and why. */
+.plan-ring-invalid input {
+    border-color: var(--color-danger, #e5484d);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-danger, #e5484d) 22%, transparent);
+}
+
+.plan-ring-invalid .unit {
+    color: var(--color-danger, #e5484d);
+}
+
 /* The derived row states what the backend will do, so it carries no controls:
    a disabled input invites an attempt to change it. */
 .plan-row-derived .plan-static {

@@ -18,7 +18,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pbx.core.call_router import CallRouter
-from pbx.features.find_me_follow_me import MAX_DESTINATIONS, FindMeFollowMe, FMFMState
+from pbx.features.find_me_follow_me import (
+    MAX_DESTINATIONS,
+    MAX_RING_TIME,
+    FindMeFollowMe,
+    FMFMState,
+)
 
 CALL_ID = "fmfm-call-1"
 EXTENSION = "1001"
@@ -50,7 +55,13 @@ def _make_response(status: int, branch: str) -> MagicMock:
 class _Harness:
     """A handler wired to a mocked PBX, with the dialled legs recorded."""
 
-    def __init__(self, strategy: dict[str, Any], *, initial_ring_time: int | None = 0) -> None:
+    def __init__(
+        self,
+        strategy: dict[str, Any],
+        *,
+        initial_ring_time: int | None = 0,
+        voicemail_timeout: int = 30,
+    ) -> None:
         """
         Args:
             strategy: The ring strategy `get_ring_strategy` should return.
@@ -59,11 +70,13 @@ class _Harness:
                 the ring-mechanics tests see exactly the destinations they
                 configure; pass None to omit the key and exercise the shipped
                 default instead.
+            voicemail_timeout: `voicemail.no_answer_timeout`, which is also the
+                ceiling on a ring time in simultaneous mode.
         """
         pbx = MagicMock()
         pbx.logger = MagicMock()
         pbx.config.get.side_effect = lambda key, default=None: (
-            30 if key == "voicemail.no_answer_timeout" else default
+            voicemail_timeout if key == "voicemail.no_answer_timeout" else default
         )
 
         # The real pattern, so internal/external classification matches production.
@@ -260,7 +273,31 @@ class TestPlanFor:
         h = _Harness(_sequential(("1003", 1), ("1004", 9999)))
         plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
         assert plan is not None
-        assert [d["ring_time"] for d in plan.destinations] == [5, 120]
+        assert [d["ring_time"] for d in plan.destinations] == [5, MAX_RING_TIME]
+
+    def test_simultaneous_is_capped_at_the_voicemail_timeout(self) -> None:
+        """
+        A burst's longest leg is the caller's whole wait, which is the thing
+        voicemail.no_answer_timeout already governs -- so FMFM must not let a
+        caller ring longer than dialling the extension plainly would.
+        """
+        h = _Harness(_simultaneous(("1003", 9999)), voicemail_timeout=25)
+        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
+        assert plan is not None
+        assert [d["ring_time"] for d in plan.destinations] == [25]
+
+    def test_sequential_is_not_capped_at_the_voicemail_timeout(self) -> None:
+        """There the legs run back to back, so no single one is the whole wait."""
+        h = _Harness(_sequential(("1003", 9999)), voicemail_timeout=25)
+        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
+        assert plan is not None
+        assert [d["ring_time"] for d in plan.destinations] == [MAX_RING_TIME]
+
+    def test_a_long_voicemail_timeout_does_not_lift_the_absolute_ceiling(self) -> None:
+        h = _Harness(_simultaneous(("1003", 9999)), voicemail_timeout=600)
+        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
+        assert plan is not None
+        assert [d["ring_time"] for d in plan.destinations] == [MAX_RING_TIME]
 
     def test_destination_list_is_capped(self) -> None:
         h = _Harness(_sequential(*[(f"20{i:02d}", 20) for i in range(MAX_DESTINATIONS + 5)]))
@@ -298,11 +335,23 @@ class TestPlanFor:
         Otherwise the desk falls silent while the call is still ringing
         elsewhere -- walk back to your desk mid-call and it is not ringing.
         """
-        h = _Harness(_simultaneous(("1003", 45), ("1004", 30)), initial_ring_time=None)
+        h = _Harness(
+            _simultaneous(("1003", 45), ("1004", 30)),
+            initial_ring_time=None,
+            voicemail_timeout=45,
+        )
         plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
         assert plan is not None
         assert plan.destinations[0]["destination"] == EXTENSION
         assert plan.destinations[0]["ring_time"] == 45
+
+    def test_desk_leg_obeys_the_simultaneous_ceiling_too(self) -> None:
+        """Stretching to match the longest leg must not outrun the cap."""
+        h = _Harness(_simultaneous(("1003", 9999)), initial_ring_time=None, voicemail_timeout=25)
+        plan = h.handler.plan_for(EXTENSION, CALLER, CALL_ID)
+        assert plan is not None
+        assert plan.destinations[0]["destination"] == EXTENSION
+        assert plan.destinations[0]["ring_time"] == 25
 
     def test_sequential_desk_ring_is_not_stretched(self) -> None:
         """There the desk's time is additive, so it stays short."""

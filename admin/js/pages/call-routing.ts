@@ -171,16 +171,48 @@ let fmfmDestinationCounter = 0;
 // per-config and drawing it server-side would mean a request per row.
 // ---------------------------------------------------------------------------
 
-/** Mirrors MAX_DESTINATIONS and the ring-time bounds in find_me_follow_me.py. */
-const FMFM_MAX_DESTINATIONS = 10;
-const FMFM_MIN_RING_TIME = 5;
-const FMFM_MAX_RING_TIME = 120;
 const FMFM_DEFAULT_RING_TIME = 20;
 
 const FMFM_LOAD_TIMEOUT = 10000;
 
+/**
+ * Mirrors MAX_DESTINATIONS and the ring-time bounds in find_me_follow_me.py.
+ *
+ * These are fetched rather than hardcoded because the simultaneous ceiling is
+ * derived from `voicemail.no_answer_timeout`, which is deployment-specific and
+ * invisible from here. The literals below are only the fallback for a failed
+ * statistics call -- keep them in step with the module's own defaults.
+ */
+interface FMFMBounds {
+    min: number;
+    maxSequential: number;
+    maxSimultaneous: number;
+    maxDestinations: number;
+}
+
+const FMFM_FALLBACK_BOUNDS: FMFMBounds = {
+    min: 5,
+    maxSequential: 60,
+    maxSimultaneous: 30,
+    maxDestinations: 10,
+};
+
+let fmfmBounds: FMFMBounds = { ...FMFM_FALLBACK_BOUNDS };
+
+/** A bound from the server, falling back when it is missing or nonsensical. */
+const bound = (raw: unknown, fallback: number): number =>
+    typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+
+/** The ceiling that applies in `mode`. */
+const maxRingFor = (mode: string): number =>
+    mode === 'simultaneous' ? fmfmBounds.maxSimultaneous : fmfmBounds.maxSequential;
+
 interface FMFMStatistics {
     initial_ring_time?: number;
+    min_ring_time?: number;
+    max_ring_time_sequential?: number;
+    max_ring_time_simultaneous?: number;
+    max_destinations?: number;
 }
 
 interface RingLeg {
@@ -225,8 +257,31 @@ const fmfmExpanded = new Set<string>();
 
 const fmfmEl = (id: string): HTMLElement | null => document.getElementById(id);
 
-const clampRing = (seconds: number): number =>
-    Math.max(FMFM_MIN_RING_TIME, Math.min(FMFM_MAX_RING_TIME, seconds));
+const clampRing = (seconds: number, mode: string): number =>
+    Math.max(fmfmBounds.min, Math.min(maxRingFor(mode), seconds));
+
+/**
+ * The number a ring-time field holds, or null if it does not hold one.
+ *
+ * The editor keeps the field's text verbatim rather than a parsed number, so
+ * that a half-typed value is never rewritten under the operator -- rewriting
+ * it was what made a two-digit entry so hard to complete. Everything that
+ * needs a number goes through here, and null is what blocks the save.
+ */
+const parseRing = (raw: string): number | null => {
+    const text = raw.trim();
+    if (!/^\d{1,4}$/.test(text)) return null;
+    return parseInt(text, 10);
+};
+
+/** Why a ring-time field cannot be saved, or null if it can. */
+function ringError(raw: string, mode: string): string | null {
+    const value = parseRing(raw);
+    if (value === null) return raw.trim() ? 'is not a whole number of seconds' : 'is empty';
+    if (value < fmfmBounds.min) return `is below the ${fmfmBounds.min} s minimum`;
+    if (value > maxRingFor(mode)) return `is above the ${maxRingFor(mode)} s maximum`;
+    return null;
+}
 
 /**
  * The ring plan a set of destinations will actually produce. Mirrors
@@ -251,12 +306,12 @@ function computePlan(
     const rows: PlanRow[] = [];
     for (const dest of destinations) {
         const number = dest.number.trim();
-        const ring = clampRing(Number(dest.ring) || FMFM_DEFAULT_RING_TIME);
+        const ring = clampRing(Number(dest.ring) || FMFM_DEFAULT_RING_TIME, mode);
         if (!number) {
             rows.push({ number, ring, drop: 'empty' });
         } else if (seen.has(number)) {
             rows.push({ number, ring, drop: 'duplicate' });
-        } else if (seen.size >= FMFM_MAX_DESTINATIONS) {
+        } else if (seen.size >= fmfmBounds.maxDestinations) {
             rows.push({ number, ring, drop: 'over-cap' });
         } else {
             seen.add(number);
@@ -282,7 +337,7 @@ function computePlan(
             // destination, so it is not silent while the call is still being
             // chased elsewhere.
             const ring = simultaneous
-                ? Math.max(fmfmInitialRing, ...legs.map((leg) => leg.ring))
+                ? clampRing(Math.max(fmfmInitialRing, ...legs.map((leg) => leg.ring)), mode)
                 : fmfmInitialRing;
             legs = [{ number: extension, ring, derived: true, from: 0, to: 0 }, ...legs];
         }
@@ -291,9 +346,9 @@ function computePlan(
         // implicit leg consumes one of the ten and the last stored destination
         // silently stops ringing. Marked on the input row so the editor can say
         // so rather than letting it be discovered on a live call.
-        if (legs.length > FMFM_MAX_DESTINATIONS) {
-            const dropped = new Set(legs.slice(FMFM_MAX_DESTINATIONS).map((leg) => leg.number));
-            legs = legs.slice(0, FMFM_MAX_DESTINATIONS);
+        if (legs.length > fmfmBounds.maxDestinations) {
+            const dropped = new Set(legs.slice(fmfmBounds.maxDestinations).map((leg) => leg.number));
+            legs = legs.slice(0, fmfmBounds.maxDestinations);
             for (const row of rows) {
                 if (!row.drop && dropped.has(row.number)) row.drop = 'over-cap';
             }
@@ -742,9 +797,19 @@ export async function loadFMFMExtensions(): Promise<void> {
         .then((data: FMFMStatistics | null) => {
             const raw = data?.initial_ring_time;
             fmfmInitialRing = typeof raw === 'number' && Number.isFinite(raw) ? raw : null;
+            fmfmBounds = {
+                min: bound(data?.min_ring_time, FMFM_FALLBACK_BOUNDS.min),
+                maxSequential: bound(
+                    data?.max_ring_time_sequential, FMFM_FALLBACK_BOUNDS.maxSequential),
+                maxSimultaneous: bound(
+                    data?.max_ring_time_simultaneous, FMFM_FALLBACK_BOUNDS.maxSimultaneous),
+                maxDestinations: bound(
+                    data?.max_destinations, FMFM_FALLBACK_BOUNDS.maxDestinations),
+            };
         })
         .catch(() => {
             fmfmInitialRing = null;
+            fmfmBounds = { ...FMFM_FALLBACK_BOUNDS };
         });
 
     try {
@@ -800,7 +865,15 @@ interface FMFMDraft {
     extension: string;
     mode: string;
     enabled: boolean;
-    destinations: { number: string; ring: number }[];
+    /**
+     * `ring` is the field's text, not a number. Holding the parsed value meant
+     * re-rendering the input with it on every keystroke, which rewrote a
+     * half-typed entry -- clearing the box produced "0", and the next digit
+     * landed beside it. The text is now left exactly as typed and validated on
+     * the way out, so an out-of-range value is reported and blocks the save
+     * rather than being silently corrected mid-keystroke.
+     */
+    destinations: { number: string; ring: string }[];
 }
 
 let fmfmDraft: FMFMDraft | null = null;
@@ -872,7 +945,7 @@ export function showAddFMFMModal(): void {
         extension: '',
         mode: 'sequential',
         enabled: true,
-        destinations: [{ number: '', ring: FMFM_DEFAULT_RING_TIME }],
+        destinations: [{ number: '', ring: String(FMFM_DEFAULT_RING_TIME) }],
     });
 }
 
@@ -889,7 +962,10 @@ export function editFMFMConfig(config: FMFMConfig): void {
         enabled: config.enabled !== false,
         destinations: (config.destinations ?? []).map((dest) => ({
             number: String(dest.number ?? ''),
-            ring: Number(dest.ring_time) || FMFM_DEFAULT_RING_TIME,
+            // Shown as stored, not as clamped. A config saved before the
+            // ceiling came down still opens with its own number visible and
+            // flagged, so the operator sees what has to change.
+            ring: String(Number(dest.ring_time) || FMFM_DEFAULT_RING_TIME),
         })),
     });
 }
@@ -902,7 +978,7 @@ export function editFMFMConfig(config: FMFMConfig): void {
  */
 export function addFMFMDestinationRow(): void {
     if (!fmfmDraft) return;
-    fmfmDraft.destinations.push({ number: '', ring: FMFM_DEFAULT_RING_TIME });
+    fmfmDraft.destinations.push({ number: '', ring: String(FMFM_DEFAULT_RING_TIME) });
     fmfmDestinationCounter += 1;
     renderFMFMDialog();
     const inputs = document.querySelectorAll<HTMLElement>('#fmfm-destinations-list [data-fmfm-dest]');
@@ -917,7 +993,13 @@ function renderFMFMDialog(): void {
 
     const draft = fmfmDraft;
     const simultaneous = draft.mode === 'simultaneous';
-    const plan = computePlan(draft.extension, draft.mode, draft.destinations);
+    // The plan needs numbers; the fields hold text. A field that does not hold
+    // a usable number is drawn at the default so the plan stays readable while
+    // it is being fixed -- the warning below says the save is blocked.
+    const plan = computePlan(draft.extension, draft.mode, draft.destinations.map((dest) => ({
+        number: dest.number,
+        ring: parseRing(dest.ring) ?? FMFM_DEFAULT_RING_TIME,
+    })));
 
     for (const option of document.querySelectorAll<HTMLElement>('.mode-opt')) {
         option.classList.toggle('selected', option.dataset.fmfmMode === draft.mode);
@@ -949,6 +1031,11 @@ function renderFMFMDialog(): void {
 
     plan.rows.forEach((row, index) => {
         if (!row.drop) position += 1;
+        // Straight off the draft, not off the plan: the plan holds the clamped
+        // number, and echoing that back into the box is what used to overwrite
+        // what was being typed.
+        const rawRing = draft.destinations[index]?.ring ?? '';
+        const badRing = ringError(rawRing, draft.mode) !== null;
         const leg = row.drop
             ? undefined
             : plan.legs.find((candidate) => !candidate.derived && candidate.number === row.number);
@@ -969,9 +1056,10 @@ function renderFMFMDialog(): void {
                            placeholder="Phone number or extension" autocomplete="off"
                            aria-label="Destination ${index + 1} number">
                 </span>
-                <span class="plan-ring">
-                    <input type="number" value="${row.ring}" data-fmfm-ring="${index}"
-                           min="${FMFM_MIN_RING_TIME}" max="${FMFM_MAX_RING_TIME}"
+                <span class="plan-ring${badRing ? ' plan-ring-invalid' : ''}">
+                    <input type="text" inputmode="numeric" value="${escapeHtml(rawRing)}"
+                           data-fmfm-ring="${index}" autocomplete="off" size="4"
+                           aria-invalid="${badRing ? 'true' : 'false'}"
                            aria-label="Destination ${index + 1} ring time in seconds">
                     <span class="unit">s</span>
                 </span>
@@ -998,13 +1086,13 @@ function renderFMFMDialog(): void {
     // The implicit desk leg consumes one of the ten, so the point at which
     // adding another becomes pointless is nine, not ten.
     const keptRows = plan.rows.filter((row) => !row.drop).length;
-    const legRoom = plan.legs.length >= FMFM_MAX_DESTINATIONS
-        || keptRows >= FMFM_MAX_DESTINATIONS;
+    const legRoom = plan.legs.length >= fmfmBounds.maxDestinations
+        || keptRows >= fmfmBounds.maxDestinations;
 
     html += `
         <div class="plan-add">
             <button type="button" class="btn-ghost" id="fmfm-add-destination"${legRoom ? ' disabled' : ''}>Add destination</button>
-            <span class="count">${plan.legs.length} of ${FMFM_MAX_DESTINATIONS} legs</span>
+            <span class="count">${plan.legs.length} of ${fmfmBounds.maxDestinations} legs</span>
         </div>`;
 
     container.innerHTML = html;
@@ -1015,7 +1103,7 @@ function renderFMFMDialog(): void {
         notes.push('A destination is listed twice. Only the first occurrence is dialled — the duplicate is dropped when the call is placed.');
     }
     if (plan.rows.some((row) => row.drop === 'over-cap')) {
-        notes.push(`Over the ${FMFM_MAX_DESTINATIONS}-leg cap. The extension's own phone counts toward it, so the last destination will never be dialled.`);
+        notes.push(`Over the ${fmfmBounds.maxDestinations}-leg cap. The extension's own phone counts toward it, so the last destination will never be dialled.`);
     }
     if (plan.listsSelf) {
         notes.push(`This lists extension ${escapeHtml(draft.extension)} itself, so it is not also rung automatically first — your placement is used instead, including its ring time and its position in the order.`);
@@ -1023,8 +1111,17 @@ function renderFMFMDialog(): void {
     if (plan.deskUnknown) {
         notes.push("The extension's own phone also rings, before this list. Its length could not be read from the server, so the plan above omits it and the total is short by that much.");
     }
-    if (draft.destinations.some((dest) => dest.ring < FMFM_MIN_RING_TIME || dest.ring > FMFM_MAX_RING_TIME)) {
-        notes.push(`A ring time is outside ${FMFM_MIN_RING_TIME}–${FMFM_MAX_RING_TIME} s. It is clamped when the call is placed, so the plan above shows the clamped value.`);
+    // Reported per row and blocking, rather than clamped on the operator's
+    // behalf. A silently corrected ring time is a config that does not do what
+    // the screen said it would.
+    const badRings = draft.destinations
+        .map((dest, index) => ({ index, why: ringError(dest.ring, draft.mode) }))
+        .filter((entry) => entry.why !== null);
+    for (const entry of badRings) {
+        notes.push(`Ring time for destination ${entry.index + 1} ${entry.why} — allowed range is
+                    ${fmfmBounds.min}–${maxRingFor(draft.mode)} s${simultaneous
+                        ? ', because in simultaneous mode the longest destination is the whole time the caller waits'
+                        : ''}. Fix it to save.`);
     }
     if (!simultaneous && plan.total > 120) {
         notes.push(`The caller waits ${plan.total} s before reaching voicemail. Most hang up well before two minutes.`);
@@ -1033,6 +1130,17 @@ function renderFMFMDialog(): void {
     warnings.innerHTML = notes
         .map((note) => `<div class="form-warn"><span aria-hidden="true">⚠</span><span>${note}</span></div>`)
         .join('');
+
+    // Only a bad ring time blocks the save. The other notes describe things the
+    // backend handles deliberately (a duplicate is dropped, an over-cap row is
+    // never dialled), so they warn without standing in the way.
+    const save = fmfmEl('fmfm-dialog-save') as HTMLButtonElement | null;
+    if (save) {
+        save.disabled = badRings.length > 0;
+        save.title = badRings.length > 0
+            ? 'A ring time is out of range. Fix it to save.'
+            : '';
+    }
 }
 
 /** Moves a destination, keeping the moved row focused. */
@@ -1099,7 +1207,7 @@ function attachFMFMDialogListeners(): void {
         if (dest !== undefined) {
             row.number = target.value;
         } else if (ring !== undefined) {
-            row.ring = parseInt(target.value, 10) || 0;
+            row.ring = target.value;
         } else {
             return;
         }
@@ -1186,9 +1294,23 @@ export async function saveFMFMConfig(event: Event): Promise<void> {
     // in, and storing only the surviving rows would silently discard input the
     // operator can still see on screen -- the warnings already say what will be
     // dropped, and reopening shows the same rows and the same warnings.
+    // Enforced here rather than only on the button, because pressing Enter in a
+    // text field submits the form without going near it.
+    const bad = fmfmDraft.destinations.findIndex(
+        (dest) => ringError(dest.ring, fmfmDraft?.mode ?? 'sequential') !== null);
+    if (bad !== -1) {
+        const why = ringError(fmfmDraft.destinations[bad]?.ring ?? '', fmfmDraft.mode);
+        showNotification(`Ring time for destination ${bad + 1} ${why}`, 'error');
+        (document.querySelector(`[data-fmfm-ring="${bad}"]`) as HTMLElement | null)?.focus();
+        return;
+    }
+
     const destinations: FMFMDestination[] = fmfmDraft.destinations
         .filter((dest) => dest.number.trim())
-        .map((dest) => ({ number: dest.number.trim(), ring_time: dest.ring }));
+        .map((dest) => ({
+            number: dest.number.trim(),
+            ring_time: parseRing(dest.ring) ?? FMFM_DEFAULT_RING_TIME,
+        }));
 
     if (destinations.length === 0) {
         showNotification('At least one destination is required', 'error');

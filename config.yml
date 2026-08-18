@@ -450,6 +450,12 @@ features:
     # destination list. To control where the extension rings instead (say,
     # second, after the mobile), list it in its own destination list and this
     # stop is skipped.
+    #
+    # Like every FMFM ring time this is clamped: 5 s minimum, and a maximum of
+    # 60 s sequentially. In simultaneous mode the maximum is instead
+    # voicemail.no_answer_timeout below, because there the longest leg is the
+    # caller's entire wait -- a burst must never keep a caller ringing longer
+    # than dialling the extension without FMFM would.
     initial_ring_time: 20
 recording:
   # Recordings are always PCM16 at 8 kHz, one channel per participant -- the two legs can

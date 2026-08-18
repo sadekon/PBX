@@ -223,9 +223,17 @@ describe('Find Me/Follow Me page', () => {
       expect(expand('1001')).toEqual([{ number: '2005', when: '0 – 10 s' }]);
     });
 
-    it('clamps a ring time outside 5-120 rather than honouring it', async () => {
+    it('clamps a stored ring time above the sequential ceiling', async () => {
       await load([config({ destinations: [{ number: '2005', ring_time: 500 }] })], { initialRing: 0 });
-      expect(expand('1001')).toEqual([{ number: '2005', when: '0 – 120 s' }]);
+      expect(expand('1001')).toEqual([{ number: '2005', when: '0 – 60 s' }]);
+    });
+
+    it('clamps a simultaneous config to the shorter voicemail-timeout ceiling', async () => {
+      await load([config({
+        mode: 'simultaneous',
+        destinations: [{ number: '2005', ring_time: 60 }]
+      })], { initialRing: 0 });
+      expect(expand('1001')).toEqual([{ number: '2005', when: '0 – 30 s' }]);
     });
 
     it('counts the implicit desk leg toward the ten-leg cap', async () => {
@@ -412,9 +420,77 @@ describe('Find Me/Follow Me page', () => {
       expect(document.querySelector('.plan-add .count').textContent).toBe('10 of 10 legs');
     });
 
+    // The editor used to hold the parsed number and echo it back into the box
+    // on every keystroke, so clearing the field produced "0" and the next digit
+    // landed beside it -- entering 30 was very nearly impossible. The field now
+    // keeps its own text and the save is blocked instead.
+    it('leaves a half-typed ring time exactly as typed', async () => {
+      page.editFMFMConfig(config({ destinations: [{ number: '2005', ring_time: 20 }] }));
+      typeInto('[data-fmfm-ring="0"]', '');
+      expect(document.querySelector('[data-fmfm-ring="0"]').value).toBe('');
+      typeInto('[data-fmfm-ring="0"]', '3');
+      expect(document.querySelector('[data-fmfm-ring="0"]').value).toBe('3');
+      typeInto('[data-fmfm-ring="0"]', '30');
+      expect(document.querySelector('[data-fmfm-ring="0"]').value).toBe('30');
+      expect(document.getElementById('fmfm-dialog-save').disabled).toBe(false);
+    });
+
+    it('blocks the save while a ring time is out of range, and says which row', () => {
+      page.editFMFMConfig(config({ destinations: [{ number: '2005', ring_time: 20 }] }));
+      typeInto('[data-fmfm-ring="0"]', '3');
+      expect(document.getElementById('fmfm-dialog-save').disabled).toBe(true);
+      expect(warnings().join(' ')).toMatch(/destination 1 is below the 5 s minimum/);
+
+      typeInto('[data-fmfm-ring="0"]', '300');
+      expect(document.getElementById('fmfm-dialog-save').disabled).toBe(true);
+      expect(warnings().join(' ')).toMatch(/destination 1 is above the 60 s maximum/);
+
+      typeInto('[data-fmfm-ring="0"]', '30');
+      expect(document.getElementById('fmfm-dialog-save').disabled).toBe(false);
+      expect(warnings().join(' ')).not.toMatch(/Fix it to save/);
+    });
+
+    it('holds an empty ring time as an error rather than turning it into zero', () => {
+      page.editFMFMConfig(config({ destinations: [{ number: '2005', ring_time: 20 }] }));
+      typeInto('[data-fmfm-ring="0"]', '');
+      expect(document.getElementById('fmfm-dialog-save').disabled).toBe(true);
+      expect(warnings().join(' ')).toMatch(/destination 1 is empty/);
+    });
+
+    it('applies the shorter simultaneous ceiling as soon as the mode changes', () => {
+      page.editFMFMConfig(config({ destinations: [{ number: '2005', ring_time: 45 }] }));
+      expect(document.getElementById('fmfm-dialog-save').disabled).toBe(false);
+
+      const radio = document.querySelector('input[name="fmfm-mode"][value="simultaneous"]');
+      radio.checked = true;
+      radio.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // 45 s was fine while the legs ran back to back; in a burst it is the
+      // caller's whole wait, so it now exceeds the voicemail timeout.
+      expect(document.getElementById('fmfm-dialog-save').disabled).toBe(true);
+      expect(warnings().join(' ')).toMatch(/is above the 30 s maximum/);
+    });
+
+    it('refuses to submit an out-of-range ring time even without the button', async () => {
+      page.editFMFMConfig(config({ destinations: [{ number: '2005', ring_time: 20 }] }));
+      typeInto('[data-fmfm-ring="0"]', '300');
+      fetch.mockClear();
+
+      await page.saveFMFMConfig(new Event('submit'));
+
+      expect(fetch).not.toHaveBeenCalled();
+      expect(showNotification).toHaveBeenCalledWith(
+        expect.stringMatching(/destination 1 is above the 60 s maximum/), 'error');
+    });
+
     it('warns when the caller would wait more than two minutes', async () => {
+      // Three legs at the sequential ceiling, plus the 20 s desk leg.
       page.editFMFMConfig(config({
-        destinations: [{ number: '2005', ring_time: 120 }, { number: '2006', ring_time: 60 }]
+        destinations: [
+          { number: '2005', ring_time: 60 },
+          { number: '2006', ring_time: 60 },
+          { number: '2007', ring_time: 60 }
+        ]
       }));
       expect(warnings().join(' ')).toMatch(/waits 200 s/);
     });

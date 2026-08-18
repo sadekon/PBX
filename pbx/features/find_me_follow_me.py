@@ -99,8 +99,13 @@ MAX_DESTINATIONS = 10
 # Bounds on a per-destination ring time, matching the admin UI's min/max. A
 # stored value outside this range is clamped rather than rejected -- the call
 # still needs somewhere to go.
+#
+# The ceiling is mode-dependent, so see _max_ring_time(): this is the
+# sequential one, where each leg is only a slice of the caller's wait and a
+# long stop merely delays the next. Simultaneous is capped lower, at the
+# voicemail timeout, because there the longest leg *is* the whole wait.
 MIN_RING_TIME = 5
-MAX_RING_TIME = 120
+MAX_RING_TIME = 60
 DEFAULT_RING_TIME = 20
 
 
@@ -646,6 +651,13 @@ class FindMeFollowMe:
             # have to assume DEFAULT_RING_TIME and would silently misreport
             # every plan on a deployment that tuned this.
             "initial_ring_time": self._initial_ring_time(),
+            # The editor refuses to save a ring time outside these, so they
+            # have to be the real ones. The simultaneous ceiling is derived
+            # from voicemail.no_answer_timeout, which the UI cannot see.
+            "min_ring_time": MIN_RING_TIME,
+            "max_ring_time_sequential": self._max_ring_time("sequential"),
+            "max_ring_time_simultaneous": self._max_ring_time("simultaneous"),
+            "max_destinations": MAX_DESTINATIONS,
         }
 
     # ==================================================================
@@ -681,7 +693,10 @@ class FindMeFollowMe:
             # "normal" -- no config, or the config is disabled.
             return None
 
-        destinations = self._sanitize(strategy.get("destinations"), extension, from_ext)
+        max_ring = self._max_ring_time(mode)
+        destinations = self._sanitize(
+            strategy.get("destinations"), extension, from_ext, max_ring=max_ring
+        )
 
         if not destinations:
             self.logger.warning(
@@ -695,7 +710,7 @@ class FindMeFollowMe:
         # just "my mobile" behave the way it reads. Skipped when the config
         # already places the extension somewhere itself (that placement wins,
         # ring time included), and when initial_ring_time is 0.
-        initial_ring = self._initial_ring_time()
+        initial_ring = self._initial_ring_time(max_ring)
         if initial_ring and not any(d["destination"] == extension for d in destinations):
             if mode == "simultaneous":
                 # Everything rings together here, so the desk's own time no
@@ -721,7 +736,40 @@ class FindMeFollowMe:
         )
         return state
 
-    def _initial_ring_time(self) -> int:
+    def _max_ring_time(self, mode: str) -> int:
+        """
+        The longest a single destination may ring in `mode`.
+
+        The two modes spend the caller's patience differently, so one ceiling
+        cannot suit both. In sequential mode a destination's ring time is a
+        slice of the total: a long stop delays the ones behind it but the
+        caller is still making progress through the list, so the ceiling is
+        just a sanity bound. In simultaneous mode every leg starts at zero and
+        the longest one *is* the caller's entire wait, which makes it exactly
+        the thing ``voicemail.no_answer_timeout`` already governs for an
+        ordinary call -- so that is the ceiling, and a burst can never leave a
+        caller ringing longer than dialling the extension without FMFM would.
+
+        Args:
+            mode: "sequential" or "simultaneous".
+
+        Returns:
+            Seconds, never below MIN_RING_TIME.
+        """
+        if mode != "simultaneous":
+            return MAX_RING_TIME
+        if self.pbx_core is None:
+            return MAX_RING_TIME
+        try:
+            timeout = int(self.pbx_core.config.get("voicemail.no_answer_timeout", 30))
+        except (TypeError, ValueError):
+            timeout = 30
+        # A deployment that sets a very long voicemail timeout still does not
+        # get to exceed the absolute ceiling, and one that sets a very short
+        # one must still leave room for a ring time to exist at all.
+        return max(MIN_RING_TIME, min(MAX_RING_TIME, timeout))
+
+    def _initial_ring_time(self, max_ring: int = MAX_RING_TIME) -> int:
         """
         How long the dialled extension's own phone rings before the configured
         destinations, from ``features.find_me_follow_me.initial_ring_time``.
@@ -747,7 +795,7 @@ class FindMeFollowMe:
             return DEFAULT_RING_TIME
         if seconds <= 0:
             return 0
-        return max(MIN_RING_TIME, min(MAX_RING_TIME, seconds))
+        return max(MIN_RING_TIME, min(max_ring, seconds))
 
     def _sanitize(
         self,
@@ -755,6 +803,7 @@ class FindMeFollowMe:
         extension: str,
         from_ext: str,
         exclude: set[str] | None = None,
+        max_ring: int = MAX_RING_TIME,
     ) -> list[dict[str, Any]]:
         """
         Turn a ring strategy's destination list into one that is safe to dial:
@@ -768,6 +817,7 @@ class FindMeFollowMe:
                 before moving on.
             from_ext: The caller, excluded so a config cannot ring them back.
             exclude: Additional destinations already claimed.
+            max_ring: Ceiling for a ring time, from _max_ring_time().
 
         Returns:
             Cleaned destination dicts, each with `destination` and `ring_time`.
@@ -795,7 +845,7 @@ class FindMeFollowMe:
                 ring_time = int(entry.get("ring_time") or DEFAULT_RING_TIME)
             except (TypeError, ValueError):
                 ring_time = DEFAULT_RING_TIME
-            ring_time = max(MIN_RING_TIME, min(MAX_RING_TIME, ring_time))
+            ring_time = max(MIN_RING_TIME, min(max_ring, ring_time))
 
             cleaned.append({"destination": number, "ring_time": ring_time})
             if len(cleaned) >= MAX_DESTINATIONS:
