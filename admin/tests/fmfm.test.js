@@ -450,11 +450,18 @@ describe('Find Me/Follow Me page', () => {
       expect(warnings().join(' ')).not.toMatch(/Fix it to save/);
     });
 
-    it('holds an empty ring time as an error rather than turning it into zero', () => {
-      page.editFMFMConfig(config({ destinations: [{ number: '2005', ring_time: 20 }] }));
-      typeInto('[data-fmfm-ring="0"]', '');
-      expect(document.getElementById('fmfm-dialog-save').disabled).toBe(true);
-      expect(warnings().join(' ')).toMatch(/destination 1 is empty/);
+    it('treats an empty ring time as the default rather than an error', () => {
+      // Superseded: a blank box used to block the save with "is empty". It now
+      // stands for the placeholder's value, which is the mode's default.
+      page.editFMFMConfig(config({ destinations: [{ number: '2005', ring_time: 15 }] }));
+      const box = document.querySelector('[data-fmfm-ring="0"]');
+      box.value = '';
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+
+      expect(box.placeholder).toBe('20');
+      expect([...document.querySelectorAll('#fmfm-dialog-warnings .form-warn')]
+        .map((w) => w.textContent).join(' ')).not.toMatch(/empty/);
+      expect(document.querySelector('.plan-tail .grand').textContent).toBe('40 s');
     });
 
     it('applies the shorter simultaneous ceiling as soon as the mode changes', () => {
@@ -539,6 +546,141 @@ describe('Find Me/Follow Me page', () => {
       page.showAddFMFMModal();
       // ui/tabs.ts matches `.modal.active`; an inline display style would not.
       expect(document.querySelector('.modal.active')).toBe(dialog());
+    });
+  });
+
+  describe('the ring-time default', () => {
+    const ringBox = (i) => document.querySelector(`[data-fmfm-ring="${i}"]`);
+    const rows = () => [...document.querySelectorAll('#fmfm-destinations-list .plan-row')];
+    const warnings = () => [...document.querySelectorAll('#fmfm-dialog-warnings .form-warn')]
+      .map((w) => w.textContent.replace(/\s+/g, ' ').trim());
+
+    function chooseMode(mode) {
+      const radio = document.querySelector(`input[name="fmfm-mode"][value="${mode}"]`);
+      radio.checked = true;
+      radio.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function setRing(i, value) {
+      const box = ringBox(i);
+      box.value = value;
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    beforeEach(async () => { await load([]); });
+
+    it('starts a new destination blank, showing the default as a placeholder', async () => {
+      page.showAddFMFMModal();
+      expect(ringBox(0).value).toBe('');
+      expect(ringBox(0).placeholder).toBe('20');
+    });
+
+    it('offers 30 rather than 20 once the mode is simultaneous', async () => {
+      page.showAddFMFMModal();
+      chooseMode('simultaneous');
+      expect(ringBox(0).placeholder).toBe('30');
+      expect(ringBox(0).value).toBe('');
+    });
+
+    it('re-times a blank leg when the mode changes, without filling the box', async () => {
+      page.showAddFMFMModal();
+      document.getElementById('fmfm-extension').value = '1001';
+      document.getElementById('fmfm-extension').dispatchEvent(new Event('input', { bubbles: true }));
+      setRing(0, '');
+      document.querySelector('[data-fmfm-dest="0"]').value = '2005';
+      document.querySelector('[data-fmfm-dest="0"]').dispatchEvent(new Event('input', { bubbles: true }));
+
+      const when = () => rows().at(-1).querySelector('.ring-when').textContent.trim();
+      expect(when()).toBe('20 – 40 s');          // sequential: desk 20 then 20
+      chooseMode('simultaneous');
+      expect(when()).toBe('0 – 30 s');           // simultaneous: its own 30
+      expect(ringBox(0).value).toBe('');         // still blank, still a default
+    });
+
+    it('puts the desk leg at 30 in a burst, because the default destination is', async () => {
+      page.showAddFMFMModal();
+      document.getElementById('fmfm-extension').value = '1001';
+      document.getElementById('fmfm-extension').dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('[data-fmfm-dest="0"]').value = '2005';
+      document.querySelector('[data-fmfm-dest="0"]').dispatchEvent(new Event('input', { bubbles: true }));
+      chooseMode('simultaneous');
+      // desk = max(initial_ring_time 20, longest destination 30)
+      expect(rows()[0].querySelector('.ring-when').textContent.trim()).toBe('0 – 30 s');
+      expect(document.querySelector('.plan-tail .grand').textContent).toBe('30 s');
+    });
+
+    it('does not treat a cleared box as an out-of-range value', async () => {
+      page.editFMFMConfig(config({ destinations: [{ number: '2005', ring_time: 15 }] }));
+      setRing(0, '');
+      expect(warnings().join(' ')).not.toMatch(/outside/);
+      setRing(0, '2');
+      expect(warnings().join(' ')).toMatch(/is below the 5 s minimum/);
+    });
+
+    it('keeps an explicitly entered value over the default', async () => {
+      page.showAddFMFMModal();
+      chooseMode('simultaneous');
+      // 30 is the simultaneous ceiling, so an explicit value has to be under it
+      // to be distinguishable from the default.
+      setRing(0, '18');
+      expect(ringBox(0).value).toBe('18');
+      document.querySelector('[data-fmfm-dest="0"]').value = '2005';
+      document.querySelector('[data-fmfm-dest="0"]').dispatchEvent(new Event('input', { bubbles: true }));
+      expect(rows().at(-1).querySelector('.ring-when').textContent.trim()).toBe('0 – 18 s');
+    });
+
+    it('saves the placeholder value a blank box promised, per mode', async () => {
+      const post = async () => {
+        fetch.mockImplementation((url, options) => {
+          if (String(url).includes('/api/fmfm/config') && options?.method === 'POST') {
+            return Promise.resolve(jsonResponse({ success: true }));
+          }
+          if (String(url).includes('/api/fmfm/statistics')) {
+            return Promise.resolve(jsonResponse({ initial_ring_time: 20 }));
+          }
+          return Promise.resolve(jsonResponse({ extensions: [] }));
+        });
+        await page.saveFMFMConfig(new Event('submit'));
+        const call = fetch.mock.calls.filter(([, o]) => o?.method === 'POST').at(-1);
+        return JSON.parse(call[1].body).destinations;
+      };
+
+      page.showAddFMFMModal();
+      document.getElementById('fmfm-extension').value = '1001';
+      document.getElementById('fmfm-extension').dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('[data-fmfm-dest="0"]').value = '2005';
+      document.querySelector('[data-fmfm-dest="0"]').dispatchEvent(new Event('input', { bubbles: true }));
+      chooseMode('simultaneous');
+      expect(await post()).toEqual([{ number: '2005', ring_time: 30 }]);
+
+      jest.clearAllMocks();
+      page.showAddFMFMModal();
+      document.getElementById('fmfm-extension').value = '1002';
+      document.getElementById('fmfm-extension').dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('[data-fmfm-dest="0"]').value = '2006';
+      document.querySelector('[data-fmfm-dest="0"]').dispatchEvent(new Event('input', { bubbles: true }));
+      expect(await post()).toEqual([{ number: '2006', ring_time: 20 }]);
+    });
+  });
+
+  describe('deleting a configuration', () => {
+    it('asks through the styled dialog rather than window.confirm', async () => {
+      await load([config()]);
+      document.querySelector('[data-fmfm-delete]')
+        .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await Promise.resolve();
+
+      const dialog = document.getElementById('confirm-modal');
+      expect(dialog).not.toBeNull();
+      expect(dialog.classList.contains('active')).toBe(true);
+      expect(document.getElementById('confirm-message').textContent)
+        .toBe("Are you sure you'd like to delete Find Me / Follow Me for extension 1001? This cannot be undone.");
+
+      // Cancelling must not issue the DELETE.
+      document.getElementById('confirm-cancel')
+        .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await Promise.resolve();
+      expect(fetch.mock.calls.some(([, o]) => o?.method === 'DELETE')).toBe(false);
     });
   });
 });

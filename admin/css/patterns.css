@@ -903,3 +903,36 @@
     font-size: 0.8rem;
     color: var(--color-text-secondary);
 }
+
+/* --------------------------------------------------------------------------
+   Confirmation dialog
+
+   Replaces window.confirm(), which cannot be styled, blocks the whole browser
+   while it is up, and names the page's origin rather than the application.
+
+   No mark. The sentence names what is about to go and the red button says what
+   will happen to it; a warning icon beside those states the same fact a third
+   time. Everything else is the .dialog vocabulary above -- a confirmation is
+   the same object as a configure dialog, smaller and with nothing to fill in.
+   -------------------------------------------------------------------------- */
+
+.confirm-dialog {
+    max-width: 400px;
+}
+
+.confirm-dialog .confirm-body {
+    padding: 20px 20px 16px;
+}
+
+.confirm-dialog .confirm-body p {
+    margin: 0;
+    font-size: 0.87rem;
+    line-height: 1.55;
+    color: var(--color-text-secondary);
+}
+
+/* The subject, so the sentence names exactly what is going. */
+.confirm-dialog .confirm-body strong {
+    color: var(--color-text);
+    font-weight: 600;
+}

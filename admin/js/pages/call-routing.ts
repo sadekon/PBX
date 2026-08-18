@@ -6,6 +6,7 @@
 
 import { fetchWithTimeout, getAuthHeaders, getApiBaseUrl } from '../api/client.ts';
 import { showNotification } from '../ui/notifications.ts';
+import { confirmDelete } from '../ui/confirm.ts';
 import { escapeHtml } from '../utils/html.ts';
 
 // ---------------------------------------------------------------------------
@@ -173,6 +174,24 @@ let fmfmDestinationCounter = 0;
 
 const FMFM_DEFAULT_RING_TIME = 20;
 
+/**
+ * The ring time a blank box stands for, which depends on the mode.
+ *
+ * Sequentially a ring time is a delay charged to every destination below it, so
+ * the default is kept short. In a burst it delays nothing and only decides how
+ * long that leg keeps trying, so there is no reason to offer less than the
+ * ceiling -- and taking the ceiling from `fmfmBounds` rather than repeating its
+ * number here means a deployment that raises `max_ring_time_simultaneous` moves
+ * the default with it instead of silently diverging from it.
+ *
+ * This is a UI default, not a backend one: the resolved value is always sent
+ * explicitly, so find_me_follow_me.py's DEFAULT_RING_TIME still governs a config
+ * created through the API without a ring time.
+ */
+function defaultRingFor(mode: string): number {
+    return mode === 'simultaneous' ? maxRingFor(mode) : FMFM_DEFAULT_RING_TIME;
+}
+
 const FMFM_LOAD_TIMEOUT = 10000;
 
 /**
@@ -277,7 +296,9 @@ const parseRing = (raw: string): number | null => {
 /** Why a ring-time field cannot be saved, or null if it can. */
 function ringError(raw: string, mode: string): string | null {
     const value = parseRing(raw);
-    if (value === null) return raw.trim() ? 'is not a whole number of seconds' : 'is empty';
+    // A blank box is not a mistake: it stands for the mode's default, which the
+    // field shows as a placeholder and which is what gets saved.
+    if (value === null) return raw.trim() ? 'is not a whole number of seconds' : null;
     if (value < fmfmBounds.min) return `is below the ${fmfmBounds.min} s minimum`;
     if (value > maxRingFor(mode)) return `is above the ${maxRingFor(mode)} s maximum`;
     return null;
@@ -306,7 +327,7 @@ function computePlan(
     const rows: PlanRow[] = [];
     for (const dest of destinations) {
         const number = dest.number.trim();
-        const ring = clampRing(Number(dest.ring) || FMFM_DEFAULT_RING_TIME, mode);
+        const ring = clampRing(dest.ring, mode);
         if (!number) {
             rows.push({ number, ring, drop: 'empty' });
         } else if (seen.has(number)) {
@@ -383,7 +404,7 @@ function ringPlan(config: FMFMConfig): RingPlan {
         config.mode,
         (config.destinations ?? []).map((dest) => ({
             number: String(dest.number ?? ''),
-            ring: Number(dest.ring_time) || FMFM_DEFAULT_RING_TIME,
+            ring: dest.ring_time == null ? defaultRingFor(config.mode) : Number(dest.ring_time),
         }))
     );
 }
@@ -945,7 +966,7 @@ export function showAddFMFMModal(): void {
         extension: '',
         mode: 'sequential',
         enabled: true,
-        destinations: [{ number: '', ring: String(FMFM_DEFAULT_RING_TIME) }],
+        destinations: [{ number: '', ring: '' }],
     });
 }
 
@@ -978,7 +999,7 @@ export function editFMFMConfig(config: FMFMConfig): void {
  */
 export function addFMFMDestinationRow(): void {
     if (!fmfmDraft) return;
-    fmfmDraft.destinations.push({ number: '', ring: String(FMFM_DEFAULT_RING_TIME) });
+    fmfmDraft.destinations.push({ number: '', ring: '' });
     fmfmDestinationCounter += 1;
     renderFMFMDialog();
     const inputs = document.querySelectorAll<HTMLElement>('#fmfm-destinations-list [data-fmfm-dest]');
@@ -998,7 +1019,7 @@ function renderFMFMDialog(): void {
     // it is being fixed -- the warning below says the save is blocked.
     const plan = computePlan(draft.extension, draft.mode, draft.destinations.map((dest) => ({
         number: dest.number,
-        ring: parseRing(dest.ring) ?? FMFM_DEFAULT_RING_TIME,
+        ring: parseRing(dest.ring) ?? defaultRingFor(draft.mode),
     })));
 
     for (const option of document.querySelectorAll<HTMLElement>('.mode-opt')) {
@@ -1058,9 +1079,10 @@ function renderFMFMDialog(): void {
                 </span>
                 <span class="plan-ring${badRing ? ' plan-ring-invalid' : ''}">
                     <input type="text" inputmode="numeric" value="${escapeHtml(rawRing)}"
+                           placeholder="${defaultRingFor(draft.mode)}"
                            data-fmfm-ring="${index}" autocomplete="off" size="4"
                            aria-invalid="${badRing ? 'true' : 'false'}"
-                           aria-label="Destination ${index + 1} ring time in seconds">
+                           aria-label="Destination ${index + 1} ring time in seconds, default ${defaultRingFor(draft.mode)}">
                     <span class="unit">s</span>
                 </span>
                 ${trailing}
@@ -1305,11 +1327,15 @@ export async function saveFMFMConfig(event: Event): Promise<void> {
         return;
     }
 
+    // Captured because the closure below cannot narrow the module-level draft.
+    const draftMode = fmfmDraft.mode;
     const destinations: FMFMDestination[] = fmfmDraft.destinations
         .filter((dest) => dest.number.trim())
         .map((dest) => ({
             number: dest.number.trim(),
-            ring_time: parseRing(dest.ring) ?? FMFM_DEFAULT_RING_TIME,
+            // A blank box promised the placeholder's value, so that is what is
+            // stored -- not the backend's own default, which is mode-blind.
+            ring_time: parseRing(dest.ring) ?? defaultRingFor(draftMode),
         }));
 
     if (destinations.length === 0) {
@@ -1347,9 +1373,7 @@ export async function saveFMFMConfig(event: Event): Promise<void> {
 }
 
 export async function deleteFMFMConfig(extension: string): Promise<void> {
-    if (!confirm(`Are you sure you want to delete FMFM configuration for extension ${extension}?`)) {
-        return;
-    }
+    if (!await confirmDelete(`Find Me / Follow Me for extension ${extension}`)) return;
 
     try {
         const API_BASE = getApiBaseUrl();

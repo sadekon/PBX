@@ -962,7 +962,7 @@
                 <h2>Registered ATAs (Analog Telephone Adapters)</h2>
                 <button class="btn btn-primary" onclick="loadRegisteredATAs()">🔄 Refresh</button>
             </div>
-            
+
             <div class="info-box">
                 <p><strong>📠 About ATAs:</strong> Analog Telephone Adapters (ATAs) allow you to connect traditional analog phones, fax machines, and other analog devices to your VoIP system.</p>
                 <p><strong>Supported ATAs:</strong> Cisco ATA series (including ATA 191/192 and SPA112/122), Grandstream HT series (e.g., HT801/HT802/HT812/HT814/HT818), and Obihai OBi series.</p>
@@ -1275,7 +1275,7 @@
                         <button class="btn btn-secondary" onclick="toggleMenuTreeView()">🌲 Tree View</button>
                     </div>
                 </div>
-                
+
                 <!-- Current Menu Breadcrumb -->
                 <div id="menu-breadcrumb" style="margin: 10px 0; padding: 10px; background: #f5f5f5; border-radius: 5px; display: flex; align-items: center; gap: 5px;">
                     <span style="color: #666;">Current Menu:</span>
@@ -5496,12 +5496,12 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                             <label class="mode-opt" data-fmfm-mode="sequential">
                                 <input type="radio" name="fmfm-mode" value="sequential" checked>
                                 <strong>Sequential</strong>
-                                <span>One at a time, in order. Each ring time delays everything below it.</span>
+                                <!-- <span>One at a time, in order. Each ring time delays everything below it.</span> -->
                             </label>
                             <label class="mode-opt" data-fmfm-mode="simultaneous">
                                 <input type="radio" name="fmfm-mode" value="simultaneous">
                                 <strong>Simultaneous</strong>
-                                <span>All at once. Each drops out when its own time is up; first to answer wins.</span>
+                                <!-- <span>All at once. Each drops out when its own time is up; first to answer wins.</span> -->
                             </label>
                         </div>
                     </div>
@@ -5510,12 +5510,11 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                         <span class="field-label">Destinations, and what the caller hears</span>
                         <div class="g g3 plan-list" id="fmfm-destinations-list"></div>
                         <div id="fmfm-dialog-warnings"></div>
-                        <span class="field-note">Ring time is 5–120 seconds. A value outside that is clamped when the call is placed, not rejected on save.</span>
+                        <span class="field-note">Ring time is 5–120 seconds.</span>
                     </div>
 
                     <label class="filter-check" for="fmfm-enabled">
-                        <input type="checkbox" id="fmfm-enabled" checked>
-                        Enabled — uncheck to keep this configuration but stop consulting it
+                        <input type="checkbox" id="fmfm-enabled" checked>Enabled
                     </label>
                 </form>
 
