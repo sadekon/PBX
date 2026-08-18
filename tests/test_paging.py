@@ -769,3 +769,99 @@ class TestSdpOriginIsNumeric:
         from pbx.sip.sdp import _numeric_session_id
 
         assert int(_numeric_session_id("some-call-id")) < 2**64
+
+
+# --------------------------------------------------------------------------- hanging up
+
+
+@pytest.mark.unit
+class TestHangUpPager:
+    """
+    A PBX-initiated hangup has to tell the pager's phone.
+
+    PBXCore.end_call only tears internal state down -- correct when the pager hung up first,
+    since their BYE is what got us there, and wrong for every hangup the PBX starts. Without
+    the BYE the phone keeps counting against a page that is already over, which is what a
+    failed page did on real hardware.
+    """
+
+    def _call(self):
+        call = MagicMock()
+        call.from_extension = "1513"
+        call.caller_addr = ("192.168.10.139", 5060)
+        call.paging_dialog_to = "<sip:799@192.168.1.14>;tag=abc12345"
+        call.original_invite.get_header.side_effect = {
+            "To": "<sip:799@192.168.1.14>",
+            "From": "<sip:1513@192.168.10.139>;tag=phonetag",
+            "Contact": "<sip:1513@192.168.10.139:5060>",
+        }.get
+        return call
+
+    def _handler(self, call):
+        from pbx.core.paging_handler import PagingHandler
+
+        pbx = MagicMock()
+        pbx.call_manager.get_call.return_value = call
+        pbx._get_server_ip.return_value = "192.168.1.14"
+        pbx.config.get.side_effect = lambda key, default=None: (
+            5060 if key == "server.sip_port" else default
+        )
+        return PagingHandler(pbx), pbx
+
+    def test_a_bye_goes_to_the_pager(self):
+        call = self._call()
+        handler, pbx = self._handler(call)
+        handler.hang_up_pager("c1")
+
+        pbx.sip_server._send_message.assert_called_once()
+        payload, addr = pbx.sip_server._send_message.call_args[0]
+        assert payload.startswith("BYE ")
+        assert addr == ("192.168.10.139", 5060)
+
+    def test_the_bye_carries_our_own_to_tag(self):
+        """
+        build_response mints a fresh to-tag for the 200 OK. A BYE whose From does not carry
+        that exact tag is out-of-dialog, and the phone discards it.
+        """
+        call = self._call()
+        handler, pbx = self._handler(call)
+        handler.hang_up_pager("c1")
+
+        payload = pbx.sip_server._send_message.call_args[0][0]
+        assert "tag=abc12345" in payload
+
+    def test_it_is_addressed_to_the_pagers_contact(self):
+        call = self._call()
+        handler, pbx = self._handler(call)
+        handler.hang_up_pager("c1")
+
+        payload = pbx.sip_server._send_message.call_args[0][0]
+        assert payload.startswith("BYE sip:1513@192.168.10.139:5060")
+
+    def test_the_call_is_still_ended(self):
+        call = self._call()
+        handler, pbx = self._handler(call)
+        handler.hang_up_pager("c1")
+        pbx.end_call.assert_called_once_with("c1")
+
+    def test_a_call_that_is_already_gone_still_ends_cleanly(self):
+        from pbx.core.paging_handler import PagingHandler
+
+        pbx = MagicMock()
+        pbx.call_manager.get_call.return_value = None
+        handler = PagingHandler(pbx)
+        handler.hang_up_pager("c1")
+
+        pbx.sip_server._send_message.assert_not_called()
+        pbx.end_call.assert_called_once_with("c1")
+
+    def test_a_call_with_no_invite_sends_nothing(self):
+        """A leg the PBX placed itself has no caller dialog to end."""
+        call = MagicMock()
+        call.original_invite = None
+        call.caller_addr = None
+        handler, pbx = self._handler(call)
+        handler.hang_up_pager("c1")
+
+        pbx.sip_server._send_message.assert_not_called()
+        pbx.end_call.assert_called_once_with("c1")

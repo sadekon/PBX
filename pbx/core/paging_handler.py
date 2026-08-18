@@ -232,6 +232,11 @@ class PagingHandler:
             sip_port = pbx.config.get("server.sip_port", 5060)
             response.set_header("Contact", f"<sip:{call.to_extension}@{server_ip}:{sip_port}>")
             pbx.sip_server._send_message(response.build(), call.caller_addr)
+            # build_response mints a fresh to-tag. Keep the header verbatim: a BYE the PBX
+            # sends later has to carry that exact tag in its From, or the pager treats it as
+            # out-of-dialog and ignores it -- leaving the phone counting against a page that
+            # is already over.
+            call.paging_dialog_to = response.get_header("To")
         except Exception as e:
             pbx.logger.error(f"Could not answer paging call {call.call_id}: {e}")
             return False
@@ -510,14 +515,104 @@ class PagingHandler:
                 pbx.logger.debug(f"Could not play paging tone: {e}")
             finally:
                 if then_hang_up:
-                    try:
-                        pbx.end_call(session.call_id)
-                    except Exception as e:
-                        pbx.logger.error(f"Could not end failed page {session.call_id}: {e}")
+                    # Through hang_up_pager, not end_call: the pager is still in the dialog
+                    # and needs a BYE, or their phone keeps counting against a page that
+                    # already failed.
+                    self.hang_up_pager(session.call_id)
 
         threading.Thread(
             target=_run, name=f"paging-tone-{session.page.page_id[:16]}", daemon=True
         ).start()
+
+    # ------------------------------------------------------------------ hanging up
+
+    def hang_up_pager(self, call_id: str) -> None:
+        """
+        End a page the PBX decided to stop, and tell the pager's phone about it.
+
+        `PBXCore.end_call` only tears internal state down; it sends nothing. That is right
+        when the pager hung up first -- their BYE is what brought us here -- and wrong for
+        every hangup the PBX initiates. Without the BYE the phone sits in a session the PBX
+        has already forgotten, still counting, until someone puts the handset down.
+
+        Reached when a zone's destinations all refuse the call, and when a page runs past its
+        duration cap.
+
+        Args:
+            call_id: The pager's call id
+        """
+        pbx = self.pbx_core
+
+        call = pbx.call_manager.get_call(call_id)
+        if call:
+            self._send_bye_to_pager(call, call_id)
+
+        try:
+            pbx.end_call(call_id)
+        except Exception as e:
+            pbx.logger.error(f"Could not end paging call {call_id}: {e}")
+
+    def _send_bye_to_pager(self, call: Any, call_id: str) -> None:
+        """
+        Send an in-dialog BYE to whoever placed the page.
+
+        The PBX answered their INVITE, so it is the UAS of this dialog: From and To are
+        swapped relative to that INVITE, and From carries the to-tag our own 200 OK
+        generated. Getting either wrong produces a BYE the phone discards as belonging to no
+        dialog it knows.
+
+        Args:
+            call: The pager's Call
+            call_id: The pager's call id
+        """
+        import re
+        import uuid
+
+        from pbx.sip.message import SIPMessageBuilder
+
+        pbx = self.pbx_core
+
+        invite = getattr(call, "original_invite", None)
+        caller_addr = getattr(call, "caller_addr", None)
+        if not (invite and caller_addr):
+            return
+
+        def _header(value: Any) -> str:
+            return value if isinstance(value, str) else ""
+
+        from_header = _header(getattr(call, "paging_dialog_to", None)) or _header(
+            invite.get_header("To")
+        )
+        to_header = _header(invite.get_header("From"))
+
+        # Their Contact is where in-dialog requests belong; the network address is the
+        # fallback for a phone that sent none.
+        uri = f"sip:{call.from_extension}@{caller_addr[0]}:{caller_addr[1]}"
+        contact = _header(invite.get_header("Contact"))
+        if contact:
+            match = re.search(r"<(sips?:[^>]+)>", contact)
+            if match:
+                uri = match.group(1)
+
+        try:
+            bye = SIPMessageBuilder.build_request(
+                method="BYE",
+                uri=uri,
+                from_addr=from_header,
+                to_addr=to_header,
+                call_id=call_id,
+                cseq=2,
+            )
+            server_ip = pbx._get_server_ip()
+            sip_port = pbx.config.get("server.sip_port", 5060)
+            bye.set_header(
+                "Via", f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{uuid.uuid4().hex}"
+            )
+            bye.set_header("Max-Forwards", "70")
+            pbx.sip_server._send_message(bye.build(), caller_addr)
+            pbx.logger.info(f"Sent BYE to paging caller for {call_id}")
+        except (KeyError, OSError, TypeError, ValueError) as e:
+            pbx.logger.error(f"Could not send BYE to paging caller {call_id}: {e}")
 
     # ------------------------------------------------------------------ teardown
 

@@ -724,7 +724,14 @@ class PagingSystem:
         call_id = page.call_id
         if self.pbx_core and call_id:
             try:
-                self.pbx_core.end_call(call_id)
+                # Through the handler rather than end_call directly: the pager did not hang
+                # up -- the PBX cut them off -- so their phone needs a BYE to leave the
+                # dialog. end_call alone would leave it counting against a finished page.
+                handler = getattr(self.pbx_core, "paging_handler", None)
+                if handler:
+                    handler.hang_up_pager(call_id)
+                else:
+                    self.pbx_core.end_call(call_id)
                 return
             except Exception as e:
                 self.logger.error(f"Could not end call {call_id} for expired page: {e}")
