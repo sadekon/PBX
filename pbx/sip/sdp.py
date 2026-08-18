@@ -3,7 +3,40 @@ SDP (Session Description Protocol) Parser and Builder
 Used for media negotiation in SIP calls
 """
 
+import hashlib
 from typing import Any
+
+
+def _numeric_session_id(session_id: str) -> str:
+    """
+    Coerce a session id into the numeric form RFC 4566 requires.
+
+    The `o=` line's sess-id is specified as "a numeric string", and callers here pass
+    whatever identifies the call: a SIP Call-ID such as `0_3466822012@192.168.10.139`, or a
+    UUID such as `b415260f-7318-485b-bbae-c829032b4487` for a PBX-originated leg. Neither is
+    numeric, so every SDP the PBX built carried a malformed origin line.
+
+    Lenient endpoints ignore it -- which is why this went unnoticed -- but a strict SDP
+    parser is entitled to reject the whole offer, and a Cisco ATA 191 answers one with 488
+    Not Acceptable Here.
+
+    The digest is deterministic, so the same call keeps the same sess-id across re-INVITEs.
+    That matters: per RFC 4566 a changed sess-id means a *different* session, and a hold or
+    codec renegotiation that changed it would read as one.
+
+    Args:
+        session_id: Any identifier for the session.
+
+    Returns:
+        The identifier if it is already numeric, otherwise a stable numeric digest of it.
+    """
+    if session_id.isdigit():
+        return session_id
+
+    # 60 bits: comfortably inside the 64-bit unsigned range endpoints parse into, with far
+    # more room than the collision needs -- uniqueness only has to hold within the tuple of
+    # username, address and this value.
+    return str(int(hashlib.sha1(session_id.encode()).hexdigest()[:15], 16))
 
 
 class SDPSession:
@@ -267,7 +300,7 @@ class SDPBuilder:
         sdp.version = 0
         sdp.origin = {
             "username": "pbx",
-            "session_id": session_id,
+            "session_id": _numeric_session_id(session_id),
             "version": "0",
             "network_type": "IN",
             "address_type": "IP4",

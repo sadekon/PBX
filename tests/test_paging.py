@@ -714,3 +714,58 @@ class TestPageFailureHandling:
         session.torn_down = True
         handler._on_leg_failed(session, destination, "busy")
         assert destination.destination_id not in session.failed
+
+
+# --------------------------------------------------------------------------- SDP validity
+
+
+@pytest.mark.unit
+class TestSdpOriginIsNumeric:
+    """
+    RFC 4566 specifies the o= line's sess-id as "a numeric string".
+
+    Callers pass whatever identifies the call -- a SIP Call-ID, or a UUID for a
+    PBX-originated leg -- so every SDP the PBX built carried a malformed origin line.
+    Lenient endpoints ignore it, which is why it went unnoticed; a Cisco ATA 191 answers
+    one with 488 Not Acceptable Here, which is how a page to it failed.
+    """
+
+    def test_uuid_session_id_becomes_numeric(self):
+        import uuid
+
+        from pbx.sip.sdp import SDPBuilder
+
+        sdp = SDPBuilder.build_audio_sdp(
+            "192.168.1.14", 10000, session_id=str(uuid.uuid4()), codecs=["0"]
+        )
+        origin = next(line for line in sdp.splitlines() if line.startswith("o="))
+        assert origin.split()[1].isdigit()
+
+    def test_sip_call_id_becomes_numeric(self):
+        from pbx.sip.sdp import SDPBuilder
+
+        sdp = SDPBuilder.build_audio_sdp(
+            "192.168.1.14", 10000, session_id="0_3466822012@192.168.10.139", codecs=["0"]
+        )
+        origin = next(line for line in sdp.splitlines() if line.startswith("o="))
+        assert origin.split()[1].isdigit()
+
+    def test_a_numeric_id_is_left_alone(self):
+        from pbx.sip.sdp import _numeric_session_id
+
+        assert _numeric_session_id("1234567890") == "1234567890"
+
+    def test_the_same_call_keeps_its_session_id(self):
+        """
+        A changed sess-id means a different session per RFC 4566, so a re-INVITE for hold or
+        a codec change must not appear to start one.
+        """
+        from pbx.sip.sdp import _numeric_session_id
+
+        assert _numeric_session_id("call-abc") == _numeric_session_id("call-abc")
+        assert _numeric_session_id("call-abc") != _numeric_session_id("call-def")
+
+    def test_it_fits_the_range_endpoints_parse(self):
+        from pbx.sip.sdp import _numeric_session_id
+
+        assert int(_numeric_session_id("some-call-id")) < 2**64
