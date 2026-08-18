@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Tests for Phone Book and Paging features
+Tests for the Phone Book feature.
+
+Paging moved to tests/test_paging.py when zones and destinations replaced the
+config-backed zone/DAC-device API this file used to cover.
 """
 
-from pbx.features.paging import PagingSystem
 from pbx.features.phone_book import PhoneBook
 
 
@@ -78,76 +80,6 @@ def test_phone_book_export() -> None:
     )
 
 
-def test_paging_system_basic() -> None:
-    """Test basic paging system operations"""
-
-    config = {
-        "features.paging.enabled": True,
-        "features.paging.prefix": "7",
-        "features.paging.all_call_extension": "700",
-        "features.paging.zones": [],
-    }
-
-    paging_system = PagingSystem(config, database=None)
-
-    # Test is_paging_extension
-    assert paging_system.is_paging_extension("700"), "All-call should be paging extension"
-    assert paging_system.is_paging_extension("701"), "7xx should be paging extension"
-    assert not paging_system.is_paging_extension("1001"), "1001 should not be paging extension"
-
-    # Test add zone
-    success = paging_system.add_zone(
-        extension="701", name="Zone 1 - Office", description="Main office area"
-    )
-    assert success, "Failed to add paging zone"
-
-    # Test get zone
-    zone = paging_system.get_zone_for_extension("701")
-    assert zone is not None, "Failed to get zone"
-    assert zone["name"] == "Zone 1 - Office", "Zone name mismatch"
-
-    # Test get all zones
-    zones = paging_system.get_zones()
-    assert len(zones) == 1, "Should have one zone"
-
-    # Test remove zone
-    success = paging_system.remove_zone("701")
-    assert success, "Failed to remove zone"
-
-    zones = paging_system.get_zones()
-    assert len(zones) == 0, "Should have no zones"
-
-
-def test_paging_system_devices() -> None:
-    """Test paging system DAC device configuration"""
-
-    config = {
-        "features.paging.enabled": True,
-        "features.paging.prefix": "7",
-        "features.paging.all_call_extension": "700",
-        "features.paging.zones": [],
-        "features.paging.dac_devices": [],
-    }
-
-    paging_system = PagingSystem(config, database=None)
-
-    # Test configure DAC device
-    success = paging_system.configure_dac_device(
-        device_id="paging-gateway-1",
-        device_type="cisco_vg224",
-        sip_uri="sip:paging@192.168.1.100:5060",
-        ip_address="192.168.1.100",
-        port=5060,
-    )
-    assert success, "Failed to configure DAC device"
-
-    # Test get DAC devices
-    devices = paging_system.get_dac_devices()
-    assert len(devices) == 1, "Should have one device"
-    assert devices[0]["device_id"] == "paging-gateway-1", "Device ID mismatch"
-    assert devices[0]["device_type"] == "cisco_vg224", "Device type mismatch"
-
-
 def test_phone_book_disabled() -> None:
     """Test phone book when disabled"""
 
@@ -159,16 +91,3 @@ def test_phone_book_disabled() -> None:
     assert not phone_book.add_entry("1001", "Test"), "Should fail when disabled"
     assert phone_book.get_entry("1001") is None, "Should return None when disabled"
     assert phone_book.get_all_entries() == [], "Should return empty list when disabled"
-
-
-def test_paging_system_disabled() -> None:
-    """Test paging system when disabled"""
-
-    config = {"features.paging.enabled": False}
-
-    paging_system = PagingSystem(config, database=None)
-
-    # All operations should return False/empty when disabled
-    assert not paging_system.is_paging_extension("700"), "Should return False when disabled"
-    assert not paging_system.add_zone("701", "Test"), "Should fail when disabled"
-    assert paging_system.get_zones() == [], "Should return empty list when disabled"

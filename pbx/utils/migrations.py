@@ -1177,3 +1177,86 @@ def register_all_migrations(manager: MigrationManager) -> None:
             ON recording_analyses(sentiment, analyzed_at);
     """),
     )
+
+    # Migration 1024: Paging zones and destinations
+    #
+    # Paging had no persistence at all. PagingSystem.add_zone() appended to a list on the
+    # instance, with a comment conceding that saving it was unimplemented, so every zone and
+    # device created through the admin API vanished on restart.
+    #
+    # WHAT IS DELIBERATELY NOT HERE: a device table. The old in-memory `dac_devices` carried
+    # device_id, device_type, sip_uri, ip_address and port -- a second hardware registry
+    # shadowing provisioned_devices, which already holds mac_address, vendor, model,
+    # device_type ('phone'|'ata'), static_ip, and extension_number_2 for dual-port ATAs.
+    # Persisting that copy would have guaranteed it drifted from the record provisioning
+    # actually uses. A destination names the FXS port's extension and nothing else; vendor and
+    # model are one join away.
+    #
+    # A dual-port ATA is therefore two extensions and two destinations off one hardware row,
+    # which is correct: two FXS ports drive two independent amplifier circuits, and those may
+    # sit in different zones.
+    #
+    # paging_zones.extension takes no foreign key -- it is a dialled number, not a SIP
+    # identity. Uniqueness against extensions.number is enforced on write instead, because a
+    # zone numbered 701 colliding with a real user at 701 is the bug the old prefix matcher
+    # caused, re-entered through the front door.
+    manager.register_migration(
+        1024,
+        "Paging Zones and Destinations",
+        manager._build_migration_sql("""
+        CREATE TABLE IF NOT EXISTS paging_zones (
+            id {SERIAL},
+            -- The number dialled to reach this zone. Not an extensions.number row.
+            extension VARCHAR(20) UNIQUE NOT NULL,
+            name VARCHAR(100) NOT NULL,
+            description {TEXT},
+            enabled BOOLEAN DEFAULT {BOOLEAN_TRUE},
+            -- Per-zone override of features.paging.max_duration. 0 = unlimited.
+            max_duration_seconds INTEGER DEFAULT 120,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS paging_destinations (
+            id {SERIAL},
+            zone_id INTEGER NOT NULL REFERENCES paging_zones(id) ON DELETE CASCADE,
+            -- 'sip_endpoint' now; 'multicast' is accepted by the schema so adding desk-phone
+            -- paging later needs no migration.
+            kind VARCHAR(20) NOT NULL DEFAULT 'sip_endpoint',
+            label VARCHAR(100),
+            enabled BOOLEAN DEFAULT {BOOLEAN_TRUE},
+            sort_order INTEGER DEFAULT 0,
+
+            -- kind = 'sip_endpoint'. RESTRICT rather than CASCADE: deleting the extension
+            -- an ATA answers on would otherwise silently empty a zone, and a page that
+            -- reaches nothing is indistinguishable from one that works.
+            endpoint_extension VARCHAR(20)
+                REFERENCES extensions(number) ON DELETE RESTRICT,
+            -- NULL means derive the auto-answer header from provisioned_devices.vendor.
+            -- Set only when hardware does not behave the way its vendor implies.
+            auto_answer_override VARCHAR(20),
+
+            -- kind = 'multicast'. Unused until desk-phone paging lands.
+            multicast_address VARCHAR(45),
+            multicast_port INTEGER,
+
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+            CONSTRAINT paging_dest_kind_fields CHECK (
+                (kind = 'sip_endpoint' AND endpoint_extension IS NOT NULL)
+                OR (kind = 'multicast' AND multicast_address IS NOT NULL
+                                       AND multicast_port IS NOT NULL)
+            )
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_paging_dest_zone
+            ON paging_destinations(zone_id);
+        CREATE INDEX IF NOT EXISTS idx_paging_dest_endpoint
+            ON paging_destinations(endpoint_extension);
+        -- One amplifier circuit cannot be listed twice in the same zone; it would be
+        -- INVITEd twice and the second leg would collide with the first.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_paging_dest_unique_endpoint
+            ON paging_destinations(zone_id, endpoint_extension)
+            WHERE kind = 'sip_endpoint';
+    """),
+    )

@@ -327,8 +327,16 @@ class TestWebRTCAutoAttendant:
 class TestWebRTCPaging:
     """Test cases for WebRTC paging routing"""
 
-    def test_webrtc_paging_routing(self) -> None:
-        """Test that WebRTC calls to paging extension route to paging handler"""
+    def test_webrtc_paging_is_refused_and_releases_its_port(self) -> None:
+        """
+        Paging from a browser is refused rather than half-done.
+
+        The branch this covers used to call `pbx_core._paging_session`, which has never
+        existed on PBXCore -- it was private to PagingHandler -- so a browser dialling a zone
+        raised AttributeError and leaked the service port it had already taken. It now
+        refuses cleanly and gives the port back. Wiring WebRTC onto the fan-out media path is
+        outstanding work, not something this test should pretend is done.
+        """
         mock_pbx_core = MagicMock()
         mock_pbx_core.extension_registry = MagicMock()
         mock_pbx_core.extension_registry.get_extension.return_value = None
@@ -352,14 +360,6 @@ class TestWebRTCPaging:
         # Set up paging
         mock_pbx_core.paging_system = MagicMock()
         mock_pbx_core.paging_system.is_paging_extension.return_value = True
-        mock_pbx_core.paging_system.initiate_page.return_value = "page-123"
-        mock_pbx_core.paging_system.get_page_info.return_value = {
-            "zone_names": "Zone A",
-            "zones": [{"zone_id": "z1", "dac_device": "dac-1"}],
-        }
-        mock_pbx_core.paging_system.get_dac_devices.return_value = [
-            {"device_id": "dac-1", "device_type": "SIP", "ip_address": "192.168.1.50"},
-        ]
 
         gateway = WebRTCGateway(mock_pbx_core)
 
@@ -372,34 +372,19 @@ class TestWebRTCPaging:
         mock_signaling = MagicMock()
         mock_signaling.get_session.return_value = mock_session
 
-        with (
-            patch("threading.Thread") as mock_thread,
-            patch.object(mock_signaling, "start_service_media_bridge", return_value=40000),
-        ):
+        with patch.object(mock_signaling, "start_service_media_bridge", return_value=40000):
             call_id = gateway.initiate_call(
                 session_id="test-session",
                 target_extension="700",
                 webrtc_signaling=mock_signaling,
             )
 
-            assert call_id is not None
-
-            # Verify paging attributes set
-            assert mock_call.paging_active, "Call should be marked as paging"
-            assert mock_call.page_id == "page-123"
-            assert mock_call.paging_zones == "Zone A"
-
-            # Verify call connected
-            mock_call.connect.assert_called_once()
-
-            # Verify CDR started
-            mock_pbx_core.cdr_system.start_record.assert_called_once()
-
-            # Verify paging session thread started
-            mock_thread.assert_called_once()
-            thread_call = mock_thread.call_args
-            assert thread_call[1]["target"] == mock_pbx_core._paging_session
-            assert thread_call[1]["daemon"]
+        assert call_id is None, "browser paging must be refused, not partly set up"
+        # initiate_call pops a service port before it knows where the call is going. The
+        # refusal has to put it back, or every browser attempt at a zone leaks one.
+        assert mock_pbx_core.rtp_relay.port_pool == [30000, 30002]
+        # Nothing is half-started: no call is connected.
+        mock_call.connect.assert_not_called()
 
     def test_webrtc_paging_initiate_fails(self) -> None:
         """Test graceful handling when paging initiation fails"""

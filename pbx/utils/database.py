@@ -2196,6 +2196,440 @@ class ProvisionedDevicesDB:
         return self.db.execute(query, (static_ip, datetime.now(UTC), mac_address))
 
 
+class PagingZonesDB:
+    """
+    Paging zone persistence.
+
+    A zone is a place you can address by dialling a number -- "Warehouse" = 701. It owns no
+    hardware; the mechanisms that put audio into it are rows in paging_destinations.
+    """
+
+    #: Columns update() will write. Anything else is ignored rather than interpolated, so a
+    #: caller cannot reach the SQL through a field name.
+    _UPDATABLE = ("name", "description", "enabled", "max_duration_seconds")
+
+    def __init__(self, db: DatabaseBackend) -> None:
+        """
+        Initialize paging zones database.
+
+        Args:
+            db: DatabaseBackend instance
+        """
+        self.db = db
+        self.logger = get_logger()
+
+    def extension_conflict(self, extension: str, exclude_zone_id: int | None = None) -> str | None:
+        """
+        Report what already answers to `extension`, if anything.
+
+        Checked against both tables on purpose. A zone number and a user extension are drawn
+        from the same dial plan, so a zone at 701 colliding with a real user at 701 makes one
+        of them unreachable -- which is the failure the old `startswith(prefix)` matcher
+        caused, and re-entering it through zone creation would be no better.
+
+        Args:
+            extension: The number to test
+            exclude_zone_id: Zone to ignore, when re-checking during an update
+
+        Returns:
+            "zone", "extension", or None if the number is free
+        """
+        if exclude_zone_id is None:
+            row = self.db.fetch_one(
+                "SELECT id FROM paging_zones WHERE extension = %s", (extension,)
+            )
+        else:
+            row = self.db.fetch_one(
+                "SELECT id FROM paging_zones WHERE extension = %s AND id <> %s",
+                (extension, exclude_zone_id),
+            )
+        if row:
+            return "zone"
+
+        if self.db.fetch_one("SELECT id FROM extensions WHERE number = %s", (extension,)):
+            return "extension"
+
+        return None
+
+    def create(
+        self,
+        extension: str,
+        name: str,
+        description: str | None = None,
+        enabled: bool = True,
+        max_duration_seconds: int = 120,
+    ) -> int | None:
+        """
+        Create a paging zone.
+
+        Args:
+            extension: Number dialled to reach this zone
+            name: Human name, e.g. "Warehouse"
+            description: Optional longer note
+            enabled: Whether the zone answers
+            max_duration_seconds: Page cutoff; 0 for unlimited
+
+        Returns:
+            int: New zone id, or None if the write failed
+        """
+        now = datetime.now(UTC)
+        row = self.db.fetch_one(
+            """
+            INSERT INTO paging_zones
+                (extension, name, description, enabled, max_duration_seconds,
+                 created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (extension, name, description, enabled, max_duration_seconds, now, now),
+        )
+        try:
+            return int(row["id"]) if row else None
+        except (KeyError, TypeError, ValueError):
+            self.logger.error(f"Paging zone {extension} created but its id could not be read")
+            return None
+
+    def get(self, zone_id: int) -> dict | None:
+        """
+        Get a zone by id.
+
+        Args:
+            zone_id: Zone id
+
+        Returns:
+            dict: Zone row or None
+        """
+        return self.db.fetch_one("SELECT * FROM paging_zones WHERE id = %s", (zone_id,))
+
+    def get_by_extension(self, extension: str) -> dict | None:
+        """
+        Get a zone by the number dialled to reach it.
+
+        Args:
+            extension: Zone extension
+
+        Returns:
+            dict: Zone row or None
+        """
+        return self.db.fetch_one("SELECT * FROM paging_zones WHERE extension = %s", (extension,))
+
+    def list_all(self) -> list[dict]:
+        """
+        list every zone, dial order.
+
+        Returns:
+            list: Zone rows
+        """
+        return self.db.fetch_all("SELECT * FROM paging_zones ORDER BY extension")
+
+    def list_enabled_extensions(self) -> list[str]:
+        """
+        list the numbers that currently route to paging.
+
+        This is what replaces the prefix match: an extension is a paging extension when a
+        zone claims it, not when it happens to start with a 7.
+
+        Returns:
+            list: Zone extensions that are enabled
+        """
+        rows = self.db.fetch_all(
+            "SELECT extension FROM paging_zones WHERE enabled = TRUE ORDER BY extension"
+        )
+        return [row["extension"] for row in (rows or [])]
+
+    def update(self, zone_id: int, **fields: object) -> bool:
+        """
+        Update a zone's mutable fields.
+
+        `extension` is not updatable: it is the dialled identity, and changing it in place
+        would silently move a zone out from under anyone who had memorised the number.
+        Delete and recreate instead.
+
+        Args:
+            zone_id: Zone id
+            **fields: Any of name, description, enabled, max_duration_seconds
+
+        Returns:
+            bool: True if a write was attempted and succeeded
+        """
+        sets = [(k, v) for k, v in fields.items() if k in self._UPDATABLE]
+        if not sets:
+            return False
+
+        assignments = ", ".join(f"{k} = %s" for k, _ in sets)
+        params = (*(v for _, v in sets), datetime.now(UTC), zone_id)
+        return self.db.execute(
+            f"UPDATE paging_zones SET {assignments}, updated_at = %s WHERE id = %s",
+            params,
+        )
+
+    def delete(self, zone_id: int) -> bool:
+        """
+        Delete a zone. Its destinations cascade.
+
+        Args:
+            zone_id: Zone id
+
+        Returns:
+            bool: True if successful
+        """
+        return self.db.execute("DELETE FROM paging_zones WHERE id = %s", (zone_id,))
+
+
+class PagingDestinationsDB:
+    """
+    Paging destination persistence.
+
+    A destination is one mechanism that puts audio into a zone. Today that means a SIP
+    endpoint -- an ATA's FXS port, named by the extension it answers on. It deliberately
+    stores no hardware detail: vendor, model, MAC and IP all live in provisioned_devices,
+    and are joined in by :meth:`list_resolved_for_zone` when a page needs them.
+    """
+
+    _UPDATABLE = (
+        "label",
+        "enabled",
+        "sort_order",
+        "auto_answer_override",
+        "multicast_address",
+        "multicast_port",
+    )
+
+    def __init__(self, db: DatabaseBackend) -> None:
+        """
+        Initialize paging destinations database.
+
+        Args:
+            db: DatabaseBackend instance
+        """
+        self.db = db
+        self.logger = get_logger()
+
+    def add_sip_endpoint(
+        self,
+        zone_id: int,
+        endpoint_extension: str,
+        label: str | None = None,
+        auto_answer_override: str | None = None,
+        sort_order: int = 0,
+    ) -> int | None:
+        """
+        Add an ATA (or other SIP endpoint) to a zone.
+
+        Args:
+            zone_id: Owning zone
+            endpoint_extension: The extension the FXS port answers on. For a dual-port ATA
+                this is either of the device's two extensions -- each port is a separate
+                amplifier circuit and so a separate destination.
+            label: Optional name for this circuit, e.g. "Ceiling horns"
+            auto_answer_override: Force a header form, or "none" to send none. Leave NULL to
+                derive it from the device's vendor.
+            sort_order: Display order within the zone
+
+        Returns:
+            int: New destination id, or None if the write failed
+        """
+        row = self.db.fetch_one(
+            """
+            INSERT INTO paging_destinations
+                (zone_id, kind, label, enabled, sort_order,
+                 endpoint_extension, auto_answer_override, created_at)
+            VALUES (%s, 'sip_endpoint', %s, TRUE, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                zone_id,
+                label,
+                sort_order,
+                endpoint_extension,
+                auto_answer_override,
+                datetime.now(UTC),
+            ),
+        )
+        try:
+            return int(row["id"]) if row else None
+        except (KeyError, TypeError, ValueError):
+            self.logger.error(
+                f"Paging destination {endpoint_extension} created but its id could not be read"
+            )
+            return None
+
+    def add_multicast(
+        self,
+        zone_id: int,
+        multicast_address: str,
+        multicast_port: int,
+        label: str | None = None,
+        sort_order: int = 0,
+    ) -> int | None:
+        """
+        Add a multicast group to a zone.
+
+        Accepted by the schema so desk-phone paging needs no migration later. Nothing sends
+        to one yet.
+
+        Args:
+            zone_id: Owning zone
+            multicast_address: Group address, conventionally in 239.0.0.0/8
+            multicast_port: Group port
+            label: Optional name
+            sort_order: Display order within the zone
+
+        Returns:
+            int: New destination id, or None if the write failed
+        """
+        row = self.db.fetch_one(
+            """
+            INSERT INTO paging_destinations
+                (zone_id, kind, label, enabled, sort_order,
+                 multicast_address, multicast_port, created_at)
+            VALUES (%s, 'multicast', %s, TRUE, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (zone_id, label, sort_order, multicast_address, multicast_port, datetime.now(UTC)),
+        )
+        try:
+            return int(row["id"]) if row else None
+        except (KeyError, TypeError, ValueError):
+            self.logger.error("Multicast destination created but its id could not be read")
+            return None
+
+    def get(self, destination_id: int) -> dict | None:
+        """
+        Get a destination by id.
+
+        Args:
+            destination_id: Destination id
+
+        Returns:
+            dict: Destination row or None
+        """
+        return self.db.fetch_one(
+            "SELECT * FROM paging_destinations WHERE id = %s", (destination_id,)
+        )
+
+    def list_for_zone(self, zone_id: int) -> list[dict]:
+        """
+        list a zone's destinations, unresolved.
+
+        Args:
+            zone_id: Zone id
+
+        Returns:
+            list: Destination rows in display order
+        """
+        return self.db.fetch_all(
+            "SELECT * FROM paging_destinations WHERE zone_id = %s ORDER BY sort_order, id",
+            (zone_id,),
+        )
+
+    def list_resolved_for_zone(self, zone_id: int, enabled_only: bool = True) -> list[dict]:
+        """
+        list a zone's destinations with their hardware joined in.
+
+        This is what a page runs on, so it is one query: the handler must not go back to the
+        database once audio is flowing.
+
+        The device join matches `extension_number_2` as well as `extension_number`, because a
+        dual-port ATA is one provisioned_devices row covering two extensions, and the second
+        FXS port is every bit as real a destination as the first. Matching only the first
+        column would leave port 2 with no vendor and silently fall back to the default
+        auto-answer header.
+
+        LEFT JOIN throughout: a destination whose extension has no provisioned device is
+        still a valid destination -- it just has no vendor to derive a header from.
+
+        Args:
+            zone_id: Zone id
+            enabled_only: Skip destinations that are switched off
+
+        Returns:
+            list: Destination rows widened with mac_address, vendor, model, device_type,
+                static_ip and the extension's display name
+        """
+        query = """
+        SELECT d.id, d.zone_id, d.kind, d.label, d.enabled, d.sort_order,
+               d.endpoint_extension, d.auto_answer_override,
+               d.multicast_address, d.multicast_port,
+               pd.mac_address, pd.vendor, pd.model, pd.device_type, pd.static_ip,
+               e.name AS endpoint_name
+        FROM paging_destinations d
+        LEFT JOIN provisioned_devices pd
+               ON pd.extension_number = d.endpoint_extension
+               OR pd.extension_number_2 = d.endpoint_extension
+        LEFT JOIN extensions e
+               ON e.number = d.endpoint_extension
+        WHERE d.zone_id = %s
+        """
+        if enabled_only:
+            query += " AND d.enabled = TRUE"
+        query += " ORDER BY d.sort_order, d.id"
+
+        return self.db.fetch_all(query, (zone_id,))
+
+    def zones_using_extension(self, endpoint_extension: str) -> list[dict]:
+        """
+        Find every zone that pages through a given endpoint.
+
+        Contention is per destination, not per zone: all-call and a specific zone overlap by
+        definition, so paging the warehouse while all-call is live has to be refused even
+        though the warehouse zone itself is idle.
+
+        Args:
+            endpoint_extension: The endpoint's extension
+
+        Returns:
+            list: Rows of zone id, extension and name
+        """
+        return self.db.fetch_all(
+            """
+            SELECT z.id, z.extension, z.name
+            FROM paging_destinations d
+            JOIN paging_zones z ON z.id = d.zone_id
+            WHERE d.endpoint_extension = %s AND d.kind = 'sip_endpoint'
+            ORDER BY z.extension
+            """,
+            (endpoint_extension,),
+        )
+
+    def update(self, destination_id: int, **fields: object) -> bool:
+        """
+        Update a destination's mutable fields.
+
+        `kind`, `zone_id` and `endpoint_extension` are fixed: changing any of them turns the
+        row into a different destination, and the zone's page would follow it mid-flight.
+
+        Args:
+            destination_id: Destination id
+            **fields: Any of label, enabled, sort_order, auto_answer_override,
+                multicast_address, multicast_port
+
+        Returns:
+            bool: True if a write was attempted and succeeded
+        """
+        sets = [(k, v) for k, v in fields.items() if k in self._UPDATABLE]
+        if not sets:
+            return False
+
+        assignments = ", ".join(f"{k} = %s" for k, _ in sets)
+        params = (*(v for _, v in sets), destination_id)
+        return self.db.execute(
+            f"UPDATE paging_destinations SET {assignments} WHERE id = %s", params
+        )
+
+    def delete(self, destination_id: int) -> bool:
+        """
+        Delete a destination.
+
+        Args:
+            destination_id: Destination id
+
+        Returns:
+            bool: True if successful
+        """
+        return self.db.execute("DELETE FROM paging_destinations WHERE id = %s", (destination_id,))
+
+
 # Global instance
 _database = None
 

@@ -75,6 +75,9 @@ class CallOriginator:
         on_answer: Callable[[Any], None] | None = None,
         on_failure: Callable[[Any, str], None] | None = None,
         rtp_ports_override: tuple[int, int] | None = None,
+        extra_headers: dict[str, str] | None = None,
+        codecs: list[str] | None = None,
+        sdp_direction: str = "sendrecv",
     ) -> Any | None:
         """
         Place a call from the PBX to `destination` (extension or external
@@ -110,6 +113,18 @@ class CallOriginator:
                 leg never connects.
             rtp_ports_override: Reuse an already-allocated relay (e.g. the
                 other leg's, when bridging) instead of allocating a new one.
+            extra_headers: Headers to set on the INVITE, beyond the ones every
+                leg carries. Paging uses this for the vendor-specific
+                auto-answer header (`Call-Info: <sip:host>;answer-after=0` and
+                friends) that makes an ATA go off-hook without a human.
+            codecs: Payload types to offer, as strings ("0" is PCMU). Defaults
+                to the SDP builder's full set. Pass a single codec when the leg
+                must agree with something the PBX cannot renegotiate -- paging
+                fans one stream out to several endpoints and the PBX does not
+                transcode, so every leg has to be PCMU.
+            sdp_direction: Media direction to advertise. "sendonly" for a
+                one-way leg such as an overhead page, where the amplifier has
+                nothing to send back.
 
         Returns:
             The originated `Call`, or None if it could not be started at
@@ -159,6 +174,8 @@ class CallOriginator:
             server_ip,
             call.rtp_ports[0],
             session_id=call_id,
+            codecs=codecs,
+            direction=sdp_direction,
         )
 
         # Where the leg goes, and how the request line, To and Contact name
@@ -223,6 +240,11 @@ class CallOriginator:
         )
         invite_request.set_header("Contact", f"<sip:{contact_user}@{server_ip}:{sip_port}>")
         SIPMessageBuilder.add_caller_id_headers(invite_request, cid_number, cid_name, server_ip)
+
+        # Set last so a caller can override a header this method chose -- and so an
+        # auto-answer header cannot be clobbered by the caller-ID block above.
+        for header_name, header_value in (extra_headers or {}).items():
+            invite_request.set_header(header_name, header_value)
 
         call_router.send_leg_invite(
             call,

@@ -753,6 +753,14 @@ class PBXCore:
             # first: the caller hanging up mid-ring is exactly when this matters.
             self.find_me_follow_me.on_call_ended(call)
 
+            # A page holds legs to every amplifier in its zone plus a media socket, none of
+            # which the Call itself owns. Without this they would survive the hangup until
+            # the zone's duration timer fired, leaving the amplifiers keyed up and the zone
+            # marked busy against the next page. Returns False for anything that is not a
+            # page, including the paging legs this itself hangs up.
+            if self.paging_handler:
+                self.paging_handler.teardown_page(call_id)
+
             # Cancel INVITE retransmission if still running
             if hasattr(call, "invite_transaction") and call.invite_transaction:
                 call.invite_transaction.cancel()

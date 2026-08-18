@@ -389,6 +389,47 @@ class RTPRelay:
             del self.active_relays[call_id]
             self.logger.info(f"Released RTP relay for call {call_id}")
 
+    def allocate_port(self) -> tuple[int, int] | None:
+        """
+        Draw an RTP/RTCP port pair from the pool without building a relay.
+
+        allocate_relay() constructs and starts an RTPRelayHandler as a side effect, which is
+        exactly right for a two-party call and wrong for anything that owns its own socket.
+        Paging fans one inbound stream out to several endpoints, which the two-party handler
+        cannot express, so it binds its own socket and needs nothing from here but a port
+        nobody else will take.
+
+        The caller owns the pair and must hand it back to release_port(); it is not tracked
+        in active_relays, so nothing else will clean it up.
+
+        Thread-safe: uses the same lock as allocate_relay/release_relay.
+
+        Returns:
+            (rtp_port, rtcp_port), or None if the pool is empty.
+        """
+        with self._pool_lock:
+            if not self.port_pool:
+                self.logger.error("No available ports for standalone RTP allocation")
+                return None
+            rtp_port = self.port_pool.pop(0)
+        return (rtp_port, rtp_port + 1)
+
+    def release_port(self, rtp_port: int) -> None:
+        """
+        Return a port pair taken by allocate_port() to the pool.
+
+        Safe to call twice: a port already in the pool is not added again, because
+        double-counting it would let two unrelated sessions bind the same port.
+
+        Args:
+            rtp_port: The RTP port previously handed out by allocate_port().
+        """
+        with self._pool_lock:
+            if rtp_port in self.port_pool:
+                return
+            self.port_pool.append(rtp_port)
+            self.port_pool.sort()
+
     def release_relay_keep_port(self, call_id: str) -> tuple[int, int] | None:
         """
         Stop and deregister a relay WITHOUT returning its port to the pool.

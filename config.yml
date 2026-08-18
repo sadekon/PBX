@@ -222,6 +222,26 @@ features:
   auto_attendant: true
   max_call_duration: 7200
 
+  # Overhead paging.
+  #
+  # Zones and their destinations live in Postgres (paging_zones,
+  # paging_destinations) and are managed from the admin Paging tab -- there is
+  # deliberately nothing here describing a zone, a number to dial, or a piece of
+  # hardware. An ATA is an ordinary extension; its vendor, model and MAC are
+  # already in provisioned_devices.
+  #
+  # There is no dial prefix. A number reaches paging when a zone claims it,
+  # which is what keeps zones from colliding with call parking on 7x
+  # (dialplan.parking_pattern) or with a user extension.
+  paging:
+    enabled: false             # Turn on once at least one zone has a destination
+    max_duration: 120          # Seconds before a page is cut off; per-zone override in the DB
+    codec: PCMU                # Fixed. The PBX does not transcode, and a page is fanned out
+                               # to endpoints that never negotiated with each other.
+    # multicast:               # Desk-phone paging. Not implemented yet.
+    #   interface: 0.0.0.0     # Explicit, so a multi-homed host does not guess
+    #   ttl: 1                 # Keeps paging audio on the local segment
+
   # DTMF Configuration - Global settings for all devices
   # Note: Individual phone templates may override these for device-specific requirements
   #

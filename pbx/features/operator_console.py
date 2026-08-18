@@ -314,33 +314,27 @@ class OperatorConsole:
                 "features.operator_console.paging.multicast_port", 5004
             )
 
-            # Use the PBX core's paging system if available for full SIP-based paging
-            if hasattr(self.pbx_core, "paging_system") and self.pbx_core.paging_system.enabled:
-                # Delegate to the paging system which handles SIP INVITE to DAC devices
-                # and RTP audio routing through the paging handler
-                all_call_ext = self.pbx_core.paging_system.all_call_extension
-                page_id = self.pbx_core.paging_system.initiate_page("operator", all_call_ext)
-                if page_id:
-                    self.logger.info(f"Multicast page initiated via paging system: {page_id}")
-                else:
-                    self.logger.warning("Paging system failed to initiate multicast page")
-            else:
-                # Direct multicast: send a UDP packet to the multicast group
-                # so that multicast-capable speakers/paging devices receive the notification
-                import socket
+            # Deliberately does not go through the paging system. A zone page carries a live
+            # caller's audio from an answered SIP leg, and this is a text notification with
+            # no caller and no audio -- the old call here registered a page that nothing
+            # ever streamed to, so it was only ever a log line that looked like success.
+            #
+            # Direct multicast: send a UDP packet to the multicast group so that
+            # multicast-capable speakers/paging devices receive the notification.
+            import socket
 
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
-                    # Encode the page message as a simple payload for multicast receivers
-                    payload = full_message.encode("utf-8")
-                    sock.sendto(payload, (multicast_addr, multicast_port))
-                    sock.close()
-                    self.logger.info(
-                        f"Sent multicast page to {multicast_addr}:{multicast_port}: {full_message}"
-                    )
-                except OSError as mcast_err:
-                    self.logger.error(f"Failed to send multicast page: {mcast_err}")
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 32)
+                # Encode the page message as a simple payload for multicast receivers
+                payload = full_message.encode("utf-8")
+                sock.sendto(payload, (multicast_addr, multicast_port))
+                sock.close()
+                self.logger.info(
+                    f"Sent multicast page to {multicast_addr}:{multicast_port}: {full_message}"
+                )
+            except OSError as mcast_err:
+                self.logger.error(f"Failed to send multicast page: {mcast_err}")
 
         elif method == "sip":
             # SIP-based paging via the PBX core's paging handler
@@ -348,23 +342,15 @@ class OperatorConsole:
                 "features.operator_console.paging.sip_uri", "sip:page-all@pbx.local"
             )
 
-            if hasattr(self.pbx_core, "paging_system") and self.pbx_core.paging_system.enabled:
-                # Use the paging system's all-call extension to initiate a SIP page
-                all_call_ext = self.pbx_core.paging_system.all_call_extension
-                page_id = self.pbx_core.paging_system.initiate_page("operator", all_call_ext)
-                if page_id:
-                    self.logger.info(
-                        f"SIP page initiated via paging system to {paging_uri}: {full_message} "
-                        f"(page_id={page_id})"
-                    )
-                else:
-                    self.logger.warning(
-                        f"Paging system failed to initiate SIP page to {paging_uri}"
-                    )
-            else:
-                self.logger.warning(
-                    f"SIP paging requested but paging system is not available: {paging_uri}"
-                )
+            # A zone page relays a live caller's audio to the zone's amplifiers. There is no
+            # caller here and no audio to relay -- only text -- so there is nothing for the
+            # paging system to carry. Announcing this notification over the speakers needs
+            # text-to-speech feeding a page, which does not exist yet.
+            self.logger.warning(
+                f"SIP paging cannot deliver a text notification ({paging_uri}): a page "
+                f"carries a caller's live audio, and this message has none. Use the "
+                f"multicast or email method instead: {full_message}"
+            )
 
         elif method == "email":
             # Email notification via the voicemail system's email capabilities

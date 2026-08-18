@@ -1888,42 +1888,26 @@ class WebRTCGateway:
                     and self.pbx_core.paging_system
                     and self.pbx_core.paging_system.is_paging_extension(target_extension)
                 ):
-                    # Paging extension (7xx pattern)
-                    page_id = self.pbx_core.paging_system.initiate_page(
-                        from_extension, target_extension
+                    # Paging from a WebRTC client is not wired up.
+                    #
+                    # What was here called `self.pbx_core._paging_session`, which has never
+                    # existed on PBXCore -- the method lived on PagingHandler and was private
+                    # to it -- so this branch raised AttributeError the moment anyone dialled
+                    # a zone from a browser. It also read `zone_names` and `get_dac_devices`
+                    # off the old in-memory device registry, which is gone.
+                    #
+                    # Reinstating it means giving the WebRTC leg the same treatment the SIP
+                    # path gets in PagingHandler: a PCMU-only answer, one auto-answer leg per
+                    # destination, and the audio fanned out through PagingMediaSession. The
+                    # gateway builds its own call and port here, so that is a real piece of
+                    # work rather than a call swap, and it is deliberately not being faked.
+                    self.logger.error(
+                        f"Paging zone {target_extension} cannot be dialled from a WebRTC "
+                        f"client: browser paging is not implemented. Page from a desk phone."
                     )
-                    if not page_id:
-                        self.logger.error(f"Failed to initiate page for {target_extension}")
-                        self.pbx_core.rtp_relay.port_pool.append(service_port)
-                        self.pbx_core.rtp_relay.port_pool.sort()
-                        return None
-
-                    page_info = self.pbx_core.paging_system.get_page_info(page_id)
-                    call.paging_active = True
-                    call.page_id = page_id
-                    call.paging_zones = page_info.get("zone_names", "Unknown")
-                    call.connect()
-                    if self.pbx_core.cdr_system:
-                        self.pbx_core.cdr_system.start_record(
-                            call_id, from_extension, target_extension
-                        )
-                        self.pbx_core.cdr_system.mark_answered(call_id)
-
-                    dac_devices = self.pbx_core.paging_system.get_dac_devices(
-                        page_info.get("zones", [])
-                    )
-                    dac_device = dac_devices[0] if dac_devices else None
-
-                    paging_thread = threading.Thread(
-                        target=self.pbx_core._paging_session,
-                        args=(call_id, call, dac_device, page_info),
-                        daemon=True,
-                        name=f"WebRTC-Page-{call_id[:8]}",
-                    )
-                    paging_thread.start()
-                    self.logger.info(
-                        f"Paging started for WebRTC call {call_id} (zone {call.paging_zones})"
-                    )
+                    self.pbx_core.rtp_relay.port_pool.append(service_port)
+                    self.pbx_core.rtp_relay.port_pool.sort()
+                    return None
                 else:
                     aa = self.pbx_core.auto_attendant
                     if aa and target_extension == aa.get_extension():
