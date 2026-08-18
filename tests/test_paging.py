@@ -565,3 +565,69 @@ def test_concurrent_pages_to_one_zone_yield_exactly_one_winner():
     winners = [page for page, _ in results if page is not None]
     assert len(winners) == 1
     assert all(error == "busy" for page, error in results if page is None)
+
+
+# --------------------------------------------------------------------------- reachability
+
+
+@pytest.mark.unit
+class TestDestinationReachability:
+    """
+    A destination registered at this PBX's own SIP address is refused.
+
+    A stale registered_phones row -- 127.0.0.1 is the one seen in the field -- makes
+    resolve_extension() hand back the PBX's own address. The leg then INVITEs this server,
+    which receives its own INVITE as a new inbound call and routes it to the same extension.
+    """
+
+    def _handler(self, address):
+        from pbx.core.paging_handler import PagingHandler
+
+        pbx = MagicMock()
+        pbx.config.get.side_effect = lambda key, default=None: (
+            5060 if key == "server.sip_port" else default
+        )
+        resolved = MagicMock()
+        resolved.address = address
+        pbx.call_router.resolve_extension.return_value = resolved
+        return PagingHandler(pbx)
+
+    def test_loopback_registration_is_refused(self):
+        handler = self._handler(("127.0.0.1", 5060))
+        assert not handler._destination_is_reachable(_destination(), "192.168.1.14", 5060)
+
+    def test_own_address_is_refused(self):
+        handler = self._handler(("192.168.1.14", 5060))
+        assert not handler._destination_is_reachable(_destination(), "192.168.1.14", 5060)
+
+    def test_ipv6_loopback_is_refused(self):
+        handler = self._handler(("::1", 5060))
+        assert not handler._destination_is_reachable(_destination(), "192.168.1.14", 5060)
+
+    def test_a_real_ata_is_accepted(self):
+        handler = self._handler(("192.168.10.50", 5060))
+        assert handler._destination_is_reachable(_destination(), "192.168.1.14", 5060)
+
+    def test_loopback_on_another_port_is_accepted(self):
+        """
+        A SIP endpoint genuinely running on this host, on its own port, is not the PBX --
+        only the PBX's own SIP port is the loop.
+        """
+        handler = self._handler(("127.0.0.1", 5080))
+        assert handler._destination_is_reachable(_destination(), "192.168.1.14", 5060)
+
+    def test_unregistered_destination_is_refused(self):
+        from pbx.core.paging_handler import PagingHandler
+
+        pbx = MagicMock()
+        pbx.call_router.resolve_extension.return_value = None
+        handler = PagingHandler(pbx)
+        assert not handler._destination_is_reachable(_destination(), "192.168.1.14", 5060)
+
+    def test_resolution_failure_is_refused_not_raised(self):
+        from pbx.core.paging_handler import PagingHandler
+
+        pbx = MagicMock()
+        pbx.call_router.resolve_extension.side_effect = RuntimeError("registry down")
+        handler = PagingHandler(pbx)
+        assert not handler._destination_is_reachable(_destination(), "192.168.1.14", 5060)

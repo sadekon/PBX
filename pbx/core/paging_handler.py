@@ -261,7 +261,13 @@ class PagingHandler:
             self._on_all_destinations_failed(session)
             return
 
+        sip_port = pbx.config.get("server.sip_port", 5060)
+
         for destination in sip_destinations:
+            if not self._destination_is_reachable(destination, server_ip, sip_port):
+                self._on_leg_failed(session, destination, "unreachable")
+                continue
+
             extra_headers: dict[str, str] = {}
             header = destination.auto_answer_header(server_ip)
             if header:
@@ -300,6 +306,61 @@ class PagingHandler:
             else:
                 with session.lock:
                     session.leg_call_ids[destination.destination_id] = leg.call_id
+
+    def _destination_is_reachable(
+        self, destination: Any, server_ip: str, sip_port: int
+    ) -> bool:
+        """
+        Refuse a destination whose registration points back at the PBX.
+
+        A stale or bogus `registered_phones` row -- typically 127.0.0.1 -- makes
+        `resolve_extension()` hand back the PBX's own SIP address, and the leg then INVITEs
+        this server. The PBX receives its own INVITE as a fresh inbound call, routes it to
+        the same extension, and resolves the same address again. Nothing on the far side is
+        an amplifier, so the page reaches no speaker either way; refusing it here keeps a
+        misconfigured destination from turning into a signalling loop.
+
+        Checked per destination rather than once, since only some of a zone's endpoints may
+        be affected and the rest of the page should still go through.
+
+        Args:
+            destination: The destination about to be INVITEd
+            server_ip: This PBX's advertised address
+            sip_port: This PBX's SIP port
+
+        Returns:
+            bool: True if the leg is worth placing
+        """
+        pbx = self.pbx_core
+
+        try:
+            resolved = pbx.call_router.resolve_extension(destination.endpoint_extension)
+        except Exception as e:
+            pbx.logger.error(
+                f"Could not resolve paging destination {destination.display_name}: {e}"
+            )
+            return False
+
+        if not resolved or not getattr(resolved, "address", None):
+            pbx.logger.error(
+                f"Paging destination {destination.display_name} "
+                f"(ext {destination.endpoint_extension}) is not registered"
+            )
+            return False
+
+        host, port = resolved.address[0], resolved.address[1]
+        loops_back = host in ("127.0.0.1", "localhost", "::1", server_ip) and port == sip_port
+        if loops_back:
+            pbx.logger.error(
+                f"Paging destination {destination.display_name} "
+                f"(ext {destination.endpoint_extension}) is registered at {host}:{port}, "
+                f"which is this PBX. Its registration is wrong -- the INVITE would come "
+                f"straight back here instead of reaching an amplifier. Check "
+                f"registered_phones for that extension."
+            )
+            return False
+
+        return True
 
     def _on_leg_answered(self, session: _PageSession, destination: Any, leg_call: Any) -> None:
         """
