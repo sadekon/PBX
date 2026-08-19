@@ -891,6 +891,7 @@ class RegisteredPhonesDB:
         user_agent: str | None = None,
         contact_uri: str | None = None,
         sip_port: int | None = None,
+        address_is_authoritative: bool = True,
     ) -> tuple[bool, str | None]:
         """
         Register or update a phone registration
@@ -903,6 +904,12 @@ class RegisteredPhonesDB:
             contact_uri: Contact URI from SIP message
             sip_port: Port the phone registered from. Stored so the call router can reach
                 it after a restart; phones do not always use 5060.
+            address_is_authoritative: Whether `ip_address` is where this phone can be
+                *called*. True for a SIP REGISTER, whose source address is exactly that.
+                False for anything that merely observed the device at an address -- a
+                provisioning fetch says where it asked for a file, which is a different
+                fact, and behind a reverse proxy is not even the device's address. A
+                non-authoritative caller can create a row but never overwrites one.
 
         Returns:
             tuple[bool, str | None]: Success status and the actual MAC address stored (or None)
@@ -920,8 +927,13 @@ class RegisteredPhonesDB:
                     f"Phone MAC {mac_address} was registered to extension {old_by_mac['extension_number']}, will update to {extension_number}"
                 )
 
-        # Check if this IP is registered to a different extension
-        old_by_ip = self.get_by_ip(ip_address)
+        # Check if this IP is registered to a different extension.
+        #
+        # Only when the address really identifies the device. A proxied provisioning fetch
+        # reports the proxy's address for every phone, so this would read each fetch as the
+        # device having moved and delete the previous phone's registration -- phones
+        # deleting each other in turn, none of them reachable for long.
+        old_by_ip = self.get_by_ip(ip_address) if address_is_authoritative else None
         if (
             old_by_ip
             and old_by_ip["extension_number"] != extension_number
@@ -956,7 +968,14 @@ class RegisteredPhonesDB:
             # Update existing registration
             # Preserve existing values if new values are None (device didn't send them)
             updated_mac = mac_address if mac_address is not None else existing.get("mac_address")
-            updated_ip = ip_address if ip_address is not None else existing.get("ip_address")
+            # A caller that only observed the device leaves the stored address alone: the
+            # row already holds one learned from a REGISTER, which is the only message that
+            # says where the phone can be called.
+            updated_ip = (
+                ip_address
+                if ip_address is not None and address_is_authoritative
+                else existing.get("ip_address")
+            )
             updated_user_agent = (
                 user_agent if user_agent is not None else existing.get("user_agent")
             )
@@ -1111,9 +1130,20 @@ class RegisteredPhonesDB:
 
     def cleanup_incomplete_registrations(self) -> tuple[bool, int]:
         """
-        Remove phone registrations that are missing MAC address, IP address, or extension number.
-        Only phones with all three fields (MAC, IP, and Extension) should be retained.
-        This is called at startup to ensure data integrity.
+        Remove phone registrations that could never be used to reach a phone.
+
+        Two kinds. A row missing its MAC, IP or extension is incomplete and always was
+        dropped here. A row whose address is loopback is worse than incomplete: it looks
+        valid, survives restarts, and sends every call to that extension straight back into
+        the PBX -- which is how a paging destination came to resolve to the PBX itself.
+        Nothing legitimate registers from 127.0.0.1, since a phone that shares a host with
+        the PBX is not a phone.
+
+        The "webrtc" marker rows are deliberately spared: that is a session identifier
+        rather than an address, and the call router already knows not to dial it.
+
+        Called at startup, so a bad row left by an older build is gone before it can route
+        anything. The phone re-registers on its own timer and the row comes back correct.
 
         Returns:
             tuple[bool, int]: Success status and count of removed registrations
@@ -1124,6 +1154,8 @@ class RegisteredPhonesDB:
             WHERE mac_address IS NULL OR mac_address = ''
                OR ip_address IS NULL OR ip_address = ''
                OR extension IS NULL OR extension = ''
+               OR ip_address LIKE '127.%'
+               OR ip_address IN ('localhost', '::1')
             """
             count = self.db.execute_rowcount(delete_query)
 
@@ -1132,10 +1164,11 @@ class RegisteredPhonesDB:
                 return (False, 0)
 
             if count == 0:
-                self.logger.info("No incomplete phone registrations found")
+                self.logger.info("No unusable phone registrations found")
             else:
                 self.logger.info(
-                    f"Cleaned up {count} incomplete phone registration(s) from database"
+                    f"Cleaned up {count} unusable phone registration(s) from database "
+                    f"(incomplete, or pointing at the PBX itself)"
                 )
 
             return (True, count)

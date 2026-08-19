@@ -703,6 +703,13 @@ def handle_provisioning_request(path: str) -> Response:
                             mac_address=normalized_mac,
                             user_agent=request_info.get("user_agent", "Unknown"),
                             contact_uri=None,  # Not available during provisioning request
+                            # A config fetch says where the device asked for a file, not
+                            # where it can be called -- and behind a reverse proxy it is the
+                            # proxy's address, not the device's at all. Recording it as a
+                            # registration reset every phone's address to 127.0.0.1 on its
+                            # own provisioning timer, which among other things made a paging
+                            # destination resolve to the PBX itself.
+                            address_is_authoritative=False,
                         )
                         if success:
                             logger.info(
