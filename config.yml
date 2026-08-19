@@ -234,7 +234,7 @@ features:
   # which is what keeps zones from colliding with call parking on 7x
   # (dialplan.parking_pattern) or with a user extension.
   paging:
-    enabled: false             # Turn on once at least one zone has a destination
+    enabled: true              # Turn on once at least one zone has a destination
     max_duration: 120          # Seconds before a page is cut off; per-zone override in the DB
     # How long a destination gets to answer before its leg is cancelled. An endpoint that
     # auto-answers takes about a second; an amplifier that seizes the line on ring voltage
