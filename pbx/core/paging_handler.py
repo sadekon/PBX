@@ -23,19 +23,17 @@ CODEC
 """
 
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 #: G.711 u-law. The only codec a page is answered with -- see the module docstring.
 PCMU_PAYLOAD_TYPE = "0"
 
-#: Confirmation tone, played to the pager once a destination is live. The cue that means
-#: "you are being heard"; it must never play before a leg has actually answered.
-READY_TONE_HZ = 1000
-READY_TONE_MS = 250
-
-#: Failure tone. Lower and repeated, so it cannot be mistaken for the ready beep by someone
-#: who is already talking.
+#: The only tone the PBX plays, and only when a page reached nothing at all. Low and
+#: repeated so it reads as a fault rather than as one of the amplifier's own prompts, which
+#: are what the pager otherwise hears. Nothing else can report this: a page with no
+#: destination up produces exactly the same silence as a working one.
 FAILURE_TONE_HZ = 440
 FAILURE_TONE_MS = 200
 FAILURE_TONE_REPEATS = 3
@@ -54,7 +52,6 @@ class _PageSession:
     leg_call_ids: dict[int, str] = field(default_factory=dict)
     answered: set[int] = field(default_factory=set)
     failed: set[int] = field(default_factory=set)
-    ready_tone_played: bool = False
     torn_down: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -416,18 +413,125 @@ class PagingHandler:
             if session.torn_down:
                 return
             session.answered.add(destination.destination_id)
-            play_tone = not session.ready_tone_played
-            session.ready_tone_played = True
 
-        session.media.add_target(destination.destination_id, endpoint)
         pbx.paging_system.set_destination_state(
             session.page.page_id, destination.destination_id, "answered"
         )
 
-        if play_tone:
-            # Only on the first answer: the pager needs one cue that they are live, not one
-            # per amplifier.
-            self._play_tone(session, READY_TONE_HZ, READY_TONE_MS, repeats=1)
+        if destination.dtmf_sequence:
+            # Direct-dial: pick the circuit before anyone is broadcast into the building.
+            # The tones go to this amplifier alone and the destination joins the fan-out
+            # only once they are done, so the pager's voice cannot reach a circuit that has
+            # not been chosen yet. Threaded because the tones play in real time and this
+            # runs on a SIP callback thread that must not block.
+            threading.Thread(
+                target=self._select_circuit_then_stream,
+                args=(session, destination, endpoint),
+                name=f"paging-select-{session.page.page_id[:12]}",
+                daemon=True,
+            ).start()
+            return
+
+        # Manual: the person paging picks the circuit on their own keypad, so the amplifier
+        # has to be receiving before they press anything.
+        session.media.add_target(destination.destination_id, endpoint)
+
+        # No tone from the PBX here. The amplifier announces itself when it answers, and
+        # again when a zone digit lands, and the media session now carries both back to the
+        # pager. A synthetic beep on top would talk over the one cue that actually says
+        # which circuit opened -- and the PBX cannot know that, since everything past the
+        # FXS port is analog. The failure tone stays, because nothing else can report a
+        # page that reached nothing.
+
+    def _select_circuit_then_stream(
+        self, session: _PageSession, destination: Any, endpoint: tuple[str, int]
+    ) -> None:
+        """
+        Play a destination's circuit-selection digits, then start relaying the pager to it.
+
+        Inband, as audio, because that is what the amplifiers listen for -- the same tones a
+        person would produce on a keypad. Not RFC 2833: the leg negotiates PCMU alone, so
+        there is no telephone-event payload to carry named events, and the amplifier is
+        listening to the audio anyway.
+
+        Sent to this one destination, never the whole fan-out. Two amplifiers in the same
+        zone can want different circuits, and in any case a digit meant for one has no
+        business arriving at another.
+
+        Runs on its own thread: the tones play in real time.
+
+        Args:
+            session: The live page
+            destination: The destination whose circuit is being selected
+            endpoint: Where that destination receives RTP
+        """
+        pbx = self.pbx_core
+        digits = destination.dtmf_sequence
+
+        try:
+            from pbx.rtp.handler import RTPPlayer
+            from pbx.utils.audio import float_samples_to_pcm16, pcm16_to_ulaw
+            from pbx.utils.dtmf import DTMFGenerator
+
+            settle_ms = pbx.config.get("features.paging.dtmf_settle_ms", 500)
+            tone_ms = pbx.config.get("features.paging.dtmf_tone_ms", 120)
+            gap_ms = pbx.config.get("features.paging.dtmf_gap_ms", 80)
+            confirm_ms = pbx.config.get("features.paging.dtmf_confirm_ms", 600)
+
+            # An amplifier that has just gone off-hook is not always listening yet.
+            if settle_ms > 0:
+                time.sleep(settle_ms / 1000.0)
+
+            with session.lock:
+                if session.torn_down:
+                    return
+
+            samples = (
+                DTMFGenerator().generate_sequence(digits, tone_ms=tone_ms, gap_ms=gap_ms)
+                if session.media.socket is not None
+                else []
+            )
+            if not samples:
+                pbx.logger.error(
+                    f"Page {session.page.page_id}: could not build tones for "
+                    f"{destination.display_name} from '{digits}'"
+                )
+            else:
+                player = RTPPlayer(
+                    session.rtp_port,
+                    endpoint[0],
+                    endpoint[1],
+                    call_id=session.call_id,
+                    external_socket=session.media.socket,
+                )
+                if player.start():
+                    player.send_audio(
+                        pcm16_to_ulaw(float_samples_to_pcm16(samples)), payload_type=0
+                    )
+                    pbx.logger.info(
+                        f"Page {session.page.page_id}: sent '{digits}' to "
+                        f"{destination.display_name} to select its circuit"
+                    )
+
+            # Let the amplifier act on the selection -- and let its confirmation tone reach
+            # the pager, which the media session returns on its own -- before the page starts
+            # flowing into it.
+            if confirm_ms > 0:
+                time.sleep(confirm_ms / 1000.0)
+        except Exception as e:
+            # A destination that could not be told which circuit to use is still better
+            # joined than dropped: the amplifier will page whatever it defaults to, which is
+            # more useful than silence, and the log says what happened.
+            pbx.logger.error(
+                f"Page {session.page.page_id}: circuit selection failed for "
+                f"{destination.display_name}: {e}"
+            )
+
+        with session.lock:
+            if session.torn_down:
+                return
+
+        session.media.add_target(destination.destination_id, endpoint)
 
     def _on_leg_failed(self, session: _PageSession, destination: Any, reason: str) -> None:
         """
