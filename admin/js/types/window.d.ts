@@ -160,15 +160,12 @@ declare global {
 
         // pages/paging.ts
         loadPagingData: () => Promise<void>;
-        loadPagingZones: () => Promise<void>;
-        loadPagingDevices: () => Promise<void>;
-        loadActivePages: () => Promise<void>;
-        deletePagingZone: (zoneId: string) => Promise<void>;
         showAddZoneModal: () => void;
         closeZoneModal: () => void;
-        showAddDeviceModal: () => void;
-        closeDeviceModal: () => void;
-        deletePagingDevice: (deviceId: string) => Promise<void>;
+        closeDestinationModal: () => void;
+        deletePagingZone: (zoneId: number) => Promise<void>;
+        deletePagingDestination: (destinationId: number) => Promise<void>;
+        endActivePage: (pageId: string) => Promise<void>;
 
         // pages/queues.ts
         loadQueuesData: () => Promise<void>;

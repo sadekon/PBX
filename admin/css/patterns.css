@@ -743,6 +743,38 @@
     border-top: none;
 }
 
+/* The naming half of a read-only plan row — a paging destination rather than an
+   editable ring step. Takes the slack so the stats and actions beside it sit
+   against the right edge, the way a card head is arranged. */
+.plan-main {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+/* Shown in place of the rows when a list that ought to hold something is empty.
+   Lighter than .empty-state, which replaces a whole page's worth of cards. */
+.plan-empty {
+    padding: 4px 0 10px;
+}
+
+.plan-empty p {
+    font-size: 0.86rem;
+    color: var(--color-text-secondary);
+    margin: 0 0 10px;
+}
+
+/* A second, quieter identifier beside the bold one in a card title — a zone's
+   name after its number, where the number is what gets dialled and the name is
+   what makes it recognisable. */
+.card-sub {
+    font-size: 0.86rem;
+    font-weight: 400;
+    color: var(--color-text-secondary);
+}
+
 .plan-grip {
     flex: 0 0 auto;
     padding: 2px 3px;

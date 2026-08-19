@@ -1495,116 +1495,70 @@
             </div>
         </div>
 
-        <div id="paging" class="tab-content">
-            <div class="section-header">
-                <h2>📢 Paging System</h2>
-                <button class="btn btn-primary" onclick="loadPagingData()">🔄 Refresh</button>
+        <div id="paging" class="tab-content glass-page">
+            <div class="g g1 page-head">
+                <span class="page-mark" aria-hidden="true">📢</span>
+                <div>
+                    <h2>Paging</h2>
+                    <p class="page-sub">Dial a zone to speak through the overhead amplifiers</p>
+                </div>
+                <span class="page-head-actions">
+                    <button type="button" class="btn-ghost" id="paging-refresh">Refresh</button>
+                    <button type="button" class="btn-ghost btn-ghost-accent" id="paging-add-zone">Add zone</button>
+                </span>
             </div>
 
-            <div class="info-box">
-                <h3>ℹ️ About Paging System</h3>
-                <p>The paging system allows overhead announcements through digital-to-analog converters (DACs). Configure zones, devices, and monitor active paging sessions.</p>
-                <p><strong>Usage:</strong> Dial a zone extension (e.g., 701) to page that zone, or dial the all-call extension (default: 700) to page all zones.</p>
+            <div class="stats-grid" style="margin-bottom: 30px;">
+                <div class="g g2 stat-card">
+                    <div class="stat-value" id="paging-zone-count">-</div>
+                    <div class="stat-label">Zones</div>
+                </div>
+                <div class="g g2 stat-card">
+                    <div class="stat-value" id="paging-destination-count">-</div>
+                    <div class="stat-label">Destinations</div>
+                </div>
+                <div class="g g2 stat-card">
+                    <div class="stat-value" id="paging-active-count">-</div>
+                    <div class="stat-label">Pages In Progress</div>
+                </div>
             </div>
 
-            <!-- Active Paging Sessions -->
+            <div class="config-section" id="paging-active-section" hidden>
+                <p class="list-caption">In progress now</p>
+                <div id="paging-active-list"></div>
+            </div>
+
             <div class="config-section">
-                <h3>📡 Active Paging Sessions</h3>
-                <div class="table-container">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th>Page ID</th>
-                                <th>From Extension</th>
-                                <th>Zone(s)</th>
-                                <th>Started</th>
-                                <th>Status</th>
-                            </tr>
-                        </thead>
-                        <tbody id="active-pages-table-body">
-                            <tr>
-                                <td colspan="5" class="loading">Loading active paging sessions...</td>
-                            </tr>
-                        </tbody>
-                    </table>
+                <p class="list-caption">Zones
+                    <span class="filter-summary" id="paging-count" aria-live="polite"></span>
+                </p>
+
+                <div class="g g2 filter-bar">
+                    <span class="filter-field">
+                        <label class="filter-label" for="paging-search">Search</label>
+                        <input type="search" id="paging-search" autocomplete="off"
+                               placeholder="Zone number, name, or destination">
+                    </span>
+                    <label class="filter-check" for="paging-enabled-only">
+                        <input type="checkbox" id="paging-enabled-only">
+                        Enabled only
+                    </label>
+                    <button type="button" class="btn-ghost" id="paging-clear-filter" hidden>Clear filters</button>
                 </div>
+
+                <div id="paging-list"></div>
             </div>
 
-            <!-- Paging Zones -->
-            <div class="config-section">
-                <div class="section-header">
-                    <h3>🗺️ Paging Zones</h3>
-                    <button class="btn btn-success" onclick="showAddZoneModal()">➕ Add Zone</button>
-                </div>
-                <div class="table-container">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th>Extension</th>
-                                <th>Zone Name</th>
-                                <th>Description</th>
-                                <th>Device</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="paging-zones-table-body">
-                            <tr>
-                                <td colspan="5" class="loading">Loading paging zones...</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- DAC Devices -->
-            <div class="config-section">
-                <div class="section-header">
-                    <h3>🔌 DAC Devices</h3>
-                    <button class="btn btn-success" onclick="showAddDeviceModal()">➕ Add Device</button>
-                </div>
-                <div class="info-box" style="margin-bottom: 15px;">
-                    <p><strong>Supported Devices:</strong> SIP-to-analog gateways (Cisco VG series, Grandstream HT series, etc.)</p>
-                    <p><strong>Note:</strong> Devices should be configured to auto-answer and have their analog outputs connected to PA amplifiers.</p>
-                </div>
-                <div class="table-container">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th>Device ID</th>
-                                <th>Name</th>
-                                <th>Type</th>
-                                <th>SIP Address</th>
-                                <th>Status</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="paging-devices-table-body">
-                            <tr>
-                                <td colspan="6" class="loading">Loading DAC devices...</td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Test Paging -->
-            <div class="config-section">
-                <h3>🧪 Test Paging</h3>
-                <form id="test-paging-form">
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="test-page-from">From Extension:</label>
-                            <input type="text" id="test-page-from" placeholder="1001" required>
-                        </div>
-                        <div class="form-group">
-                            <label for="test-page-zone">Zone Extension:</label>
-                            <select id="test-page-zone" required>
-                                <option value="">Select Zone</option>
-                            </select>
-                        </div>
-                    </div>
-                    <button type="submit" class="btn btn-primary">📢 Initiate Test Page</button>
-                </form>
+            <div class="g g4 info-box">
+                <h3>ℹ️ About Paging</h3>
+                <p>A zone is a number people dial to make an announcement. Dialling it opens a call to every destination in that zone at once and copies the speaker's audio to all of them until they hang up.</p>
+                <ul>
+                    <li><strong>A destination is one amplifier input</strong> — the extension an ATA's FXS port answers on. Its hardware details come from Provisioning; only the extension is recorded here.</li>
+                    <li><strong>The amplifier chooses the speaker circuit</strong>, not the PBX. Once the call is up, the person paging dials the amplifier's own digit for the circuit they want, exactly as they did on the analogue system.</li>
+                    <li><strong>Set a circuit selection</strong> on a destination only when one number should always reach one circuit. The PBX then dials those digits itself and the caller does nothing.</li>
+                    <li><strong>An amplifier takes one call at a time.</strong> A zone that is already paging refuses a second attempt with a busy signal rather than interrupting.</li>
+                    <li><strong>Audio is G.711 µ-law throughout.</strong> The PBX does not transcode, so a phone that cannot offer it is refused rather than answered into silence.</li>
+                </ul>
             </div>
         </div>
 
@@ -5525,6 +5479,127 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                     <button type="button" class="btn-ghost" id="fmfm-dialog-cancel">Cancel</button>
                     <button type="submit" form="add-fmfm-form"
                             class="btn-ghost btn-ghost-accent" id="fmfm-dialog-save">Save configuration</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add/Edit Paging Zone Modal -->
+    <div id="add-paging-zone-modal" class="modal">
+        <div class="glass-page">
+            <div class="g g1 dialog" role="dialog" aria-modal="true"
+                 aria-labelledby="paging-zone-dialog-title">
+                <div class="dialog-head">
+                    <span class="page-mark" aria-hidden="true">📢</span>
+                    <div>
+                        <h3 id="paging-zone-dialog-title">Paging zone</h3>
+                        <p class="dialog-sub" id="paging-zone-dialog-sub">A number people dial to make an announcement</p>
+                    </div>
+                    <button type="button" class="dialog-close" id="paging-zone-dialog-close"
+                            aria-label="Close">&times;</button>
+                </div>
+
+                <form id="add-paging-zone-form" class="dialog-body">
+                    <div class="field">
+                        <label for="paging-zone-extension">Number to dial</label>
+                        <input type="text" id="paging-zone-extension" required pattern="[0-9]+"
+                               placeholder="799" autocomplete="off" inputmode="numeric">
+                        <span class="field-note" id="paging-zone-extension-note">Must not be a number an extension already answers on. Fixed once the zone exists.</span>
+                    </div>
+
+                    <div class="field">
+                        <label for="paging-zone-name">Name</label>
+                        <input type="text" id="paging-zone-name" required
+                               placeholder="All buildings" autocomplete="off" maxlength="100">
+                    </div>
+
+                    <div class="field">
+                        <label for="paging-zone-description">Description</label>
+                        <input type="text" id="paging-zone-description" autocomplete="off"
+                               placeholder="Optional — what this zone reaches">
+                    </div>
+
+                    <div class="field">
+                        <label for="paging-zone-max-duration">Time limit</label>
+                        <input type="number" id="paging-zone-max-duration" min="0" max="3600"
+                               inputmode="numeric" placeholder="120">
+                        <span class="field-note">Seconds before the page is ended for you. 0 means no limit — an amplifier held open by a forgotten handset blocks every later page.</span>
+                    </div>
+
+                    <label class="filter-check" for="paging-zone-enabled">
+                        <input type="checkbox" id="paging-zone-enabled" checked>Enabled
+                    </label>
+                </form>
+
+                <div class="dialog-foot">
+                    <button type="button" class="btn-ghost btn-ghost-danger"
+                            id="paging-zone-dialog-delete">Delete zone</button>
+                    <span class="spacer"></span>
+                    <button type="button" class="btn-ghost" id="paging-zone-dialog-cancel">Cancel</button>
+                    <button type="submit" form="add-paging-zone-form"
+                            class="btn-ghost btn-ghost-accent" id="paging-zone-dialog-save">Save zone</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Paging Destination Modal -->
+    <div id="add-paging-destination-modal" class="modal">
+        <div class="glass-page">
+            <div class="g g1 dialog" role="dialog" aria-modal="true"
+                 aria-labelledby="paging-destination-dialog-title">
+                <div class="dialog-head">
+                    <span class="page-mark" aria-hidden="true">🔈</span>
+                    <div>
+                        <h3 id="paging-destination-dialog-title">Add destination</h3>
+                        <p class="dialog-sub" id="paging-destination-dialog-sub">An amplifier input this zone speaks through</p>
+                    </div>
+                    <button type="button" class="dialog-close" id="paging-destination-dialog-close"
+                            aria-label="Close">&times;</button>
+                </div>
+
+                <form id="add-paging-destination-form" class="dialog-body">
+                    <div class="field">
+                        <label for="paging-destination-endpoint">Amplifier input</label>
+                        <select id="paging-destination-endpoint" required>
+                            <option value="">Loading…</option>
+                        </select>
+                        <span class="field-note" id="paging-destination-endpoint-note">The extension the ATA's phone port answers on. Each port drives one amplifier, so a two-port ATA offers two.</span>
+                    </div>
+
+                    <div class="field">
+                        <label for="paging-destination-label">Name</label>
+                        <input type="text" id="paging-destination-label" autocomplete="off"
+                               placeholder="Optional — e.g. Building 1 amplifier" maxlength="100">
+                    </div>
+
+                    <div class="field">
+                        <label for="paging-destination-dtmf">Circuit selection</label>
+                        <input type="text" id="paging-destination-dtmf" autocomplete="off"
+                               placeholder="Leave empty — the caller dials it">
+                        <span class="field-note">Leave empty and whoever is paging picks the circuit on their own keypad, as on the analogue system. Fill it in and the PBX dials these digits itself, so this number always reaches one circuit. Digits 0-9, * and #.</span>
+                    </div>
+
+                    <div class="field">
+                        <label for="paging-destination-auto-answer">Auto-answer</label>
+                        <select id="paging-destination-auto-answer">
+                            <option value="">From the device's vendor (recommended)</option>
+                            <option value="cisco">Cisco — Call-Info: answer-after=0</option>
+                            <option value="yealink">Yealink — Call-Info: answer-after=0</option>
+                            <option value="zultys">Zultys — Call-Info: answer-after=0</option>
+                            <option value="polycom">Polycom — Alert-Info: Ring Answer</option>
+                            <option value="grandstream">Grandstream — Alert-Info: alert-autoanswer</option>
+                            <option value="none">Send nothing</option>
+                        </select>
+                        <span class="field-note">Which header tells the device to pick up on its own. Override only when hardware does not behave the way its vendor implies. "Send nothing" suits an amplifier that seizes the line on ring voltage and needs no instruction.</span>
+                    </div>
+                </form>
+
+                <div class="dialog-foot">
+                    <span class="spacer"></span>
+                    <button type="button" class="btn-ghost" id="paging-destination-dialog-cancel">Cancel</button>
+                    <button type="submit" form="add-paging-destination-form"
+                            class="btn-ghost btn-ghost-accent" id="paging-destination-dialog-save">Add destination</button>
                 </div>
             </div>
         </div>
