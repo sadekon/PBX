@@ -1,5 +1,5 @@
 """
-One-way RTP fan-out for overhead paging.
+RTP fan-out for overhead paging.
 
 A page is one caller's audio arriving on one socket and leaving to several endpoints at once
 -- one per amplifier circuit. Neither existing mechanism can do that:
@@ -18,8 +18,11 @@ currently answered. Packets are forwarded verbatim rather than rebuilt, which ke
 pager's sequence numbers, timestamps and SSRC intact across every leg -- the same thing an RTP
 relay does, and what endpoints expect.
 
-Strictly one-way. Anything arriving from a destination is discarded: an amplifier has nothing
-to say, and forwarding it would put one circuit's noise onto every other.
+Not symmetric, but not one-way either. The pager's audio goes to every destination; a
+destination's audio goes only back to the pager, never to the other destinations. That
+asymmetry is the point: an amplifier answers a keypress with its own prompt or confirmation
+tone, and since everything past the FXS port is analog, that tone is the only evidence the
+right zone opened. Fanning it sideways would put one circuit's noise onto every other.
 """
 
 import contextlib
@@ -80,6 +83,9 @@ class PagingMediaSession:
 
         self.packets_received = 0
         self.packets_dropped_no_targets = 0
+        #: Packets sent back from an amplifier to the pager -- its prompt and confirmation
+        #: tones, which are the only feedback that a zone selection worked.
+        self.packets_returned = 0
         #: destination_id -> count
         self.packets_sent: dict[int, int] = {}
 
@@ -159,7 +165,7 @@ class PagingMediaSession:
             return len(self._targets)
 
     def _receive_loop(self) -> None:
-        """Receive from the pager, copy to every live target."""
+        """Relay the pager out to every destination, and the destinations back to the pager."""
         sock = self.socket
         if sock is None:
             return
@@ -175,7 +181,16 @@ class PagingMediaSession:
                     self.logger.debug(f"Paging media socket error on page {self.page_id}")
                 continue
 
-            if self._source is None:
+            with self._targets_lock:
+                targets = list(self._targets.items())
+            target_endpoints = {endpoint for _, endpoint in targets}
+
+            # Learn the pager from the first packet that is not already a known destination.
+            # Ordering makes this safe in practice -- the pager starts sending the moment it
+            # gets our 200 OK, before any leg answers -- but an amplifier that answered
+            # first would otherwise be mistaken for the pager, and its audio then fanned out
+            # to every other amplifier.
+            if self._source is None and addr not in target_endpoints:
                 self._source = addr
                 if self._expected_source and addr != self._expected_source:
                     self.logger.info(
@@ -183,15 +198,27 @@ class PagingMediaSession:
                         f"not the {self._expected_source[0]}:{self._expected_source[1]} it "
                         f"advertised -- using the address the packets came from"
                     )
-            elif addr != self._source:
-                # A destination talking back, or a stray sender. Overhead paging is one-way;
-                # relaying this would put one amplifier's noise onto every other circuit.
+
+            if addr in target_endpoints:
+                # An amplifier talking back. It is not mixed into the page: it goes only to
+                # the pager, so pressing a zone digit produces the amp's own prompt or
+                # confirmation tone in the pager's ear. That tone is the only evidence the
+                # selection landed -- everything past the FXS port is analog and silent to
+                # the PBX -- so discarding it, as this loop used to, left the person paging
+                # with no way to tell which zone they had opened.
+                if self._source is not None:
+                    try:
+                        sock.sendto(data, self._source)
+                        self.packets_returned += 1
+                    except OSError as e:
+                        self.logger.debug(f"Page {self.page_id}: return to pager failed: {e}")
+                continue
+
+            if self._source is not None and addr != self._source:
+                # Neither the pager nor a destination we are streaming to.
                 continue
 
             self.packets_received += 1
-
-            with self._targets_lock:
-                targets = list(self._targets.items())
 
             if not targets:
                 self.packets_dropped_no_targets += 1
@@ -249,6 +276,7 @@ class PagingMediaSession:
         return {
             "local_port": self.local_port,
             "packets_received": self.packets_received,
+            "packets_returned": self.packets_returned,
             "packets_dropped_no_targets": self.packets_dropped_no_targets,
             "packets_sent": dict(self.packets_sent),
             "targets": {str(k): f"{v[0]}:{v[1]}" for k, v in targets.items()},
