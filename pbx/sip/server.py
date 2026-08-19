@@ -1049,19 +1049,29 @@ class SIPServer:
         if self.pbx_core is None:
             return
 
+        # Deliberately tolerates a missing call record. Acknowledging a final response is a
+        # transaction-layer obligation (RFC 3261 SS17.1.1.3), not an application one: a 487
+        # answering our own CANCEL routinely arrives after the call it belonged to has been
+        # torn down, and returning early there leaves the far end retransmitting until
+        # Timer H expires 32 seconds later -- with its INVITE transaction still live, which
+        # is enough to make an endpoint answer the next call 486 Busy.
+        #
+        # Everything an ACK needs is in the response itself. The call record only supplies
+        # nicer values, so its absence degrades the ACK rather than skipping it.
         call = self.pbx_core.call_manager.get_call(call_id)
-        if not call:
-            return
 
-        # Build ACK for the callee's 200 OK.
+        # Build ACK for the callee's final response.
         # The Request-URI, From, To (with tag), and Call-ID must match the
         # original INVITE dialog.  CSeq uses the same number as the INVITE.
-        callee_invite = getattr(call, "callee_invite", None)
-        request_uri = (
-            callee_invite.uri
-            if callee_invite
-            else f"sip:{call.to_extension}@{callee_addr[0]}:{callee_addr[1]}"
-        )
+        callee_invite = getattr(call, "callee_invite", None) if call else None
+        if callee_invite:
+            request_uri = callee_invite.uri
+        elif call:
+            request_uri = f"sip:{call.to_extension}@{callee_addr[0]}:{callee_addr[1]}"
+        else:
+            # No call to name the user part, so address the host itself. A UAS matches the
+            # ACK on branch, To-tag, Call-ID and CSeq -- never the Request-URI.
+            request_uri = f"sip:{callee_addr[0]}:{callee_addr[1]}"
         from_header = response_200.get_header("From") or ""
         # To header from the 200 OK includes the remote tag
         to_header = response_200.get_header("To") or ""
@@ -1081,6 +1091,12 @@ class SIPServer:
         invite_via = (
             callee_invite.get_header("Via") if use_invite_branch and callee_invite else None
         )
+        if not invite_via and use_invite_branch:
+            # The response carries our own Via straight back, branch included, so a non-2xx
+            # ACK can be matched to its INVITE transaction even with no stored INVITE to
+            # copy it from. Without this a 487 arriving after teardown would get an ACK on a
+            # fresh branch, which the far end cannot match and therefore ignores.
+            invite_via = response_200.get_header("Via")
         if invite_via:
             # Non-2xx ACK: same transaction as the INVITE, same branch
             ack.set_header("Via", invite_via)
@@ -2618,6 +2634,21 @@ class SIPServer:
                         return
 
                 self.logger.warning(f"Callee error {message.status_code} for call {call_id}")
+
+                # Acknowledge first, unconditionally, before anything looks at application
+                # state. RFC 3261 SS17.1.1.3 makes this the transaction layer's job: every
+                # non-2xx final response to an INVITE is ACKed, whether or not the PBX still
+                # has a call to attach it to.
+                #
+                # It used to sit inside `if call:` below, so a response arriving after the
+                # call was gone got no ACK at all. A 487 answering our own CANCEL is exactly
+                # that case -- the CANCEL tears the call down, then the 487 arrives to find
+                # nothing -- and the far end then retransmits it until Timer H expires 32
+                # seconds later, holding its INVITE transaction open the whole time. An
+                # endpoint in that state answers the next call 486 Busy.
+                if "INVITE" in cseq_header:
+                    self._send_ack_to_callee(message, addr, call_id, use_invite_branch=True)
+
                 if call_id:
                     call = self.pbx_core.call_manager.get_call(call_id)
                     if call:
@@ -2630,11 +2661,6 @@ class SIPServer:
                         if call.transfer_session_id and call.state != CallState.CONNECTED:
                             from pbx.core.transfer_session import LegEvent, LegEventResult
 
-                            cseq_header = message.get_header("CSeq") or ""
-                            if "INVITE" in cseq_header:
-                                self._send_ack_to_callee(
-                                    message, addr, call_id, use_invite_branch=True
-                                )
                             result = self.pbx_core.transfer_handler.on_leg_event(
                                 call, LegEvent.REJECTED, side="callee"
                             )
@@ -2650,24 +2676,12 @@ class SIPServer:
                         # the call would tear down the live voicemail
                         # recording session.
                         if call.routed_to_voicemail or call.state == CallState.CONNECTED:
-                            cseq_header = message.get_header("CSeq") or ""
-                            if "INVITE" in cseq_header:
-                                self._send_ack_to_callee(
-                                    message, addr, call_id, use_invite_branch=True
-                                )
                             self.logger.info(
                                 f"Ignoring callee error {message.status_code} for call "
                                 f"{call_id} - caller leg already answered "
                                 "(callee leg cancelled)"
                             )
                             return
-                        # Per RFC 3261 Section 17.1.1.3, ACK the non-2xx final
-                        # response (e.g. 487 Request Terminated after our
-                        # CANCEL) so the callee's transaction completes
-                        # instead of retransmitting.
-                        cseq_header = message.get_header("CSeq") or ""
-                        if "INVITE" in cseq_header:
-                            self._send_ack_to_callee(message, addr, call_id, use_invite_branch=True)
                         # A Find Me/Follow Me destination that is busy, on DND,
                         # or declines has not ended the call -- there are more
                         # places to try. FMFM decides for a call it is ringing;

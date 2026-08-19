@@ -783,85 +783,150 @@ class TestHangUpPager:
     since their BYE is what got us there, and wrong for every hangup the PBX starts. Without
     the BYE the phone keeps counting against a page that is already over, which is what a
     failed page did on real hardware.
-    """
 
-    def _call(self):
-        call = MagicMock()
-        call.from_extension = "1513"
-        call.caller_addr = ("192.168.10.139", 5060)
-        call.paging_dialog_to = "<sip:799@192.168.1.14>;tag=abc12345"
-        call.original_invite.get_header.side_effect = {
-            "To": "<sip:799@192.168.1.14>",
-            "From": "<sip:1513@192.168.10.139>;tag=phonetag",
-            "Contact": "<sip:1513@192.168.10.139:5060>",
-        }.get
-        return call
+    The BYE itself is SIPServer's job. It reads caller_dialog_to for the to-tag, draws CSeq
+    from the call's own counter, and adds the Via, Max-Forwards and Contact a strict UA wants
+    before it will act on a BYE -- none of which a hand-built one here would carry.
+    """
 
     def _handler(self, call):
         from pbx.core.paging_handler import PagingHandler
 
         pbx = MagicMock()
         pbx.call_manager.get_call.return_value = call
-        pbx._get_server_ip.return_value = "192.168.1.14"
-        pbx.config.get.side_effect = lambda key, default=None: (
-            5060 if key == "server.sip_port" else default
-        )
         return PagingHandler(pbx), pbx
 
-    def test_a_bye_goes_to_the_pager(self):
-        call = self._call()
-        handler, pbx = self._handler(call)
+    def test_the_server_is_asked_to_bye_the_caller_side(self):
+        handler, pbx = self._handler(MagicMock())
         handler.hang_up_pager("c1")
 
-        pbx.sip_server._send_message.assert_called_once()
-        payload, addr = pbx.sip_server._send_message.call_args[0]
-        assert payload.startswith("BYE ")
-        assert addr == ("192.168.10.139", 5060)
-
-    def test_the_bye_carries_our_own_to_tag(self):
-        """
-        build_response mints a fresh to-tag for the 200 OK. A BYE whose From does not carry
-        that exact tag is out-of-dialog, and the phone discards it.
-        """
-        call = self._call()
-        handler, pbx = self._handler(call)
-        handler.hang_up_pager("c1")
-
-        payload = pbx.sip_server._send_message.call_args[0][0]
-        assert "tag=abc12345" in payload
-
-    def test_it_is_addressed_to_the_pagers_contact(self):
-        call = self._call()
-        handler, pbx = self._handler(call)
-        handler.hang_up_pager("c1")
-
-        payload = pbx.sip_server._send_message.call_args[0][0]
-        assert payload.startswith("BYE sip:1513@192.168.10.139:5060")
+        pbx.sip_server._send_leg_bye.assert_called_once()
+        _, kwargs = pbx.sip_server._send_leg_bye.call_args
+        assert kwargs["side"] == "caller"
 
     def test_the_call_is_still_ended(self):
-        call = self._call()
-        handler, pbx = self._handler(call)
+        handler, pbx = self._handler(MagicMock())
         handler.hang_up_pager("c1")
         pbx.end_call.assert_called_once_with("c1")
 
     def test_a_call_that_is_already_gone_still_ends_cleanly(self):
+        handler, pbx = self._handler(None)
+        handler.hang_up_pager("c1")
+
+        pbx.sip_server._send_leg_bye.assert_not_called()
+        pbx.end_call.assert_called_once_with("c1")
+
+    def test_a_failed_bye_does_not_stop_the_teardown(self):
+        """
+        Whatever the phone does with the BYE, the PBX still has a port, a media session and
+        a zone reservation to release.
+        """
+        handler, pbx = self._handler(MagicMock())
+        pbx.sip_server._send_leg_bye.side_effect = OSError("network gone")
+        handler.hang_up_pager("c1")
+
+        pbx.end_call.assert_called_once_with("c1")
+
+
+@pytest.mark.unit
+class TestPagerDialogIsRecorded:
+    """
+    The to-tag our 200 OK minted is this dialog's identity, and it has to be stored where the
+    rest of the PBX looks for it -- `caller_dialog_to`, which SIPServer._send_leg_bye reads,
+    the same attribute the auto attendant and queue handler set after their own 200 OK.
+    """
+
+    def test_answering_records_the_dialog_to_header(self):
         from pbx.core.paging_handler import PagingHandler
 
         pbx = MagicMock()
-        pbx.call_manager.get_call.return_value = None
-        handler = PagingHandler(pbx)
-        handler.hang_up_pager("c1")
+        pbx._get_server_ip.return_value = "192.168.1.14"
+        pbx._get_dtmf_payload_type.return_value = 101
+        pbx.config.get.side_effect = lambda key, default=None: (
+            5060 if key == "server.sip_port" else default
+        )
 
-        pbx.sip_server._send_message.assert_not_called()
-        pbx.end_call.assert_called_once_with("c1")
-
-    def test_a_call_with_no_invite_sends_nothing(self):
-        """A leg the PBX placed itself has no caller dialog to end."""
         call = MagicMock()
-        call.original_invite = None
-        call.caller_addr = None
-        handler, pbx = self._handler(call)
-        handler.hang_up_pager("c1")
+        call.call_id = "c1"
+        call.to_extension = "799"
+        call.caller_addr = ("192.168.10.139", 5060)
 
-        pbx.sip_server._send_message.assert_not_called()
-        pbx.end_call.assert_called_once_with("c1")
+        handler = PagingHandler(pbx)
+        assert handler._answer_pager(call, 10000)
+
+        # Set from the response actually sent, not invented alongside it.
+        assert call.caller_dialog_to is not None
+
+
+# --------------------------------------------------------------------------- legs ending
+
+
+@pytest.mark.unit
+class TestDestinationHangsUp:
+    """
+    A destination that answered and then hung up has to be noticed.
+
+    PBXCore.end_call runs for every call, and a destination's BYE arrives under that leg's
+    call id -- not the pager's. Matching only the pager left the page running with nothing on
+    the other end: still relaying to an amplifier that had hung up, and still holding the
+    zone busy against the next page.
+    """
+
+    def _page_with(self, destination_ids):
+        from pbx.core.paging_handler import PagingHandler, _PageSession
+
+        pbx = MagicMock()
+        handler = PagingHandler(pbx)
+        destinations = [
+            _destination(destination_id=d, extension=f"780{d}") for d in destination_ids
+        ]
+        page = ActivePage(
+            page_id="p1",
+            from_extension="1513",
+            zone_id=1,
+            zone_extension="799",
+            zone_name="Test Page",
+            destinations=destinations,
+            started_at=datetime.now(UTC),
+            call_id="pager-call",
+        )
+        session = _PageSession(page=page, media=MagicMock(), rtp_port=10000, call_id="pager-call")
+        for d in destination_ids:
+            session.leg_call_ids[d] = f"leg-{d}"
+            session.answered.add(d)
+        handler._sessions["p1"] = session
+        return handler, session, pbx
+
+    def test_a_leg_call_id_is_recognised_as_part_of_a_page(self):
+        handler, _, _ = self._page_with([1])
+        assert handler.teardown_page("leg-1")
+
+    def test_an_unrelated_call_is_not(self):
+        handler, _, _ = self._page_with([1])
+        assert not handler.teardown_page("some-other-call")
+
+    def test_one_of_several_hanging_up_leaves_the_page_running(self):
+        handler, session, pbx = self._page_with([1, 2])
+        handler.teardown_page("leg-1")
+
+        session.media.remove_target.assert_called_once_with(1)
+        assert session.answered == {2}
+        assert not session.torn_down
+        pbx.end_call.assert_not_called()
+
+    def test_the_last_one_hanging_up_ends_the_page(self):
+        handler, session, pbx = self._page_with([1])
+        handler.teardown_page("leg-1")
+
+        session.media.remove_target.assert_called_once_with(1)
+        # Ends the pager's call, not the leg's.
+        pbx.end_call.assert_called_once_with("pager-call")
+
+    def test_a_leg_ending_after_teardown_is_ignored(self):
+        """The pager's BYE and a destination's can cross on the wire."""
+        handler, session, pbx = self._page_with([1])
+        session.torn_down = True
+        handler.teardown_page("leg-1")
+
+        session.media.remove_target.assert_not_called()
+        pbx.end_call.assert_not_called()

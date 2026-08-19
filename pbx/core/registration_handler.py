@@ -55,43 +55,60 @@ class RegistrationHandler:
         self, contact: str | None, addr: tuple[str, int]
     ) -> tuple[str, int]:
         """
-        Extract SIP address and port from Contact header.
+        Decide where a phone can actually be reached, from its Contact header and the
+        address its REGISTER arrived from.
 
-        SIP phones send their listening address in the Contact header during
-        REGISTER. This is more reliable than the UDP source address, which
-        might use an ephemeral port.
+        The Contact header is worth reading for one thing: the port the phone listens on,
+        which is often 5060 even when it registered from an ephemeral source port. It is not
+        worth trusting for the host. A phone advertises whatever its own config says, and
+        that has been observed wrong in two different ways on this deployment -- an ATA
+        claiming 127.0.0.1, which made the PBX INVITE itself, and the same ATA claiming
+        10.0.0.27 while sitting on 192.168.10.120, which made every call to it disappear
+        into a subnet with nothing on it. Both survived restarts, because the bad address
+        was recorded and then recovered from the database.
+
+        So the host comes from the packet, which cannot lie about where it came from, and
+        the port comes from the Contact only when the Contact's host agrees with it. When
+        they disagree the whole Contact is suspect, and the source address is used entire.
+
+        This is what a SIP proxy's `nat=yes` does, and it is right here for the same reason:
+        every endpoint is on the LAN with the PBX, so the source address is both reachable
+        and authoritative.
 
         Args:
             contact: Contact header value (e.g., "<sip:1501@192.168.1.100:5060>")
-            addr: Fallback address (UDP source address)
+            addr: The UDP source address the REGISTER arrived from
 
         Returns:
-            Tuple of (ip_address, port) to use for phone registration
+            Tuple of (ip_address, port) to reach this phone on
         """
         pbx = self.pbx_core
 
         if not contact:
             return addr
 
-        # Parse Contact header to extract SIP address and port
         # Format: <sip:extension@ip:port[;params]> or <sip:extension@ip[;params]>
         contact_match = re.search(r"sip:[^@]+@([^:;>]+)(?::(\d+))?", contact)
-        if contact_match:
-            ip_address = contact_match.group(1)
-            port_str = contact_match.group(2)
-            port = int(port_str) if port_str else 5060
+        if not contact_match:
+            return addr
 
-            # Validate the extracted address
-            if ip_address and port:
-                contact_addr = (ip_address, port)
-                # Log when we use Contact header address instead of UDP source
-                if contact_addr != addr:
-                    pbx.logger.debug(
-                        f"Using Contact address {contact_addr} instead of UDP source {addr}"
-                    )
-                return contact_addr
+        contact_host = contact_match.group(1)
+        port_str = contact_match.group(2)
+        contact_port = int(port_str) if port_str else _DEFAULT_PHONE_SIP_PORT
 
-        # If we can't parse the Contact header, fall back to UDP source address
+        if not contact_host:
+            return addr
+
+        if contact_host == addr[0]:
+            # Consistent: take the port it named, which is the one it listens on.
+            return (contact_host, contact_port)
+
+        pbx.logger.warning(
+            f"Phone at {addr[0]} advertised Contact host {contact_host}, which is not where "
+            f"its REGISTER came from. Registering it at {addr[0]}:{addr[1]} instead -- a "
+            f"phone reachable only at the address it advertises would be unreachable from "
+            f"here. Check that device's network configuration."
+        )
         return addr
 
     def register_extension(

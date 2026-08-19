@@ -236,6 +236,11 @@ features:
   paging:
     enabled: false             # Turn on once at least one zone has a destination
     max_duration: 120          # Seconds before a page is cut off; per-zone override in the DB
+    # How long a destination gets to answer before its leg is cancelled. An endpoint that
+    # auto-answers takes about a second; an amplifier that seizes the line on ring voltage
+    # needs whole ring cycles (2s on, 4s off), and a timeout expiring mid-ring cancels a
+    # destination that was about to answer. Raise it if pages are cancelled while ringing.
+    answer_timeout: 30
     codec: PCMU                # Fixed. The PBX does not transcode, and a page is fanned out
                                # to endpoints that never negotiated with each other.
     # multicast:               # Desk-phone paging. Not implemented yet.

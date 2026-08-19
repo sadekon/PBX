@@ -634,6 +634,30 @@ class CallRouter:
             and address[0] == CallRouter.WEBRTC_HOST_MARKER
         )
 
+    def _is_unusable_recovery_host(self, host: str) -> bool:
+        """
+        Whether a stored registration address is one no call could ever reach.
+
+        Only the addresses that are wrong by construction, not merely unreachable right now:
+        a loopback host means the PBX would INVITE itself, and the PBX's own address means
+        the same. Anything else is left alone -- a phone on another subnet may be perfectly
+        reachable, and this is not the place to guess at routing.
+
+        Args:
+            host: The stored ip_address
+
+        Returns:
+            bool: True if recovering it would send calls nowhere
+        """
+        if not host:
+            return True
+        if host in ("127.0.0.1", "localhost", "::1") or host.startswith("127."):
+            return True
+        try:
+            return bool(host == self.pbx_core._get_server_ip())
+        except Exception:
+            return False
+
     def resolve_extension(self, to_ext: str) -> Any | None:
         """
         Look up `to_ext` in the in-memory extension registry, recovering its
@@ -689,7 +713,20 @@ class CallRouter:
                             ext_obj = ExtensionRegistry.create_extension_from_db(db_ext)
                             pbx.extension_registry.extensions[to_ext] = ext_obj
                             dest_ext = ext_obj
-                    if dest_ext:
+                    # A row written before registration stopped trusting the Contact header
+                    # can name a host the phone never had -- a loopback address, or one on a
+                    # subnet it has since left. Recovering it silently sends every call to
+                    # that extension into a void, and because it is recovered again on each
+                    # restart, the fault looks permanent. Better to leave the extension
+                    # unregistered and say why: the phone re-registers on its own timer and
+                    # the row corrects itself.
+                    if self._is_unusable_recovery_host(phone_ip):
+                        pbx.logger.warning(
+                            f"Not recovering {to_ext} from the database: its stored address "
+                            f"{phone_ip}:{phone_port} is not usable. Waiting for the phone "
+                            f"to register again."
+                        )
+                    elif dest_ext:
                         dest_ext.register((phone_ip, phone_port))
                         pbx.logger.info(
                             f"Recovered registration for {to_ext} from database: "

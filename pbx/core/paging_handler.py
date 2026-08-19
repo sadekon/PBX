@@ -231,12 +231,13 @@ class PagingHandler:
             response.set_header("Content-type", "application/sdp")
             sip_port = pbx.config.get("server.sip_port", 5060)
             response.set_header("Contact", f"<sip:{call.to_extension}@{server_ip}:{sip_port}>")
+            # build_response mints a fresh to-tag, and that tag is this dialog's identity.
+            # `caller_dialog_to` is where the rest of the PBX looks for it -- SIPServer's
+            # _send_leg_bye reads it to build an in-dialog BYE, exactly as the auto attendant
+            # and queue handler record it after their own 200 OK. Set before the response
+            # goes out, so a teardown racing the answer still finds it.
+            call.caller_dialog_to = response.get_header("To")
             pbx.sip_server._send_message(response.build(), call.caller_addr)
-            # build_response mints a fresh to-tag. Keep the header verbatim: a BYE the PBX
-            # sends later has to carry that exact tag in its From, or the pager treats it as
-            # out-of-dialog and ignores it -- leaving the phone counting against a page that
-            # is already over.
-            call.paging_dialog_to = response.get_header("To")
         except Exception as e:
             pbx.logger.error(f"Could not answer paging call {call.call_id}: {e}")
             return False
@@ -268,6 +269,15 @@ class PagingHandler:
 
         sip_port = pbx.config.get("server.sip_port", 5060)
 
+        # How long a destination gets to answer before the leg is CANCELled.
+        #
+        # An endpoint that auto-answers takes a second -- a fax machine sends 180 then 200 OK
+        # almost immediately. An amplifier that seizes the line on ring voltage instead needs
+        # whole ring cycles (2s on, 4s off), and a timeout that expires mid-ring CANCELs a
+        # destination that was about to answer. Configurable because it depends entirely on
+        # what is wired to the FXS port, which the PBX cannot know.
+        answer_timeout = pbx.config.get("features.paging.answer_timeout", 30)
+
         for destination in sip_destinations:
             if not self._destination_is_reachable(destination, server_ip, sip_port):
                 self._on_leg_failed(session, destination, "unreachable")
@@ -291,7 +301,7 @@ class PagingHandler:
                 from_context=page.from_extension,
                 destination=destination.endpoint_extension,
                 caller_id=(page.from_extension, f"Page {page.zone_name}"),
-                answer_timeout=15,
+                answer_timeout=answer_timeout,
                 # Every leg advertises the page's own media port, so audio leaves from the
                 # port each endpoint was told to expect and no per-leg relay is built.
                 rtp_ports_override=(session.rtp_port, session.rtp_port + 1),
@@ -524,6 +534,62 @@ class PagingHandler:
             target=_run, name=f"paging-tone-{session.page.page_id[:16]}", daemon=True
         ).start()
 
+    # ------------------------------------------------------------------ legs ending
+
+    def _find_leg(self, call_id: str) -> tuple[_PageSession | None, int]:
+        """
+        Find the page a destination leg belongs to.
+
+        Args:
+            call_id: A leg's call id
+
+        Returns:
+            (session, destination_id), or (None, 0) if this is not a paging leg
+        """
+        with self._sessions_lock:
+            for session in self._sessions.values():
+                with session.lock:
+                    for destination_id, leg_call_id in session.leg_call_ids.items():
+                        if leg_call_id == call_id:
+                            return session, destination_id
+        return None, 0
+
+    def _on_leg_ended(self, session: _PageSession, destination_id: int) -> None:
+        """
+        A destination that had answered has hung up.
+
+        Stops sending to it, and ends the whole page once the last one goes: a page with no
+        destination left reaches nothing, so keeping it alive would only hold the zone busy
+        and leave the pager talking to themselves.
+
+        Args:
+            session: The live page
+            destination_id: The destination whose leg ended
+        """
+        pbx = self.pbx_core
+
+        with session.lock:
+            if session.torn_down:
+                return
+            session.leg_call_ids.pop(destination_id, None)
+            session.answered.discard(destination_id)
+            any_left = bool(session.answered)
+
+        session.media.remove_target(destination_id)
+        pbx.paging_system.set_destination_state(session.page.page_id, destination_id, "ended")
+
+        if any_left:
+            pbx.logger.info(
+                f"Page {session.page.page_id}: destination {destination_id} hung up, "
+                f"{len(session.answered)} still receiving"
+            )
+            return
+
+        pbx.logger.info(
+            f"Page {session.page.page_id}: last destination hung up, ending the page"
+        )
+        self.hang_up_pager(session.call_id)
+
     # ------------------------------------------------------------------ hanging up
 
     def hang_up_pager(self, call_id: str) -> None:
@@ -545,96 +611,61 @@ class PagingHandler:
 
         call = pbx.call_manager.get_call(call_id)
         if call:
-            self._send_bye_to_pager(call, call_id)
+            try:
+                # SIPServer owns this: it reads caller_dialog_to for the to-tag our 200 OK
+                # minted, draws CSeq from the call's own pbx_leg_cseq counter so successive
+                # PBX requests do not reuse a number, and adds the Via, Max-Forwards and
+                # Contact a strict UA needs before it will act on a BYE at all.
+                pbx.sip_server._send_leg_bye(call, side="caller")
+            except Exception as e:
+                pbx.logger.error(f"Could not send BYE to paging caller {call_id}: {e}")
 
         try:
             pbx.end_call(call_id)
         except Exception as e:
             pbx.logger.error(f"Could not end paging call {call_id}: {e}")
 
-    def _send_bye_to_pager(self, call: Any, call_id: str) -> None:
-        """
-        Send an in-dialog BYE to whoever placed the page.
-
-        The PBX answered their INVITE, so it is the UAS of this dialog: From and To are
-        swapped relative to that INVITE, and From carries the to-tag our own 200 OK
-        generated. Getting either wrong produces a BYE the phone discards as belonging to no
-        dialog it knows.
-
-        Args:
-            call: The pager's Call
-            call_id: The pager's call id
-        """
-        import re
-        import uuid
-
-        from pbx.sip.message import SIPMessageBuilder
-
-        pbx = self.pbx_core
-
-        invite = getattr(call, "original_invite", None)
-        caller_addr = getattr(call, "caller_addr", None)
-        if not (invite and caller_addr):
-            return
-
-        def _header(value: Any) -> str:
-            return value if isinstance(value, str) else ""
-
-        from_header = _header(getattr(call, "paging_dialog_to", None)) or _header(
-            invite.get_header("To")
-        )
-        to_header = _header(invite.get_header("From"))
-
-        # Their Contact is where in-dialog requests belong; the network address is the
-        # fallback for a phone that sent none.
-        uri = f"sip:{call.from_extension}@{caller_addr[0]}:{caller_addr[1]}"
-        contact = _header(invite.get_header("Contact"))
-        if contact:
-            match = re.search(r"<(sips?:[^>]+)>", contact)
-            if match:
-                uri = match.group(1)
-
-        try:
-            bye = SIPMessageBuilder.build_request(
-                method="BYE",
-                uri=uri,
-                from_addr=from_header,
-                to_addr=to_header,
-                call_id=call_id,
-                cseq=2,
-            )
-            server_ip = pbx._get_server_ip()
-            sip_port = pbx.config.get("server.sip_port", 5060)
-            bye.set_header(
-                "Via", f"SIP/2.0/UDP {server_ip}:{sip_port};branch=z9hG4bK{uuid.uuid4().hex}"
-            )
-            bye.set_header("Max-Forwards", "70")
-            pbx.sip_server._send_message(bye.build(), caller_addr)
-            pbx.logger.info(f"Sent BYE to paging caller for {call_id}")
-        except (KeyError, OSError, TypeError, ValueError) as e:
-            pbx.logger.error(f"Could not send BYE to paging caller {call_id}: {e}")
-
     # ------------------------------------------------------------------ teardown
 
     def teardown_page(self, call_id: str) -> bool:
         """
-        Tear down the page a call is carrying.
+        End whatever part of a page this call was carrying.
 
-        Reachable from the pager hanging up, the zone's duration timer, and an operator
-        killing the page, so it is idempotent -- whichever arrives second does nothing.
+        Called from `PBXCore.end_call` for every call, so it has to recognise both ends of a
+        page: the pager's call, whose ending ends the page, and a destination's leg, whose
+        ending only removes that one amplifier.
+
+        Reachable from the pager hanging up, a destination hanging up, the zone's duration
+        timer, and an operator killing the page, so it is idempotent -- whichever arrives
+        second does nothing.
 
         Args:
-            call_id: The pager's call id
+            call_id: A call id -- the pager's, or one of the destination legs'
 
         Returns:
-            bool: True if this call tore a page down
+            bool: True if this call was part of a page
         """
         pbx = self.pbx_core
 
         with self._sessions_lock:
             session = next((s for s in self._sessions.values() if s.call_id == call_id), None)
-            if session is None:
+
+        # Deliberately outside the lock above, and not folded into it: _find_leg takes the
+        # same lock, which is not reentrant, and _on_leg_ended can end the pager's call --
+        # re-entering this method. Holding the lock across either deadlocks the SIP thread
+        # that delivered the BYE, and with it every call the PBX is handling.
+        if session is None:
+            # Not a pager. A destination that answered and later sent BYE arrives here under
+            # its leg's call id, and without this the page would keep running with nothing on
+            # the other end -- relaying audio to an amplifier that had hung up, and holding
+            # the zone busy against the next page.
+            leg_session, destination_id = self._find_leg(call_id)
+            if leg_session is None:
                 return False
+            self._on_leg_ended(leg_session, destination_id)
+            return True
+
+        with self._sessions_lock:
             with session.lock:
                 if session.torn_down:
                     return False
@@ -697,18 +728,21 @@ class PagingHandler:
         """
         Send a bare SIP response to the pager.
 
+        Through the server's own _send_response rather than building and sending the message
+        here: that is what applies _add_via_nat_params, which writes received= and rport=
+        onto the Via (RFC 3261 SS18.2.2, RFC 3581). A phone whose Via sent-by differs from
+        where its packet actually came from needs those to match the response to its
+        transaction, and a hand-built response silently omits them.
+
         Args:
             message: The request being responded to
             from_addr: Where to send it
             code: SIP status code
             reason: SIP reason phrase
         """
-        from pbx.sip.message import SIPMessageBuilder
-
         pbx = self.pbx_core
         try:
-            response = SIPMessageBuilder.build_response(code, reason, message)
-            pbx.sip_server._send_message(response.build(), from_addr)
+            pbx.sip_server._send_response(code, reason, message, from_addr)
         except Exception as e:
             pbx.logger.error(f"Could not send {code} {reason} to paging caller: {e}")
 
