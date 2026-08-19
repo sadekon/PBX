@@ -11,7 +11,7 @@ import socket
 import threading
 import time
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -457,35 +457,108 @@ class TestPagingMediaSession:
             listener_a.close()
             listener_b.close()
 
-    def test_audio_from_a_destination_is_not_relayed(self):
+    def test_a_destination_reaches_the_pager_but_not_other_destinations(self):
         """
-        Paging is one-way. Forwarding a destination's audio would put one amplifier's noise
-        onto every other circuit.
+        The asymmetry the whole design turns on.
+
+        An amplifier answers a zone keypress with its own prompt or confirmation tone, and
+        everything past the FXS port is analog, so that tone is the only evidence the right
+        zone opened. It must reach the pager. It must NOT reach the other amplifiers, which
+        would put one circuit's noise onto every other.
         """
         listener_a, addr_a = self._listener()
+        listener_b, addr_b = self._listener()
+        pager = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        pager.bind(("127.0.0.1", 0))
+        pager.settimeout(2.0)
+
         session = PagingMediaSession(self._free_port(), "page-test")
         assert session.start()
 
         try:
             session.add_target(1, addr_a)
+            session.add_target(2, addr_b)
 
-            pager = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # The pager speaks first, so the session learns which address it is.
+            pager.sendto(b"from-pager", ("127.0.0.1", session.local_port))
+            assert listener_a.recv(2048) == b"from-pager"
+            assert listener_b.recv(2048) == b"from-pager"
+
+            # Amplifier A answers with its confirmation tone.
+            listener_a.sendto(b"confirm-tone", ("127.0.0.1", session.local_port))
+
+            # The pager hears it...
+            assert pager.recv(2048) == b"confirm-tone"
+
+            # ...and amplifier B does not.
+            listener_b.settimeout(0.4)
+            with pytest.raises(TimeoutError):
+                listener_b.recv(2048)
+
+            pager.close()
+        finally:
+            session.stop()
+            listener_a.close()
+            listener_b.close()
+
+    def test_a_stray_sender_is_still_ignored(self):
+        """Only the pager and the destinations we are streaming to are relayed."""
+        listener_a, addr_a = self._listener()
+        pager = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        pager.bind(("127.0.0.1", 0))
+        pager.settimeout(2.0)
+
+        session = PagingMediaSession(self._free_port(), "page-test")
+        assert session.start()
+
+        try:
+            session.add_target(1, addr_a)
             pager.sendto(b"from-pager", ("127.0.0.1", session.local_port))
             assert listener_a.recv(2048) == b"from-pager"
 
-            # A second sender is not the pager, so it must be ignored.
             stray = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            stray.sendto(b"from-amplifier", ("127.0.0.1", session.local_port))
+            stray.sendto(b"who-is-this", ("127.0.0.1", session.local_port))
 
             listener_a.settimeout(0.4)
             with pytest.raises(TimeoutError):
                 listener_a.recv(2048)
+            pager.settimeout(0.4)
+            with pytest.raises(TimeoutError):
+                pager.recv(2048)
 
             pager.close()
             stray.close()
         finally:
             session.stop()
             listener_a.close()
+
+    def test_an_amplifier_answering_first_is_not_mistaken_for_the_pager(self):
+        """
+        Ordering makes this unlikely -- the pager sends as soon as it gets our 200 OK -- but
+        an amplifier taken for the pager would have its audio fanned out to every other
+        amplifier, which is the one thing this must never do.
+        """
+        listener_a, addr_a = self._listener()
+        listener_b, addr_b = self._listener()
+
+        session = PagingMediaSession(self._free_port(), "page-test")
+        assert session.start()
+
+        try:
+            session.add_target(1, addr_a)
+            session.add_target(2, addr_b)
+
+            # Amplifier A speaks before the pager ever does.
+            listener_a.sendto(b"early-tone", ("127.0.0.1", session.local_port))
+
+            listener_b.settimeout(0.4)
+            with pytest.raises(TimeoutError):
+                listener_b.recv(2048)
+            assert session._source is None
+        finally:
+            session.stop()
+            listener_a.close()
+            listener_b.close()
 
     def test_packets_before_any_destination_answers_are_counted_not_crashed(self):
         session = PagingMediaSession(self._free_port(), "page-test")
@@ -930,3 +1003,175 @@ class TestDestinationHangsUp:
 
         session.media.remove_target.assert_not_called()
         pbx.end_call.assert_not_called()
+
+
+# --------------------------------------------------------------------------- circuit select
+
+
+@pytest.mark.unit
+class TestDtmfSequenceValidation:
+    """
+    Checked on write, because the generator does not check on send.
+
+    DTMFGenerator.generate_tone returns an empty list for an unknown digit and only logs a
+    warning, so a typo would produce a page that selects nothing, plays over whatever circuit
+    the amplifier defaulted to, and gives no sign of why.
+    """
+
+    def test_digits_pass_through(self):
+        from pbx.features.paging import normalise_dtmf_sequence
+
+        # The amplifiers here take 1-3 with 4 for all-call, or 5-7 with 8. Both banks work.
+        for digits in ("1", "2", "3", "4", "5", "6", "7", "8"):
+            assert normalise_dtmf_sequence(digits) == (digits, None)
+
+    def test_star_and_hash_are_dialable(self):
+        from pbx.features.paging import normalise_dtmf_sequence
+
+        assert normalise_dtmf_sequence("*") == ("*", None)
+        assert normalise_dtmf_sequence("#") == ("#", None)
+
+    def test_whitespace_is_trimmed(self):
+        from pbx.features.paging import normalise_dtmf_sequence
+
+        assert normalise_dtmf_sequence("  2  ") == ("2", None)
+
+    def test_none_and_empty_mean_manual_selection(self):
+        from pbx.features.paging import normalise_dtmf_sequence
+
+        assert normalise_dtmf_sequence(None) == (None, None)
+        assert normalise_dtmf_sequence("") == (None, None)
+        assert normalise_dtmf_sequence("   ") == (None, None)
+
+    def test_a_letter_is_rejected_with_the_offending_character(self):
+        from pbx.features.paging import normalise_dtmf_sequence
+
+        sequence, error = normalise_dtmf_sequence("1X")
+        assert sequence is None
+        assert "X" in error
+
+    def test_multiple_digits_are_allowed(self):
+        from pbx.features.paging import normalise_dtmf_sequence
+
+        assert normalise_dtmf_sequence("12") == ("12", None)
+
+    def test_a_bad_sequence_never_reaches_the_database(self):
+        system = _system()
+        system.zones_db.get.return_value = {"id": 1}
+        destination_id, error = system.add_sip_destination(1, "1501", dtmf_sequence="9!")
+        assert destination_id is None
+        assert error is not None
+        system.destinations_db.add_sip_endpoint.assert_not_called()
+
+    def test_a_good_sequence_is_stored(self):
+        system = _system()
+        system.zones_db.get.return_value = {"id": 1}
+        system.destinations_db.add_sip_endpoint.return_value = 5
+        destination_id, error = system.add_sip_destination(1, "1501", dtmf_sequence="2")
+        assert (destination_id, error) == (5, None)
+        assert system.destinations_db.add_sip_endpoint.call_args.kwargs["dtmf_sequence"] == "2"
+
+
+@pytest.mark.unit
+class TestCircuitSelectionSequencing:
+    """
+    The branch that decides when a destination joins the fan-out.
+
+    Manual: it must join immediately, or the pager's own keypresses never reach the
+    amplifier. Direct-dial: it must NOT join until the digits have been sent, or the pager is
+    broadcast into a building before anyone has chosen which circuit.
+    """
+
+    def _answered(self, dtmf_sequence):
+        from pbx.core.paging_handler import PagingHandler, _PageSession
+
+        pbx = MagicMock()
+        handler = PagingHandler(pbx)
+        destination = _destination(destination_id=1)
+        destination.dtmf_sequence = dtmf_sequence
+        page = ActivePage(
+            page_id="p1",
+            from_extension="1513",
+            zone_id=1,
+            zone_extension="701",
+            zone_name="Building 1",
+            destinations=[destination],
+            started_at=datetime.now(UTC),
+            call_id="c1",
+        )
+        session = _PageSession(page=page, media=MagicMock(), rtp_port=10000, call_id="c1")
+        leg = MagicMock()
+        leg.callee_rtp = {"address": "192.168.10.120", "port": 16400}
+        return handler, session, destination, leg
+
+    def test_manual_joins_the_fanout_immediately(self):
+        handler, session, destination, leg = self._answered(None)
+        handler._on_leg_answered(session, destination, leg)
+
+        session.media.add_target.assert_called_once_with(1, ("192.168.10.120", 16400))
+
+    def test_direct_dial_does_not_join_before_its_digits_are_sent(self):
+        handler, session, destination, leg = self._answered("2")
+        with patch("threading.Thread") as thread:
+            handler._on_leg_answered(session, destination, leg)
+
+        # Handed to the selection thread rather than added here.
+        session.media.add_target.assert_not_called()
+        thread.assert_called_once()
+        assert thread.call_args.kwargs["target"] == handler._select_circuit_then_stream
+
+    def test_a_leg_answering_without_media_is_dropped(self):
+        handler, session, destination, leg = self._answered("2")
+        leg.callee_rtp = None
+        handler._on_leg_answered(session, destination, leg)
+
+        session.media.add_target.assert_not_called()
+        assert 1 in session.failed
+
+    def test_selection_still_joins_the_fanout_when_the_tones_fail(self):
+        """
+        An amplifier that could not be told which circuit to use is better joined than
+        dropped: it pages whatever it defaults to, which beats silence.
+        """
+        handler, session, destination, _leg = self._answered("2")
+        session.media.socket = None  # nothing to send tones on
+
+        handler.pbx_core.config.get.side_effect = lambda key, default=None: (
+            0 if "ms" in key else default
+        )
+        handler._select_circuit_then_stream(session, destination, ("192.168.10.120", 16400))
+
+        session.media.add_target.assert_called_once_with(1, ("192.168.10.120", 16400))
+
+    def test_selection_is_abandoned_if_the_page_ended_first(self):
+        handler, session, destination, _leg = self._answered("2")
+        session.torn_down = True
+        handler.pbx_core.config.get.side_effect = lambda key, default=None: (
+            0 if "ms" in key else default
+        )
+        handler._select_circuit_then_stream(session, destination, ("192.168.10.120", 16400))
+
+        session.media.add_target.assert_not_called()
+
+
+@pytest.mark.unit
+class TestDtmfToneEncoding:
+    """The generator works in floats; the RTP path wants companded bytes."""
+
+    def test_a_digit_encodes_to_the_expected_length(self):
+        from pbx.utils.dtmf import DTMFGenerator
+
+        samples = DTMFGenerator().generate_sequence("1", tone_ms=120, gap_ms=80)
+        assert len(samples) == 1600  # 200ms at 8kHz
+
+    def test_summed_tones_clamp_rather_than_wrap(self):
+        """
+        A DTMF digit is two sine waves added together and peaks above 1.0. An integer that
+        wrapped would turn a clean tone into noise the amplifier cannot recognise.
+        """
+        import struct
+
+        from pbx.utils.audio import float_samples_to_pcm16
+
+        encoded = float_samples_to_pcm16([2.0, -2.0, 0.0])
+        assert struct.unpack("<3h", encoded) == (32767, -32767, 0)

@@ -191,6 +191,11 @@ def handle_add_zone_destination(zone_id: int) -> Response:
     kind "sip_endpoint" takes the extension an ATA's FXS port answers on -- hardware detail
     is not accepted here, because it already lives in provisioned_devices and a second copy
     would drift. kind "multicast" is stored but not yet streamed to.
+
+    `dtmf_sequence` is optional and usually omitted: the amplifiers pick their own speaker
+    circuit from digits dialled once a call is up, and by default the person paging dials
+    them. Supply it only where one number should always reach one circuit, and the PBX will
+    play the digits itself.
     """
     paging_system = _get_paging_system()
     if not paging_system:
@@ -205,6 +210,7 @@ def handle_add_zone_destination(zone_id: int) -> Response:
             endpoint_extension=data.get("endpoint_extension"),
             label=data.get("label"),
             auto_answer_override=data.get("auto_answer_override"),
+            dtmf_sequence=data.get("dtmf_sequence"),
         )
     elif kind == "multicast":
         port = _int_or_none(data.get("multicast_port"))

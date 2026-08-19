@@ -2391,6 +2391,7 @@ class PagingDestinationsDB:
         "enabled",
         "sort_order",
         "auto_answer_override",
+        "dtmf_sequence",
         "multicast_address",
         "multicast_port",
     )
@@ -2411,6 +2412,7 @@ class PagingDestinationsDB:
         endpoint_extension: str,
         label: str | None = None,
         auto_answer_override: str | None = None,
+        dtmf_sequence: str | None = None,
         sort_order: int = 0,
     ) -> int | None:
         """
@@ -2424,6 +2426,10 @@ class PagingDestinationsDB:
             label: Optional name for this circuit, e.g. "Ceiling horns"
             auto_answer_override: Force a header form, or "none" to send none. Leave NULL to
                 derive it from the device's vendor.
+            dtmf_sequence: Digits the PBX plays to pick a circuit on this amplifier once it
+                answers. NULL leaves the choice to whoever is paging, who dials it on their
+                own keypad -- which is how the analogue system worked and remains the
+                default.
             sort_order: Display order within the zone
 
         Returns:
@@ -2433,8 +2439,8 @@ class PagingDestinationsDB:
             """
             INSERT INTO paging_destinations
                 (zone_id, kind, label, enabled, sort_order,
-                 endpoint_extension, auto_answer_override, created_at)
-            VALUES (%s, 'sip_endpoint', %s, TRUE, %s, %s, %s, %s)
+                 endpoint_extension, auto_answer_override, dtmf_sequence, created_at)
+            VALUES (%s, 'sip_endpoint', %s, TRUE, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -2443,6 +2449,7 @@ class PagingDestinationsDB:
                 sort_order,
                 endpoint_extension,
                 auto_answer_override,
+                dtmf_sequence,
                 datetime.now(UTC),
             ),
         )
@@ -2549,7 +2556,7 @@ class PagingDestinationsDB:
         """
         query = """
         SELECT d.id, d.zone_id, d.kind, d.label, d.enabled, d.sort_order,
-               d.endpoint_extension, d.auto_answer_override,
+               d.endpoint_extension, d.auto_answer_override, d.dtmf_sequence,
                d.multicast_address, d.multicast_port,
                pd.mac_address, pd.vendor, pd.model, pd.device_type, pd.static_ip,
                e.name AS endpoint_name

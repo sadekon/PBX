@@ -1,18 +1,32 @@
 """
 Paging System Feature
 
-Overhead paging: dial a zone's extension and the PBX answers, opens a one-way leg to every
+Overhead paging: dial a zone's extension and the PBX answers, opens a leg to every
 destination in that zone, and relays your audio to them.
 
 THREE WORDS, USED CONSISTENTLY
-    zone         A place you can address by dialling a number. "Warehouse" = 701. Zones exist
-                 for scoping -- so the loading dock can be paged without the executive
-                 offices. They own no hardware.
+    zone         A place you can address by dialling a number. "Building 1" = 701. Zones
+                 exist for scoping -- so one building can be paged without the others. They
+                 own no hardware.
     destination  One mechanism that puts audio into a zone. Today a `sip_endpoint`: an ATA's
-                 FXS port, driving an amplifier and its horn speakers. `multicast` -- desk
-                 phone speakers, which have no SIP dialog at all -- is accepted by the schema
-                 and not yet sent to.
+                 FXS port, driving an amplifier. `multicast` -- desk phone speakers, which
+                 have no SIP dialog at all -- is accepted by the schema and not yet sent to.
     page         One live session, from one caller to one zone.
+
+WHO PICKS THE SPEAKER CIRCUIT
+    The amplifiers have their own zones, selected by DTMF once a call is up. The PBX does
+    not model those: doing so would state the same fact twice, and re-patching a circuit
+    would leave the database quietly wrong about the building.
+
+    So by default a destination has no `dtmf_sequence` and the person paging dials the
+    circuit on their own keypad, exactly as they did on the analogue system. Their leg
+    negotiates PCMU alone, so a phone with digits to send has to send them in band as audio
+    -- which the media session relays like any other audio.
+
+    A destination that *does* carry a sequence is the exception, for the few numbers worth
+    dedicating to one circuit. The PBX plays the digits itself once the amplifier answers,
+    and only then starts relaying the pager, so no one is broadcast into a building before
+    the circuit is chosen.
 
 WHAT THIS MODULE NO LONGER DOES
     It used to keep a `dac_devices` list holding device_id, device_type, sip_uri, ip_address
@@ -57,6 +71,39 @@ AUTO_ANSWER_HEADERS: dict[str, tuple[str, str] | None] = {
 #: auto_answer_override, not by editing code.
 DEFAULT_AUTO_ANSWER_VENDOR = "cisco"
 
+#: Every symbol a DTMF keypad can produce, including the A-D column most phones lack.
+#: Validated on write rather than left to the generator, which returns silence for an
+#: unknown digit and only warns -- so a typo would produce a page that selects nothing and
+#: gives no sign of why.
+VALID_DTMF_DIGITS = frozenset("0123456789*#ABCD")
+
+
+def normalise_dtmf_sequence(sequence: str | None) -> tuple[str | None, str | None]:
+    """
+    Clean up and check a circuit-selection sequence.
+
+    Args:
+        sequence: Digits as entered, or None for manual selection
+
+    Returns:
+        (sequence, error). The sequence is None when nothing was given, which is the
+        default and means whoever is paging picks the circuit themselves.
+    """
+    if sequence is None:
+        return None, None
+
+    cleaned = sequence.strip().upper()
+    if not cleaned:
+        return None, None
+
+    invalid = sorted(set(cleaned) - VALID_DTMF_DIGITS)
+    if invalid:
+        return None, (
+            f"{', '.join(invalid)} cannot be dialled. Use digits 0-9, * or #."
+        )
+
+    return cleaned, None
+
 
 @dataclass
 class PagingDestination:
@@ -75,6 +122,9 @@ class PagingDestination:
     endpoint_extension: str | None = None
     endpoint_name: str | None = None
     auto_answer_override: str | None = None
+    #: Digits to play once this amplifier answers, to pick a circuit on it. None means the
+    #: person paging chooses, on their own keypad -- see the module docstring.
+    dtmf_sequence: str | None = None
 
     # kind == "multicast" -- carried, not yet sent to
     multicast_address: str | None = None
@@ -135,6 +185,7 @@ class PagingDestination:
             endpoint_extension=row.get("endpoint_extension"),
             endpoint_name=row.get("endpoint_name"),
             auto_answer_override=row.get("auto_answer_override"),
+            dtmf_sequence=row.get("dtmf_sequence"),
             multicast_address=row.get("multicast_address"),
             multicast_port=row.get("multicast_port"),
             mac_address=row.get("mac_address"),
@@ -448,6 +499,7 @@ class PagingSystem:
         endpoint_extension: str,
         label: str | None = None,
         auto_answer_override: str | None = None,
+        dtmf_sequence: str | None = None,
     ) -> tuple[int | None, str | None]:
         """
         Add an ATA's FXS port to a zone.
@@ -475,11 +527,16 @@ class PagingSystem:
             known = ", ".join(sorted(AUTO_ANSWER_HEADERS))
             return None, f"Unknown auto-answer mode. Use one of: {known}"
 
+        dtmf_sequence, dtmf_error = normalise_dtmf_sequence(dtmf_sequence)
+        if dtmf_error:
+            return None, dtmf_error
+
         destination_id = self.destinations_db.add_sip_endpoint(
             zone_id=zone_id,
             endpoint_extension=endpoint_extension,
             label=label,
             auto_answer_override=auto_answer_override,
+            dtmf_sequence=dtmf_sequence,
         )
         if destination_id is None:
             return None, (

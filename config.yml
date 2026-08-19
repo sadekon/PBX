@@ -241,6 +241,15 @@ features:
     # needs whole ring cycles (2s on, 4s off), and a timeout expiring mid-ring cancels a
     # destination that was about to answer. Raise it if pages are cancelled while ringing.
     answer_timeout: 30
+    # Circuit selection, for destinations that carry a dtmf_sequence. Most do not: by
+    # default whoever is paging dials the circuit on their own keypad, exactly as they did
+    # on the analogue system, and none of these apply.
+    dtmf_settle_ms: 500        # Wait after the amplifier answers before sending digits.
+                               # A relay that has just closed is not listening instantly.
+    dtmf_tone_ms: 120          # Length of each digit
+    dtmf_gap_ms: 80            # Silence between digits
+    dtmf_confirm_ms: 600       # Wait after the digits before relaying the pager, so the
+                               # amplifier can act and its confirmation tone can come back
     codec: PCMU                # Fixed. The PBX does not transcode, and a page is fanned out
                                # to endpoints that never negotiated with each other.
     # multicast:               # Desk-phone paging. Not implemented yet.

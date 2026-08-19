@@ -1260,3 +1260,28 @@ def register_all_migrations(manager: MigrationManager) -> None:
             WHERE kind = 'sip_endpoint';
     """),
     )
+
+    # Migration 1025: Direct-dial zone selection
+    #
+    # The amplifiers pick their own speaker circuit from DTMF sent once a call is up, so by
+    # default the PBX stays out of it: a page reaches the amplifier and the person dials the
+    # circuit on their own keypad, exactly as they did on the analogue system. The pager's
+    # leg negotiates PCMU alone, so a phone with digits to send has to send them in band as
+    # audio -- and audio is what the media session already relays.
+    #
+    # This column is for the exceptions. Where one number should reach one circuit
+    # ("page the loading dock"), the destination carries the digits and the PBX plays them
+    # itself after the amplifier answers. NULL keeps the manual behaviour.
+    #
+    # Deliberately not a constrained enum. The digit that selects a circuit is a property of
+    # whatever is wired to the FXS port, and the amplifiers here already accept two
+    # equivalent banks (1-3 with 4 for all-call, or 5-7 with 8) -- a schema that encoded one
+    # vendor's scheme would be wrong for the next.
+    manager.register_migration(
+        1025,
+        "Paging Direct-Dial Zone Selection",
+        manager._build_migration_sql("""
+        ALTER TABLE paging_destinations
+            ADD COLUMN IF NOT EXISTS dtmf_sequence VARCHAR(16);
+    """),
+    )

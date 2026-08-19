@@ -136,6 +136,33 @@ def _alaw_byte_to_linear(alaw_byte: int) -> int:
     return -sample if sign else sample
 
 
+def float_samples_to_pcm16(samples: list[float], amplitude: float = DEFAULT_AMPLITUDE) -> bytes:
+    """
+    Encode normalized float samples to raw 16-bit PCM.
+
+    The inverse of :func:`g711_to_float_samples`, and the bridge between the generators that
+    work in floats (DTMFGenerator) and the RTP path, which wants PCM bytes to hand to
+    :func:`pcm16_to_ulaw`.
+
+    Samples are clamped rather than allowed to wrap: a DTMF digit is the sum of two sine
+    waves and can exceed 1.0 on its peaks, and an integer that wraps turns a clean tone into
+    a burst of noise the far end will not recognise as a digit.
+
+    Args:
+        samples: Audio samples, nominally in [-1.0, 1.0].
+        amplitude: Fraction of full scale to use. Matches generate_beep_tone's default, which
+            leaves headroom rather than driving the line flat out.
+
+    Returns:
+        bytes: Raw PCM audio data (16-bit signed, little-endian).
+    """
+    peak = MAX_16BIT_SIGNED * amplitude
+    return b"".join(
+        struct.pack("<h", int(max(-MAX_16BIT_SIGNED, min(MAX_16BIT_SIGNED, sample * peak))))
+        for sample in samples
+    )
+
+
 def g711_to_float_samples(payload: bytes, payload_type: int = 0) -> list[float]:
     """
     Decode G.711 audio bytes to normalized float samples in [-1.0, 1.0].
