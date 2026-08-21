@@ -440,14 +440,18 @@ class PagingHandler:
                 self._on_leg_failed(session, destination, "unreachable")
                 continue
 
+            # Normally empty. An amplifier is not a SIP device: it watches the FXS port for
+            # ring voltage, which the ATA only raises while it is ringing, so the leg is left
+            # to ring and the amplifier seizes the line itself. A header is attached only
+            # where a destination was explicitly given one -- a desk phone, which has no ring
+            # voltage to offer and would otherwise ring at somebody until answered by hand.
             extra_headers: dict[str, str] = {}
             header = destination.auto_answer_header(server_ip)
             if header:
                 extra_headers[header[0]] = header[1]
-            else:
-                pbx.logger.info(
-                    f"Page {page.page_id}: no auto-answer header for "
-                    f"{destination.display_name}; relying on the amplifier to seize the line"
+                pbx.logger.debug(
+                    f"Page {page.page_id}: telling {destination.display_name} to auto-answer "
+                    f"with {header[0]}"
                 )
 
             pbx.paging_system.set_destination_state(

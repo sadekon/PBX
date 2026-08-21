@@ -65,50 +65,67 @@ def _destination(destination_id=1, extension="7801", vendor="cisco", **kwargs):
 
 @pytest.mark.unit
 class TestAutoAnswerHeader:
-    """The header is derived from the device's vendor, not stored per destination."""
+    """
+    Nothing is sent unless a destination was explicitly given something to send.
 
-    def test_cisco_gets_call_info(self):
-        header = _destination(vendor="cisco").auto_answer_header("10.0.0.1")
-        assert header == ("Call-Info", "<sip:10.0.0.1>;answer-after=0")
+    This inverted after the hardware disagreed with the design. An amplifier is not a SIP
+    device: it is wired to an ATA's FXS port and seizes the line when it detects ring
+    voltage, which the ATA raises only while it is actually ringing. Deriving
+    `Call-Info: answer-after=0` from the ATA's vendor therefore defeated the mechanism it was
+    meant to serve -- the ATA answered on the SIP side without ringing the port, and the
+    amplifier, listening for a ring that never came, never seized.
 
-    def test_grandstream_gets_alert_info(self):
-        name, value = _destination(vendor="grandstream").auto_answer_header("10.0.0.1")
-        assert name == "Alert-Info"
-        assert "alert-autoanswer" in value
+    The map is kept for destinations that really do have to be told: a desk phone paged over
+    SIP has no ring voltage to offer and would otherwise ring at somebody until answered.
+    """
 
-    def test_polycom_gets_ring_answer(self):
-        assert _destination(vendor="polycom").auto_answer_header("10.0.0.1") == (
-            "Alert-Info",
-            "Ring Answer",
-        )
+    def test_nothing_is_sent_by_default(self):
+        """The amplifier case, and the overwhelmingly common one."""
+        assert _destination(vendor="cisco").auto_answer_header("10.0.0.1") is None
 
-    def test_vendor_case_is_ignored(self):
-        assert _destination(vendor="CISCO").auto_answer_header("10.0.0.1")[0] == "Call-Info"
+    def test_a_vendor_alone_no_longer_implies_a_header(self):
+        """
+        The regression this class exists to prevent. Every one of these is a vendor whose
+        endpoints do honour an auto-answer header -- and none of them should be told to use
+        it merely for being that vendor.
+        """
+        for vendor in ("cisco", "polycom", "grandstream", "yealink", "zultys"):
+            destination = _destination(vendor=vendor)
+            assert destination.auto_answer_header("10.0.0.1") is None, (
+                f"{vendor} was told to auto-answer without anyone asking for it"
+            )
 
-    def test_override_beats_vendor(self):
-        """The escape hatch for hardware that does not behave like its vendor implies."""
+    def test_an_unprovisioned_endpoint_sends_nothing_either(self):
+        assert _destination(vendor=None).auto_answer_header("10.0.0.1") is None
+
+    def test_an_explicit_override_is_honoured(self):
+        """How a desk phone gets paged once desk-phone zones exist."""
+        destination = _destination(vendor=None, auto_answer_override="polycom")
+        assert destination.auto_answer_header("10.0.0.1") == ("Alert-Info", "Ring Answer")
+
+    def test_an_override_beats_the_devices_own_vendor(self):
         destination = _destination(vendor="cisco", auto_answer_override="grandstream")
         assert destination.auto_answer_header("10.0.0.1")[0] == "Alert-Info"
 
-    def test_override_none_sends_no_header(self):
-        """For an amplifier that seizes the line on ring voltage by itself."""
-        destination = _destination(vendor="cisco", auto_answer_override="none")
-        assert destination.auto_answer_header("10.0.0.1") is None
-
-    def test_unprovisioned_endpoint_falls_back(self):
-        """A destination whose extension has no device row still gets a usable header."""
-        destination = _destination(vendor=None)
+    def test_cisco_still_formats_call_info_when_asked_for(self):
+        destination = _destination(vendor=None, auto_answer_override="cisco")
         assert destination.auto_answer_header("10.0.0.1") == (
             "Call-Info",
             "<sip:10.0.0.1>;answer-after=0",
         )
 
-    def test_unknown_vendor_falls_back(self):
-        assert _destination(vendor="acme-telecom").auto_answer_header("10.0.0.1")[0] == "Call-Info"
+    def test_override_case_is_ignored(self):
+        destination = _destination(vendor=None, auto_answer_override="CISCO")
+        assert destination.auto_answer_header("10.0.0.1")[0] == "Call-Info"
+
+    def test_override_none_sends_no_header(self):
+        """Stored by older rows, and means the same as leaving it unset."""
+        destination = _destination(vendor="cisco", auto_answer_override="none")
+        assert destination.auto_answer_header("10.0.0.1") is None
 
     def test_every_known_vendor_formats_without_error(self):
         for vendor in AUTO_ANSWER_HEADERS:
-            _destination(vendor=vendor).auto_answer_header("10.0.0.1")
+            _destination(vendor=None, auto_answer_override=vendor).auto_answer_header("10.0.0.1")
 
 
 # --------------------------------------------------------------------------- routing

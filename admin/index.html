@@ -5581,17 +5581,16 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
                     </div>
 
                     <div class="field">
-                        <label for="paging-destination-auto-answer">Auto-answer</label>
+                        <label for="paging-destination-auto-answer">How it answers</label>
                         <select id="paging-destination-auto-answer">
-                            <option value="">From the device's vendor (recommended)</option>
+                            <option value="">Ring it — for an amplifier (recommended)</option>
                             <option value="cisco">Cisco — Call-Info: answer-after=0</option>
                             <option value="yealink">Yealink — Call-Info: answer-after=0</option>
                             <option value="zultys">Zultys — Call-Info: answer-after=0</option>
                             <option value="polycom">Polycom — Alert-Info: Ring Answer</option>
                             <option value="grandstream">Grandstream — Alert-Info: alert-autoanswer</option>
-                            <option value="none">Send nothing</option>
                         </select>
-                        <span class="field-note">Which header tells the device to pick up on its own. Override only when hardware does not behave the way its vendor implies. "Send nothing" suits an amplifier that seizes the line on ring voltage and needs no instruction.</span>
+                        <span class="field-note">Leave this alone for an amplifier. It is not a SIP device: it watches the phone port for ring voltage and seizes the line itself, and the ATA only raises that voltage while it is actually ringing — so telling the ATA to pick up immediately stops the amplifier ever hearing the ring. Pick a vendor only for a desk phone, which has no ring voltage to offer and would otherwise ring at somebody until answered by hand.</span>
                     </div>
                 </form>
 

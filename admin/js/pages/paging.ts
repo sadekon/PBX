@@ -19,14 +19,18 @@ import { escapeHtml } from '../utils/html.ts';
 /** Long enough for a cold database, short enough that a dead backend still paints. */
 const PAGING_LOAD_TIMEOUT = 15000;
 
-/** Mirrors `AUTO_ANSWER_HEADERS` in pbx/features/paging.py. */
+/**
+ * Mirrors `AUTO_ANSWER_HEADERS` in pbx/features/paging.py.
+ *
+ * "none" is absent deliberately: it and an unset override both mean the destination is
+ * simply rung, and the label function answers for both before reaching this map.
+ */
 const AUTO_ANSWER_VENDORS: Record<string, string> = {
     cisco: 'Cisco',
     yealink: 'Yealink',
     zultys: 'Zultys',
     polycom: 'Polycom',
     grandstream: 'Grandstream',
-    none: 'Nothing sent',
 };
 
 /** Every symbol a keypad can produce, matching VALID_DTMF_DIGITS server-side. */
@@ -149,9 +153,15 @@ function circuitLabel(destination: PagingDestination): string {
     return sequence ? escapeHtml(sequence) : 'Caller dials';
 }
 
+/**
+ * Whether this destination is told to pick up, or simply rung.
+ *
+ * Rung is the normal answer and the one that matters: an amplifier seizes the line when the
+ * ATA raises ring voltage, and a SIP auto-answer header would stop it ever ringing.
+ */
 function autoAnswerLabel(destination: PagingDestination): string {
     const override = (destination.auto_answer_override ?? '').trim().toLowerCase();
-    if (!override) return 'From vendor';
+    if (!override || override === 'none') return 'Rings';
     return AUTO_ANSWER_VENDORS[override] ?? escapeHtml(override);
 }
 
@@ -195,7 +205,7 @@ function destinationsHtml(zone: PagingZone): string {
                 <span class="meta-stats">
                     <span class="meta-stat"><span class="k">Extension</span><span class="v">${escapeHtml(destination.endpoint_extension ?? '-')}</span></span>
                     <span class="meta-stat"><span class="k">Circuit</span><span class="v">${circuitLabel(destination)}</span></span>
-                    <span class="meta-stat"><span class="k">Auto-answer</span><span class="v">${autoAnswerLabel(destination)}</span></span>
+                    <span class="meta-stat"><span class="k">Answers</span><span class="v">${autoAnswerLabel(destination)}</span></span>
                 </span>
                 <span class="card-actions">
                     <button type="button" class="btn-ghost btn-ghost-danger"

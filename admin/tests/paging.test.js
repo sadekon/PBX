@@ -3,8 +3,8 @@
  *
  * This page tells an operator what will happen when someone dials a zone, and most of what
  * it reports is not visible anywhere else until a page has already gone wrong: a zone that
- * reaches nothing, a destination whose circuit nobody selects, a vendor guess that decides
- * whether an amplifier picks up at all.
+ * reaches nothing, a destination whose circuit nobody selects, an auto-answer header that
+ * would stop an amplifier ever hearing the ring it seizes on.
  *
  * The labels are the interesting part. "Caller dials" and a blank cell would look the same
  * on screen and mean opposite things -- one is the normal arrangement inherited from the
@@ -108,7 +108,6 @@ function setupDom() {
         <select id="paging-destination-auto-answer">
           <option value="" selected></option>
           <option value="cisco">Cisco</option>
-          <option value="none">Send nothing</option>
         </select>
       </form>
       <button id="paging-destination-dialog-cancel"></button>
@@ -216,19 +215,20 @@ describe('Paging page', () => {
       expect(expand(1)[0].Circuit).toBe('2');
     });
 
-    it('reports auto-answer as derived until it is overridden', async () => {
+    it('says an amplifier is simply rung, since that is what makes it seize', async () => {
       await load([zone({ destinations: [destination()] })]);
-      expect(expand(1)[0]['Auto-answer']).toBe('From vendor');
+      expect(expand(1)[0].Answers).toBe('Rings');
     });
 
     it('names the vendor an override forces, rather than its raw key', async () => {
       await load([zone({ destinations: [destination({ auto_answer_override: 'polycom' })] })]);
-      expect(expand(1)[0]['Auto-answer']).toBe('Polycom');
+      expect(expand(1)[0].Answers).toBe('Polycom');
     });
 
-    it('spells out an override that deliberately sends no header', async () => {
+    it('reads a stored "none" the same as an unset override', async () => {
+      // Written by rows created before the header stopped being derived from vendor.
       await load([zone({ destinations: [destination({ auto_answer_override: 'none' })] })]);
-      expect(expand(1)[0]['Auto-answer']).toBe('Nothing sent');
+      expect(expand(1)[0].Answers).toBe('Rings');
     });
 
     it('falls back to the extension when no label was given', async () => {

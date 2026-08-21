@@ -49,13 +49,22 @@ from typing import Any
 
 from pbx.utils.logger import get_logger
 
-#: Vendor -> the auto-answer header that vendor's endpoints honour. Derived from
-#: provisioned_devices.vendor rather than stored per destination, so vendor knowledge lives in
-#: one place and a re-vendored ATA cannot leave a stale value behind.
+#: Vendor -> the auto-answer header that vendor's endpoints honour.
 #:
-#: `{server_ip}` is substituted at send time. A value of None means send no header at all --
-#: which is also what the "none" override means, for an amplifier that seizes the line on ring
-#: voltage itself and needs no SIP-level auto-answer.
+#: `{server_ip}` is substituted at send time. A value of None means send no header at all.
+#:
+#: NOT SENT BY DEFAULT, AND THAT IS THE POINT
+#:     An amplifier does not speak SIP. It is wired to an ATA's FXS port and seizes the line
+#:     when it detects ring voltage -- the same ~90V AC a telephone rings on. The ATA only
+#:     applies that voltage because it is *ringing*, so telling it to answer immediately with
+#:     `Call-Info: answer-after=0` is worse than unnecessary: the ATA goes off-hook on the SIP
+#:     side without ever ringing the port, the amplifier detects nothing, and the page reaches
+#:     a circuit that was never seized.
+#:
+#:     So a destination with no explicit override is INVITEd with no auto-answer header and
+#:     left to ring. This map exists for destinations that genuinely need to be told -- a desk
+#:     phone paged over SIP has no ring voltage to offer and will sit there ringing at somebody
+#:     until it is answered by hand.
 AUTO_ANSWER_HEADERS: dict[str, tuple[str, str] | None] = {
     "cisco": ("Call-Info", "<sip:{server_ip}>;answer-after=0"),
     "yealink": ("Call-Info", "<sip:{server_ip}>;answer-after=0"),
@@ -64,12 +73,6 @@ AUTO_ANSWER_HEADERS: dict[str, tuple[str, str] | None] = {
     "polycom": ("Alert-Info", "Ring Answer"),
     "none": None,
 }
-
-#: Used when a destination's extension has no provisioned device, or its vendor is not in the
-#: table above. `Call-Info: answer-after=0` is the most widely honoured of the forms, so it is
-#: the least bad guess -- and a destination that guesses wrong is fixed by setting
-#: auto_answer_override, not by editing code.
-DEFAULT_AUTO_ANSWER_VENDOR = "cisco"
 
 #: Every symbol a DTMF keypad can produce, including the A-D column most phones lack.
 #: Validated on write rather than left to the generator, which returns silence for an
@@ -98,9 +101,7 @@ def normalise_dtmf_sequence(sequence: str | None) -> tuple[str | None, str | Non
 
     invalid = sorted(set(cleaned) - VALID_DTMF_DIGITS)
     if invalid:
-        return None, (
-            f"{', '.join(invalid)} cannot be dialled. Use digits 0-9, * or #."
-        )
+        return None, (f"{', '.join(invalid)} cannot be dialled. Use digits 0-9, * or #.")
 
     return cleaned, None
 
@@ -151,17 +152,24 @@ class PagingDestination:
 
     def auto_answer_header(self, server_ip: str) -> tuple[str, str] | None:
         """
-        The header that makes this endpoint answer without a human.
+        The header that makes this endpoint answer without a human, if it needs one.
+
+        Only an explicit override produces a header. Nothing is derived from the device's
+        vendor any more: an amplifier has to be *rung* for its FXS port to raise the ring
+        voltage it seizes on, so guessing at auto-answer from the ATA's vendor stopped the
+        very thing it was meant to enable. See the note on AUTO_ANSWER_HEADERS.
 
         Args:
             server_ip: The PBX address to advertise inside the header
 
         Returns:
             (name, value), or None when this destination should be INVITEd with no
-            auto-answer header at all
+            auto-answer header at all -- which is the usual case
         """
-        vendor = (self.auto_answer_override or self.vendor or DEFAULT_AUTO_ANSWER_VENDOR).lower()
-        form = AUTO_ANSWER_HEADERS.get(vendor, AUTO_ANSWER_HEADERS[DEFAULT_AUTO_ANSWER_VENDOR])
+        if not self.auto_answer_override:
+            return None
+
+        form = AUTO_ANSWER_HEADERS.get(self.auto_answer_override.lower())
         if form is None:
             return None
         name, template = form
@@ -259,7 +267,6 @@ class PagingSystem:
 
         # Deployment-level settings. Everything describing a zone is in the database.
         self.default_max_duration = config.get("features.paging.max_duration", 120)
-        self.default_auto_answer = config.get("features.paging.default_auto_answer")
 
         self.zones_db: Any | None = None
         self.destinations_db: Any | None = None
