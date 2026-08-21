@@ -163,6 +163,7 @@ declare global {
         showAddZoneModal: () => void;
         closeZoneModal: () => void;
         closeDestinationModal: () => void;
+        closeTestPageModal: () => void;
         deletePagingZone: (zoneId: number) => Promise<void>;
         deletePagingDestination: (destinationId: number) => Promise<void>;
         endActivePage: (pageId: string) => Promise<void>;

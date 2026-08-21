@@ -124,6 +124,23 @@ class PagingMediaSession:
         )
         return True
 
+    def expect_source(self, endpoint: tuple[str, int]) -> None:
+        """
+        Name the pager's advertised address after the session is already listening.
+
+        A dialled page knows it before binding -- it is in the INVITE that started the page.
+        A page fired from the admin page does not: the PBX sends the INVITE there, and the
+        address only arrives in the 200 OK, by which time the socket has to be bound already
+        or the first packets would land on a closed port.
+
+        Advisory in both cases. The source is still learned from whichever packet actually
+        arrives, because a phone behind NAT sends from an address its SDP has no way to know.
+
+        Args:
+            endpoint: The pager's advertised RTP address
+        """
+        self._expected_source = endpoint
+
     def add_target(self, destination_id: int, endpoint: tuple[str, int]) -> None:
         """
         Start sending to a destination whose leg has answered.

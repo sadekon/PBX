@@ -114,6 +114,17 @@ function setupDom() {
       <button id="paging-destination-dialog-cancel"></button>
       <button type="submit" form="add-paging-destination-form" id="paging-destination-dialog-save"></button>
     </div>
+
+    <div id="test-paging-modal" class="modal">
+      <h3 id="test-paging-dialog-title"></h3>
+      <p id="test-paging-dialog-sub"></p>
+      <button id="test-paging-dialog-close"></button>
+      <form id="test-paging-form">
+        <input type="text" id="test-paging-extension">
+      </form>
+      <button id="test-paging-dialog-cancel"></button>
+      <button type="submit" form="test-paging-form" id="test-paging-dialog-save"></button>
+    </div>
   `;
 }
 
@@ -568,6 +579,90 @@ describe('Paging page', () => {
       expect(fetch).not.toHaveBeenCalled();
       expect(showNotification).toHaveBeenCalledWith(
         'A circuit selection can only contain 0-9, * and #', 'error');
+    });
+  });
+
+  describe('the test page dialog', () => {
+    function openTest(zoneRow = zone()) {
+      return load([zoneRow]).then(() => {
+        list().querySelector('[data-paging-test]')
+          .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      });
+    }
+
+    it('names the zone it would page', async () => {
+      await openTest(zone({ extension: '799', name: 'All buildings' }));
+      expect(bodyOf('test-paging-dialog-sub').textContent).toContain('799');
+      expect(bodyOf('test-paging-dialog-sub').textContent).toContain('All buildings');
+    });
+
+    it('posts the extension to ring', async () => {
+      await openTest();
+      bodyOf('test-paging-extension').value = '1513';
+
+      fetch.mockClear();
+      bodyOf('test-paging-form').dispatchEvent(
+        new Event('submit', { bubbles: true, cancelable: true }));
+      await flush();
+
+      const post = fetch.mock.calls.find(([, opts]) => opts?.method === 'POST');
+      expect(String(post[0])).toContain('/api/paging/zones/1/test');
+      expect(JSON.parse(post[1].body)).toEqual({ from_extension: '1513' });
+    });
+
+    it('remembers the extension between tests', async () => {
+      await openTest();
+      bodyOf('test-paging-extension').value = '1513';
+      bodyOf('test-paging-form').dispatchEvent(
+        new Event('submit', { bubbles: true, cancelable: true }));
+      await flush();
+
+      // Bringing an amplifier up means paging it repeatedly from one handset.
+      list().querySelector('[data-paging-test]')
+        .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      expect(bodyOf('test-paging-extension').value).toBe('1513');
+    });
+
+    it('does not remember an extension the server rejected', async () => {
+      await openTest();
+      bodyOf('test-paging-extension').value = '9999';
+      fetch.mockImplementation(() => Promise.resolve(
+        jsonResponse({ error: 'No route to 9999' }, 400)));
+      bodyOf('test-paging-form').dispatchEvent(
+        new Event('submit', { bubbles: true, cancelable: true }));
+      await flush();
+
+      expect(showNotification).toHaveBeenCalledWith('No route to 9999', 'error');
+
+      list().querySelector('[data-paging-test]')
+        .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      expect(bodyOf('test-paging-extension').value).toBe('');
+    });
+
+    it('refuses to start without an extension', async () => {
+      await openTest();
+      bodyOf('test-paging-extension').value = '';
+
+      fetch.mockClear();
+      bodyOf('test-paging-form').dispatchEvent(
+        new Event('submit', { bubbles: true, cancelable: true }));
+      await flush();
+
+      expect(fetch).not.toHaveBeenCalled();
+      expect(showNotification).toHaveBeenCalledWith('Name the extension to ring', 'error');
+    });
+
+    it('reports a busy zone as the server described it', async () => {
+      await openTest();
+      bodyOf('test-paging-extension').value = '1513';
+      fetch.mockImplementation(() => Promise.resolve(
+        jsonResponse({ error: 'Building 1 amplifier is already paging' }, 409)));
+      bodyOf('test-paging-form').dispatchEvent(
+        new Event('submit', { bubbles: true, cancelable: true }));
+      await flush();
+
+      expect(showNotification).toHaveBeenCalledWith(
+        'Building 1 amplifier is already paging', 'error');
     });
   });
 

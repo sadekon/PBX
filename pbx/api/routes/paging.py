@@ -294,6 +294,43 @@ def handle_get_candidate_endpoints() -> Response:
         return send_json({"endpoints": []})
 
 
+@paging_bp.route("/zones/<int:zone_id>/test", methods=["POST"])
+@require_auth
+def handle_test_page(zone_id: int) -> Response:
+    """
+    Page a zone from the admin view, by ringing an extension first.
+
+    Takes an extension rather than paging from the browser: the admin page has no audio
+    path, and a page nobody can speak into proves only that the SIP legs came up. Ringing a
+    real handset tests the thing that actually matters -- that audio reaches the amplifier
+    and its tones come back.
+
+    The zone is reserved before the phone rings, so a busy amplifier is reported here rather
+    than after someone has picked up.
+    """
+    paging_system = _get_paging_system()
+    if not paging_system:
+        return send_json({"error": "Paging is not enabled"}, 503)
+
+    pbx_core = get_pbx_core()
+    if not pbx_core or not getattr(pbx_core, "paging_handler", None):
+        return send_json({"error": "Paging is not running"}, 503)
+
+    data = get_request_body()
+    from_extension = str(data.get("from_extension") or "").strip()
+    if not from_extension:
+        return send_json({"error": "Name the extension to ring"}, 400)
+
+    page_id, error = pbx_core.paging_handler.start_test_page(from_extension, zone_id)
+    if error:
+        # "Busy" is the zone being used, not a fault: the caller should be told to wait
+        # rather than shown a failure they cannot act on.
+        status = 409 if "busy" in error.lower() or "paging right now" in error else 400
+        return send_json({"error": error}, status)
+
+    return send_json({"success": True, "page_id": page_id}, 202)
+
+
 # ---------------------------------------------------------------------------- active pages
 
 

@@ -1021,7 +1021,7 @@ class SIPServer:
         self,
         response_200: SIPMessage,
         callee_addr: AddrTuple,
-        call_id: str,
+        call_id: str | None,
         use_invite_branch: bool = False,
     ) -> None:
         """
@@ -1036,7 +1036,9 @@ class SIPServer:
             response_200: The final response SIPMessage from the callee
                 (200 OK, or an error response when acknowledging a non-2xx).
             callee_addr: Callee's address tuple.
-            call_id: Call identifier.
+            call_id: Call identifier, or None when the response arrived with no
+                call left to attach it to. The ACK is owed either way -- see
+                the note on the lookup below.
             use_invite_branch: Reuse the INVITE's Via branch instead of
                 generating a new one.  RFC 3261 Section 17.1.1.3: the ACK
                 for a non-2xx final response belongs to the same transaction
@@ -1058,7 +1060,7 @@ class SIPServer:
         #
         # Everything an ACK needs is in the response itself. The call record only supplies
         # nicer values, so its absence degrades the ACK rather than skipping it.
-        call = self.pbx_core.call_manager.get_call(call_id)
+        call = self.pbx_core.call_manager.get_call(call_id) if call_id else None
 
         # Build ACK for the callee's final response.
         # The Request-URI, From, To (with tag), and Call-ID must match the
@@ -1082,7 +1084,11 @@ class SIPServer:
         ack.uri = request_uri
         ack.set_header("From", from_header)
         ack.set_header("To", to_header)
-        ack.set_header("Call-ID", call_id)
+        # The response's own Call-ID when there is no call record to name it. A UAS matches
+        # an ACK on branch, To-tag, Call-ID and CSeq, so an empty one here would never match
+        # and the far end would retransmit until Timer H -- the exact failure this path
+        # exists to prevent.
+        ack.set_header("Call-ID", call_id or response_200.get_header("Call-ID") or "")
         ack.set_header("CSeq", f"{cseq_num} ACK")
         ack.set_header("Content-Length", "0")
         ack.set_header("Max-Forwards", "70")

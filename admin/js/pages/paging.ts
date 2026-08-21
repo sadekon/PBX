@@ -106,6 +106,10 @@ let pagingStatus: PagingStatus = {};
 let zoneDraft: ZoneDraft | null = null;
 /** Which zone a newly added destination belongs to. */
 let destinationZoneId: number | null = null;
+/** Which zone the open test dialog would page. */
+let testZoneId: number | null = null;
+/** Remembered so bringing an amplifier up does not mean retyping the same number. */
+let lastTestExtension = '';
 
 let pagingListenersAttached = false;
 
@@ -236,6 +240,7 @@ function zoneCardHtml(zone: PagingZone): string {
                     <span class="meta-stat"><span class="k">Time limit</span><span class="v">${durationLabel(zone.max_duration_seconds)}</span></span>
                 </span>
                 <span class="card-actions">
+                    <button type="button" class="btn-ghost" data-paging-test="${zone.id}">Test</button>
                     <button type="button" class="btn-ghost" data-paging-edit="${zone.id}">Edit</button>
                     <button type="button" class="btn-ghost btn-ghost-danger" data-paging-delete="${zone.id}">Delete</button>
                 </span>
@@ -835,6 +840,76 @@ export async function deletePagingDestination(destinationId: number): Promise<vo
     }
 }
 
+// ---------------------------------------------------------------------------- test page
+
+function testDialog(): HTMLElement | null {
+    return pagingEl('test-paging-modal');
+}
+
+export function closeTestPageModal(): void {
+    testDialog()?.classList.remove('active');
+    testZoneId = null;
+}
+
+function openTestDialog(zoneId: number): void {
+    const dialog = testDialog();
+    const zone = pagingZones.find((candidate) => candidate.id === zoneId);
+    if (!dialog || !zone) return;
+
+    testZoneId = zoneId;
+
+    const subtitle = pagingEl('test-paging-dialog-sub');
+    if (subtitle) {
+        subtitle.textContent =
+            `Ring a phone, then open ${zone.extension} — ${zone.name} — to it`;
+    }
+
+    const extension = pagingEl('test-paging-extension') as HTMLInputElement | null;
+    if (extension) {
+        // Kept between tests. Bringing up an amplifier means paging it repeatedly from the
+        // same handset, and retyping the number every time is the whole friction.
+        extension.value = lastTestExtension;
+    }
+
+    dialog.classList.add('active');
+    extension?.focus();
+    extension?.select();
+}
+
+async function startTestPage(event: Event): Promise<void> {
+    event.preventDefault();
+    if (testZoneId === null) return;
+
+    const extension = ((pagingEl('test-paging-extension') as HTMLInputElement | null)?.value ?? '').trim();
+    if (!extension) {
+        showNotification('Name the extension to ring', 'error');
+        return;
+    }
+
+    try {
+        const API_BASE = getApiBaseUrl();
+        const response = await fetch(`${API_BASE}/api/paging/zones/${testZoneId}/test`, {
+            method: 'POST',
+            headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ from_extension: extension }),
+        });
+
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            showNotification(data.error ?? `Could not start the page (HTTP ${response.status})`, 'error');
+            return;
+        }
+
+        lastTestExtension = extension;
+        showNotification(`Ringing ${extension} — pick up to page`, 'success');
+        closeTestPageModal();
+        await loadPagingData();
+    } catch (error: unknown) {
+        console.error('Error starting test page:', error);
+        showNotification('Could not reach the server to start the page', 'error');
+    }
+}
+
 // ---------------------------------------------------------------------------- active pages
 
 export async function endActivePage(pageId: string): Promise<void> {
@@ -916,6 +991,12 @@ function attachPagingListeners(): void {
             return;
         }
 
+        const test = target.closest('[data-paging-test]');
+        if (test) {
+            openTestDialog(Number(test.getAttribute('data-paging-test')));
+            return;
+        }
+
         const edit = target.closest('[data-paging-edit]');
         if (edit) {
             const zoneId = Number(edit.getAttribute('data-paging-edit'));
@@ -965,10 +1046,15 @@ function attachPagingListeners(): void {
     pagingEl('paging-destination-dialog-close')?.addEventListener('click', closeDestinationModal);
     pagingEl('paging-destination-dialog-cancel')?.addEventListener('click', closeDestinationModal);
 
+    pagingEl('test-paging-form')?.addEventListener('submit', (event) => { void startTestPage(event); });
+    pagingEl('test-paging-dialog-close')?.addEventListener('click', closeTestPageModal);
+    pagingEl('test-paging-dialog-cancel')?.addEventListener('click', closeTestPageModal);
+
     // Escape closes whichever dialog is open, matching every other dialog on the site.
     document.addEventListener('keydown', (event: KeyboardEvent) => {
         if (event.key !== 'Escape') return;
-        if (destinationDialog()?.classList.contains('active')) closeDestinationModal();
+        if (testDialog()?.classList.contains('active')) closeTestPageModal();
+        else if (destinationDialog()?.classList.contains('active')) closeDestinationModal();
         else if (zoneDialog()?.classList.contains('active')) closeZoneModal();
     });
 
@@ -980,6 +1066,7 @@ window.loadPagingData = loadPagingData;
 window.showAddZoneModal = showAddZoneModal;
 window.closeZoneModal = closeZoneModal;
 window.closeDestinationModal = closeDestinationModal;
+window.closeTestPageModal = closeTestPageModal;
 window.deletePagingZone = deletePagingZone;
 window.deletePagingDestination = deletePagingDestination;
 window.endActivePage = endActivePage;

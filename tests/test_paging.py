@@ -1175,3 +1175,297 @@ class TestDtmfToneEncoding:
 
         encoded = float_samples_to_pcm16([2.0, -2.0, 0.0])
         assert struct.unpack("<3h", encoded) == (32767, -32767, 0)
+
+
+# --------------------------------------------------------------------------- test page
+
+
+@pytest.mark.unit
+class TestTestPageStartup:
+    """
+    A page fired from the admin view, which reaches the amplifier the same way a dialled one
+    does but arrives at the pager's leg from the opposite direction.
+
+    Dialled, the pager offers media in an INVITE and the PBX answers it. Fired from the
+    admin page, the PBX sends the INVITE and the media only comes back in the 200 OK -- so
+    the socket has to be listening before the INVITE goes out, and a BYE toward the pager is
+    addressed to the other side of the dialog. Both are easy to get wrong in ways that only
+    show up against real hardware, which is the thing this path exists to avoid needing.
+    """
+
+    #: Distinguishes "the caller did not care about the zone" from "the zone is gone",
+    #: which None alone cannot express and which are opposite test cases.
+    _UNSET = object()
+
+    def _handler(self, *, zone=_UNSET, page=None, error=None, leg=None):
+        from pbx.core.paging_handler import PagingHandler
+
+        pbx = MagicMock()
+        pbx.paging_system.enabled = True
+        pbx.paging_system.get_zone.return_value = (
+            {"id": 1, "extension": "799", "name": "All buildings"} if zone is self._UNSET else zone
+        )
+        pbx.paging_system.begin_page.return_value = (page, error)
+        pbx.rtp_relay.allocate_port.return_value = (10000, 10001)
+        pbx.call_originator.originate_call.return_value = leg
+        pbx.config.get.side_effect = lambda key, default=None: default
+
+        handler = PagingHandler(pbx)
+        handler._open_destination_legs = MagicMock()
+        return handler, pbx
+
+    def _page(self):
+        page = MagicMock()
+        page.page_id = "p1"
+        page.zone_name = "All buildings"
+        page.from_extension = "1513"
+        page.destinations = [_destination()]
+        return page
+
+    def _leg(self, call_id="leg-1", rtp=None):
+        leg = MagicMock()
+        leg.call_id = call_id
+        leg.callee_rtp = rtp
+        return leg
+
+    def test_the_zone_is_reserved_before_anyone_is_rung(self):
+        """
+        Ringing first and reserving after would ring someone for an amplifier that turns out
+        to be busy -- and two testers could both be told to pick up.
+        """
+        handler, pbx = self._handler(page=None, error="Building 1 amplifier is already paging")
+
+        page_id, error = handler.start_test_page("1513", 1)
+
+        assert page_id is None
+        assert "already paging" in error
+        pbx.call_originator.originate_call.assert_not_called()
+
+    def test_the_socket_is_listening_before_the_invite_goes_out(self):
+        """
+        A phone set to auto-answer can reply before originate_call has returned. Binding
+        after would drop the opening packets onto a closed port.
+        """
+        listening = {}
+
+        with patch("pbx.rtp.paging_media.PagingMediaSession") as media_class:
+            media = media_class.return_value
+            media.start.return_value = True
+
+            handler, pbx = self._handler(page=self._page(), leg=self._leg())
+            pbx.call_originator.originate_call.side_effect = lambda *a, **k: (
+                listening.update(bound=media.start.called) or self._leg()
+            )
+
+            handler.start_test_page("1513", 1)
+
+        assert listening["bound"] is True
+
+    def test_the_leg_advertises_the_pages_own_port(self):
+        """
+        Without the override, originate_call would allocate a relay and bind a second socket
+        to a port this session already owns.
+        """
+        with patch("pbx.rtp.paging_media.PagingMediaSession") as media_class:
+            media_class.return_value.start.return_value = True
+            handler, pbx = self._handler(page=self._page(), leg=self._leg())
+            handler.start_test_page("1513", 1)
+
+        kwargs = pbx.call_originator.originate_call.call_args.kwargs
+        assert kwargs["rtp_ports_override"] == (10000, 10001)
+
+    def test_the_leg_offers_pcmu_alone_and_two_way_audio(self):
+        """
+        Every endpoint on a page has to already agree, since the PBX does not transcode --
+        and the pager needs a return path or the amplifier's own tones never arrive.
+        """
+        with patch("pbx.rtp.paging_media.PagingMediaSession") as media_class:
+            media_class.return_value.start.return_value = True
+            handler, pbx = self._handler(page=self._page(), leg=self._leg())
+            handler.start_test_page("1513", 1)
+
+        kwargs = pbx.call_originator.originate_call.call_args.kwargs
+        assert kwargs["codecs"] == ["0"]
+        assert kwargs["sdp_direction"] == "sendrecv"
+
+    def test_the_handset_is_shown_the_zone_rather_than_the_pbx(self):
+        with patch("pbx.rtp.paging_media.PagingMediaSession") as media_class:
+            media_class.return_value.start.return_value = True
+            handler, pbx = self._handler(page=self._page(), leg=self._leg())
+            handler.start_test_page("1513", 1)
+
+        assert pbx.call_originator.originate_call.call_args.kwargs["caller_id"] == (
+            "799",
+            "All buildings",
+        )
+
+    def test_the_page_is_findable_by_the_legs_call_id(self):
+        """
+        Teardown is keyed on it: without this the tester's hangup would end their call and
+        leave the page running, still relaying to the amplifier.
+        """
+        with patch("pbx.rtp.paging_media.PagingMediaSession") as media_class:
+            media_class.return_value.start.return_value = True
+            handler, _ = self._handler(page=self._page(), leg=self._leg("leg-1"))
+            handler.start_test_page("1513", 1)
+
+        assert handler._sessions["p1"].call_id == "leg-1"
+
+    def test_a_leg_that_never_starts_gives_the_port_and_the_zone_back(self):
+        with patch("pbx.rtp.paging_media.PagingMediaSession") as media_class:
+            media_class.return_value.start.return_value = True
+            handler, pbx = self._handler(page=self._page(), leg=None)
+
+            page_id, error = handler.start_test_page("1513", 1)
+
+        assert page_id is None
+        assert "1513" in error
+        pbx.rtp_relay.release_port.assert_called_once_with(10000)
+        pbx.paging_system.end_page.assert_called_once_with("p1")
+
+    def test_a_media_session_that_cannot_bind_gives_the_zone_back(self):
+        with patch("pbx.rtp.paging_media.PagingMediaSession") as media_class:
+            media_class.return_value.start.return_value = False
+            handler, pbx = self._handler(page=self._page(), leg=self._leg())
+
+            page_id, error = handler.start_test_page("1513", 1)
+
+        assert page_id is None
+        assert error is not None
+        pbx.call_originator.originate_call.assert_not_called()
+        pbx.rtp_relay.release_port.assert_called_once_with(10000)
+        pbx.paging_system.end_page.assert_called_once_with("p1")
+
+    def test_a_zone_that_is_gone_is_refused_without_reserving_anything(self):
+        handler, pbx = self._handler(zone=None, page=None)
+
+        page_id, error = handler.start_test_page("1513", 99)
+
+        assert page_id is None
+        assert error is not None
+        pbx.paging_system.begin_page.assert_not_called()
+
+
+@pytest.mark.unit
+class TestTestPageAnswer:
+    """What happens when the handset picks up, which is where the page really begins."""
+
+    def _session(self, pager_is_originated=True):
+        from pbx.core.paging_handler import PagingHandler, _PageSession
+
+        pbx = MagicMock()
+        handler = PagingHandler(pbx)
+        handler._open_destination_legs = MagicMock()
+
+        page = MagicMock()
+        page.page_id = "p1"
+        page.zone_name = "All buildings"
+        page.from_extension = "1513"
+
+        session = _PageSession(
+            page=page,
+            media=MagicMock(),
+            rtp_port=10000,
+            call_id="",
+            pager_is_originated=pager_is_originated,
+        )
+        return handler, pbx, session
+
+    def test_the_pager_is_taken_from_the_answer_not_an_offer(self):
+        handler, _, session = self._session()
+        call = MagicMock()
+        call.call_id = "leg-1"
+        call.callee_rtp = {"address": "192.168.10.50", "port": 16400}
+
+        handler._on_test_pager_answered(session, call)
+
+        assert session.pager_endpoint == ("192.168.10.50", 16400)
+        session.media.expect_source.assert_called_once_with(("192.168.10.50", 16400))
+
+    def test_the_zone_opens_only_once_the_handset_is_up(self):
+        handler, _, session = self._session()
+        call = MagicMock()
+        call.call_id = "leg-1"
+        call.callee_rtp = {"address": "192.168.10.50", "port": 16400}
+
+        handler._on_test_pager_answered(session, call)
+
+        handler._open_destination_legs.assert_called_once_with(session)
+
+    def test_an_answer_with_no_media_is_abandoned_rather_than_left_open(self):
+        """
+        Nothing could be relayed, and the page would otherwise hold the zone reserved
+        against the next attempt.
+        """
+        handler, _, session = self._session()
+        handler.hang_up_pager = MagicMock()
+        call = MagicMock()
+        call.call_id = "leg-1"
+        call.callee_rtp = None
+
+        handler._on_test_pager_answered(session, call)
+
+        handler._open_destination_legs.assert_not_called()
+        handler.hang_up_pager.assert_called_once_with("leg-1")
+
+    def test_a_handset_that_never_answers_releases_everything(self):
+        handler, pbx, session = self._session()
+        handler._sessions["p1"] = session
+
+        handler._on_test_pager_failed(session, "no_answer")
+
+        assert session.torn_down is True
+        pbx.rtp_relay.release_port.assert_called_once_with(10000)
+        pbx.paging_system.end_page.assert_called_once_with("p1")
+        session.media.stop.assert_called_once()
+
+
+@pytest.mark.unit
+class TestOriginatedPagerHangup:
+    """
+    Which side of the dialog a BYE is addressed to depends on who placed the leg.
+
+    On a dialled page the pager is the caller and the tag we need is the one our own 200 OK
+    minted. On a test page the PBX sent the INVITE, so the pager is the callee -- addressing
+    a BYE to the caller side there builds it from headers that were never populated.
+    """
+
+    def _handler(self, session=None):
+        from pbx.core.paging_handler import PagingHandler
+
+        pbx = MagicMock()
+        pbx.call_manager.get_call.return_value = MagicMock()
+        handler = PagingHandler(pbx)
+        if session is not None:
+            handler._sessions["p1"] = session
+        return handler, pbx
+
+    def _session(self, call_id, originated):
+        from pbx.core.paging_handler import _PageSession
+
+        return _PageSession(
+            page=MagicMock(),
+            media=MagicMock(),
+            rtp_port=10000,
+            call_id=call_id,
+            pager_is_originated=originated,
+        )
+
+    def test_an_originated_pager_is_byed_on_the_side_the_pbx_dialled(self):
+        handler, pbx = self._handler(self._session("leg-1", originated=True))
+        handler.hang_up_pager("leg-1")
+
+        assert pbx.sip_server._send_leg_bye.call_args.kwargs["side"] is None
+
+    def test_a_dialled_pager_is_still_byed_on_the_caller_side(self):
+        handler, pbx = self._handler(self._session("c1", originated=False))
+        handler.hang_up_pager("c1")
+
+        assert pbx.sip_server._send_leg_bye.call_args.kwargs["side"] == "caller"
+
+    def test_a_page_with_no_session_left_falls_back_to_the_caller_side(self):
+        """The dialled case is the one that survives losing its session, so it is the default."""
+        handler, pbx = self._handler()
+        handler.hang_up_pager("c1")
+
+        assert pbx.sip_server._send_leg_bye.call_args.kwargs["side"] == "caller"

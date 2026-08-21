@@ -758,7 +758,7 @@ class PBXCore:
             # the zone's duration timer fired, leaving the amplifiers keyed up and the zone
             # marked busy against the next page. Returns False for anything that is not a
             # page, including the paging legs this itself hangs up.
-            if self.paging_handler:
+            if self.paging_handler is not None:
                 self.paging_handler.teardown_page(call_id)
 
             # Cancel INVITE retransmission if still running

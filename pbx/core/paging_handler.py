@@ -53,6 +53,9 @@ class _PageSession:
     answered: set[int] = field(default_factory=set)
     failed: set[int] = field(default_factory=set)
     torn_down: bool = False
+    #: True when the PBX placed the pager's leg rather than answering it -- a test page
+    #: fired from the admin view. It changes which side of the dialog a BYE is addressed to.
+    pager_is_originated: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -193,6 +196,163 @@ class PagingHandler:
         self._open_destination_legs(session)
         return True
 
+    # ------------------------------------------------------------------ test page
+
+    def start_test_page(self, from_extension: str, zone_id: int) -> tuple[str | None, str | None]:
+        """
+        Page a zone without anybody dialling it, by ringing an extension first.
+
+        The same page as a dialled one from the amplifier's side. What differs is only how
+        the pager's leg comes to exist, and that changes two things:
+
+          * the pager's media is in the 200 OK it sends back, not in an offer it made, so
+            the media session has to be listening before the INVITE goes out rather than
+            after -- the phone may answer instantly and start sending immediately;
+          * the PBX is the caller, so a BYE toward the pager goes to the callee side of the
+            dialog. `pager_is_originated` is what tells `hang_up_pager` that.
+
+        The zone is reserved before the phone is rung, not after it answers. Ringing someone
+        for a zone that turns out to be busy wastes their time, and two people testing the
+        same amplifier at once is exactly what the reservation exists to prevent.
+
+        Args:
+            from_extension: The extension to ring, whose handset becomes the pager
+            zone_id: The zone to open once it answers
+
+        Returns:
+            (page_id, error). Only one is ever set.
+        """
+        pbx = self.pbx_core
+        paging_system = getattr(pbx, "paging_system", None)
+        if not paging_system or not paging_system.enabled:
+            return None, "Paging is not enabled"
+
+        zone = paging_system.get_zone(zone_id)
+        if not zone:
+            return None, "That zone no longer exists"
+
+        page, error = paging_system.begin_page(from_extension, zone["extension"])
+        if not page:
+            return None, error or "Could not start the page"
+
+        rtp_ports = pbx.rtp_relay.allocate_port()
+        if not rtp_ports:
+            pbx.logger.error(f"No RTP port available for test page to {zone['extension']}")
+            paging_system.end_page(page.page_id)
+            return None, "No RTP port was free"
+
+        rtp_port = rtp_ports[0]
+
+        from pbx.rtp.paging_media import PagingMediaSession
+
+        media = PagingMediaSession(rtp_port, page.page_id, logger=pbx.logger)
+        if not media.start():
+            pbx.logger.error(f"Could not open paging media for test page {page.page_id}")
+            pbx.rtp_relay.release_port(rtp_port)
+            paging_system.end_page(page.page_id)
+            return None, "Could not open the media session"
+
+        session = _PageSession(
+            page=page,
+            media=media,
+            rtp_port=rtp_port,
+            call_id="",
+            pager_is_originated=True,
+        )
+
+        # Registered before the INVITE goes out. A phone set to auto-answer can respond
+        # before originate_call has even returned, and the callback that runs then expects
+        # to find its own session.
+        with self._sessions_lock:
+            self._sessions[page.page_id] = session
+
+        leg = pbx.call_originator.originate_call(
+            "paging-test",
+            from_extension,
+            answer_timeout=pbx.config.get("features.paging.answer_timeout", 30),
+            # Shown as the zone, because from the handset's side the call is with the zone
+            # rather than with whatever the PBX calls its own originating context.
+            caller_id=(zone["extension"], zone.get("name") or "Paging test"),
+            # The page's own socket, so the phone is told to send where the fan-out is
+            # already listening. Passing the ports also skips relay allocation, which would
+            # otherwise bind a second socket to a port this session already owns.
+            rtp_ports_override=rtp_ports,
+            codecs=[PCMU_PAYLOAD_TYPE],
+            sdp_direction="sendrecv",
+            on_answer=lambda call: self._on_test_pager_answered(session, call),
+            on_failure=lambda _call, reason: self._on_test_pager_failed(session, reason),
+        )
+
+        if leg is None:
+            pbx.logger.error(f"Could not place a test page leg to {from_extension}")
+            self._close_session(session)
+            return None, f"Could not place a call to {from_extension}"
+
+        # Both this and the answer callback assign the same value, so whichever runs first
+        # wins harmlessly. It is set here as well because a leg that rings and is never
+        # answered still has to be findable by call id when its BYE or CANCEL arrives.
+        session.call_id = leg.call_id
+        page.call_id = leg.call_id
+        leg.paging_active = True
+        leg.page_id = page.page_id
+        leg.paging_zones = page.zone_name
+
+        pbx.logger.info(
+            f"Test page {page.page_id}: ringing {from_extension} to open "
+            f"{page.zone_name} ({len(page.destinations)} destination(s))"
+        )
+        return page.page_id, None
+
+    def _on_test_pager_answered(self, session: _PageSession, call: Any) -> None:
+        """
+        The extension picked up: it is the pager now, so open the zone to it.
+
+        Args:
+            session: The page waiting on this answer
+            call: The answered leg
+        """
+        pbx = self.pbx_core
+
+        session.call_id = call.call_id
+        session.page.call_id = call.call_id
+
+        rtp = getattr(call, "callee_rtp", None)
+        if not rtp:
+            # Answered with no media to send to. Nothing can be relayed, and the page would
+            # otherwise sit open holding the zone reserved.
+            pbx.logger.error(
+                f"Test page {session.page.page_id}: {session.page.from_extension} answered "
+                f"without usable media; abandoning the page"
+            )
+            self.hang_up_pager(call.call_id)
+            return
+
+        endpoint = (rtp["address"], rtp["port"])
+        session.pager_endpoint = endpoint
+        session.media.expect_source(endpoint)
+
+        pbx.cdr_system.mark_answered(call.call_id)
+        pbx.logger.info(
+            f"Test page {session.page.page_id}: {session.page.from_extension} answered; "
+            f"opening {session.page.zone_name}"
+        )
+
+        self._open_destination_legs(session)
+
+    def _on_test_pager_failed(self, session: _PageSession, reason: str) -> None:
+        """
+        The extension never picked up, so there is no page to run.
+
+        Args:
+            session: The page that was waiting on it
+            reason: Why, from CallOriginator
+        """
+        self.pbx_core.logger.warning(
+            f"Test page {session.page.page_id} to {session.page.zone_name} abandoned: "
+            f"{session.page.from_extension} did not answer ({reason})"
+        )
+        self._close_session(session)
+
     # ------------------------------------------------------------------ pager leg
 
     def _answer_pager(self, call: Any, rtp_port: int) -> bool:
@@ -331,9 +491,7 @@ class PagingHandler:
                 with session.lock:
                     session.leg_call_ids[destination.destination_id] = leg.call_id
 
-    def _destination_is_reachable(
-        self, destination: Any, server_ip: str, sip_port: int
-    ) -> bool:
+    def _destination_is_reachable(self, destination: Any, server_ip: str, sip_port: int) -> bool:
         """
         Refuse a destination whose registration points back at the PBX.
 
@@ -689,9 +847,7 @@ class PagingHandler:
             )
             return
 
-        pbx.logger.info(
-            f"Page {session.page.page_id}: last destination hung up, ending the page"
-        )
+        pbx.logger.info(f"Page {session.page.page_id}: last destination hung up, ending the page")
         self.hang_up_pager(session.call_id)
 
     # ------------------------------------------------------------------ hanging up
@@ -713,14 +869,24 @@ class PagingHandler:
         """
         pbx = self.pbx_core
 
+        with self._sessions_lock:
+            session = next((s for s in self._sessions.values() if s.call_id == call_id), None)
+        originated = bool(session and session.pager_is_originated)
+
         call = pbx.call_manager.get_call(call_id)
         if call:
             try:
-                # SIPServer owns this: it reads caller_dialog_to for the to-tag our 200 OK
-                # minted, draws CSeq from the call's own pbx_leg_cseq counter so successive
-                # PBX requests do not reuse a number, and adds the Via, Max-Forwards and
-                # Contact a strict UA needs before it will act on a BYE at all.
-                pbx.sip_server._send_leg_bye(call, side="caller")
+                # SIPServer owns this: it reads the dialog's to-tag, draws CSeq from the
+                # call's own pbx_leg_cseq counter so successive PBX requests do not reuse a
+                # number, and adds the Via, Max-Forwards and Contact a strict UA needs
+                # before it will act on a BYE at all.
+                #
+                # Which side depends on who placed the leg. On a dialled page the pager is
+                # the caller and the tag we need is the one our own 200 OK minted, so the
+                # side is forced. On a test page the PBX sent the INVITE, making the pager
+                # the callee; the default picks that side, exactly as originate_and_bridge
+                # does when it ends a leg it placed.
+                pbx.sip_server._send_leg_bye(call, side=None if originated else "caller")
             except Exception as e:
                 pbx.logger.error(f"Could not send BYE to paging caller {call_id}: {e}")
 
@@ -749,8 +915,6 @@ class PagingHandler:
         Returns:
             bool: True if this call was part of a page
         """
-        pbx = self.pbx_core
-
         with self._sessions_lock:
             session = next((s for s in self._sessions.values() if s.call_id == call_id), None)
 
@@ -769,6 +933,25 @@ class PagingHandler:
             self._on_leg_ended(leg_session, destination_id)
             return True
 
+        return self._close_session(session)
+
+    def _close_session(self, session: _PageSession) -> bool:
+        """
+        Release everything one page owns: its legs, its socket, its port, its reservation.
+
+        Split out from `teardown_page` because a test page can fail before it has a call id
+        to be found by -- the pager's phone never answered -- and that path still has to
+        give back the port and free the zone, or the amplifier stays reserved against a page
+        that never happened.
+
+        Args:
+            session: The page to close
+
+        Returns:
+            bool: True if this call closed it, False if it was already closed
+        """
+        pbx = self.pbx_core
+
         with self._sessions_lock:
             with session.lock:
                 if session.torn_down:
@@ -786,7 +969,7 @@ class PagingHandler:
         try:
             session.media.stop()
         except Exception as e:
-            pbx.logger.error(f"Could not stop paging media for {call_id}: {e}")
+            pbx.logger.error(f"Could not stop paging media for page {session.page.page_id}: {e}")
 
         pbx.rtp_relay.release_port(session.rtp_port)
         pbx.paging_system.end_page(session.page.page_id)
@@ -866,4 +1049,5 @@ class PagingHandler:
             session = self._sessions.get(page_id)
         if not session:
             return None
-        return session.media.get_stats()
+        stats: dict[str, Any] = session.media.get_stats()
+        return stats

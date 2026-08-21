@@ -5605,6 +5605,44 @@ unzip EspoCRM-7.x.x.zip -d /var/www/espocrm
         </div>
     </div>
 
+    <!-- Test Page Modal -->
+    <div id="test-paging-modal" class="modal">
+        <div class="glass-page">
+            <div class="g g1 dialog" role="dialog" aria-modal="true"
+                 aria-labelledby="test-paging-dialog-title">
+                <div class="dialog-head">
+                    <span class="page-mark" aria-hidden="true">🧪</span>
+                    <div>
+                        <h3 id="test-paging-dialog-title">Test page</h3>
+                        <p class="dialog-sub" id="test-paging-dialog-sub">Ring a phone, then open the zone to it</p>
+                    </div>
+                    <button type="button" class="dialog-close" id="test-paging-dialog-close"
+                            aria-label="Close">&times;</button>
+                </div>
+
+                <form id="test-paging-form" class="dialog-body">
+                    <div class="field">
+                        <label for="test-paging-extension">Extension to ring</label>
+                        <input type="text" id="test-paging-extension" required pattern="[0-9]+"
+                               placeholder="1001" autocomplete="off" inputmode="numeric">
+                        <span class="field-note">Pick up that phone and it becomes the pager: whatever you say goes out to the zone, and the amplifier's own tones come back to you. Hang up to end the page.</span>
+                    </div>
+
+                    <div class="g g4 info-box" style="margin: 0;">
+                        <p><strong>The zone is reserved the moment you start.</strong> If an amplifier in it is already carrying a page, this is refused before the phone rings rather than after you have picked up.</p>
+                    </div>
+                </form>
+
+                <div class="dialog-foot">
+                    <span class="spacer"></span>
+                    <button type="button" class="btn-ghost" id="test-paging-dialog-cancel">Cancel</button>
+                    <button type="submit" form="test-paging-form"
+                            class="btn-ghost btn-ghost-accent" id="test-paging-dialog-save">Start test page</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Add Time Routing Rule Modal -->
     <div id="add-time-rule-modal" class="modal">
         <div class="modal-content">
