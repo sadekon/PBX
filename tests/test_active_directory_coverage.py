@@ -420,7 +420,9 @@ class TestAuthenticateUser:
         ad, conn = _make_ad_connected()
         conn.search.side_effect = OSError("network error")
 
-        result = ad.authenticate_user("jdoe", "password123")
+        # The reconnect attempt hits the same network error
+        with patch(f"{MOD}.Connection", side_effect=OSError("network error")):
+            result = ad.authenticate_user("jdoe", "password123")
         assert result is None
 
     def test_auth_exception_key_error(self) -> None:
@@ -491,6 +493,31 @@ class TestAuthenticateUser:
         entries = [_make_ldap_entry(), _make_ldap_entry()]
         result, _search = self._authenticate("shared@example.com", entries=entries)
         assert result is None
+
+    def test_auth_reconnects_when_service_connection_was_dropped(self) -> None:
+        """An idle-timed-out service connection must not surface as a failed login."""
+        ad, stale_conn = _make_ad_connected()
+        stale_conn.search.side_effect = OSError("session terminated by server")
+
+        fresh_conn = MagicMock()
+        fresh_conn.bound = True
+        fresh_conn.entries = [_make_ldap_entry()]
+
+        with patch(f"{MOD}.Connection", return_value=fresh_conn):
+            result = ad.authenticate_user("jdoe", "password123")
+
+        assert result is not None
+        assert result["username"] == "jdoe"
+        assert ad.connection is fresh_conn
+        stale_conn.search.assert_called_once()
+        fresh_conn.search.assert_called_once()
+
+    def test_auth_fails_when_directory_stays_unreachable(self) -> None:
+        ad, stale_conn = _make_ad_connected()
+        stale_conn.search.side_effect = OSError("connection reset")
+
+        with patch(f"{MOD}.Connection", side_effect=OSError("connection refused")):
+            assert ad.authenticate_user("jdoe", "password123") is None
 
     def test_auth_rejects_empty_password_without_binding(self) -> None:
         ad, conn = _make_ad_connected(entries=[_make_ldap_entry()])

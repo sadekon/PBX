@@ -109,6 +109,47 @@ class ActiveDirectoryIntegration:
             self.connection = None
             return False
 
+    def _find_login_user(self, search_base: str | None, search_filter: str) -> list[Any]:
+        """
+        Search for the user signing in, using the shared service connection
+
+        Directory servers drop idle connections (Active Directory after 15
+        minutes by default), which only shows up when the connection is next
+        used. Reconnect and retry once so that is not reported to the user as
+        a failed login.
+
+        Args:
+            search_base: DN to search under
+            search_filter: LDAP filter identifying the user
+
+        Returns:
+            list: Matching directory entries
+        """
+        with self._auth_lock:
+            for is_retry in (False, True):
+                try:
+                    self.connection.search(
+                        search_base=search_base,
+                        search_filter=search_filter,
+                        search_scope=SUBTREE,
+                        attributes=[
+                            "sAMAccountName",
+                            "displayName",
+                            "mail",
+                            "telephoneNumber",
+                            "memberOf",
+                        ],
+                    )
+                    return list(self.connection.entries)
+                except (LDAPException, OSError) as e:
+                    if is_retry:
+                        raise
+                    self.logger.warning(f"Directory connection lost ({e}), reconnecting")
+                    self.connection = None
+                    if not self.connect():
+                        raise
+        return []
+
     def authenticate_user(self, username: str, password: str) -> dict | None:
         """
         Authenticate user against Active Directory
@@ -157,20 +198,7 @@ class ActiveDirectoryIntegration:
                 "integrations.active_directory.user_search_base", self.base_dn
             )
 
-            with self._auth_lock:
-                self.connection.search(
-                    search_base=user_search_base,
-                    search_filter=search_filter,
-                    search_scope=SUBTREE,
-                    attributes=[
-                        "sAMAccountName",
-                        "displayName",
-                        "mail",
-                        "telephoneNumber",
-                        "memberOf",
-                    ],
-                )
-                entries = list(self.connection.entries)
+            entries = self._find_login_user(user_search_base, search_filter)
 
             if not entries:
                 self.logger.warning(f"User not found: {username}")
