@@ -1,21 +1,31 @@
 """Authentication Blueprint routes.
 
-Handles login and logout for the PBX API. Login supports both regular
-extension authentication (via voicemail PIN) and the special license
-admin extension.
+Handles login and logout for the PBX API. Login supports directory
+authentication (Active Directory / Exchange username and password),
+regular extension authentication (via voicemail PIN) and the special
+license admin extension.
 """
 
 import secrets
 import traceback
+from typing import Any
 
 from flask import Blueprint, Response
 
 from pbx.api.utils import get_pbx_core, get_request_body, send_json
 from pbx.utils.logger import get_logger
+from pbx.utils.security import RateLimiter
 
 logger = get_logger()
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
+
+# Longest directory username accepted (a UPN is at most 1024, sAMAccountName 20)
+MAX_DIRECTORY_USERNAME_LENGTH = 256
+
+# Failed directory logins count toward the directory's own account lockout,
+# so throttle them here before they reach the directory server
+_directory_rate_limiter = RateLimiter()
 
 
 def _record_auth_metric(status: str) -> None:
@@ -26,9 +36,87 @@ def _record_auth_metric(status: str) -> None:
         exporter.record_auth_attempt(status=status)
 
 
+def _directory_login_enabled(pbx_core: Any) -> bool:
+    """Whether users can sign in with their directory username and password."""
+    ad_integration = getattr(pbx_core, "ad_integration", None)
+    return ad_integration is not None and getattr(ad_integration, "enabled", False) is True
+
+
+def _handle_directory_login(pbx_core: Any, username: str, password: str) -> Response:
+    """Authenticate against the directory and sign in to the linked extension."""
+    if not _directory_login_enabled(pbx_core):
+        _record_auth_metric("failure")
+        return send_json(
+            {"error": "Directory sign-in is not enabled. Use your extension number."}, 401
+        )
+
+    if not pbx_core.extension_db:
+        return send_json({"error": "Database not available"}, 500)
+
+    rate_limit_key = username.lower()
+    is_limited, retry_after = _directory_rate_limiter.is_rate_limited(rate_limit_key)
+    if is_limited:
+        _record_auth_metric("failure")
+        minutes = max(1, ((retry_after or 0) + 59) // 60)
+        return send_json(
+            {"error": f"Too many failed sign-in attempts. Try again in {minutes} minute(s)."},
+            429,
+        )
+
+    user = pbx_core.ad_integration.authenticate_user(username, password)
+    if not user:
+        _directory_rate_limiter.record_attempt(rate_limit_key)
+        _record_auth_metric("failure")
+        return send_json({"error": "Invalid credentials"}, 401)
+
+    _directory_rate_limiter.record_attempt(rate_limit_key, successful=True)
+
+    ext = pbx_core.extension_db.get_by_ad_username(user["username"])
+    if not ext:
+        logger.warning(f"Directory user {user['username']} has no linked extension")
+        _record_auth_metric("failure")
+        return send_json(
+            {
+                "error": "Your account is not linked to a phone extension. "
+                "Contact your administrator."
+            },
+            403,
+        )
+
+    from pbx.utils.session_token import get_session_token_manager
+
+    name = ext.get("name") or user.get("display_name")
+    email = ext.get("email") or user.get("email")
+    token = get_session_token_manager().generate_token(
+        extension=ext["number"],
+        is_admin=ext.get("is_admin", False),
+        name=name,
+        email=email,
+    )
+
+    _record_auth_metric("success")
+    return send_json(
+        {
+            "success": True,
+            "token": token,
+            "extension": ext["number"],
+            "is_admin": ext.get("is_admin", False),
+            "name": name or "User",
+            "email": email or "",
+        }
+    )
+
+
+@auth_bp.route("/methods", methods=["GET"])
+def handle_login_methods() -> Response:
+    """Report which sign-in methods the login page should offer."""
+    pbx_core = get_pbx_core()
+    return send_json({"directory_login": _directory_login_enabled(pbx_core)})
+
+
 @auth_bp.route("/login", methods=["POST"])
 def handle_login() -> Response:
-    """Authenticate extension and return session token."""
+    """Authenticate a directory user or extension and return session token."""
     pbx_core = get_pbx_core()
     if not pbx_core:
         return send_json({"error": "PBX not initialized"}, 500)
@@ -36,7 +124,17 @@ def handle_login() -> Response:
     try:
         body = get_request_body()
         extension_number = body.get("extension")
+        username = body.get("username")
         password = body.get("password")
+
+        # A username without an extension is a directory (AD / Exchange) login
+        if not extension_number and username:
+            if not isinstance(username, str) or not isinstance(password, str) or not password:
+                return send_json({"error": "Username and password required"}, 400)
+            username = username.strip()
+            if not username or len(username) > MAX_DIRECTORY_USERNAME_LENGTH:
+                return send_json({"error": "Username and password required"}, 400)
+            return _handle_directory_login(pbx_core, username, password)
 
         if not extension_number or not password:
             return send_json({"error": "Extension and password required"}, 400)

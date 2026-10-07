@@ -452,6 +452,59 @@ class TestAuthenticateUser:
         call_kwargs = conn.search.call_args[1]
         assert call_kwargs["search_base"] == "OU=Staff,DC=example,DC=com"
 
+    def _authenticate(self, username: str, entries: list | None = None) -> tuple:
+        """Run authenticate_user with a successful bind; return (result, search kwargs)."""
+        ad, conn = _make_ad_connected()
+        found = [_make_ldap_entry()] if entries is None else entries
+
+        def do_search(**kwargs):
+            conn.entries = found
+
+        conn.search.side_effect = do_search
+
+        user_conn = MagicMock()
+        user_conn.bound = True
+
+        with patch(f"{MOD}.Connection", return_value=user_conn):
+            result = ad.authenticate_user(username, "password123")
+
+        return result, conn.search.call_args[1] if conn.search.called else None
+
+    def test_auth_searches_by_sam_account_name(self) -> None:
+        result, search = self._authenticate("jdoe")
+        assert result is not None
+        assert search["search_filter"] == "(&(objectClass=user)(sAMAccountName=jdoe))"
+
+    def test_auth_searches_by_upn_or_mail_for_email_address(self) -> None:
+        result, search = self._authenticate("jdoe@example.com")
+        assert result is not None
+        assert search["search_filter"] == (
+            "(&(objectClass=user)(|(userPrincipalName=jdoe@example.com)(mail=jdoe@example.com)))"
+        )
+
+    def test_auth_strips_domain_prefix(self) -> None:
+        result, search = self._authenticate("EXAMPLE\\jdoe")
+        assert result is not None
+        assert search["search_filter"] == "(&(objectClass=user)(sAMAccountName=jdoe))"
+
+    def test_auth_rejects_ambiguous_match(self) -> None:
+        entries = [_make_ldap_entry(), _make_ldap_entry()]
+        result, _search = self._authenticate("shared@example.com", entries=entries)
+        assert result is None
+
+    def test_auth_rejects_empty_password_without_binding(self) -> None:
+        ad, conn = _make_ad_connected(entries=[_make_ldap_entry()])
+        with patch(f"{MOD}.Connection") as connection_cls:
+            assert ad.authenticate_user("jdoe", "") is None
+        conn.search.assert_not_called()
+        connection_cls.assert_not_called()
+
+    def test_auth_rejects_blank_username(self) -> None:
+        ad, conn = _make_ad_connected(entries=[_make_ldap_entry()])
+        assert ad.authenticate_user("   ", "password123") is None
+        assert ad.authenticate_user("EXAMPLE\\", "password123") is None
+        conn.search.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Tests: _map_groups_to_permissions()

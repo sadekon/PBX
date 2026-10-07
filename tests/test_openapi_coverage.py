@@ -141,7 +141,7 @@ class TestOpenAPIPaths:
     def test_total_path_count(self) -> None:
         """Verify the total number of paths."""
         paths = get_openapi_spec()["paths"]
-        assert len(paths) == 11
+        assert len(paths) == 12
 
 
 @pytest.mark.unit
@@ -591,10 +591,11 @@ class TestComponentsSchemas:
         assert status["enum"] == ["ready", "not_ready", "error"]
 
     def test_login_request_schema(self) -> None:
-        """LoginRequest must require extension and password."""
+        """LoginRequest must require a password plus a username or extension."""
         schema = get_openapi_spec()["components"]["schemas"]["LoginRequest"]
         assert schema["type"] == "object"
-        assert set(schema["required"]) == {"extension", "password"}
+        assert set(schema["required"]) == {"password"}
+        assert schema["properties"]["username"]["type"] == "string"
         assert schema["properties"]["extension"]["type"] == "string"
         assert schema["properties"]["password"]["type"] == "string"
 
@@ -731,6 +732,7 @@ class TestOpenAPIOperationIds:
             "detailedHealth",
             "getStatus",
             "login",
+            "loginMethods",
             "logout",
             "getExtensions",
             "createExtension",

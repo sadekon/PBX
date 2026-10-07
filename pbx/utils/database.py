@@ -1304,6 +1304,21 @@ class ExtensionDB:
         """
         return self.db.fetch_all(query)
 
+    def get_by_ad_username(self, ad_username: str) -> dict | None:
+        """
+        Get the extension linked to an Active Directory username
+
+        Args:
+            ad_username: Active Directory username (sAMAccountName), case-insensitive
+
+        Returns:
+            dict: Extension data or None
+        """
+        query = """
+        SELECT id, number, name, email, password_hash, password_salt, allow_external, voicemail_pin_hash, voicemail_pin_salt, voicemail_email_enabled, is_admin, ad_synced, ad_username, password_changed_at, failed_login_attempts, account_locked_until, created_at, updated_at, sip_password, did_number FROM extensions WHERE LOWER(ad_username) = LOWER(%s) ORDER BY number
+        """
+        return self.db.fetch_one(query, (ad_username,))
+
     def get_ad_synced(self) -> list[dict]:
         """
         Get all AD-synced extensions

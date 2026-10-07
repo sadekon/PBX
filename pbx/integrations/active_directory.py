@@ -5,6 +5,7 @@ Provides SSO, user provisioning, and group-based permissions
 
 import re
 import secrets
+import threading
 from typing import Any, cast
 
 from pbx.utils.logger import get_logger
@@ -43,6 +44,8 @@ class ActiveDirectoryIntegration:
         self.auto_provision = config.get("integrations.active_directory.auto_provision", False)
         self.connection: Any = None
         self.server: Any = None
+        # The service connection is shared; logins arrive on concurrent API threads
+        self._auth_lock = threading.Lock()
 
         if self.enabled:
             if not LDAP3_AVAILABLE:
@@ -111,7 +114,7 @@ class ActiveDirectoryIntegration:
         Authenticate user against Active Directory
 
         Args:
-            username: Username (SAM account name or UPN)
+            username: SAM account name, DOMAIN\\name, UPN or email address
             password: User's password
 
         Returns:
@@ -119,6 +122,18 @@ class ActiveDirectoryIntegration:
         """
         if not self.enabled or not LDAP3_AVAILABLE:
             return None
+
+        # An empty password would be an unauthenticated bind, which some
+        # directory servers accept - never treat that as a successful login
+        username = (username or "").strip()
+        if not username or not password:
+            return None
+
+        # Accept the down-level logon form (DOMAIN\user)
+        if "\\" in username:
+            username = username.rsplit("\\", 1)[1]
+            if not username:
+                return None
 
         if not self.connect():
             return None
@@ -130,23 +145,42 @@ class ActiveDirectoryIntegration:
             from ldap3.utils.conv import escape_filter_chars
 
             safe_username = escape_filter_chars(username)
-            search_filter = f"(&(objectClass=user)(sAMAccountName={safe_username}))"
+            if "@" in username:
+                # UPN or email address
+                search_filter = (
+                    f"(&(objectClass=user)"
+                    f"(|(userPrincipalName={safe_username})(mail={safe_username})))"
+                )
+            else:
+                search_filter = f"(&(objectClass=user)(sAMAccountName={safe_username}))"
             user_search_base = self.config.get(
                 "integrations.active_directory.user_search_base", self.base_dn
             )
 
-            self.connection.search(
-                search_base=user_search_base,
-                search_filter=search_filter,
-                search_scope=SUBTREE,
-                attributes=["sAMAccountName", "displayName", "mail", "telephoneNumber", "memberOf"],
-            )
+            with self._auth_lock:
+                self.connection.search(
+                    search_base=user_search_base,
+                    search_filter=search_filter,
+                    search_scope=SUBTREE,
+                    attributes=[
+                        "sAMAccountName",
+                        "displayName",
+                        "mail",
+                        "telephoneNumber",
+                        "memberOf",
+                    ],
+                )
+                entries = list(self.connection.entries)
 
-            if not self.connection.entries:
+            if not entries:
                 self.logger.warning(f"User not found: {username}")
                 return None
 
-            user_entry = self.connection.entries[0]
+            if len(entries) > 1:
+                self.logger.warning(f"Multiple directory users match: {username}")
+                return None
+
+            user_entry = entries[0]
             user_dn = user_entry.entry_dn
 
             # Attempt to bind with user credentials

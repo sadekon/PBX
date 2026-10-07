@@ -134,8 +134,9 @@ def get_openapi_spec() -> dict[str, Any]:
                     "tags": ["Auth"],
                     "summary": "Login",
                     "description": (
-                        "Authenticate an extension using its voicemail PIN. "
-                        "Returns a session token on success."
+                        "Authenticate with a directory (Active Directory / Exchange) "
+                        "username and password, or with an extension and its "
+                        "voicemail PIN. Returns a session token on success."
                     ),
                     "operationId": "login",
                     "requestBody": {
@@ -171,6 +172,27 @@ def get_openapi_spec() -> dict[str, Any]:
                                 }
                             },
                         },
+                    },
+                }
+            },
+            "/api/auth/methods": {
+                "get": {
+                    "tags": ["Auth"],
+                    "summary": "Available sign-in methods",
+                    "description": "Reports whether directory sign-in is offered.",
+                    "operationId": "loginMethods",
+                    "responses": {
+                        "200": {
+                            "description": "Sign-in methods",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {"directory_login": {"type": "boolean"}},
+                                    }
+                                }
+                            },
+                        }
                     },
                 }
             },
@@ -531,6 +553,14 @@ def get_openapi_spec() -> dict[str, Any]:
                 "LoginRequest": {
                     "type": "object",
                     "properties": {
+                        "username": {
+                            "type": "string",
+                            "description": (
+                                "Directory username, DOMAIN\\username or email address. "
+                                "Send instead of extension to sign in with the directory."
+                            ),
+                            "example": "jsmith",
+                        },
                         "extension": {
                             "type": "string",
                             "description": "4-digit extension number",
@@ -538,11 +568,14 @@ def get_openapi_spec() -> dict[str, Any]:
                         },
                         "password": {
                             "type": "string",
-                            "description": "Voicemail PIN",
+                            "description": (
+                                "Directory password (with username) or voicemail PIN "
+                                "(with extension)"
+                            ),
                             "example": "1234",
                         },
                     },
-                    "required": ["extension", "password"],
+                    "required": ["password"],
                 },
                 "LoginResponse": {
                     "type": "object",

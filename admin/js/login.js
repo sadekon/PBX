@@ -90,17 +90,65 @@ setTimeout(testAPIConnection, 500);
 var loginForm = document.getElementById('login-form');
 var loginButton = document.getElementById('login-button');
 var errorMessage = document.getElementById('error-message');
-var extensionInput = document.getElementById('extension');
+var usernameInput = document.getElementById('username');
 var passwordInput = document.getElementById('password');
+
+// Directory (Active Directory / Exchange) sign-in is offered unless the server says otherwise
+var directoryLoginEnabled = true;
+
+// An all-digit entry is an extension signing in with its voicemail PIN;
+// anything else is a directory username
+function isExtensionNumber(value) {
+    return /^[0-9]+$/.test(value);
+}
+
+// Fall back to the extension-only form when the server has no directory configured
+async function loadLoginMethods() {
+    try {
+        var response = await fetch(API_BASE + '/api/auth/methods', {
+            headers: { 'Accept': 'application/json' }
+        });
+        if (!response.ok) {
+            return;
+        }
+        var methods = await response.json();
+        if (methods.directory_login === false) {
+            directoryLoginEnabled = false;
+            document.getElementById('username-label').textContent = 'Extension Number';
+            document.getElementById('username-hint').textContent =
+                'Sign in with your extension number and voicemail PIN.';
+            document.getElementById('password-label').textContent = 'Voicemail PIN';
+            usernameInput.placeholder = 'e.g., 1001';
+            usernameInput.inputMode = 'numeric';
+            passwordInput.placeholder = 'Enter your voicemail PIN';
+        }
+    } catch (error) {
+        debugWarn('Could not load login methods:', error);
+    }
+}
+
+loadLoginMethods();
 
 loginForm.addEventListener('submit', async function(e) {
     e.preventDefault();
 
-    var extension = extensionInput.value.trim();
+    var identifier = usernameInput.value.trim();
     var password = passwordInput.value;
 
-    if (!extension || !password) {
-        showError('Please enter both extension and password');
+    if (!identifier || !password) {
+        showError(directoryLoginEnabled
+            ? 'Please enter your username or extension and your password'
+            : 'Please enter both extension and voicemail PIN');
+        return;
+    }
+
+    var credentials = { password: password };
+    if (isExtensionNumber(identifier)) {
+        credentials.extension = identifier;
+    } else if (directoryLoginEnabled) {
+        credentials.username = identifier;
+    } else {
+        showError('Please enter your extension number');
         return;
     }
 
@@ -115,10 +163,7 @@ loginForm.addEventListener('submit', async function(e) {
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({
-                extension: extension,
-                password: password
-            })
+            body: JSON.stringify(credentials)
         });
 
         // Check if response is JSON before parsing
@@ -184,18 +229,18 @@ passwordToggle.addEventListener('click', function() {
     passwordToggle.setAttribute('aria-label', isPassword ? 'Hide password' : 'Show password');
 });
 
-// Remember Me: save/restore extension from localStorage
+// Remember Me: save/restore username or extension from localStorage
 var rememberMe = document.getElementById('remember-me');
 var savedExtension = localStorage.getItem('pbx_remembered_extension');
 if (savedExtension) {
-    extensionInput.value = savedExtension;
+    usernameInput.value = savedExtension;
     rememberMe.checked = true;
 }
 
 // Save on successful login
 loginForm.addEventListener('submit', function() {
     if (rememberMe.checked) {
-        localStorage.setItem('pbx_remembered_extension', extensionInput.value.trim());
+        localStorage.setItem('pbx_remembered_extension', usernameInput.value.trim());
     } else {
         localStorage.removeItem('pbx_remembered_extension');
     }
@@ -208,9 +253,9 @@ forgotLink.addEventListener('click', function(e) {
     alert('Please contact your system administrator to reset your password.');
 });
 
-// Auto-focus: if extension pre-filled, focus password instead
+// Auto-focus: if username pre-filled, focus password instead
 if (savedExtension) {
     passwordInput.focus();
 } else {
-    extensionInput.focus();
+    usernameInput.focus();
 }

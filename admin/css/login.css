@@ -131,6 +131,14 @@ input[type="password"]:focus {
     transform: translateY(-1px);
 }
 
+.field-hint {
+    display: block;
+    margin-top: 8px;
+    color: #666;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
 .error-message {
     background: #fee;
     color: #c33;
@@ -342,6 +350,10 @@ input[type="password"]:focus {
 
     label {
         color: #cdd5de;
+    }
+
+    .field-hint {
+        color: #a0aab4;
     }
 
     input[type="text"],

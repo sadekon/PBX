@@ -28,21 +28,27 @@
 
         <form id="login-form" aria-label="Login form">
             <div class="form-group">
-                <label for="extension">Extension Number</label>
+                <label for="username" id="username-label">Username or Extension</label>
                 <input
                     type="text"
-                    id="extension"
-                    name="extension"
-                    placeholder="e.g., 1001"
+                    id="username"
+                    name="username"
+                    placeholder="e.g., jsmith or 1001"
                     required
-                    pattern="[0-9]+"
-                    maxlength="6"
+                    maxlength="256"
                     autocomplete="username"
+                    autocapitalize="none"
+                    spellcheck="false"
+                    aria-describedby="username-hint"
                 >
+                <small id="username-hint" class="field-hint">
+                    Sign in with your network username or email address and its password,
+                    or with your extension number and voicemail PIN.
+                </small>
             </div>
 
             <div class="form-group">
-                <label for="password">Password</label>
+                <label for="password" id="password-label">Password</label>
                 <div class="password-wrapper">
                     <input
                         type="password"
@@ -75,7 +81,7 @@
         <div class="security-note">
             🔒 Your session is secured with encrypted authentication
         </div>
-        
+
         <div id="troubleshooting" class="security-note troubleshooting-note">
             <strong>Connection Troubleshooting:</strong><br>
             <small id="troubleshooting-details"></small>
